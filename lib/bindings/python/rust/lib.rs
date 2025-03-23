@@ -384,7 +384,8 @@ impl Client {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let stream = client.round_robin(request.into()).await.map_err(to_pyerr)?;
-            tokio::spawn(process_stream(stream, tx));
+            let ignore_response = request.contains_key("ignore_response") && request["ignore_response"].as_bool().unwrap_or(false);
+            tokio::spawn(process_stream(stream, tx, ignore_response));
             Ok(AsyncResponseStream {
                 rx: Arc::new(Mutex::new(rx)),
                 annotated,
@@ -408,7 +409,8 @@ impl Client {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let stream = client.random(request.into()).await.map_err(to_pyerr)?;
-            tokio::spawn(process_stream(stream, tx));
+            let ignore_response = request.contains_key("ignore_response") && request["ignore_response"].as_bool().unwrap_or(false);
+            tokio::spawn(process_stream(stream, tx, ignore_response));
             Ok(AsyncResponseStream {
                 rx: Arc::new(Mutex::new(rx)),
                 annotated,
@@ -437,7 +439,8 @@ impl Client {
                 .await
                 .map_err(to_pyerr)?;
 
-            tokio::spawn(process_stream(stream, tx));
+            let ignore_response = request.contains_key("ignore_response") && request["ignore_response"].as_bool().unwrap_or(false);
+            tokio::spawn(process_stream(stream, tx, ignore_response));
 
             Ok(AsyncResponseStream {
                 rx: Arc::new(Mutex::new(rx)),
@@ -450,6 +453,7 @@ impl Client {
 async fn process_stream(
     stream: EngineStream<serde_json::Value>,
     tx: tokio::sync::mpsc::Sender<RsAnnotated<PyObject>>,
+    ignore_response: bool,
 ) {
     let mut stream = stream;
     while let Some(response) = stream.next().await {
@@ -477,7 +481,12 @@ async fn process_stream(
 
         // Send the PyObject through the channel or log an error
         if let Err(e) = tx.send(annotated).await {
-            tracing::error!("Failed to send response: {:?}", e);
+            let msg = format!("Failed to send response to channel: {:?}", e);
+            if ignore_response {
+                tracing::debug!(%msg);
+            } else {
+                tracing::warn!(%msg);
+            }
         }
 
         if is_error {
