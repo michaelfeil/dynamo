@@ -273,117 +273,117 @@ RUN cargo build --release --locked --features mistralrs,sglang,vllm,python && \
     cp target/release/metrics /usr/local/bin && \
     cp target/release/mock_worker /usr/local/bin
 
-# COPY deploy/dynamo/sdk /workspace/deploy/dynamo/sdk
-# # Build dynamo wheel
-# RUN source /opt/dynamo/venv/bin/activate && \
-#     cd /workspace/lib/bindings/python && \
-#     uv build --wheel --out-dir /workspace/dist && \
-#     uv pip install /workspace/dist/ai_dynamo_runtime*cp312*.whl && \
-#     cd /workspace && \
-#     uv build --wheel --out-dir /workspace/dist && \
-#     uv pip install /workspace/dist/ai_dynamo*any.whl
+COPY deploy/dynamo/sdk /workspace/deploy/dynamo/sdk
+# Build dynamo wheel
+RUN source /opt/dynamo/venv/bin/activate && \
+    cd /workspace/lib/bindings/python && \
+    uv build --wheel --out-dir /workspace/dist && \
+    uv pip install /workspace/dist/ai_dynamo_runtime*cp312*.whl && \
+    cd /workspace && \
+    uv build --wheel --out-dir /workspace/dist && \
+    uv pip install /workspace/dist/ai_dynamo*any.whl
 
-# # Package the bindings
-# RUN mkdir -p /opt/dynamo/bindings/wheels && \
-#     mkdir /opt/dynamo/bindings/lib && \
-#     cp dist/ai_dynamo*cp312*.whl /opt/dynamo/bindings/wheels/. && \
-#     cp target/release/libdynamo_llm_capi.so /opt/dynamo/bindings/lib/. && \
-#     cp -r lib/bindings/c/include /opt/dynamo/bindings/.
+# Package the bindings
+RUN mkdir -p /opt/dynamo/bindings/wheels && \
+    mkdir /opt/dynamo/bindings/lib && \
+    cp dist/ai_dynamo*cp312*.whl /opt/dynamo/bindings/wheels/. && \
+    cp target/release/libdynamo_llm_capi.so /opt/dynamo/bindings/lib/. && \
+    cp -r lib/bindings/c/include /opt/dynamo/bindings/.
 
-# # Tell vllm to use the Dynamo LLM C API for KV Cache Routing
-# ENV VLLM_KV_CAPI_PATH="/opt/dynamo/bindings/lib/libdynamo_llm_capi.so"
+# Tell vllm to use the Dynamo LLM C API for KV Cache Routing
+ENV VLLM_KV_CAPI_PATH="/opt/dynamo/bindings/lib/libdynamo_llm_capi.so"
 
-# # Copy launch banner
-# RUN --mount=type=bind,source=./container/launch_message.txt,target=/workspace/launch_message.txt \
-#     sed '/^#\s/d' /workspace/launch_message.txt > ~/.launch_screen && \
-#     echo "cat ~/.launch_screen" >> ~/.bashrc
+# Copy launch banner
+RUN --mount=type=bind,source=./container/launch_message.txt,target=/workspace/launch_message.txt \
+    sed '/^#\s/d' /workspace/launch_message.txt > ~/.launch_screen && \
+    echo "cat ~/.launch_screen" >> ~/.bashrc
 
-# CMD []
+CMD []
 
-# #######################################
-# ########## CI Minimum Image ###########
-# #######################################
-# FROM build AS ci_minimum
+#######################################
+########## CI Minimum Image ###########
+#######################################
+FROM build AS ci_minimum
 
-# COPY . /workspace
+COPY . /workspace
 
-# ##########################################
-# ########## Perf Analyzer Image ###########
-# ##########################################
-# FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS perf_analyzer
+##########################################
+########## Perf Analyzer Image ###########
+##########################################
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS perf_analyzer
 
-# ARG GENAI_PERF_TAG
+ARG GENAI_PERF_TAG
 
-# WORKDIR /workspace
+WORKDIR /workspace
 
-# # Build and install Perf Analyzer for benchmarking
-# RUN apt-get update -y && apt-get -y install cmake g++ libssl-dev python3 rapidjson-dev zlib1g-dev
-# RUN git clone https://github.com/triton-inference-server/perf_analyzer.git
-# RUN git -C perf_analyzer checkout ${GENAI_PERF_TAG}
-# RUN mkdir perf_analyzer/build
-# RUN cmake -B perf_analyzer/build -S perf_analyzer -D TRITON_ENABLE_PERF_ANALYZER_OPENAI=ON
-# RUN cmake --build perf_analyzer/build -- -j8
-# RUN mkdir bin &&  \
-#     cp -r perf_analyzer/build/perf_analyzer/src/perf-analyzer-build /workspace/bin/
+# Build and install Perf Analyzer for benchmarking
+RUN apt-get update -y && apt-get -y install cmake g++ libssl-dev python3 rapidjson-dev zlib1g-dev
+RUN git clone https://github.com/triton-inference-server/perf_analyzer.git
+RUN git -C perf_analyzer checkout ${GENAI_PERF_TAG}
+RUN mkdir perf_analyzer/build
+RUN cmake -B perf_analyzer/build -S perf_analyzer -D TRITON_ENABLE_PERF_ANALYZER_OPENAI=ON
+RUN cmake --build perf_analyzer/build -- -j8
+RUN mkdir bin &&  \
+    cp -r perf_analyzer/build/perf_analyzer/src/perf-analyzer-build /workspace/bin/
 
-# ########################################
-# ########## Development Image ###########
-# ########################################
-# FROM build AS dev
+########################################
+########## Development Image ###########
+########################################
+FROM build AS dev
 
-# ARG GENAI_PERF_TAG
+ARG GENAI_PERF_TAG
 
-# COPY --from=perf_analyzer /workspace/bin/perf-analyzer-build/ /perf/bin
-# COPY --from=perf_analyzer /workspace/perf_analyzer /perf_analyzer
-# ENV PATH="/perf/bin:${PATH}"
+COPY --from=perf_analyzer /workspace/bin/perf-analyzer-build/ /perf/bin
+COPY --from=perf_analyzer /workspace/perf_analyzer /perf_analyzer
+ENV PATH="/perf/bin:${PATH}"
 
-# # Install genai-perf for benchmarking
-# RUN uv pip install "git+https://github.com/triton-inference-server/perf_analyzer.git@${GENAI_PERF_TAG}#subdirectory=genai-perf"
-# RUN uv pip uninstall tritonclient
+# Install genai-perf for benchmarking
+RUN uv pip install "git+https://github.com/triton-inference-server/perf_analyzer.git@${GENAI_PERF_TAG}#subdirectory=genai-perf"
+RUN uv pip uninstall tritonclient
 
-# COPY . /workspace
+COPY . /workspace
 
-# ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
 
-# CMD []
+CMD []
 
-# ####################################
-# ########## Runtime Image ###########
-# ####################################
+####################################
+########## Runtime Image ###########
+####################################
 
-# FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS runtime
+FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS runtime
 
-# WORKDIR /workspace
-# ENV VIRTUAL_ENV=/opt/dynamo/venv
+WORKDIR /workspace
+ENV VIRTUAL_ENV=/opt/dynamo/venv
 
-# # Copy NIXL
-# COPY --from=build /usr/local/nixl /usr/local/nixl
-# ENV LD_LIBRARY_PATH=/usr/local/nixl/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH
-# ENV PYTHONPATH=/usr/local/nixl/lib/python3/dist-packages/:/opt/nixl/test/python/:$PYTHONPATH
+# Copy NIXL
+COPY --from=build /usr/local/nixl /usr/local/nixl
+ENV LD_LIBRARY_PATH=/usr/local/nixl/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH
+ENV PYTHONPATH=/usr/local/nixl/lib/python3/dist-packages/:/opt/nixl/test/python/:$PYTHONPATH
 
-# # Setup the python environment
-# COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-# RUN apt-get update && \
-#     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev && \
-#     rm -rf /var/lib/apt/lists/* && \
-#     uv venv $VIRTUAL_ENV --python 3.12 && \
-#     echo "source $VIRTUAL_ENV/bin/activate" >> ~/.bashrc
+# Setup the python environment
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    uv venv $VIRTUAL_ENV --python 3.12 && \
+    echo "source $VIRTUAL_ENV/bin/activate" >> ~/.bashrc
 
-# # Install the wheels
-# COPY --from=build /workspace/dist/*.whl wheelhouse/
-# RUN uv pip install ai-dynamo[vllm] --find-links wheelhouse && \
-#     rm -r wheelhouse
+# Install the wheels
+COPY --from=build /workspace/dist/*.whl wheelhouse/
+RUN uv pip install ai-dynamo[vllm] --find-links wheelhouse && \
+    rm -r wheelhouse
 
-# # Tell vllm to use the Dynamo LLM C API for KV Cache Routing
-# ENV VLLM_KV_CAPI_PATH="/opt/dynamo/bindings/lib/libdynamo_llm_capi.so"
+# Tell vllm to use the Dynamo LLM C API for KV Cache Routing
+ENV VLLM_KV_CAPI_PATH="/opt/dynamo/bindings/lib/libdynamo_llm_capi.so"
 
-# # Copy launch banner
-# RUN --mount=type=bind,source=./container/launch_message.txt,target=/workspace/launch_message.txt \
-#     sed '/^#\s/d' /workspace/launch_message.txt > ~/.launch_screen && \
-#     echo "cat ~/.launch_screen" >> ~/.bashrc
+# Copy launch banner
+RUN --mount=type=bind,source=./container/launch_message.txt,target=/workspace/launch_message.txt \
+    sed '/^#\s/d' /workspace/launch_message.txt > ~/.launch_screen && \
+    echo "cat ~/.launch_screen" >> ~/.bashrc
 
-# # Copy examples
-# COPY ./examples examples/
+# Copy examples
+COPY ./examples examples/
 
-# ENTRYPOINT [ "/usr/bin/bash" ]
-# CMD []
+ENTRYPOINT [ "/usr/bin/bash" ]
+CMD []
