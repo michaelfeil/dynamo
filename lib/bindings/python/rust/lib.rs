@@ -378,7 +378,7 @@ impl Client {
     ) -> PyResult<Bound<'p, PyAny>> {
         let request: serde_json::Value = pythonize::depythonize(&request.into_bound(py))?;
         let ignore_response = request
-            .get("ignore_response")  // returns an Option<&Value> if request is an object
+            .get("ignore_response") // returns an Option<&Value> if request is an object
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         let annotated = annotated.unwrap_or(false);
@@ -406,7 +406,7 @@ impl Client {
     ) -> PyResult<Bound<'p, PyAny>> {
         let request: serde_json::Value = pythonize::depythonize(&request.into_bound(py))?;
         let ignore_response = request
-            .get("ignore_response")  // returns an Option<&Value> if request is an object
+            .get("ignore_response") // returns an Option<&Value> if request is an object
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         let annotated = annotated.unwrap_or(false);
@@ -435,7 +435,7 @@ impl Client {
     ) -> PyResult<Bound<'p, PyAny>> {
         let request: serde_json::Value = pythonize::depythonize(&request.into_bound(py))?;
         let ignore_response = request
-            .get("ignore_response")  // returns an Option<&Value> if request is an object
+            .get("ignore_response") // returns an Option<&Value> if request is an object
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         let annotated = annotated.unwrap_or(false);
