@@ -23,9 +23,9 @@ This guide explains how to use the `dynamo build` command to containerize Dynamo
 
 - [What is dynamo build?](#what-is-dynamo-build)
 - [Building a containerized inference graph](#building-a-containerized-inference-graph)
-- [Configuration options](#configuration-options)
-- [Guided Example](#guided-example)
-- [Advanced topics](#advanced-topics)
+- [Guided Example for containerizing Hello World pipeline](#guided-example-for-containerizing-hello-world-pipeline)
+- [Guided Example for containerizing LLM pipeline](#guided-example-for-containerizing-llm-pipeline)
+
 
 ## What is dynamo build?
 
@@ -97,6 +97,79 @@ Starting your container with host networking and required environment variables:
 docker run --network host \
   --entrypoint sh \
   -w /src \
+  --ipc host \
   frontend-hello-world:latest \
   -c "uv run dynamo serve hello_world:Frontend"
+```
+
+## Guided Example for containerizing LLM pipeline
+
+This section will walk through an example of building a containerized LLM inference graph using the example available at `examples/llm`.
+
+### 1. Define your graph and check that it works with `dynamo serve`
+
+```bash
+cd examples/llm
+dynamo serve graphs.agg:Frontend -f ./configs/agg.yaml
+```
+
+### 2. Build a base image
+
+For LLM inference, we'll use the GPU-enabled base image with CUDA and vLLM support. You can use the `dynamo:latest-vllm` image created from running `./container/build.sh` as the base image.
+
+```bash
+# Build the base image with CUDA and vLLM support
+./container/build.sh
+# This will create dynamo:latest-vllm image
+```
+
+### 3. Containerize your graph with `dynamo build`
+
+```bash
+export DYNAMO_IMAGE=dynamo:latest-vllm
+dynamo build graphs.agg:Frontend --containerize
+
+# Output will contain tag for the newly created image
+# e.g frontend-llm-agg:latest
+```
+
+### 4. Run your container
+
+As a prerequisite, ensure you have NATS and etcd running by running the docker compose in the deploy directory. You can find it [here](../../deploy/docker-compose.yml).
+
+```bash
+docker compose up -d
+```
+
+Starting your container with host networking and required environment variables:
+```bash
+# Host networking is required for NATS and etcd to be accessible from the container
+docker run --network host \
+  --entrypoint sh \
+  --gpus all \
+  --shm-size 10G \
+  -w /src \
+  --ipc host \
+  frontend-llm-agg:latest \
+  -c "uv run dynamo serve graphs.agg:Frontend -f ./configs/agg.yaml"
+```
+
+### 5. Test your containerized LLM service
+
+Once the container is running, you can test it by making a request to the service:
+
+```bash
+curl localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
+    ],
+    "stream": false,
+    "max_tokens": 30
+  }'
 ```
