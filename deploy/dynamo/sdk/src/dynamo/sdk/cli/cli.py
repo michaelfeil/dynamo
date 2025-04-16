@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import typer
+import importlib.metadata
 from rich.console import Console
 
 from dynamo.sdk.cli.env import app as env_app
@@ -35,8 +36,9 @@ cli = typer.Typer(
 
 def version_callback(value: bool):
     if value:
+        version = importlib.metadata.version("ai-dynamo")
         console.print(
-            f"[bold green]Dynamo CLI[/bold green] version: [cyan]0.1.0[/cyan]"
+            f"[bold green]Dynamo CLI[/bold green] version: [cyan]{version}[/cyan]"
         )
         raise typer.Exit()
 
