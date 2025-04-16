@@ -281,7 +281,7 @@ def _parse_service_args(args: list[str]) -> t.Dict[str, t.Any]:
 
 
 def resolve_service_config(
-    config_file: str | t.TextIO | None = None,
+    config_file: pathlib.Path | t.TextIO | None = None,
     args: list[str] | None = None,
 ) -> dict[str, dict[str, t.Any]]:
     """Resolve service configuration from file and command line arguments.
@@ -308,7 +308,6 @@ def resolve_service_config(
         except Exception as e:
             logger.warning(f"Failed to parse DYN_DEPLOYMENT_CONFIG: {e}")
     else:
-        # Load file if provided
         if config_file:
             with open(config_file) if isinstance(
                 config_file, str

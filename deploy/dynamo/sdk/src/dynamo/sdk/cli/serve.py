@@ -98,7 +98,7 @@ def serve(
     from dynamo.sdk.lib.service import LinkedServices
 
     # Extract extra arguments not captured by typer
-    service_configs = resolve_service_config(str(file), ctx.args)
+    service_configs = resolve_service_config(file, ctx.args)
 
     # Process depends
     runner_map_dict = {}
