@@ -15,7 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.s
 -->
 
-# [Experimental] Using `dynamo build` to containerize inference graphs
+# 🔨 [Experimental] Using `dynamo build` to containerize inference graphs
 
 This guide explains how to use the `dynamo build` command to containerize Dynamo inference graphs (pipelines) for deployment.
 
