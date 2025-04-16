@@ -19,11 +19,12 @@ import platform
 import subprocess
 import sys
 
-import typer
 import distro
 import pkg_resources
+import typer
 
 app = typer.Typer(help="Environment management commands")
+
 
 def get_os_version() -> str:
     """Get OS version."""
