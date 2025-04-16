@@ -19,6 +19,53 @@ from __future__ import annotations
 
 import click
 import psutil
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich import print as rprint
+from rich.table import Table
+
+console = Console()
+
+app = typer.Typer(
+    name="dynamo",
+    help="The Dynamo CLI is a CLI for serving, containerizing, and deploying Dynamo applications.",
+    add_completion=True,
+    no_args_is_help=True,
+)
+
+def version_callback(value: bool):
+    if value:
+        from bentoml._internal.configuration import BENTOML_VERSION
+        console.print(f"[bold green]Dynamo CLI[/bold green] version: [cyan]{BENTOML_VERSION}[/cyan]")
+        raise typer.Exit()
+    
+@app.callback()
+def main(
+    version: bool = typer.Option(
+        False, "--version", "-v", help="Show the application version and exit.", 
+        callback=version_callback, is_eager=True
+    ),
+    ctx: typer.Context = None,
+):
+    """
+    The Dynamo CLI is a CLI for serving, containerizing, and deploying Dynamo applications.
+    It takes inspiration from and leverages core pieces of the BentoML deployment stack.
+
+    At a high level, you use `serve` to run a set of dynamo services locally,
+    `build` and `containerize` to package them up for deployment, and then `server`
+    and `deploy` to deploy them to a K8s cluster running the Dynamo Server
+    """
+
+    from bentoml._internal.context import server_context
+    server_context.service_type = "cli"
+
+from dynamo.sdk.cli.env import app as env_app
+
+app.add_typer(env_app, help="Environment management commands.") 
+
+if __name__ == "__main__":
+    app()
 
 
 def create_bentoml_cli() -> click.Command:
