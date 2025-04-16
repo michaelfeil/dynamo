@@ -23,7 +23,7 @@ from rich.console import Console
 
 from dynamo.sdk.cli.env import app as env_app
 from dynamo.sdk.cli.serve import app as serve_app
-
+from dynamo.sdk.cli.run import app as run_app
 console = Console()
 
 cli = typer.Typer(
@@ -64,8 +64,9 @@ def main(
     and `deploy` to deploy them to a K8s cluster running the Dynamo Server
     """
 
-cli.add_typer(env_app, help="Environment management commands.")
-cli.add_typer(serve_app, help="Serve Dynamo inference graphs locally")
+cli.add_typer(env_app, name="env", help="Environment management commands.")
+cli.add_typer(serve_app, name="serve", help="Serve Dynamo inference graphs locally")
+cli.add_typer(run_app, name="run", help="Run dynamo-run")
 
 if __name__ == "__main__":
     cli()
