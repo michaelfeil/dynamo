@@ -176,15 +176,15 @@ one node and let's consider that node to be the head node of the whole deploymen
 Note that if you are starting etcd server directly instead of using `docker compose`,
 you should add additional arguments to be discoverable in other node.
 ```bash
-etcd --advertise-client-urls http://<head-node-ip>:2379 --listen-client-urls http://<head-node-ip>,http://127.0.0.1:2379
+etcd --advertise-client-urls http://<head-node-ip>:2379 --listen-client-urls http://<head-node-ip>:2379,http://127.0.0.1:2379
 ```
 
 Now you can start the deployment by running `dynamo serve` on one of the node on
 each Ray cluster, for decode:
 ```bash
 # if not head node
-export NATS_SERVER = 'nats://<nats-server-ip>:4222'
-export ETCD_ENDPOINTS = '<etcd-endpoints-ip>:2379'
+export NATS_SERVER='nats://<nats-server-ip>:4222'
+export ETCD_ENDPOINTS='<etcd-endpoints-ip>:2379'
 
 cd $DYNAMO_HOME/examples/llm
 dynamo serve graphs.agg:Frontend -f ./configs/mutinode_disagg_r1.yaml

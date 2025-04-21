@@ -30,9 +30,7 @@ Processor:
 
 VllmWorker:
   remote-prefill: true
-  conditional-disagg: true
-  max-local-prefill-length: 10
-  max-prefill-queue-size: 2
+  conditional-disagg: false
   ServiceArgs:
     workers: 1
     resources:
