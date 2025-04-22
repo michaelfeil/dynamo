@@ -40,20 +40,20 @@ console = Console()
 
 
 def serve(
-    bento: str = typer.Argument(..., help="The path to the Bento to serve"),
+    dynamo_pipeline: str = typer.Argument(..., help="The path to the Dynamo pipeline to serve"),
     service_name: str = typer.Option(
         "",
         help="Only serve the specified service. Don't serve any dependencies of this service.",
-        envvar="BENTOML_SERVE_SERVICE_NAME",
+        envvar="DYNAMO_SERVE_SERVICE_NAME",
     ),
     depends: List[str] = typer.Option(
         [],
-        help="List of runners map",
-        envvar="BENTOML_SERVE_DEPENDS",
+        help="List of runner dependencies in name=value format",
+        envvar="DYNAMO_SERVE_DEPENDS",
     ),
-    file: Optional[Path] = typer.Option(
+    config_file: Optional[Path] = typer.Option(
         None,
-        "--file",
+        "--config-file",
         "-f",
         help="Path to YAML config file for service configuration",
         exists=True,
@@ -62,13 +62,13 @@ def serve(
         None,
         "--port",
         "-p",
-        help="The port to listen on for the REST api server if you are not using a dynamo service",
-        envvar="BENTOML_PORT",
+        help="The port to listen on for the REST API server",
+        envvar="DYNAMO_PORT",
     ),
     host: Optional[str] = typer.Option(
         None,
-        help="The host to bind for the REST api server if you are not using a dynamo service",
-        envvar="BENTOML_HOST",
+        help="The host to bind for the REST API server",
+        envvar="DYNAMO_HOST",
     ),
     working_dir: Optional[Path] = typer.Option(
         None,
@@ -84,7 +84,10 @@ def serve(
     ),
     ctx: typer.Context = typer.Context,
 ):
-    """Locally serve a Dynamo inference graph"""
+    """Locally serve a Dynamo pipeline.
+
+    Starts a local server for the specified Dynamo pipeline.
+    """
 
     # Warning: internal
     from bentoml._internal.service.loader import load
@@ -93,7 +96,7 @@ def serve(
     from dynamo.sdk.lib.service import LinkedServices
 
     # Extract extra arguments not captured by typer
-    service_configs = resolve_service_config(file, ctx.args)
+    service_configs = resolve_service_config(config_file, ctx.args)
 
     # Process depends
     runner_map_dict = {}
@@ -122,14 +125,14 @@ def serve(
         os.environ["DYNAMO_SERVICE_CONFIG"] = json.dumps(service_configs)
 
     if working_dir is None:
-        if os.path.isdir(os.path.expanduser(bento)):
-            working_dir = os.path.expanduser(bento)
+        if os.path.isdir(os.path.expanduser(dynamo_pipeline)):
+            working_dir = os.path.expanduser(dynamo_pipeline)
         else:
             working_dir = "."
     if sys.path[0] != working_dir:
         sys.path.insert(0, working_dir)
 
-    svc = load(bento_identifier=bento, working_dir=working_dir)
+    svc = load(bento_identifier=dynamo_pipeline, working_dir=working_dir)
 
     LinkedServices.remove_unused_edges()
 
@@ -140,14 +143,14 @@ def serve(
     # Start the service
     console.print(
         Panel.fit(
-            f"[bold]Starting Dynamo service:[/bold] [cyan]{bento}[/cyan]",
+            f"[bold]Starting Dynamo service:[/bold] [cyan]{dynamo_pipeline}[/cyan]",
             title="[bold green]Dynamo Serve[/bold green]",
             border_style="green",
         )
     )
 
     serve_http(
-        bento,
+        dynamo_pipeline,
         working_dir=working_dir,
         host=host,
         port=port,
