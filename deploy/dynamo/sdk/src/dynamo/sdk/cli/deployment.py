@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import sys
 import typing as t
 from http import HTTPStatus
 
@@ -281,25 +283,42 @@ def create_deployment(
     try:
         config_params.verify()
     except BentoMLException as e:
-        raise_deployment_config_error(e, "create")
+        print(f"Error: {str(e)}")
+        sys.exit(1)
 
     console = Console(highlight=False)
     with Spinner(console=console) as spinner:
         spinner.update("Creating deployment on Dynamo Cloud")
-        deployment = _cloud_client.deployment.create(
-            deployment_config_params=config_params
-        )
-        spinner.log(
-            f':white_check_mark: Created deployment "{deployment.name}" in cluster "{deployment.cluster}"'
-        )
-        if wait:
-            spinner.update(
-                "[bold blue]Waiting for deployment to be ready, you can use --no-wait to skip this process[/]",
+        try:
+            deployment = _cloud_client.deployment.create(
+                deployment_config_params=config_params
             )
-            retcode = deployment.wait_until_ready(timeout=timeout, spinner=spinner)
-            if retcode != 0:
-                raise SystemExit(retcode)
-        return deployment
+            spinner.log(
+                f':white_check_mark: Created deployment "{deployment.name}" in cluster "{deployment.cluster}"'
+            )
+            if wait:
+                spinner.update(
+                    "[bold blue]Waiting for deployment to be ready, you can use --no-wait to skip this process[/]",
+                )
+                retcode = deployment.wait_until_ready(timeout=timeout, spinner=spinner)
+                if retcode != 0:
+                    sys.exit(retcode)
+            return deployment
+        except BentoMLException as e:
+            error_msg = str(e)
+            if "already exists" in error_msg:
+                # Extract deployment name from error message and clean it
+                match = re.search(r'"([^"]+?)(?:\\+)?" already exists', error_msg)
+                dep_name = match.group(1).rstrip("\\") if match else name
+                error_msg = (
+                    f'Error: Deployment "{dep_name}" already exists. To create a new deployment:\n'
+                    f"1. Use a different name with the --name flag\n"
+                    f"2. Or delete the existing deployment with: dynamo deployment delete {dep_name}"
+                )
+                print(error_msg)
+                sys.exit(1)
+            print(f"Error: {str(e)}")
+            sys.exit(1)
 
 
 @inject
