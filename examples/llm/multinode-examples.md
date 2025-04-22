@@ -202,8 +202,8 @@ dynamo serve graphs.agg:Frontend -f ./configs/mutinode_disagg_r1.yaml
 For prefill:
 ```bash
 # if not head node
-export NATS_SERVER = 'nats://<nats-server-ip>:4222'
-export ETCD_ENDPOINTS = '<etcd-endpoints-ip>:2379'
+export NATS_SERVER='nats://<nats-server-ip>:4222'
+export ETCD_ENDPOINTS='<etcd-endpoints-ip>:2379'
 
 cd $DYNAMO_HOME/examples/llm
 dynamo serve components.prefill_worker:PrefillWorker -f ./configs/mutinode_disagg_r1.yaml
