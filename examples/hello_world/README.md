@@ -156,7 +156,7 @@ export DYNAMO_IMAGE=<dynamo_docker_image_name>
 
 # Prepare your project for deployment.
 cd $PROJECT_ROOT/examples/hello_world
-DYNAMO_TAG=$(dynamo build hello_world:Frontend | grep "Successfully built" | awk -F"\"" '{ print $2 }')
+DYNAMO_TAG=$(dynamo build hello_world:Frontend | grep "Successfully built" | awk '{ print $3 }' | sed 's/\.$//')
 ```
 
 3. **Deploy to Kubernetes**
