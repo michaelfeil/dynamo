@@ -23,9 +23,6 @@ import distro
 import pkg_resources
 import typer
 
-app = typer.Typer(help="Environment management commands")
-
-
 def get_os_version() -> str:
     """Get OS version."""
     # TODO: Revisit once we need to support Windows based systems
@@ -143,7 +140,6 @@ def get_python_packages() -> str:
     return "\n".join(out)
 
 
-@app.command()
 def env() -> None:
     """Display information about the current environment."""
     print("System Information:")

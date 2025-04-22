@@ -24,10 +24,8 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-app = typer.Typer(help="Run dynamo-run")
 console = Console()
 
-@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run(ctx: typer.Context):
     """Execute dynamo-run with any additional arguments."""
     # Check if dynamo-run is available in PATH

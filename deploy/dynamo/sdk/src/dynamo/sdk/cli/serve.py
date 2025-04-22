@@ -38,12 +38,7 @@ if t.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 console = Console()
 
-app = typer.Typer(help="Serve Dynamo applications locally")
 
-
-@app.command(
-    context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
-)
 def serve(
     bento: str = typer.Argument(..., help="The path to the Bento to serve"),
     service_name: str = typer.Option(
