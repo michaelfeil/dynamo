@@ -296,6 +296,7 @@ def create_deployment(
             spinner.log(
                 f':white_check_mark: Created deployment "{deployment.name}" in cluster "{deployment.cluster}"'
             )
+            _display_deployment_info(spinner, deployment)
             if wait:
                 spinner.update(
                     "[bold blue]Waiting for deployment to be ready, you can use --no-wait to skip this process[/]",
@@ -310,15 +311,34 @@ def create_deployment(
                 # Extract deployment name from error message and clean it
                 match = re.search(r'"([^"]+?)(?:\\+)?" already exists', error_msg)
                 dep_name = match.group(1).rstrip("\\") if match else name
-                error_msg = (
-                    f'Error: Deployment "{dep_name}" already exists. To create a new deployment:\n'
-                    f"1. Use a different name with the --name flag\n"
-                    f"2. Or delete the existing deployment with: dynamo deployment delete {dep_name}"
+                spinner.log(
+                    "[red]:x: Error:[/] "
+                    f'Deployment "{dep_name}" already exists. To create a new deployment:'
                 )
-                print(error_msg)
+                spinner.log("  1. Use a different name with the --name flag")
+                spinner.log(
+                    f"  2. Or delete the existing deployment with: dynamo deployment delete {dep_name}"
+                )
                 sys.exit(1)
-            print(f"Error: {str(e)}")
+            spinner.log(f"[red]:x: Error:[/] {str(e)}")
             sys.exit(1)
+
+
+def _display_deployment_info(spinner: Spinner, deployment: Deployment) -> None:
+    """Helper function to display deployment status and URLs consistently."""
+    # Get status directly from schema and escape any Rich markup
+    status = deployment._schema.status if deployment._schema.status else "unknown"
+    # Escape any characters that are interpreted as markup
+    reformatted_status = status.replace("[", "\\[")
+    spinner.log(f"[bold]Status:[/] {reformatted_status}")
+
+    # Get URLs directly from schema
+    spinner.log("[bold]Ingress URLs:[/]")
+    if deployment._urls:
+        for url in deployment._urls:
+            spinner.log(f"    {url}")
+    else:
+        spinner.log("    No URLs available yet")
 
 
 @inject
@@ -336,13 +356,16 @@ def get_deployment(
             spinner.log(
                 f':white_check_mark: Found deployment "{deployment.name}" in cluster "{deployment.cluster}"'
             )
+            _display_deployment_info(spinner, deployment)
             return deployment
         except BentoMLException as e:
             if "No cloud context default found" in str(e):
-                raise BentoMLException(
-                    "Not logged in to Dynamo Cloud. Please run 'dynamo cloud login' first."
-                ) from None
-            raise_deployment_config_error(e, "get")
+                spinner.log(
+                    "[red]:x: Error:[/] Not logged in to Dynamo Cloud. Please run 'dynamo cloud login' first."
+                )
+                sys.exit(1)
+            spinner.log(f"[red]:x: Error:[/] Failed to get deployment: {str(e)}")
+            sys.exit(1)
 
 
 @inject
@@ -398,10 +421,21 @@ def list_deployments(
 
             spinner.log(":white_check_mark: Found deployments:")
             for deployment in deployments:
-                spinner.log(f"  • {deployment.name} (cluster: {deployment.cluster})")
+                spinner.log(f"\n• {deployment.name} (cluster: {deployment.cluster})")
+                _display_deployment_info(spinner, deployment)
         except BentoMLException as e:
             if "No cloud context default found" in str(e):
-                raise BentoMLException(
-                    "Not logged in to Dynamo Cloud. Please run 'dynamo cloud login' first."
-                ) from None
-            raise_deployment_config_error(e, "list")
+                spinner.log(
+                    "[red]:x: Error:[/] Not logged in to Dynamo Cloud. Please run 'dynamo cloud login' first."
+                )
+                sys.exit(1)
+            spinner.log(f"[red]:x: Error:[/] Failed to list deployments: {str(e)}")
+            sys.exit(1)
+
+
+def _display_deployment_urls(spinner: Spinner, deployment: Deployment) -> None:
+    """Helper function to display deployment URLs consistently."""
+    if hasattr(deployment, "urls") and deployment.urls:
+        spinner.log("Ingress URLs:")
+        for url in deployment.urls:
+            spinner.log(f"    {url}")
