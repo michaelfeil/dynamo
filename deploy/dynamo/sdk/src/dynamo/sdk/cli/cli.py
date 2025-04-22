@@ -26,6 +26,7 @@ from dynamo.sdk.cli.serve import serve
 from dynamo.sdk.cli.run import run
 from dynamo.sdk.cli.cloud import app as cloud_app
 from dynamo.sdk.cli.deployment import app as deployment_app, deploy
+from dynamo.sdk.cli.pipeline import build, get
 console = Console()
 
 cli = typer.Typer(
@@ -133,6 +134,8 @@ cli.command(context_settings={"allow_extra_args": True, "ignore_unknown_options"
 cli.add_typer(cloud_app, name="cloud")
 cli.add_typer(deployment_app, name="deployment")
 cli.command()(deploy)
+cli.command()(build)
+cli.command()(get)
 
 if __name__ == "__main__":
     cli()
