@@ -75,9 +75,9 @@ def deploy(
     ),
     ctx: typer.Context = typer.Context,
 ) -> None:
-    """Create a deployment on Dynamo Cloud.
+    """Create a deployment on Dynamo Cloud (shorthand for 'deployment create').
 
-    Create a deployment using parameters, or using config yaml file.
+    Deploy a Dynamo pipeline to Dynamo Cloud using parameters or a config file.
     """
     config_file_io = config_file.open() if config_file else None
     create_deployment(
@@ -118,7 +118,8 @@ def create(
 ) -> None:
     """Create a deployment on Dynamo Cloud.
 
-    Create a deployment using parameters, or using config yaml file.
+    Deploy a Dynamo pipeline to Dynamo Cloud using parameters or a config file.
+    Use the 'deploy' command as a shorthand for this command.
     """
     config_file_io = config_file.open() if config_file else None
     create_deployment(

@@ -1,3 +1,7 @@
+bentoml/*
+scratch/*
+scratch.md
+
 .idea
 .vs/
 .vscode/
