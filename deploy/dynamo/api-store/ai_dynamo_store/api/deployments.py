@@ -193,15 +193,15 @@ def get_deployment_status(resource: Dict[str, Any]) -> str:
 def get_urls(resource: Dict[str, Any]) -> List[str]:
     """
     Get the URLs for a deployment.
-    Returns URLs as soon as they are available from IngressHostSet condition.
+    Returns URLs as soon as they are available from EndpointExposed condition.
     """
     urls = []
     conditions = resource.get("status", {}).get("conditions", [])
 
-    # Check for IngressHostSet condition
+    # Check for EndpointExposed condition
     for condition in conditions:
         if (
-            condition.get("type") == "IngressHostSet"
+            condition.get("type") == "EndpointExposed"
             and condition.get("status") == "True"
         ):
             if message := condition.get("message"):

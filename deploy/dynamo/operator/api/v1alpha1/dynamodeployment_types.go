@@ -87,16 +87,16 @@ func (s *DynamoDeployment) SetSpec(spec any) {
 	s.Spec = spec.(DynamoDeploymentSpec)
 }
 
-func (s *DynamoDeployment) SetIngressStatus(isSecured bool, ingressHost string) {
+func (s *DynamoDeployment) SetEndpointStatus(isSecured bool, endpointHost string) {
 	protocol := "http"
 	if isSecured {
 		protocol = "https"
 	}
 	s.AddStatusCondition(metav1.Condition{
-		Type:               "IngressHostSet",
+		Type:               "EndpointExposed",
 		Status:             metav1.ConditionTrue,
-		Reason:             "IngressEnabled",
-		Message:            fmt.Sprintf("%s://%s", protocol, ingressHost),
+		Reason:             "EndpointExposed",
+		Message:            fmt.Sprintf("%s://%s", protocol, endpointHost),
 		LastTransitionTime: metav1.Now(),
 	})
 }

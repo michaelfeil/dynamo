@@ -51,7 +51,9 @@ def test_get_deployment_status():
 def test_get_urls():
     resource = {
         "status": {
-            "conditions": [{"type": "IngressHostSet", "message": "https://example.com"}]
+            "conditions": [
+                {"type": "EndpointExposed", "message": "https://example.com"}
+            ]
         }
     }
     assert get_urls(resource) == ["https://example.com"]
