@@ -354,14 +354,14 @@ def _display_deployment_info(spinner: Spinner, deployment: Deployment) -> None:
             for url in urls:
                 spinner.log(f"  - {url}")
         else:
-            spinner.log("    No URLs available yet")
+            spinner.log("    No URLs available")
     except Exception:
         # If refresh fails, fall back to existing URLs
         if deployment._urls:
             for url in deployment._urls:
                 spinner.log(f"  - {url}")
         else:
-            spinner.log("    No URLs available yet")
+            spinner.log("    No URLs available")
 
 
 @inject
