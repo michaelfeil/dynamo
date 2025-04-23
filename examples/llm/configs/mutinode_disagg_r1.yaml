@@ -14,10 +14,11 @@
 # limitations under the License.
 Common:
   model: deepseek-ai/DeepSeek-R1
-  block-size: 64
-  max-model-len: 16384
+  block-size: 128
+  max-model-len: 3500
   kv-transfer-config: '{"kv_connector":"DynamoNixlConnector"}'
   tensor-parallel-size: 16
+  disable-log-requests: true
 
 Frontend:
   served_model_name: deepseek-ai/DeepSeek-R1
@@ -35,12 +36,12 @@ VllmWorker:
     workers: 1
     resources:
       gpu: 16
-  common-configs: [model, block-size, max-model-len, kv-transfer-config, tensor-parallel-size]
+  common-configs: [model, block-size, max-model-len, kv-transfer-config, tensor-parallel-size, disable-log-requests]
 
 PrefillWorker:
-  max-num-batched-tokens: 16384
+  max-num-batched-tokens: 3500
   ServiceArgs:
     workers: 1
     resources:
       gpu: 16
-  common-configs: [model, block-size, max-model-len, kv-transfer-config, tensor-parallel-size]
+  common-configs: [model, block-size, max-model-len, kv-transfer-config, tensor-parallel-size, disable-log-requests]

@@ -176,7 +176,7 @@ one node and let's consider that node to be the head node of the whole deploymen
 Note that if you are starting etcd server directly instead of using `docker compose`,
 you should add additional arguments to be discoverable in other node.
 ```bash
-etcd --advertise-client-urls http://<head-node-ip>:2379 --listen-client-urls http://<head-node-ip>:2379,http://127.0.0.1:2379
+etcd --advertise-client-urls http://0.0.0.0:2379 --listen-client-urls http://0.0.0.0:2379
 ```
 
 **Step 1**: On every two nodes, set up Ray cluster as described in
