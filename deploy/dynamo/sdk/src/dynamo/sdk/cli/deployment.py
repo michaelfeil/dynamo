@@ -37,6 +37,9 @@ from dynamo.sdk.lib.logging import configure_server_logging
 
 from .utils import resolve_service_config
 
+# Configure logging to suppress INFO HTTP logs
+logging.getLogger("httpx").setLevel(logging.WARNING)  # HTTP client library logs
+logging.getLogger("httpcore").setLevel(logging.WARNING)  # HTTP core library logs
 configure_server_logging()
 
 logger = logging.getLogger(__name__)
@@ -293,14 +296,14 @@ def create_deployment(
             deployment = _cloud_client.deployment.create(
                 deployment_config_params=config_params
             )
-            deployment.admin_console = ""  # remove dashboard url
+            deployment.admin_console = _get_urls(deployment)  # remove dashboard url
             spinner.log(
                 f':white_check_mark: Created deployment "{deployment.name}" in cluster "{deployment.cluster}"'
             )
 
             if wait:
                 # Update spinner text for waiting phase
-                spinner.update(
+                spinner.log(
                     "[bold blue]Waiting for deployment to be ready, you can use --no-wait to skip this process[/]"
                 )
                 retcode = deployment.wait_until_ready(timeout=timeout, spinner=spinner)
@@ -327,6 +330,13 @@ def create_deployment(
             sys.exit(1)
 
 
+def _get_urls(deployment: Deployment) -> list[str]:
+    """Get URLs from deployment."""
+    latest = deployment._client.v2.get_deployment(deployment.name, deployment.cluster)
+    urls = latest.urls if hasattr(latest, "urls") else None
+    return urls
+
+
 def _display_deployment_info(spinner: Spinner, deployment: Deployment) -> None:
     """Helper function to display deployment status and URLs consistently."""
     # Get status directly from schema and escape any Rich markup
@@ -339,10 +349,7 @@ def _display_deployment_info(spinner: Spinner, deployment: Deployment) -> None:
     spinner.log("[bold]Ingress URLs:[/]")
     try:
         # Get latest deployment info for URLs
-        latest = deployment._client.v2.get_deployment(
-            deployment.name, deployment.cluster
-        )
-        urls = latest.urls if hasattr(latest, "urls") else None
+        urls = _get_urls(deployment)
         if urls:
             for url in urls:
                 spinner.log(f"  - {url}")
@@ -429,7 +436,6 @@ def list_deployments(
     """List all deployments from Dynamo Cloud."""
     console = Console(highlight=False)
     with Spinner(console=console) as spinner:
-        spinner.update("Getting all deployments from Dynamo Cloud")
         try:
             # Handle label-based filtering
             if labels is not None:
@@ -439,6 +445,8 @@ def list_deployments(
                 else:
                     q = label_query
 
+            spinner.update("Getting deployments from Dynamo Cloud...")
+            # Get all deployments in a single call by setting count=1000
             deployments = _cloud_client.deployment.list(
                 cluster=cluster, search=search, dev=dev, q=q
             )
