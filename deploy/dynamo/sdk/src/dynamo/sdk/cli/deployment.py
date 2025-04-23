@@ -334,7 +334,7 @@ def _get_urls(deployment: Deployment) -> list[str]:
     """Get URLs from deployment."""
     latest = deployment._client.v2.get_deployment(deployment.name, deployment.cluster)
     urls = latest.urls if hasattr(latest, "urls") else None
-    return urls
+    return urls if urls is not None else []
 
 
 def _display_deployment_info(spinner: Spinner, deployment: Deployment) -> None:
