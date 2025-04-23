@@ -1600,6 +1600,7 @@ version = "0.1.1"
 dependencies = [
  "akin",
  "anyhow",
+ "async-nats",
  "async-openai",
  "async-stream",
  "async-trait",
@@ -1649,6 +1650,7 @@ dependencies = [
  "toktrie_hf_tokenizers 0.6.31",
  "tracing",
  "unicode-segmentation",
+ "url",
  "uuid 1.16.0",
  "validator",
  "xxhash-rust",
@@ -1729,6 +1731,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid 1.16.0",
  "validator",
  "xxhash-rust",
@@ -6915,6 +6918,7 @@ dependencies = [
  "form_urlencoded",
  "idna",
  "percent-encoding",
+ "serde",
 ]
 
 [[package]]
