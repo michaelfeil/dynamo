@@ -1518,18 +1518,18 @@ func (r *DynamoComponentDeploymentReconciler) generatePodTemplateSpec(ctx contex
 				ContainerPort: int32(proxyPort),
 				Protocol:      corev1.ProtocolTCP,
 			},
+			{
+				ContainerPort: int32(9901),
+			},
 		},
 		ReadinessProbe: &corev1.Probe{
 			InitialDelaySeconds: 5,
 			TimeoutSeconds:      5,
 			FailureThreshold:    10,
 			ProbeHandler: corev1.ProbeHandler{
-				Exec: &corev1.ExecAction{
-					Command: []string{
-						"sh",
-						"-c",
-						"curl -s localhost:9901/server_info | grep state | grep -q LIVE",
-					},
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/ready",
+					Port: intstr.FromInt(9901),
 				},
 			},
 		},
@@ -1538,12 +1538,9 @@ func (r *DynamoComponentDeploymentReconciler) generatePodTemplateSpec(ctx contex
 			TimeoutSeconds:      5,
 			FailureThreshold:    10,
 			ProbeHandler: corev1.ProbeHandler{
-				Exec: &corev1.ExecAction{
-					Command: []string{
-						"sh",
-						"-c",
-						"curl -s localhost:9901/server_info | grep state | grep -q LIVE",
-					},
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/server_info",
+					Port: intstr.FromInt(9901),
 				},
 			},
 		},
