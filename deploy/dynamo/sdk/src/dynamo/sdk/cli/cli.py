@@ -32,10 +32,8 @@ def create_bentoml_cli() -> click.Command:
 
     from dynamo.sdk.cli.bentos import bento_command
     from dynamo.sdk.cli.cloud import cloud_command
-    from dynamo.sdk.cli.deployment import deployment_command
+    from dynamo.sdk.cli.deployment import deploy_command, deployment_command
     from dynamo.sdk.cli.env import env_command
-
-    # from dynamo.sdk.cli.deploy import deploy_command
     from dynamo.sdk.cli.run import run_command
     from dynamo.sdk.cli.serve import serve_command
     from dynamo.sdk.cli.utils import DynamoCommandGroup
@@ -63,7 +61,7 @@ def create_bentoml_cli() -> click.Command:
     bentoml_cli.add_single_command(bento_command, "get")
     bentoml_cli.add_subcommands(serve_command)
     bentoml_cli.add_subcommands(run_command)
-    # bentoml_cli.add_command(deploy_command)
+    bentoml_cli.add_command(deploy_command)
     # bentoml_cli.add_command(containerize_command)
     bentoml_cli.add_command(deployment_command)
     bentoml_cli.add_command(env_command)
