@@ -288,24 +288,28 @@ def create_deployment(
     console = Console(highlight=False)
     with Spinner(console=console) as spinner:
         try:
+            # Create deployment with initial status message
             spinner.update("Creating deployment on Dynamo Cloud...")
             deployment = _cloud_client.deployment.create(
                 deployment_config_params=config_params
             )
+            deployment.admin_console = ""  # remove dashboard url
             spinner.log(
                 f':white_check_mark: Created deployment "{deployment.name}" in cluster "{deployment.cluster}"'
             )
+
             if wait:
+                # Update spinner text for waiting phase
                 spinner.update(
-                    "[bold blue]Waiting for deployment to be ready, you can use --no-wait to skip this process[/]",
+                    "[bold blue]Waiting for deployment to be ready, you can use --no-wait to skip this process[/]"
                 )
                 retcode = deployment.wait_until_ready(timeout=timeout, spinner=spinner)
                 if retcode != 0:
-                    spinner.log("[red]:x: Deployment failed to become ready[/]")
                     sys.exit(retcode)
-                spinner.log("[green]:white_check_mark: Deployment is ready[/]")
+
             _display_deployment_info(spinner, deployment)
             return deployment
+
         except BentoMLException as e:
             error_msg = str(e)
             if "already exists" in error_msg:
@@ -333,11 +337,24 @@ def _display_deployment_info(spinner: Spinner, deployment: Deployment) -> None:
 
     # Get URLs directly from schema
     spinner.log("[bold]Ingress URLs:[/]")
-    if deployment._urls:
-        for url in deployment._urls:
-            spinner.log(f"    {url}")
-    else:
-        spinner.log("    No URLs available yet")
+    try:
+        # Get latest deployment info for URLs
+        latest = deployment._client.v2.get_deployment(
+            deployment.name, deployment.cluster
+        )
+        urls = latest.urls if hasattr(latest, "urls") else None
+        if urls:
+            for url in urls:
+                spinner.log(f"  - {url}")
+        else:
+            spinner.log("    No URLs available yet")
+    except Exception:
+        # If refresh fails, fall back to existing URLs
+        if deployment._urls:
+            for url in deployment._urls:
+                spinner.log(f"  - {url}")
+        else:
+            spinner.log("    No URLs available yet")
 
 
 @inject

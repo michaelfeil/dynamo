@@ -28,11 +28,11 @@ dynamo-operator:
 
   dynamo:
     ingress:
-      enabled: false
+      enabled: true
       className: nginx
       tlsSecretName: my-tls-secret
     istio:
-      enabled: false
+      enabled: true
       gateway: istio-system/ingress-alb
     ingressHostSuffix: ${DYNAMO_INGRESS_SUFFIX}
     dockerRegistry:
