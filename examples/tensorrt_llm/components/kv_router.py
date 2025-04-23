@@ -14,13 +14,13 @@
 # limitations under the License.
 
 import argparse
-import asyncio
 import logging
 import random
 import traceback
 from argparse import Namespace
 from typing import AsyncIterator
 
+from common.logging import check_required_workers
 from common.protocol import Tokens
 from components.worker import TensorRTLLMWorker
 
@@ -81,25 +81,25 @@ class Router:
         logger.info("Initializing KV router.")
         class_name = self.__class__.__name__
         self.args = parse_args(class_name, "")
+        self.default_metrics = {
+            "gpu_cache_usage_perc": 0.0,
+            "num_requests_waiting": 0.0,
+            "gpu_prefix_cache_hit_rate": 0.0,
+        }
+        self.worker_name = "TensorRTLLMWorker"
 
     @async_on_start
     async def async_init(self):
         self.runtime = dynamo_context["runtime"]
         self.workers_client = (
             await self.runtime.namespace("dynamo")
-            .component("TensorRTLLMWorker")
+            .component(self.worker_name)
             .endpoint("generate")
             .client()
         )
-        while len(self.workers_client.endpoint_ids()) < self.args.min_workers:
-            logger.info(
-                f"Waiting for more workers to be ready.\n"
-                f" Current: {len(self.workers_client.endpoint_ids())},"
-                f" Required: {self.args.min_workers}"
-            )
-            await asyncio.sleep(2)
+        await check_required_workers(self.workers_client, self.args.min_workers)
 
-        kv_listener = self.runtime.namespace("dynamo").component("TensorRTLLMWorker")
+        kv_listener = self.runtime.namespace("dynamo").component(self.worker_name)
         await kv_listener.create_service()
         self.indexer = KvIndexer(kv_listener, self.args.block_size)
         self.metrics_aggregator = KvMetricsAggregator(kv_listener)
@@ -127,20 +127,14 @@ class Router:
         if metrics:
             for endpoint in metrics.endpoints:
                 worker_id = endpoint.worker_id
-            worker_metrics[worker_id] = {
-                "gpu_cache_usage_perc": endpoint.gpu_cache_usage_perc
-                if hasattr(endpoint, "gpu_cache_usage_perc")
-                else 0.0,
-                "num_requests_waiting": endpoint.num_requests_waiting
-                if hasattr(endpoint, "num_requests_waiting")
-                else 0.0,
-                "gpu_prefix_cache_hit_rate": endpoint.gpu_prefix_cache_hit_rate
-                if hasattr(endpoint, "gpu_prefix_cache_hit_rate")
-                else 0.0,
-            }
-            max_waiting = max(
-                max_waiting, worker_metrics[worker_id]["num_requests_waiting"]
-            )
+                worker_metrics[worker_id] = {
+                    key: getattr(endpoint, key, self.default_metrics[key])
+                    for key in self.default_metrics.keys()
+                }
+                max_waiting = max(
+                    max_waiting, worker_metrics[worker_id]["num_requests_waiting"]
+                )
+
         logger.debug(f"Worker metrics: {worker_metrics}")
 
         # Get all worker IDs from the client. This is needed because scores / metrics may not have values for all workers
@@ -151,14 +145,8 @@ class Router:
         for worker_id in worker_ids:
             # Use default values if worker not in scores or metrics
             score = worker_scores.get(worker_id, 0.0)
-            metrics_dict = worker_metrics.get(
-                worker_id,
-                {
-                    "gpu_cache_usage_perc": 0.0,
-                    "num_requests_waiting": 0.0,
-                    "gpu_prefix_cache_hit_rate": 0.0,
-                },
-            )
+            metrics_dict = worker_metrics.get(worker_id, self.default_metrics)
+            gpu_cache_usage = metrics_dict["gpu_cache_usage_perc"]
 
             normalized_waiting = (
                 metrics_dict["num_requests_waiting"] / max_waiting
@@ -168,15 +156,13 @@ class Router:
 
             # Have 1 metric that weights towards cache hit
             # 2 metrics that penalize overloaded worker and queuing
-            worker_logits[worker_id] = (
-                2 * score - metrics_dict["gpu_cache_usage_perc"] - normalized_waiting
-            )
+            worker_logits[worker_id] = 2 * score - gpu_cache_usage - normalized_waiting
             logger.debug(
-                f"Formula for {worker_id}: {worker_logits[worker_id]:.3f} = 2.0 * {score:.3f} - {metrics_dict['gpu_cache_usage_perc']:.3f} - {normalized_waiting:.3f}"
+                f"Formula for {worker_id}: {worker_logits[worker_id]:.3f} = 2.0 * {score:.3f} - {gpu_cache_usage:.3f} - {normalized_waiting:.3f}"
             )
 
         if not worker_logits or all(logit == 0 for logit in worker_logits.values()):
-            return ""
+            return "", 0.0
 
         # Select the worker with the highest logit
         if worker_logits:
@@ -190,23 +176,20 @@ class Router:
 
         # Log the metrics for the selected worker
         if best_worker_id:
-            logger.debug(
-                f"Selected worker: {best_worker_id}, logit: {worker_logits[best_worker_id]:.3f}"
-            )
-            logger.debug(
-                f"Score: {scores.scores.get(best_worker_id, 0.0) if scores else 0.0:.3f}"
-            )
+            metrics_dict = worker_metrics.get(best_worker_id, self.default_metrics)
 
-            metrics_dict = worker_metrics.get(best_worker_id, {})
-            logger.debug(
-                f"GPU Cache Hit Rate: {metrics_dict.get('gpu_prefix_cache_hit_rate', 0.0):.3f}"
-            )
-            logger.debug(
-                f"GPU Cache Usage: {metrics_dict.get('gpu_cache_usage_perc', 0.0):.3f}"
-            )
-            logger.debug(
-                f"Requests Waiting: {metrics_dict.get('num_requests_waiting', 0.0) / max_waiting if max_waiting > 0 else 0.0:.3f}"
-            )
+            # Create log messages
+            log_messages = [
+                f"Selected worker: {best_worker_id}, logit: {worker_logits[best_worker_id]:.3f}",
+                f"Score: {scores.scores.get(best_worker_id, 0.0) if scores else 0.0:.3f}",
+                f"GPU Cache Hit Rate: {metrics_dict['gpu_prefix_cache_hit_rate']:.3f}",
+                f"GPU Cache Usage: {metrics_dict['gpu_cache_usage_perc']:.3f}",
+                f"Requests Waiting: {metrics_dict['num_requests_waiting']}",
+            ]
+
+            # Log to logger
+            for message in log_messages:
+                logger.info(message)
 
         return best_worker_id, worker_scores.get(best_worker_id, 0.0)
 
@@ -216,22 +199,21 @@ class Router:
             yield "_0.0"
 
         lora_id = 0
-        worker_id = ""
         try:
             scores = await self.indexer.find_matches_for_request(
                 request.tokens, lora_id
             )
             token_length = len(request.tokens)
             metrics = await self.metrics_aggregator.get_metrics()
-            schedule_result = self._cost_function(scores, metrics, token_length)
+            worker_id, prefix_hit_rate = self._cost_function(
+                scores, metrics, token_length
+            )
         except Exception:
-            schedule_result = ""
+            scores = {}
             logger.warning(f"Error during worker selection: {traceback.format_exc()}")
 
-        if schedule_result == "":
-            worker_id = ""
-            prefix_hit_rate = 0.0
-        else:
-            worker_id, prefix_hit_rate = schedule_result
+        logger.info(
+            f"Scheduling to worker_id: {worker_id} with estimated prefix hit rate: {prefix_hit_rate}"
+        )
 
         yield f"{worker_id}_{prefix_hit_rate}"

@@ -17,13 +17,13 @@
 import argparse
 import logging
 import random
+import traceback
 from argparse import Namespace
 from typing import AsyncIterator
 
 from components.worker import VllmWorker
 from utils.logging import check_required_workers
 from utils.protocol import Tokens
-from vllm.logger import logger as vllm_logger
 
 from dynamo.llm import AggregatedMetrics, KvIndexer, KvMetricsAggregator, OverlapScores
 from dynamo.sdk import async_on_start, depends, dynamo_context, dynamo_endpoint, service
@@ -83,28 +83,30 @@ class Router:
     worker = depends(VllmWorker)
 
     def __init__(self):
-        vllm_logger.info("Initializing Custom Router")
-        self.args = parse_args(self.__class__.__name__, "")
+        logger.info("Initializing Custom Router")
+        class_name = self.__class__.__name__
+        self.args = parse_args(class_name, "")
 
         self.default_metrics = {
             "gpu_cache_usage_perc": 0.0,
             "num_requests_waiting": 0.0,
             "gpu_prefix_cache_hit_rate": 0.0,
         }
+        self.worker_name = "VllmWorker"
 
     @async_on_start
     async def async_init(self):
         self.runtime = dynamo_context["runtime"]
         self.workers_client = (
             await self.runtime.namespace("dynamo")
-            .component("VllmWorker")
+            .component(self.worker_name)
             .endpoint("generate")
             .client()
         )
 
         await check_required_workers(self.workers_client, self.args.min_workers)
 
-        kv_listener = self.runtime.namespace("dynamo").component("VllmWorker")
+        kv_listener = self.runtime.namespace("dynamo").component(self.worker_name)
         await kv_listener.create_service()
         self.indexer = KvIndexer(kv_listener, self.args.block_size)
         self.metrics_aggregator = KvMetricsAggregator(kv_listener)
@@ -141,7 +143,7 @@ class Router:
                 worker_scores[worker_id] = (
                     score * self.indexer.block_size() / token_length
                 )
-
+        logger.debug(f"Worker scores: {worker_scores}")
         worker_metrics = {}
         max_waiting = 0.0
         if metrics:
@@ -154,6 +156,8 @@ class Router:
                 max_waiting = max(
                     max_waiting, worker_metrics[worker_id]["num_requests_waiting"]
                 )
+
+        logger.debug(f"Worker metrics: {worker_metrics}")
 
         # Get all worker IDs from the client. This is needed because scores / metrics may not have values for all workers
         # and we want all workers to be considered in the logit calculation
@@ -175,7 +179,7 @@ class Router:
             # Have 1 metric that weights towards cache hit
             # 2 metrics that penalize overloaded worker and queuing
             worker_logits[worker_id] = 2 * score - gpu_cache_usage - normalized_waiting
-            vllm_logger.info(
+            logger.debug(
                 f"Formula for {worker_id}: {worker_logits[worker_id]:.3f} = 2.0 * {score:.3f} - {gpu_cache_usage:.3f} - {normalized_waiting:.3f}"
             )
 
@@ -183,11 +187,14 @@ class Router:
             return "", 0.0
 
         # Select the worker with the highest logit
-        max_logit = max(worker_logits.values())
-        best_workers = [
-            wid for wid, logit in worker_logits.items() if logit == max_logit
-        ]
-        best_worker_id = random.choice(best_workers)
+        if worker_logits:
+            max_logit = max(worker_logits.values())
+            best_workers = [
+                wid for wid, logit in worker_logits.items() if logit == max_logit
+            ]
+            best_worker_id = random.choice(best_workers)
+        else:
+            best_worker_id = ""
 
         # Log the metrics for the selected worker
         if best_worker_id:
@@ -202,29 +209,31 @@ class Router:
                 f"Requests Waiting: {metrics_dict['num_requests_waiting']}",
             ]
 
-            # Log to vllm_logger
+            # Log to logger
             for message in log_messages:
-                vllm_logger.info(message)
+                logger.info(message)
 
         return best_worker_id, worker_scores.get(best_worker_id, 0.0)
 
     @dynamo_endpoint()
     async def generate(self, request: Tokens) -> AsyncIterator[WorkerId]:
+        if self.indexer is None or self.metrics_aggregator is None:
+            yield "_0.0"
         lora_id = 0
         try:
             scores = await self.indexer.find_matches_for_request(
                 request.tokens, lora_id
             )
-        except Exception as e:
+            token_length = len(request.tokens)
+            metrics = await self.metrics_aggregator.get_metrics()
+            worker_id, prefix_hit_rate = self._cost_function(
+                scores, metrics, token_length
+            )
+        except Exception:
             scores = {}
-            vllm_logger.exception(f"Error finding matches: {e}")
+            logger.warning(f"Error during worker selection: {traceback.format_exc()}")
 
-        metrics = await self.metrics_aggregator.get_metrics()
-        worker_id, prefix_hit_rate = self._cost_function(
-            scores, metrics, len(request.tokens)
-        )
-
-        vllm_logger.info(
+        logger.info(
             f"Scheduling to worker_id: {worker_id} with estimated prefix hit rate: {prefix_hit_rate}"
         )
         yield f"{worker_id}_{prefix_hit_rate}"
