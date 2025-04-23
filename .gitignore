@@ -1,6 +1,7 @@
 bentoml/*
 scratch/*
 scratch.md
+yaml/*
 
 .idea
 .vs/
