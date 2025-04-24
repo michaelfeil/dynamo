@@ -37,8 +37,7 @@ from tensorrt_llm.serve.openai_protocol import (
 # However, TRTLLM protocol might still refer it as max_tokens.
 class DynamoTRTLLMCompletionRequest(CompletionRequest):
     id: str = Field(default_factory=lambda: f"cmpl-{str(uuid.uuid4().hex)}")
-    max_completion_tokens: int = Field(default=256,
-                                       validation_alias='max_tokens')
+    max_tokens: int = 256
 
 
 class DynamoTRTLLMChatCompletionRequest(ChatCompletionRequest):
