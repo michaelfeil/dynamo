@@ -15,6 +15,7 @@
 
 use super::metrics;
 use super::ModelManager;
+use super::RouteDoc;
 use crate::request_template::RequestTemplate;
 use anyhow::Result;
 use derive_builder::Builder;
@@ -27,6 +28,7 @@ pub struct HttpService {
     router: axum::Router,
     port: u16,
     host: String,
+    route_docs: Vec<RouteDoc>,
 }
 
 #[derive(Clone, Builder)]
@@ -45,6 +47,9 @@ pub struct HttpServiceConfig {
 
     #[builder(default = "true")]
     enable_cmpl_endpoints: bool,
+
+    #[builder(default = "false")]
+    enable_embeddings_endpoints: bool,
 
     #[builder(default = "None")]
     request_template: Option<RequestTemplate>,
@@ -82,11 +87,16 @@ impl HttpService {
 
         Ok(())
     }
+
+    /// Documentation of exposed HTTP endpoints
+    pub fn route_docs(&self) -> &[RouteDoc] {
+        &self.route_docs
+    }
 }
 
 impl HttpServiceConfigBuilder {
     pub fn build(self) -> Result<HttpService, anyhow::Error> {
-        let config = self.build_internal()?;
+        let config: HttpServiceConfig = self.build_internal()?;
 
         let model_manager = ModelManager::new();
 
@@ -118,6 +128,13 @@ impl HttpServiceConfigBuilder {
             ));
         }
 
+        if config.enable_embeddings_endpoints {
+            routes.push(super::openai::embeddings_router(
+                model_manager.state(),
+                None,
+            ));
+        }
+
         // for (route_docs, route) in routes.into_iter().chain(self.routes.into_iter()) {
         //     router = router.merge(route);
         //     all_docs.extend(route_docs);
@@ -133,6 +150,7 @@ impl HttpServiceConfigBuilder {
             router,
             port: config.port,
             host: config.host,
+            route_docs: all_docs,
         })
     }
 

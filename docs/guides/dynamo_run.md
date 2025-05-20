@@ -4,6 +4,8 @@
     * [Automatically download a model from Hugging Face](#use-model-from-hugging-face)
     * [Run a model from local file](#run-a-model-from-local-file)
     * [Distributed system](#distributed-system)
+    * [Network names](#network-names)
+    * [KV-aware routing](#kv-aware-routing)
 * [Full usage details](#full-usage-details)
     * [Setup](#setup)
     * [mistral.rs](#mistralrs)
@@ -23,7 +25,7 @@ It supports the following engines: mistralrs, llamacpp, sglang, vllm and tensorr
 
 Usage:
 ```
-dynamo-run in=[http|text|dyn://<path>|batch:<folder>] out=echo_core|echo_full|mistralrs|llamacpp|sglang|vllm|dyn://<path> [--http-port 8080] [--model-path <path>] [--model-name <served-model-name>] [--model-config <hf-repo>] [--tensor-parallel-size=1] [--base-gpu-id=0] [--extra-engine-args=args.json] [--router-mode random|round-robin]
+dynamo-run in=[http|text|dyn://<path>|batch:<folder>] out=echo_core|echo_full|mistralrs|llamacpp|sglang|vllm|dyn [--http-port 8080] [--model-path <path>] [--model-name <served-model-name>] [--model-config <hf-repo>] [--tensor-parallel-size=1] [--base-gpu-id=0] [--extra-engine-args=args.json] [--router-mode random|round-robin|kv]
 ```
 
 Example: `dynamo run Qwen/Qwen3-0.6B`
@@ -94,7 +96,7 @@ You will need [etcd](https://etcd.io/) and [nats](https://nats.io) with jetstrea
 OpenAI compliant HTTP server, optional pre-processing, worker discovery.
 
 ```
-dynamo-run in=http out=dyn://llama3B_pool
+dynamo-run in=http out=dyn
 ```
 
 **Node 2:**
@@ -102,14 +104,86 @@ dynamo-run in=http out=dyn://llama3B_pool
 Vllm engine. Receives and returns requests over the network.
 
 ```
-dynamo-run in=dyn://llama3B_pool out=vllm ~/llms/Llama-3.2-3B-Instruct
+dynamo-run in=dyn://llama3B.backend.generate out=vllm ~/llms/Llama-3.2-3B-Instruct
 ```
 
-This will use etcd to auto-discover the model and NATS to talk to it. You can run multiple workers on the same endpoint and it will pick one at random each time.
-
-The `llama3B_pool` name is purely symbolic, pick anything as long as it matches the other node.
+This will use etcd to auto-discover the model and NATS to talk to it. You can
+run multiple instances on the same endpoint and it will pick one based on the
+`--router-mode` (round-robin by default if left unspecified).
 
 Run `dynamo-run --help` for more options.
+
+### Network names
+
+The `in=dyn://` URLs have the format `dyn://namespace.component.endpoint`. For quickstart just use any string `dyn://test`, `dynamo-run` will default any missing parts for you. The pieces matter for a larger system.
+
+* *Namespace*: A pipeline. Usually a model. e.g "llama_8b". Just a name.
+* *Component*: A load balanced service needed to run that pipeline. "backend", "prefill", "decode", "preprocessor", "draft", etc. This typically has some configuration (which model to use, for example).
+* *Endpoint*: Like a URL. "generate", "load_metrics".
+* *Instance*: A process. Unique. Dynamo assigns each one a unique instance_id. The thing that is running is always an instance. Namespace/component/endpoint can refer to multiple instances.
+
+If you run two models, that is two pipelines. An exception would be if doing speculative decoding. The draft model is part of the pipeline of a bigger model.
+
+If you run two instances of the same model ("data parallel") they are the same namespace+component+endpoint but different instances. The router will spread traffic over all the instances of a namespace+component+endpoint. If you have four prefill workers in a pipeline, they all have the same namespace+component+endpoint and are automatically assigned unique instance_ids.
+
+Example 1: Data parallel load balanced, one model one pipeline two instances.
+```
+Node 1: dynamo-run in=dyn://qwen3-32b.backend.generate out=sglang /data/Qwen3-32B --tensor-parallel-size 2 --base-gpu-id 0
+Node 2: dynamo-run in=dyn://qwen3-32b.backend.generate out=sglang /data/Qwen3-32B --tensor-parallel-size 2 --base-gpu-id 2
+```
+
+Example 2: Two models, two pipelines.
+```
+Node 1: dynamo-run in=dyn://qwen3-32b.backend.generate out=vllm /data/Qwen3-32B
+Node 2: dynamo-run in=dyn://llama3-1-8b.backend.generate out=vllm /data/Llama-3.1-8B-Instruct/
+```
+
+Example 3: Different endpoints.
+
+The KV metrics publisher in VLLM adds a `load_metrics` endpoint to the current component. If the `llama3-1-8b.backend` component above is using patched vllm it will also expose `llama3-1-8b.backend.load_metrics`.
+
+Example 4: Multiple component in a pipeline
+
+In the P/D disaggregated setup you would have `deepseek-distill-llama8b.prefill.generate` (possibly multiple instance of this) and `deepseek-distill-llama8b.decode.generate`.
+
+For output it is always only `out=dyn`. This tells Dynamo to auto-discover the instances, group them by model, and load balance appropriately (depending on `--router-mode` flag). The old syntax of `dyn://...` is still accepted for backwards compatibility.
+
+### KV-aware routing
+
+**Setup**
+
+Only patched vllm currently supports KV-aware routing. Key setup steps:
+
+1. `etcd` and `nats` (see earlier) must be running and accessible from all nodes.
+1. Create a virtualenv: `uv venv kvtest`, source it's `activate`.
+1. EITHER install Dynamo's vllm branch: `uv pip install ai-dynamo-vllm`,
+1. OR install upstream vllm 0.8.4 (`uv pip install vllm==0.8.4`) and patch it: `cd kvtest/lib/python3.12/site-packages`, `patch -p1 < $REPO_ROOT/container/deps/vllm/vllm_v0.8.4-dynamo-kv-disagg-patch.patch`.
+1. Build the C bindings. `cd $REPO_ROOT/lib/bindings/c`. `cargo build`.
+1. Put the library you just built on library path: `export LD_LIBRARY_PATH=$REPO_ROOT/target/debug/`.
+
+If you patched locally (instead of installing `ai-dynamo-vllm`) you will need to edit vllm's `platforms/__init__.py` to undo a patch change:
+```
+    #vllm_version = version("ai_dynamo_vllm")
+    vllm_version = version("vllm")
+```
+
+**Start the workers**
+
+The workers are started normally.
+
+```
+dynamo-run in=dyn://dynamo.endpoint.generate out=vllm /data/llms/Qwen/Qwen3-4B
+```
+
+**Start the ingress node**
+
+```
+dynamo-run in=http out=dyn --router-mode kv
+```
+
+The only difference from the distributed system above is `--router-mode kv`. The patched vllm will announce when a KV block is created or removed. The Dynamo router run will find the worker with the best match for those KV blocks and direct the traffic to that node.
+
+For performance testing compare a typical workload with `--router-mode random|round-robin` to see if it will benefit from KV-aware routing.
 
 ## Full usage details
 
@@ -427,7 +501,7 @@ async def worker(runtime: DistributedRuntime):
     #
     component = runtime.namespace("namespace").component("component")
     await component.create_service()
-    model_path = "Qwen/Qwen2.5-0.5B-Instruct" # or "/data/models/Qwen2.5-0.5B-Instruct"
+    model_path = "Qwen/Qwen3-0.6B" # or "/data/models/Qwen3-0.6B"
     model_type = ModelType.Backend
     endpoint = component.endpoint("endpoint")
     # Optional last param to register_llm is model_name. If not present derives it from model_path
@@ -457,7 +531,7 @@ if __name__ == "__main__":
 
 
 The `model_path` can be:
-- A HuggingFace repo ID. It will be downloaded and cached locally.
+- A HuggingFace repo ID, optionally prefixed with `hf://`. It will be downloaded and cached locally.
 - The path to a checkout of a HuggingFace repo - any folder containing safetensor files as well as `config.json`, `tokenizer.json` and `tokenizer_config.json`.
 - The path to a GGUF file, if your engine supports that.
 
