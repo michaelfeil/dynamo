@@ -354,32 +354,28 @@ impl Client {
                 tokio::select! {
                     maybe_resp = watch_stream.next() => {
                         // Early return for None or Err cases
-                        let response = match maybe_resp {
-                            Some(Ok(response)) => response,
-                            _ => {
-                                tracing::info!("kv watch stream closed");
-                                return;
-                            }
+                        let Some(Ok(response)) = maybe_resp else {
+                            tracing::info!("kv watch stream closed");
+                            return;
                         };
 
                         // Process events
                         for event in response.events() {
                             // Extract the KeyValue if it exists
-                            let kv = match event.kv() {
-                                Some(kv) => kv.clone(),
-                                None => continue, // Skip events with no KV
+                            let Some(kv) = event.kv() else {
+                                continue; // Skip events with no KV
                             };
 
                             // Handle based on event type
                             match event.event_type() {
                                 etcd_client::EventType::Put => {
-                                    if let Err(err) = tx.send(WatchEvent::Put(kv)).await {
+                                    if let Err(err) = tx.send(WatchEvent::Put(kv.clone())).await {
                                         tracing::error!("kv watcher error forwarding WatchEvent::Put: {err}");
                                         return;
                                     }
                                 }
                                 etcd_client::EventType::Delete => {
-                                    if tx.send(WatchEvent::Delete(kv)).await.is_err() {
+                                    if tx.send(WatchEvent::Delete(kv.clone())).await.is_err() {
                                         return;
                                     }
                                 }
