@@ -14,13 +14,12 @@
 # limitations under the License.
 
 import logging
-import os
 
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from dynamo.runtime.logging import configure_dynamo_logging
-from dynamo.sdk import DYNAMO_IMAGE, depends, dynamo_api, dynamo_endpoint, service
+from dynamo.sdk import DYNAMO_IMAGE, api, depends, endpoint, service
 from dynamo.sdk.lib.config import ServiceConfig
 
 logger = logging.getLogger(__name__)
@@ -71,14 +70,14 @@ class Backend:
         self.message = config.get("Backend", {}).get("message", "back")
         logger.info(f"Backend config message: {self.message}")
 
-    @dynamo_endpoint()
+    @endpoint()
     async def generate(self, req: RequestType):
         """Generate tokens."""
         req_text = req.text
         logger.info(f"Backend received: {req_text}")
         text = f"{req_text}-{self.message}"
         for token in text.split():
-            yield f"[process_id:{os.getpid()}] Backend: {token}"
+            yield f"Backend: {token}"
 
 
 @service(
@@ -94,7 +93,7 @@ class Middle:
         self.message = config.get("Middle", {}).get("message", "mid")
         logger.info(f"Middle config message: {self.message}")
 
-    @dynamo_endpoint()
+    @endpoint()
     async def generate(self, req: RequestType):
         """Forward requests to backend."""
         req_text = req.text
@@ -103,7 +102,7 @@ class Middle:
         next_request = RequestType(text=text).model_dump_json()
         async for response in self.backend.generate(next_request):
             logger.info(f"Middle received response: {response}")
-            yield f"[process_id:{os.getpid()}] Middle: {response}"
+            yield f"Middle: {response}"
 
 
 @service(
@@ -126,14 +125,14 @@ class Frontend:
         logger.info(f"Frontend config message: {self.message}")
         logger.info(f"Frontend config port: {self.port}")
 
-    # alternative syntax: @dynamo_endpoint(transports=[DynamoTransport.HTTP])
-    @dynamo_api()
+    # alternative syntax: @endpoint(transports=[DynamoTransport.HTTP])
+    @api()
     async def generate(self, request: RequestType):
         """Stream results from the pipeline."""
         logger.info(f"Frontend received: {request.text}")
 
         async def content_generator():
             async for response in self.middle.generate(request.model_dump_json()):
-                yield f"[process_id:{os.getpid()}] Frontend: {response}"
+                yield f"Frontend: {response}"
 
         return StreamingResponse(content_generator())

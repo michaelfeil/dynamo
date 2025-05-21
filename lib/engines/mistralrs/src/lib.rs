@@ -38,10 +38,11 @@ use dynamo_runtime::protocols::annotated::Annotated;
 use dynamo_llm::protocols::openai::{
     chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse},
     completions::{prompt_to_string, CompletionRequest, CompletionResponse},
+    embeddings::{NvCreateEmbeddingRequest, NvCreateEmbeddingResponse},
 };
 
 use dynamo_llm::engines::{EngineDispatcher, StreamingEngine};
-use dynamo_llm::LocalModel;
+use dynamo_llm::local_model::LocalModel;
 
 /// How many requests mistral will run at once in the paged attention scheduler.
 /// It actually runs 1 fewer than this.
@@ -599,4 +600,20 @@ fn is_gemma3(s: &str) -> bool {
 
 fn is_llama4(s: &str) -> bool {
     s.to_lowercase().contains("llama-4")
+}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateEmbeddingRequest>,
+        ManyOut<Annotated<NvCreateEmbeddingResponse>>,
+        Error,
+    > for MistralRsEngine
+{
+    async fn generate(
+        &self,
+        _request: SingleIn<NvCreateEmbeddingRequest>,
+    ) -> Result<ManyOut<Annotated<NvCreateEmbeddingResponse>>, Error> {
+        unimplemented!()
+    }
 }

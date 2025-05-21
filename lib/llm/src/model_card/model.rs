@@ -44,8 +44,6 @@ use crate::gguf::{Content, ContentConfig, ModelConfigLike};
 use crate::key_value_store::Versioned;
 use crate::protocols::TokenIdType;
 
-pub const BUCKET_NAME: &str = "mdc";
-
 /// Delete model deployment cards that haven't been re-published after this long.
 /// Cleans up if the worker stopped.
 pub const BUCKET_TTL: Duration = Duration::from_secs(5 * 60);
@@ -145,13 +143,6 @@ impl ModelDeploymentCard {
         }
     }
 
-    /// A URL and NATS friendly and very likely unique ID for this model.
-    /// Mostly human readable. a-z, 0-9, _ and - only.
-    /// Pass the service_name.
-    pub fn service_name_slug(s: &str) -> Slug {
-        Slug::from_string(s)
-    }
-
     /// How often we should check if a model deployment card expired because it's workers are gone
     pub fn expiry_check_period() -> Duration {
         match CARD_MAX_AGE.to_std() {
@@ -188,7 +179,7 @@ impl ModelDeploymentCard {
     }
 
     pub fn slug(&self) -> Slug {
-        ModelDeploymentCard::service_name_slug(&self.service_name)
+        Slug::from_string(&self.display_name)
     }
 
     /// Serialize the model deployment card to a JSON string
