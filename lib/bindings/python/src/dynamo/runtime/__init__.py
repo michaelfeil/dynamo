@@ -68,7 +68,6 @@ def dynamo_endpoint(
     def decorator(
         func: Callable[..., AsyncGenerator[Any, None]],
     ) -> Callable[..., AsyncGenerator[Any, None]]:
-
         @wraps(func)
         async def wrapper(*args, **kwargs) -> AsyncGenerator[Any, None]:
             # Validate the request
