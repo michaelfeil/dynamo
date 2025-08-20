@@ -1035,6 +1035,7 @@ pub fn embeddings_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
         .route(&path, post(embeddings))
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state);
     (vec![doc], router)
 }
@@ -1050,7 +1051,6 @@ pub fn list_models_router(
 
     let router = Router::new()
         .route(&openai_path, get(list_models_openai))
-        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state);
 
     (vec![doc_for_openai], router)
