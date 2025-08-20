@@ -48,6 +48,8 @@ pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
+const BODY_LIMIT: usize = 45 * 1024 * 1024;
+
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
 #[derive(Serialize, Deserialize)]
@@ -1002,6 +1004,7 @@ pub fn completions_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
         .route(&path, post(handler_completions))
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state);
     (vec![doc], router)
 }
@@ -1017,6 +1020,7 @@ pub fn chat_completions_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
         .route(&path, post(handler_chat_completions))
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state((state, template));
     (vec![doc], router)
 }
@@ -1046,6 +1050,7 @@ pub fn list_models_router(
 
     let router = Router::new()
         .route(&openai_path, get(list_models_openai))
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state);
 
     (vec![doc_for_openai], router)
