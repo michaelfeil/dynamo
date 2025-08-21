@@ -49,9 +49,15 @@ pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
 // Default axum max body limit without configuring is 2MB: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
-// Configure max body limit here to 45MB to support long contexts (500K+ tokens)
-// TODO: Add a `DYN_*` env var to configure this limit without code change
-const BODY_LIMIT: usize = 45 * 1024 * 1024;
+/// Default body limit in bytes (45MB) to support 500k+ token payloads.
+/// Can be configured at compile time using the DYN_FRONTEND_BODY_LIMIT_MB environment variable
+fn get_body_limit() -> usize {
+    std::env::var("DYN_HTTP_BODY_LIMIT_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(45 * 1024 * 1024)
+}
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
@@ -1007,7 +1013,7 @@ pub fn completions_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
         .route(&path, post(handler_completions))
-        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
         .with_state(state);
     (vec![doc], router)
 }
@@ -1023,7 +1029,7 @@ pub fn chat_completions_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
         .route(&path, post(handler_chat_completions))
-        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
         .with_state((state, template));
     (vec![doc], router)
 }
@@ -1038,7 +1044,7 @@ pub fn embeddings_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
         .route(&path, post(embeddings))
-        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
         .with_state(state);
     (vec![doc], router)
 }
