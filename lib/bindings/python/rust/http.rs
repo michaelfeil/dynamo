@@ -110,8 +110,7 @@ impl HttpService {
                 ))
             })?;
 
-        self.inner
-            .sync_enable_model_endpoint(endpoint_type, enabled);
+        self.inner.enable_model_endpoint(endpoint_type, enabled);
         Ok(())
     }
 }
