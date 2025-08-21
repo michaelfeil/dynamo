@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use super::context::{callable_accepts_kwarg, PyContext};
+use futures::stream::{self, StreamExt as FuturesStreamExt};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use pyo3::{PyAny, PyErr};
@@ -21,7 +22,7 @@ use pyo3_async_runtimes::TaskLocals;
 use pythonize::{depythonize, pythonize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt as TokioStreamExt};
 
 pub use dynamo_runtime::{
     pipeline::{
@@ -208,13 +209,41 @@ where
         })
         .await??;
 
-        let stream = Box::pin(stream);
+        let mut stream = Box::pin(stream);
 
         // process the stream
         // any error thrown in the stream will be caught and complete the processing task
         // errors are captured by a task that is watching the processing task
         // the error will be emitted as an annotated error
         let request_id = id.clone();
+
+        let first_item = match FuturesStreamExt::next(&mut stream).await {
+            Some(Ok(item)) => item,
+            Some(Err(e)) => {
+                // Any Python exception (including HttpError) is already wrapped in PyErr
+                // The HttpAsyncEngine will inspect this PyErr later to see if it's an HttpError
+                tracing::debug!(
+                    request_id,
+                    "Python exception occurred before finish of first iteration: {}",
+                    e
+                );
+                return Err(Error::new(e));
+            }
+            None => {
+                tracing::warn!(
+                    request_id,
+                    "python async generator stream ended before processing started"
+                );
+                return Err(Error::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "python async generator stream ended before processing started",
+                )));
+            }
+        };
+        // Create a new stream that yields the first item followed by the rest of the original stream
+        let stream =
+            futures::StreamExt::chain(stream::once(futures::future::ok(first_item)), stream);
+        let stream = FuturesStreamExt::boxed(stream);
 
         tokio::spawn(async move {
             tracing::debug!(
@@ -225,7 +254,8 @@ where
             let mut stream = stream;
             let mut count = 0;
 
-            while let Some(item) = stream.next().await {
+            // Fix the third error by explicitly using FuturesStreamExt::next
+            while let Some(item) = FuturesStreamExt::next(&mut stream).await {
                 count += 1;
                 tracing::trace!(
                     request_id,
