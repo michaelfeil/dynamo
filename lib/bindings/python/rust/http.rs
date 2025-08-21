@@ -94,16 +94,24 @@ impl HttpService {
     }
 
     fn enable_endpoint(&self, endpoint_type: String, enabled: bool) -> PyResult<()> {
-        let endpoint_type: EndpointType = match endpoint_type.as_str() {
-            "chat" => EndpointType::Chat,
-            "completion" => EndpointType::Completion,
-            "embedding" => EndpointType::Embedding,
-            _ => return Err(to_pyerr("Invalid endpoint type")),
-        };
+        let endpoint_type = EndpointType::all()
+            .iter()
+            .find(|&&ep_type| ep_type.as_str().to_lowercase() == endpoint_type.to_lowercase())
+            .copied()
+            .ok_or_else(|| {
+                let valid_types = EndpointType::all()
+                    .iter()
+                    .map(|&ep_type| ep_type.as_str().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                to_pyerr(format!(
+                    "Invalid endpoint type: '{}'. Valid types are: {}",
+                    endpoint_type, valid_types
+                ))
+            })?;
 
-        self.inner
-            .sync_enable_model_endpoint(endpoint_type, enabled);
-        return Ok(());
+        self.inner.sync_enable_model_endpoint(endpoint_type, enabled);
+        Ok(())
     }
 }
 
