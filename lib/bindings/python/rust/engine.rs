@@ -222,7 +222,7 @@ where
             Some(Err(e)) => {
                 // Any Python exception (including HttpError) is already wrapped in PyErr
                 // The HttpAsyncEngine will inspect this PyErr later to see if it's an HttpError
-                tracing::debug!(
+                tracing::warn!(
                     request_id,
                     "Python exception occurred before finish of first iteration: {}",
                     e
