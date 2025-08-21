@@ -48,6 +48,9 @@ pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 
+// Default axum max body limit without configuring is 2MB: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
+// Configure max body limit here to 45MB to support long contexts (500K+ tokens)
+// TODO: Add a `DYN_*` env var to configure this limit without code change
 const BODY_LIMIT: usize = 45 * 1024 * 1024;
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
