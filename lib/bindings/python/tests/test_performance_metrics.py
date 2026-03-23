@@ -76,6 +76,10 @@ async def test_performance_metrics_registry_basics(runtime: DistributedRuntime):
     assert rate.name == "requests"
     assert dist.name == "ttft_ms"
     assert ratio.name == "kv_hit_rate"
+    snapshot = registry.snapshot_all()
+    assert isinstance(snapshot, dict)
+    assert "requests" in snapshot
+    assert snapshot["requests"]["kind"] == "rate"
 
 
 @pytest.mark.asyncio

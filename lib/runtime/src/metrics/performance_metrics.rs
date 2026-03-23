@@ -531,12 +531,10 @@ enum ControlMessage {
         name: String,
         resp: mpsc::Sender<anyhow::Result<()>>,
     },
-    #[cfg(test)]
     SnapshotMetric {
         name: String,
         resp: mpsc::Sender<Option<MetricSnapshot>>,
     },
-    #[cfg(test)]
     SnapshotAll {
         resp: mpsc::Sender<Vec<MetricSnapshot>>,
     },
@@ -702,6 +700,49 @@ impl PerformanceMetricsRegistry {
 
     pub fn unregister_metric(&self, name: impl Into<String>) -> anyhow::Result<()> {
         self.inner.unregister_metric(name.into())
+    }
+
+    pub fn snapshot_all_map(&self) -> HashMap<String, serde_json::Value> {
+        self.inner
+            .snapshot_all()
+            .into_iter()
+            .map(|snapshot| {
+                let quantiles = snapshot
+                    .quantiles
+                    .iter()
+                    .map(|(q, v)| (quantile_label_value(*q), serde_json::json!(*v)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>();
+
+                let mut value = serde_json::Map::new();
+                value.insert(
+                    "kind".to_string(),
+                    serde_json::json!(match snapshot.kind {
+                        PerformanceMetricKind::Rate => "rate",
+                        PerformanceMetricKind::Distribution => "distribution",
+                        PerformanceMetricKind::Ratio => "ratio",
+                    }),
+                );
+                value.insert(
+                    "rate_per_second".to_string(),
+                    serde_json::json!(snapshot.rate_per_second),
+                );
+                value.insert("average".to_string(), serde_json::json!(snapshot.average));
+                value.insert(
+                    "quantiles".to_string(),
+                    serde_json::Value::Object(quantiles),
+                );
+                value.insert(
+                    "numerator_sum".to_string(),
+                    serde_json::json!(snapshot.numerator_sum),
+                );
+                value.insert(
+                    "denominator_sum".to_string(),
+                    serde_json::json!(snapshot.denominator_sum),
+                );
+                value.insert("ratio".to_string(), serde_json::json!(snapshot.ratio));
+                (snapshot.name, serde_json::Value::Object(value))
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -1211,7 +1252,6 @@ impl RegistryInner {
         }
     }
 
-    #[cfg(test)]
     fn snapshot_metric(&self, name: String) -> Option<MetricSnapshot> {
         let (resp_tx, resp_rx) = mpsc::channel();
         if self
@@ -1227,7 +1267,6 @@ impl RegistryInner {
         resp_rx.recv().ok().flatten()
     }
 
-    #[cfg(test)]
     fn snapshot_all(&self) -> Vec<MetricSnapshot> {
         let (resp_tx, resp_rx) = mpsc::channel();
         if self
@@ -1365,7 +1404,6 @@ fn handle_control_message(msg: ControlMessage, state: &mut WorkerState) -> bool 
             };
             let _ = resp.send(result);
         }
-        #[cfg(test)]
         ControlMessage::SnapshotMetric { name, resp } => {
             let now = Instant::now();
             let snapshot = state.metrics.get_mut(&name).map(|entry| {
@@ -1375,7 +1413,6 @@ fn handle_control_message(msg: ControlMessage, state: &mut WorkerState) -> bool 
             });
             let _ = resp.send(snapshot);
         }
-        #[cfg(test)]
         ControlMessage::SnapshotAll { resp } => {
             let now = Instant::now();
             let snapshots = state
@@ -2252,6 +2289,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tracker.snapshot_all_for_test().len(), 0);
+        assert!(tracker.snapshot_all_map().is_empty());
+    }
+
+    #[test]
+    fn snapshot_all_map_exposes_metric_values_without_prometheus() {
+        let hierarchy = Arc::new(TestHierarchy::new());
+        let tracker = PerformanceMetricsRegistry::new_attached(
+            Duration::from_secs(5),
+            hierarchy,
+            "performance",
+            &[] as &[(&str, &str)],
+        )
+        .unwrap();
+        let requests = tracker
+            .new_rate_metric("requests", vec![0.5], Some(1.0), None)
+            .unwrap();
+        requests.record_count(3).unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            let snapshot = tracker.snapshot_all_map();
+            if snapshot
+                .get("requests")
+                .and_then(|v| v.get("kind"))
+                .and_then(|v| v.as_str())
+                == Some("rate")
+            {
+                assert!(
+                    snapshot["requests"]["rate_per_second"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        >= 0.0
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "snapshot_all_map did not contain requests metric before timeout"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]

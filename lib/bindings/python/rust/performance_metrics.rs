@@ -10,6 +10,7 @@ use dynamo_runtime::metrics::performance_metrics::{
     RequestMetricsOptions as RsRequestMetricsOptions,
 };
 use pyo3::{exceptions::PyValueError, prelude::*};
+use pythonize::pythonize;
 use std::collections::HashMap;
 
 use crate::prometheus_metrics::RuntimeMetrics;
@@ -188,6 +189,11 @@ impl PyPerformanceMetricsRegistry {
             })
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyRatioMetric { inner: handle })
+    }
+
+    fn snapshot_all(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let snapshots = py.allow_threads(|| self.registry.snapshot_all_map());
+        pythonize(py, &snapshots).map_err(|e| PyValueError::new_err(e.to_string()))
     }
 }
 
