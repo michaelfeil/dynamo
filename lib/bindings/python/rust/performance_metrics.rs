@@ -219,7 +219,9 @@ impl PyRequestMetricsFactory {
         successful_request_quantiles = None,
         successful_request_sample_period_seconds = None,
         successful_request_window_seconds = None,
-        itl_sample_rate = 0.05
+        itl_sample_rate = 0.05,
+        request_log_enabled = false,
+        request_log_hash_salt = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -248,6 +250,8 @@ impl PyRequestMetricsFactory {
         successful_request_sample_period_seconds: Option<f64>,
         successful_request_window_seconds: Option<f64>,
         itl_sample_rate: f64,
+        request_log_enabled: bool,
+        request_log_hash_salt: Option<String>,
     ) -> PyResult<Self> {
         let registry = performance_metrics_registry.registry.clone();
         let mut options = RsRequestMetricsOptions::default();
@@ -315,6 +319,8 @@ impl PyRequestMetricsFactory {
             options.successful_request_window_seconds = Some(v);
         }
         options.itl_sample_rate = itl_sample_rate;
+        options.request_log_enabled = request_log_enabled;
+        options.request_log_hash_salt = request_log_hash_salt;
         // Control-path setup can block due metric registration calls; release GIL.
         let inner = py
             .allow_threads(move || RsRequestMetricsFactory::new(&registry, metric_prefix, options))
@@ -323,25 +329,27 @@ impl PyRequestMetricsFactory {
         Ok(Self { inner })
     }
 
-    #[pyo3(signature = (input_tokens = 0))]
-    fn new_request(&self, input_tokens: u64) -> PyRequestMetric {
+    #[pyo3(signature = (input_token_ids))]
+    fn new_request(&self, input_token_ids: Vec<u32>) -> PyRequestMetric {
         PyRequestMetric {
-            inner: self.inner.new_request(input_tokens),
+            inner: self.inner.new_request(&input_token_ids),
         }
     }
 }
 
 #[pymethods]
 impl PyRequestMetric {
-    #[pyo3(signature = (total_tokens, cached_tokens = None))]
+    #[pyo3(signature = (output_token_ids = None, is_diff = false, cached_tokens = None))]
     fn record_tokens(
         &mut self,
         py: Python<'_>,
-        total_tokens: u64,
+        output_token_ids: Option<Vec<u32>>,
+        is_diff: bool,
         cached_tokens: Option<u64>,
     ) -> PyResult<()> {
+        let output_ids = output_token_ids.as_deref();
         // RequestMetric now uses a Send RNG, so this path can run without the GIL.
-        py.allow_threads(|| self.inner.record_tokens(total_tokens, cached_tokens))
+        py.allow_threads(|| self.inner.record_tokens(output_ids, is_diff, cached_tokens))
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 

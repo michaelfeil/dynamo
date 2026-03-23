@@ -10,16 +10,20 @@
 //! Ideal for high-cardinality metrics.
 
 use super::{MetricsHierarchy, create_metric, prometheus_names::build_component_metric_name};
+use blake3::Hasher;
 use parking_lot::Mutex;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SUFFIX_PER_SECOND: &str = "per_second";
 const SUFFIX_AVG: &str = "avg";
@@ -30,6 +34,9 @@ const SUFFIX_QUANTILE: &str = "quantile";
 const LABEL_QUANTILE: &str = "quantile";
 const DEFAULT_QUEUE_CAPACITY: usize = 16_384;
 const WORKER_POLL: Duration = Duration::from_millis(100);
+const REQUEST_HASH_BLOCK_SIZE: usize = 128;
+const REQUEST_LOG_BATCH_SIZE: usize = 256;
+const REQUEST_LOG_OUTPUT_DIR: &str = "/tmp/records";
 // Guard against unbounded memory growth and expensive quantile scans.
 // Each sample is at most ~24 bytes in the largest case (Instant + two f64s for Ratio),
 // so 100k samples is roughly 2.4 MB per metric. The time-based window (default 60s)
@@ -168,6 +175,33 @@ struct RequestMetricsFactoryInner {
     mid_stream_cancellation: RateMetricHandle,
     successful_request: RateMetricHandle,
     itl_sample_rate: f64,
+    event_recorder: Option<EventRecorder>,
+    request_log_hash_key: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RequestLogEntry {
+    timestamp_start_unix_ms: u64,
+    timestamp_ttft_unix_ms: Option<u64>,
+    timestamp_end_unix_ms: u64,
+    total_hashes: Vec<String>,
+    output_tokens: u64,
+    input_tokens: u64,
+    request_canceled: bool,
+}
+
+#[derive(Debug)]
+struct EventRecorder {
+    inner: Mutex<EventRecorderInner>,
+}
+
+#[derive(Debug)]
+struct EventRecorderInner {
+    entries: Vec<RequestLogEntry>,
+    output_dir: PathBuf,
+    batch_size: usize,
+    hostname: String,
+    file_seq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +231,8 @@ pub struct RequestMetricsOptions {
     pub successful_request_sample_period_seconds: Option<f64>,
     pub successful_request_window_seconds: Option<f64>,
     pub itl_sample_rate: f64,
+    pub request_log_enabled: bool,
+    pub request_log_hash_salt: Option<String>,
 }
 
 impl Default for RequestMetricsOptions {
@@ -224,8 +260,110 @@ impl Default for RequestMetricsOptions {
             successful_request_sample_period_seconds: Some(1.0),
             successful_request_window_seconds: None,
             itl_sample_rate: 0.05,
+            request_log_enabled: false,
+            request_log_hash_salt: None,
         }
     }
+}
+
+impl EventRecorder {
+    fn new() -> Self {
+        Self::with_output_dir(PathBuf::from(REQUEST_LOG_OUTPUT_DIR))
+    }
+
+    fn with_output_dir(output_dir: PathBuf) -> Self {
+        Self::with_output_dir_and_batch_size(output_dir, REQUEST_LOG_BATCH_SIZE)
+    }
+
+    fn with_output_dir_and_batch_size(output_dir: PathBuf, batch_size: usize) -> Self {
+        Self {
+            inner: Mutex::new(EventRecorderInner {
+                entries: Vec::with_capacity(batch_size),
+                output_dir,
+                batch_size,
+                hostname: detect_hostname(),
+                file_seq: 0,
+            }),
+        }
+    }
+
+    fn record(&self, entry: RequestLogEntry) {
+        let mut inner = self.inner.lock();
+        inner.entries.push(entry);
+        inner.flush_batch_if_needed();
+    }
+}
+
+impl Drop for EventRecorder {
+    fn drop(&mut self) {
+        self.inner.lock().flush_all();
+    }
+}
+
+impl EventRecorderInner {
+    fn flush_batch_if_needed(&mut self) {
+        while self.entries.len() >= self.batch_size {
+            if let Err(e) = self.flush_next_batch() {
+                tracing::warn!(error = %e, "failed to flush request-log batch");
+                break;
+            }
+        }
+    }
+
+    fn flush_all(&mut self) {
+        while !self.entries.is_empty() {
+            if let Err(e) = self.flush_next_batch() {
+                tracing::warn!(error = %e, "failed to flush request-log entries during drop");
+                break;
+            }
+        }
+    }
+
+    fn flush_next_batch(&mut self) -> anyhow::Result<()> {
+        let chunk_len = self.batch_size.min(self.entries.len());
+        if chunk_len == 0 {
+            return Ok(());
+        }
+        let chunk = self.entries[..chunk_len].to_vec();
+        self.write_chunk(chunk.as_slice())?;
+        self.entries.drain(..chunk_len);
+        Ok(())
+    }
+
+    fn write_chunk(&mut self, chunk: &[RequestLogEntry]) -> anyhow::Result<()> {
+        fs::create_dir_all(self.output_dir.as_path())?;
+        let filename = format!(
+            "{}-{}-{:06}.json",
+            unix_ms(SystemTime::now()),
+            self.hostname,
+            self.file_seq
+        );
+        let file_path = self.output_dir.join(filename);
+        let payload = serde_json::to_vec(chunk)?;
+        fs::write(file_path, payload)?;
+        self.file_seq = self.file_seq.saturating_add(1);
+        Ok(())
+    }
+}
+
+fn detect_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown-host".to_string())
+}
+
+fn unix_ms(ts: SystemTime) -> u64 {
+    ts.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone)]
@@ -252,8 +390,7 @@ impl Default for RequestMetricsOptions {
 /// Notes:
 /// - Rate quantiles are exported on `*_per_second_quantile` with a `quantile` label.
 /// - Distribution quantiles are exported on the base metric with a `quantile` label.
-/// - Input tokens are recorded on first [`RequestMetric::record_tokens`] call.
-///   If `new_request(input_tokens=0)` is used, first `total_tokens` is used as input-token value.
+/// - Input-token metrics are based on `input_token_ids.len()` from [`RequestMetricsFactory::new_request`].
 /// - Net-new metrics are recorded once and only when
 ///   [`RequestMetric::record_tokens`] is called with `cached_tokens=Some(...)` before first token.
 pub struct RequestMetricsFactory {
@@ -264,7 +401,12 @@ pub struct RequestMetricsFactory {
 pub struct RequestMetric {
     factory: Arc<RequestMetricsFactoryInner>,
     input_tokens: u64,
+    output_tokens_len: usize,
+    total_token_hashes: Vec<String>,
+    total_tokens_pending_hash: Vec<u32>,
     started_at: Instant,
+    started_at_wallclock: SystemTime,
+    first_token_at_wallclock: Option<SystemTime>,
     last_token_at: Option<Instant>,
     last_total_tokens: u64,
     terminal: bool,
@@ -733,6 +875,11 @@ impl RequestMetricsFactory {
                 mid_stream_cancellation,
                 successful_request,
                 itl_sample_rate: options.itl_sample_rate,
+                event_recorder: options.request_log_enabled.then(EventRecorder::new),
+                request_log_hash_key: options
+                    .request_log_hash_salt
+                    .as_deref()
+                    .map(|salt| *blake3::hash(salt.as_bytes()).as_bytes()),
             }),
         })
     }
@@ -741,33 +888,92 @@ impl RequestMetricsFactory {
     ///
     /// This records one request event immediately.
     ///
-    /// Input tokens are recorded on the first [`RequestMetric::record_tokens`] call.
-    pub fn new_request(&self, input_tokens: u64) -> RequestMetric {
+    /// Input-token metrics are derived from `input_token_ids.len()`.
+    pub fn new_request(&self, input_token_ids: &[u32]) -> RequestMetric {
         if let Err(e) = self.inner.request.record_count(1) {
             tracing::warn!(error = %e, "failed to record request rate metric");
         }
 
         RequestMetric {
             factory: Arc::clone(&self.inner),
-            input_tokens,
+            input_tokens: input_token_ids.len() as u64,
+            output_tokens_len: 0,
+            total_token_hashes: Vec::new(),
+            total_tokens_pending_hash: Vec::with_capacity(REQUEST_HASH_BLOCK_SIZE),
             started_at: Instant::now(),
+            started_at_wallclock: SystemTime::now(),
+            first_token_at_wallclock: None,
             last_token_at: None,
             last_total_tokens: 0,
             terminal: false,
             cached_tokens_hint: None,
             rng: SmallRng::from_rng(&mut rand::rng()),
         }
+        .with_input_tokens(input_token_ids)
     }
 }
 
 impl RequestMetric {
-    /// Record cumulative output token count for the request.
+    fn with_input_tokens(mut self, input_token_ids: &[u32]) -> Self {
+        self.append_tokens_to_total_hash(input_token_ids);
+        self
+    }
+
+    fn append_tokens_to_total_hash(&mut self, token_ids: &[u32]) {
+        let mut remaining = token_ids;
+        while !remaining.is_empty() {
+            let needed = REQUEST_HASH_BLOCK_SIZE - self.total_tokens_pending_hash.len();
+            let take = needed.min(remaining.len());
+            self.total_tokens_pending_hash
+                .extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if self.total_tokens_pending_hash.len() == REQUEST_HASH_BLOCK_SIZE {
+                self.flush_pending_hash_block();
+            }
+        }
+    }
+
+    fn flush_pending_hash_block(&mut self) {
+        if self.total_tokens_pending_hash.is_empty() {
+            return;
+        }
+        self.total_token_hashes.push(hash_token_block(
+            self.total_tokens_pending_hash.as_slice(),
+            self.factory.request_log_hash_key.as_ref(),
+        ));
+        self.total_tokens_pending_hash.clear();
+    }
+
+    fn flush_partial_hash_block(&mut self) {
+        self.flush_pending_hash_block();
+    }
+
+    fn enqueue_request_log_if_enabled(&self, request_canceled: bool) {
+        let Some(event_recorder) = &self.factory.event_recorder else {
+            return;
+        };
+        event_recorder.record(RequestLogEntry {
+            timestamp_start_unix_ms: unix_ms(self.started_at_wallclock),
+            timestamp_ttft_unix_ms: self.first_token_at_wallclock.map(unix_ms),
+            timestamp_end_unix_ms: unix_ms(SystemTime::now()),
+            total_hashes: self.total_token_hashes.clone(),
+            output_tokens: self.output_tokens_len as u64,
+            input_tokens: self.input_tokens,
+            request_canceled,
+        });
+    }
+
+    /// Record output token IDs for the request.
     ///
     /// On the first token this records TTFT in milliseconds. On later updates this records
     /// sampled ITL values in milliseconds per token.
+    ///
+    /// - If `is_diff=true`, `output_token_ids` is interpreted as newly generated token IDs.
+    /// - If `is_diff=false`, `output_token_ids` is interpreted as cumulative output token IDs.
     pub fn record_tokens(
         &mut self,
-        total_tokens: u64,
+        output_token_ids: Option<&[u32]>,
+        is_diff: bool,
         cached_tokens: Option<u64>,
     ) -> anyhow::Result<()> {
         if self.terminal {
@@ -778,15 +984,30 @@ impl RequestMetric {
             self.cached_tokens_hint.get_or_insert(cached_tokens);
         }
 
+        let Some(output_token_ids) = output_token_ids else {
+            return Ok(());
+        };
+
+        let delta_tokens = if is_diff {
+            output_token_ids
+        } else {
+            if output_token_ids.len() <= self.output_tokens_len {
+                return Ok(());
+            }
+            &output_token_ids[self.output_tokens_len..]
+        };
+        self.append_tokens_to_total_hash(delta_tokens);
+        self.output_tokens_len += delta_tokens.len();
+
+        let total_tokens = self.output_tokens_len as u64;
+
         if total_tokens <= self.last_total_tokens {
             return Ok(());
         }
 
         let now = Instant::now();
         if self.last_token_at.is_none() {
-            if self.input_tokens == 0 {
-                self.input_tokens = total_tokens;
-            }
+            self.first_token_at_wallclock = Some(SystemTime::now());
             if self.input_tokens > 0 {
                 self.factory.input_tokens.record_count(self.input_tokens)?;
             }
@@ -839,6 +1060,8 @@ impl RequestMetric {
         if self.terminal {
             return Ok(());
         }
+        self.flush_partial_hash_block();
+        self.enqueue_request_log_if_enabled(false);
         self.factory.successful_request.record_count(1)?;
         self.terminal = true;
         Ok(())
@@ -848,6 +1071,8 @@ impl RequestMetric {
         if self.terminal {
             return Ok(());
         }
+        self.flush_partial_hash_block();
+        self.enqueue_request_log_if_enabled(true);
         if self.last_token_at.is_some() {
             self.factory.mid_stream_cancellation.record_count(1)?;
         } else {
@@ -856,6 +1081,21 @@ impl RequestMetric {
         self.terminal = true;
         Ok(())
     }
+}
+
+fn hash_token_block(token_ids: &[u32], key: Option<&[u8; 32]>) -> String {
+    let mut bytes = Vec::with_capacity(token_ids.len() * std::mem::size_of::<u32>());
+    for token_id in token_ids {
+        bytes.extend_from_slice(&token_id.to_le_bytes());
+    }
+    let digest = if let Some(key) = key {
+        let mut hasher = Hasher::new_keyed(key);
+        hasher.update(bytes.as_slice());
+        hasher.finalize()
+    } else {
+        blake3::hash(bytes.as_slice())
+    };
+    digest.to_hex().to_string()
 }
 
 impl Drop for RequestMetric {
@@ -1839,6 +2079,7 @@ fn validate_metric_name_collisions(
 mod tests {
     use super::*;
     use crate::metrics::{MetricsHierarchy, MetricsRegistry};
+    use tempfile::tempdir;
 
     struct TestHierarchy {
         registry: MetricsRegistry,
@@ -1893,6 +2134,10 @@ mod tests {
             }
         }
         None
+    }
+
+    fn token_ids(n: usize) -> Vec<u32> {
+        (0..n).map(|i| i as u32).collect()
     }
 
     #[test]
@@ -2136,17 +2381,22 @@ mod tests {
             .unwrap();
         foo.record_value(42.0).unwrap();
 
-        let factory = RequestMetricsFactory::new(
-            &registry,
-            "request_metrics",
-            RequestMetricsOptions::default(),
-        )
+        let factory = RequestMetricsFactory::new(&registry, "request_metrics", {
+            let mut options = RequestMetricsOptions::default();
+            options.itl_sample_rate = 1.0;
+            options
+        })
         .unwrap();
-        let mut request = factory.new_request(128);
+        let input_ids = token_ids(128);
+        let mut request = factory.new_request(&input_ids);
         std::thread::sleep(Duration::from_millis(1));
-        request.record_tokens(129, None).unwrap();
+        request
+            .record_tokens(Some(&token_ids(129)), false, None)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(1));
-        request.record_tokens(145, None).unwrap();
+        request
+            .record_tokens(Some(&token_ids(145)), false, None)
+            .unwrap();
         request.success().unwrap();
 
         let deadline = Instant::now() + Duration::from_millis(1500);
@@ -2228,15 +2478,19 @@ mod tests {
         .unwrap();
 
         // Drive at least one request through first-token + later-token so TTFT/ITL paths publish.
-        let mut req = factory.new_request(128);
+        let input_ids = token_ids(128);
+        let mut req = factory.new_request(&input_ids);
         std::thread::sleep(Duration::from_millis(1));
-        req.record_tokens(129, Some(32)).unwrap();
+        req.record_tokens(Some(&token_ids(129)), false, Some(32))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(1));
-        req.record_tokens(145, None).unwrap();
+        req.record_tokens(Some(&token_ids(145)), false, None)
+            .unwrap();
         req.success().unwrap();
 
         // Exercise cancellation families as well.
-        let mut cancelled = factory.new_request(64);
+        let cancelled_ids = token_ids(64);
+        let mut cancelled = factory.new_request(&cancelled_ids);
         cancelled.cancel().unwrap();
 
         let deadline = Instant::now() + Duration::from_millis(1500);
@@ -2354,7 +2608,8 @@ mod tests {
             RequestMetricsOptions::default(),
         )
         .unwrap();
-        let _request = factory.new_request(123);
+        let request_ids = token_ids(123);
+        let _request = factory.new_request(&request_ids);
 
         let deadline = Instant::now() + Duration::from_millis(100);
         loop {
@@ -2387,9 +2642,12 @@ mod tests {
             RequestMetricsOptions::default(),
         )
         .unwrap();
-        let mut request = factory.new_request(100);
+        let input_ids = token_ids(100);
+        let mut request = factory.new_request(&input_ids);
         std::thread::sleep(Duration::from_millis(1));
-        request.record_tokens(101, None).unwrap();
+        request
+            .record_tokens(Some(&token_ids(101)), false, None)
+            .unwrap();
 
         let s = factory
             .inner
@@ -2401,7 +2659,7 @@ mod tests {
     }
 
     #[test]
-    fn request_metrics_records_input_tokens_on_first_record_tokens_call() {
+    fn request_metrics_records_input_tokens_from_request_input_ids() {
         let hierarchy = Arc::new(TestHierarchy::new());
         let registry = PerformanceMetricsRegistry::new_attached(
             Duration::from_secs(5),
@@ -2417,8 +2675,11 @@ mod tests {
             RequestMetricsOptions::default(),
         )
         .unwrap();
-        let mut request = factory.new_request(123);
-        request.record_tokens(124, None).unwrap();
+        let input_ids = token_ids(123);
+        let mut request = factory.new_request(&input_ids);
+        request
+            .record_tokens(Some(&token_ids(124)), false, None)
+            .unwrap();
 
         let deadline = Instant::now() + Duration::from_millis(100);
         loop {
@@ -2429,47 +2690,6 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "input token rate did not become positive before timeout"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-
-    #[test]
-    fn request_metrics_can_infer_input_tokens_from_first_total_tokens() {
-        let hierarchy = Arc::new(TestHierarchy::new());
-        let registry = PerformanceMetricsRegistry::new_attached(
-            Duration::from_secs(5),
-            hierarchy,
-            "baseten_frontend",
-            &[] as &[(&str, &str)],
-        )
-        .unwrap();
-
-        let factory = RequestMetricsFactory::new(
-            &registry,
-            "request_metrics",
-            RequestMetricsOptions::default(),
-        )
-        .unwrap();
-        let mut request = factory.new_request(0);
-        request.record_tokens(129, None).unwrap();
-
-        let deadline = Instant::now() + Duration::from_millis(100);
-        loop {
-            let input_tokens_snapshot = factory.inner.input_tokens.snapshot_for_test().unwrap();
-            let ttft_per_input_token_snapshot = factory
-                .inner
-                .ttft_per_input_token
-                .snapshot_for_test()
-                .unwrap();
-            if input_tokens_snapshot.rate_per_second.unwrap_or_default() > 0.0
-                && ttft_per_input_token_snapshot.average.unwrap_or_default() > 0.0
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "inferred input token metrics did not become positive before timeout"
             );
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -2492,10 +2712,15 @@ mod tests {
             RequestMetricsOptions::default(),
         )
         .unwrap();
-        let mut request = factory.new_request(100);
+        let input_ids = token_ids(100);
+        let mut request = factory.new_request(&input_ids);
         std::thread::sleep(Duration::from_millis(1));
-        request.record_tokens(101, Some(60)).unwrap();
-        request.record_tokens(116, Some(50)).unwrap();
+        request
+            .record_tokens(Some(&token_ids(101)), false, Some(60))
+            .unwrap();
+        request
+            .record_tokens(Some(&token_ids(116)), false, Some(50))
+            .unwrap();
 
         let deadline = Instant::now() + Duration::from_millis(100);
         loop {
@@ -2520,6 +2745,178 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn request_metrics_total_hashes_are_consecutive_for_cumulative_output() {
+        let hierarchy = Arc::new(TestHierarchy::new());
+        let registry = PerformanceMetricsRegistry::new_attached(
+            Duration::from_secs(5),
+            hierarchy,
+            "baseten_frontend",
+            &[] as &[(&str, &str)],
+        )
+        .unwrap();
+
+        let factory = RequestMetricsFactory::new(
+            &registry,
+            "request_metrics",
+            RequestMetricsOptions::default(),
+        )
+        .unwrap();
+        let input_ids = token_ids(0);
+        let mut request = factory.new_request(&input_ids);
+        std::thread::sleep(Duration::from_millis(1));
+        request
+            .record_tokens(Some(&token_ids(140)), false, Some(0))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        request
+            .record_tokens(Some(&token_ids(260)), false, None)
+            .unwrap();
+        assert_eq!(request.output_tokens_len, 260);
+        assert_eq!(request.total_token_hashes.len(), 2);
+        assert_eq!(request.total_tokens_pending_hash.len(), 4);
+        request.success().unwrap();
+        assert_eq!(request.total_token_hashes.len(), 3);
+
+        let all_output = token_ids(260);
+        let expected = vec![
+            hash_token_block(&all_output[0..128], None),
+            hash_token_block(&all_output[128..256], None),
+            hash_token_block(&all_output[256..260], None),
+        ];
+        assert_eq!(request.total_token_hashes, expected);
+    }
+
+    #[test]
+    fn request_metrics_total_hashes_include_input_then_output() {
+        let hierarchy = Arc::new(TestHierarchy::new());
+        let registry = PerformanceMetricsRegistry::new_attached(
+            Duration::from_secs(5),
+            hierarchy,
+            "baseten_frontend",
+            &[] as &[(&str, &str)],
+        )
+        .unwrap();
+
+        let factory = RequestMetricsFactory::new(
+            &registry,
+            "request_metrics",
+            RequestMetricsOptions::default(),
+        )
+        .unwrap();
+        let input_ids = (1000_u32..1120_u32).collect::<Vec<_>>();
+        let mut request = factory.new_request(&input_ids);
+
+        let output_delta = (1_u32..=20_u32).collect::<Vec<_>>();
+        request
+            .record_tokens(Some(output_delta.as_slice()), true, Some(0))
+            .unwrap();
+        request.success().unwrap();
+
+        let mut all_tokens = input_ids.clone();
+        all_tokens.extend_from_slice(output_delta.as_slice());
+        let expected = vec![
+            hash_token_block(&all_tokens[0..128], None),
+            hash_token_block(&all_tokens[128..140], None),
+        ];
+        assert_eq!(request.total_token_hashes, expected);
+    }
+
+    #[test]
+    fn request_metrics_hash_salt_changes_hash_output_deterministically() {
+        let hierarchy = Arc::new(TestHierarchy::new());
+        let registry = PerformanceMetricsRegistry::new_attached(
+            Duration::from_secs(5),
+            hierarchy,
+            "baseten_frontend",
+            &[] as &[(&str, &str)],
+        )
+        .unwrap();
+        let factory_unsalted = RequestMetricsFactory::new(
+            &registry,
+            "request_metrics_unsalted",
+            RequestMetricsOptions::default(),
+        )
+        .unwrap();
+        let factory_salted = RequestMetricsFactory::new(&registry, "request_metrics_salted", {
+            let mut options = RequestMetricsOptions::default();
+            options.request_log_hash_salt = Some("my-fixed-salt".to_string());
+            options
+        })
+        .unwrap();
+
+        let mut req_unsalted = factory_unsalted.new_request(&[]);
+        req_unsalted
+            .record_tokens(Some(&token_ids(130)), false, None)
+            .unwrap();
+        req_unsalted.success().unwrap();
+
+        let mut req_salted = factory_salted.new_request(&[]);
+        req_salted
+            .record_tokens(Some(&token_ids(130)), false, None)
+            .unwrap();
+        req_salted.success().unwrap();
+
+        assert_eq!(req_unsalted.total_token_hashes.len(), 2);
+        assert_eq!(req_salted.total_token_hashes.len(), 2);
+        assert_ne!(
+            req_unsalted.total_token_hashes,
+            req_salted.total_token_hashes
+        );
+    }
+
+    #[test]
+    fn event_recorder_flushes_batch_to_disk() {
+        let dir = tempdir().unwrap();
+        let recorder = EventRecorder::with_output_dir_and_batch_size(dir.path().to_path_buf(), 2);
+        let entry = |id: u64| RequestLogEntry {
+            timestamp_start_unix_ms: id,
+            timestamp_ttft_unix_ms: Some(id + 1),
+            timestamp_end_unix_ms: id + 2,
+            total_hashes: vec![format!("h{id}")],
+            output_tokens: 3,
+            input_tokens: 4,
+            request_canceled: false,
+        };
+
+        recorder.record(entry(1));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        recorder.record(entry(2));
+        let files = fs::read_dir(dir.path()).unwrap().collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let first_file = files[0].as_ref().unwrap().path();
+        let bytes = fs::read(first_file).unwrap();
+        let decoded: Vec<RequestLogEntry> = serde_json::from_slice(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].timestamp_start_unix_ms, 1);
+        assert_eq!(decoded[1].timestamp_start_unix_ms, 2);
+    }
+
+    #[test]
+    fn event_recorder_drop_flushes_partial_batch() {
+        let dir = tempdir().unwrap();
+        {
+            let recorder =
+                EventRecorder::with_output_dir_and_batch_size(dir.path().to_path_buf(), 10);
+            recorder.record(RequestLogEntry {
+                timestamp_start_unix_ms: 10,
+                timestamp_ttft_unix_ms: None,
+                timestamp_end_unix_ms: 11,
+                total_hashes: vec!["abc".to_string()],
+                output_tokens: 1,
+                input_tokens: 2,
+                request_canceled: true,
+            });
+        }
+
+        let files = fs::read_dir(dir.path()).unwrap().collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let bytes = fs::read(files[0].as_ref().unwrap().path()).unwrap();
+        let decoded: Vec<RequestLogEntry> = serde_json::from_slice(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].request_canceled);
     }
 
     #[test]

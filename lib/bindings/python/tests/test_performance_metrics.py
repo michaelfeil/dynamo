@@ -16,14 +16,14 @@ async def test_request_metrics_lifecycle_smoke(runtime: DistributedRuntime):
     registry = PerformanceMetricsRegistry(endpoint.metrics)
 
     factory = RequestMetricsFactory(registry, metric_prefix="test_request_metrics")
-    request = factory.new_request(input_tokens=128)
+    request = factory.new_request(input_token_ids=list(range(128)))
     request.record_tokens(
-        129, cached_tokens=32
+        list(range(129)), cached_tokens=32
     )  # first token: TTFT + net-new token metrics
-    request.record_tokens(145)  # later update: ITL sampling
+    request.record_tokens(list(range(145)))  # later update: ITL sampling
     request.success()
 
-    cancelled = factory.new_request(input_tokens=64)
+    cancelled = factory.new_request(input_token_ids=list(range(64)))
     cancelled.cancel()
 
 
@@ -42,8 +42,8 @@ async def test_request_metrics_factory_overrides(runtime: DistributedRuntime):
         request_sample_period_seconds=2.0,
     )
 
-    request = factory.new_request(input_tokens=100)
-    request.record_tokens(101)
+    request = factory.new_request(input_token_ids=list(range(100)))
+    request.record_tokens(list(range(101)))
     request.success()
 
 
@@ -103,9 +103,9 @@ async def test_performance_metrics_pef_round_trip(runtime: DistributedRuntime):
 
     rate.record_count(5)
     dist.record_value(42.0)
-    req = factory.new_request(input_tokens=128)
-    req.record_tokens(129, cached_tokens=32)
-    req.record_tokens(145)
+    req = factory.new_request(input_token_ids=list(range(128)))
+    req.record_tokens(list(range(129)), cached_tokens=32)
+    req.record_tokens(list(range(145)))
     req.success()
 
     # Wait for one publish tick (configured at 1s), then scrape PEF.

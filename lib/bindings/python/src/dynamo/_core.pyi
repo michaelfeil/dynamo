@@ -1720,7 +1720,7 @@ class PerformanceMetricsRegistry:
 
 class RequestMetric:
     """Per-request recorder for TTFT/ITL and terminal outcomes."""
-    def record_tokens(self, total_tokens: int, cached_tokens: Optional[int] = None) -> None: ...
+    def record_tokens(self, output_token_ids: Optional[List[int]] = None, is_diff: bool = False, cached_tokens: Optional[int] = None) -> None: ...
     def success(self) -> None: ...
     def cancel(self) -> None: ...
 
@@ -1743,8 +1743,9 @@ class RequestMetricsFactory:
     - Successful requests
 
     Semantics:
-    - `record_tokens(total_tokens, cached_tokens=None)` expects cumulative `total_tokens`.
-    - If `new_request(input_tokens=0)`, the first `total_tokens` value is used as input tokens.
+    - `new_request(input_token_ids)` sets request input-token metrics from `len(input_token_ids)`.
+    - `record_tokens(output_token_ids, is_diff=False, cached_tokens=None)`:
+      `is_diff=False` expects cumulative output token IDs; `is_diff=True` expects only new output token IDs.
     - `cached_tokens` is consumed once (first provided value before first token).
 
     Usage:
@@ -1754,12 +1755,12 @@ class RequestMetricsFactory:
             self.factory = RequestMetricsFactory(performance_metrics_registry, metric_prefix="frontend_request_metrics")
 
         async def handle_request(..):
-            req = self.factory.new_request(input_tokens=prompt_tokens)
+            req = self.factory.new_request(input_token_ids=prompt_token_ids)
             try:
                 async for stream in engine.generate(...):
-                    req.record_tokens(stream.usage.total_tokens)
+                    req.record_tokens(stream.usage.output_token_ids, is_diff=False)
                     # Optional, once before first token:
-                    # req.record_tokens(stream.usage.total_tokens, cached_tokens=cache_hit_tokens)
+                    # req.record_tokens(stream.usage.output_token_ids, is_diff=False, cached_tokens=cache_hit_tokens)
                     yield stream
                 req.success()
             except:
@@ -1793,9 +1794,11 @@ class RequestMetricsFactory:
         successful_request_sample_period_seconds: Optional[float] = None,
         successful_request_window_seconds: Optional[float] = None,
         itl_sample_rate: float = 0.05,
+        request_log_enabled: bool = False,
+        request_log_hash_salt: Optional[str] = None,
     ) -> None: ...
     """Create a request metrics factory.
 
     All args after `performance_metrics_registry` are keyword-only.
     """
-    def new_request(self, input_tokens: int = 0) -> RequestMetric: ...
+    def new_request(self, input_token_ids: List[int]) -> RequestMetric: ...
