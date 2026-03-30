@@ -1,8 +1,59 @@
 # KVBM TensorRT-LLM Integration Execution Plan
 
-Last updated: 2026-03-30 23:26:43 UTC
+Last updated: 2026-03-30 23:59:54 UTC
 
 Current run outcome:
+
+- Re-read the repo-local execution instructions in `Agents.md`, then re-read
+  the current `PLANS.md` before making changes in this run.
+- Re-ran the current validation sequence from this plan on 2026-03-30 UTC and
+  confirmed the repo-local KVBM TRT-LLM seam is still green:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
+    -> pass (`Ran 14 tests`, `OK`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 26 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
+    -> pass (`Ran 40 tests`, `OK`, `skipped=3`)
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `python3 -m venv .venv`
+    -> pass
+  - `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `.venv/bin/python -c 'import kvbm, kvbm._core'`
+    -> pass
+- Found one remaining repo-local tooling mismatch during that refresh:
+  `lib/bindings/kvbm/tools/trtllm_runtime_audit.py` still defaulted each
+  subprocess import probe to `20.0` seconds, which now falsely reported the
+  live TRT-LLM `1.3.0rc9` runtime as blocked on this machine even though the
+  imports do complete with `TLLM_DISABLE_MPI=1`.
+- Fixed that tooling mismatch by introducing
+  `DEFAULT_PROBE_TIMEOUT_S = 60.0` and using it for both
+  `build_runtime_report(..., probe_timeout_s=...)` and the CLI
+  `--probe-timeout-s` default.
+- Revalidated after that audit fix on 2026-03-30 UTC:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
+    -> pass (`Ran 14 tests`, `OK`)
+  - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
+    -> pass (`Ran 40 tests`, `OK`, `skipped=3`)
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `.venv/bin/python -c 'import kvbm, kvbm._core'`
+    -> pass
+  - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
+    -> pass, report `status: "ok"`
+- Confirmed the live runtime state in this sandbox after the audit fix:
+  - system-installed `tensorrt_llm` is `1.3.0rc9`
+  - the installed package exposes both `_torch/pyexecutor` and
+    `_torch/disaggregation`
+  - CUDA 13 `libcublasLt` is present on the host and matches the installed
+    TRT-LLM wheel metadata
+  - top-level `import tensorrt_llm` and direct import of
+    `tensorrt_llm._torch.disaggregation.native.py_cache_transceiver` both now
+    complete successfully under `TLLM_DISABLE_MPI=1`
+  - `/tmp/trtllm-latest/tensorrt_llm` is absent in this sandbox, so any future
+    source-vs-installed seam comparison that depends on that checkout still
+    needs it to be restored explicitly
 
 - Re-read the repo-local execution instructions in `Agents.md`, the
   user-provided `AGENTS.md` instructions, the current `PLANS.md`,
@@ -78,9 +129,9 @@ Current run outcome:
 
 Exact next steps if another run happens on this machine:
 
-- Do not spend another run reworking manager metadata or request shims first;
-  the repo-local rc9 Python seam is now green through the actual installed
-  `build_page_table_from_manager(...)` and `PyNativeCacheTransceiver` code.
+- Do not spend another run reworking manager metadata, request shims, or the
+  runtime audit first; the repo-local rc9 Python seam and preflight are now
+  green on this machine.
 - Re-run this exact validation sequence first:
   - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
   - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
@@ -90,6 +141,13 @@ Exact next steps if another run happens on this machine:
   - `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
   - `.venv/bin/python -c 'import kvbm, kvbm._core'`
   - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
+- If that sequence stays green, spend the next run on a real external runtime
+  exercise rather than more repo-local cleanup:
+  - restore `/tmp/trtllm-latest/tensorrt_llm` only if a checkout-vs-installed
+    seam comparison is required
+  - otherwise use the installed TRT-LLM `1.3.0rc9` runtime directly and attempt
+    a real transfer-worker / multi-rank bring-up or equivalent end-to-end
+    smoke path
 
 ## Objective
 

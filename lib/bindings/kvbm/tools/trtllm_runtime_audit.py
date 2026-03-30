@@ -19,6 +19,7 @@ from typing import Any, Iterable, Optional
 
 DEFAULT_PINNED_CHECKOUT = Path("/tmp/trtllm-latest/tensorrt_llm")
 DEFAULT_REPO_PYPROJECT = Path(__file__).resolve().parents[4] / "pyproject.toml"
+DEFAULT_PROBE_TIMEOUT_S = 60.0
 DEFAULT_LIBRARY_DIR_PATTERNS = (
     "/usr/local/cuda*/targets/*/lib",
     "/usr/local/cuda*/targets/*/lib/stubs",
@@ -332,7 +333,7 @@ def build_runtime_report(
     library_dirs: Optional[Iterable[Path]] = None,
     probe_imports: bool = False,
     python_executable: str = sys.executable,
-    probe_timeout_s: float = 20.0,
+    probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S,
     probe_env: Optional[dict[str, str]] = None,
     probe_runner: Any = subprocess.run,
 ) -> dict[str, Any]:
@@ -462,7 +463,7 @@ def main() -> int:
     parser.add_argument(
         "--probe-timeout-s",
         type=float,
-        default=20.0,
+        default=DEFAULT_PROBE_TIMEOUT_S,
         help="Timeout in seconds for each subprocess import probe",
     )
     parser.add_argument(
