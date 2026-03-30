@@ -145,7 +145,7 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
         def fake_runner(command, **kwargs):
             del kwargs
             rendered = " ".join(command)
-            if "tensorrt_llm._torch.disaggregation.transceiver" in rendered:
+            if "tensorrt_llm._torch.disaggregation.native.py_cache_transceiver" in rendered:
                 return types.SimpleNamespace(
                     returncode=1,
                     stdout="",
@@ -160,7 +160,11 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             installed_root = root / "site-packages" / "tensorrt_llm"
-            installed_root.mkdir(parents=True)
+            (installed_root / "_torch" / "disaggregation" / "native").mkdir(parents=True)
+            (installed_root / "_torch" / "disaggregation" / "native" / "py_cache_transceiver.py").write_text(
+                "",
+                encoding="utf-8",
+            )
             (root / "pyproject.toml").write_text(
                 "\n".join(
                     [
@@ -173,7 +177,11 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
                 encoding="utf-8",
             )
             checkout_root = root / "trtllm-checkout" / "tensorrt_llm"
-            (checkout_root / "_torch" / "disaggregation").mkdir(parents=True)
+            (checkout_root / "_torch" / "disaggregation" / "transceiver.py").parent.mkdir(parents=True)
+            (checkout_root / "_torch" / "disaggregation" / "transceiver.py").write_text(
+                "",
+                encoding="utf-8",
+            )
 
             report = module.build_runtime_report(
                 distribution=_FakeDistribution(
@@ -189,18 +197,15 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
                 probe_runner=fake_runner,
             )
 
-        self.assertEqual(len(report["import_probes"]), 2)
+        self.assertEqual(len(report["import_probes"]), 3)
         self.assertEqual(report["import_probes"][0]["status"], "ok")
         self.assertEqual(report["import_probes"][1]["status"], "error")
+        self.assertEqual(report["import_probes"][2]["status"], "ok")
         self.assertIn(
-            "installed tensorrt_llm package does not expose _torch.disaggregation",
+            "subprocess import of tensorrt_llm._torch.disaggregation.native.py_cache_transceiver failed",
             report["findings"][0],
         )
-        self.assertIn(
-            "subprocess import of tensorrt_llm._torch.disaggregation.transceiver failed",
-            report["findings"][1],
-        )
-        self.assertIn("Open MPI / PMIx listener startup failed", report["findings"][1])
+        self.assertIn("Open MPI / PMIx listener startup failed", report["findings"][0])
 
     def test_probe_python_import_command_exits_immediately_after_summary(self) -> None:
         module = _load_module()
@@ -224,18 +229,45 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
         self.assertEqual(probe["status"], "ok")
         self.assertIn("os._exit(0)", observed["command"][2])
 
-    def test_build_probe_targets_prefers_installed_disaggregation_surface(self) -> None:
+    def test_probe_python_import_passes_env_updates(self) -> None:
+        module = _load_module()
+        observed = {}
+
+        def fake_runner(command, **kwargs):
+            observed["env"] = kwargs["env"]
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout='{"module": "tensorrt_llm", "file": "/tmp/mod.py"}\n',
+                stderr="",
+            )
+
+        probe = module._probe_python_import(
+            python_executable="/fake/python",
+            module="tensorrt_llm",
+            env_updates={"TLLM_DISABLE_MPI": "1"},
+            runner=fake_runner,
+        )
+
+        self.assertEqual(probe["status"], "ok")
+        self.assertEqual(observed["env"]["TLLM_DISABLE_MPI"], "1")
+
+    def test_build_probe_targets_prefers_installed_probe_module(self) -> None:
         module = _load_module()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             checkout_root = Path(temp_dir) / "trtllm-checkout" / "tensorrt_llm"
-            (checkout_root / "_torch" / "disaggregation").mkdir(parents=True)
+            (checkout_root / "_torch" / "disaggregation" / "transceiver.py").parent.mkdir(parents=True)
+            (checkout_root / "_torch" / "disaggregation" / "transceiver.py").write_text(
+                "",
+                encoding="utf-8",
+            )
 
             targets = module._build_probe_targets(
                 installed={
                     "installed": True,
                     "package_root": "/usr/local/lib/python3.12/dist-packages/tensorrt_llm",
                     "has_disaggregation": True,
+                    "disaggregation_probe_module": "tensorrt_llm._torch.disaggregation.native.py_cache_transceiver",
                 },
                 pinned_checkout=checkout_root,
                 probe_imports=True,
@@ -245,12 +277,36 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
             [(target["module"], target["python_path"]) for target in targets],
             [
                 ("tensorrt_llm", None),
-                ("tensorrt_llm._torch.disaggregation.transceiver", None),
+                ("tensorrt_llm._torch.disaggregation.native.py_cache_transceiver", None),
                 (
                     "tensorrt_llm._torch.disaggregation.transceiver",
                     checkout_root.parent,
                 ),
             ],
+        )
+
+    def test_build_runtime_report_flags_missing_python_disagg_entrypoint(self) -> None:
+        module = _load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            installed_root = root / "site-packages" / "tensorrt_llm"
+            (installed_root / "_torch" / "disaggregation").mkdir(parents=True)
+
+            report = module.build_runtime_report(
+                distribution=_FakeDistribution(
+                    installed_root,
+                    version="1.3.0rc9",
+                    requires=[],
+                ),
+                pinned_checkout=Path("/does/not/exist"),
+                library_dirs=[],
+            )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn(
+            "but neither transceiver.py nor native/py_cache_transceiver.py is present",
+            report["findings"][0],
         )
 
     def test_probe_python_import_reports_timeout(self) -> None:
@@ -323,7 +379,11 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
             installed_root = root / "site-packages" / "tensorrt_llm"
             installed_root.mkdir(parents=True)
             checkout_root = root / "trtllm-checkout" / "tensorrt_llm"
-            (checkout_root / "_torch" / "disaggregation").mkdir(parents=True)
+            (checkout_root / "_torch" / "disaggregation" / "transceiver.py").parent.mkdir(parents=True)
+            (checkout_root / "_torch" / "disaggregation" / "transceiver.py").write_text(
+                "",
+                encoding="utf-8",
+            )
 
             report = module.build_runtime_report(
                 distribution=_FakeDistribution(
@@ -335,10 +395,12 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
                 library_dirs=[],
                 probe_imports=True,
                 probe_timeout_s=7.5,
+                probe_env={"TLLM_DISABLE_MPI": "1"},
                 probe_runner=fake_runner,
             )
 
         self.assertEqual(report["probe_timeout_s"], 7.5)
+        self.assertEqual(report["probe_env"], {"TLLM_DISABLE_MPI": "1"})
         self.assertEqual(observed_timeouts, [7.5, 7.5])
 
     def test_main_supports_cli_overrides_and_fail_on_blocked(self) -> None:
@@ -362,6 +424,7 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
                     "/custom/python",
                     "--probe-timeout-s",
                     "7.5",
+                    "--disable-mpi-for-probes",
                     "--fail-on-blocked",
                 ],
             ):
@@ -372,6 +435,7 @@ class TrtllmRuntimeAuditTests(unittest.TestCase):
         self.assertEqual(captured["repo_pyproject"], Path("/custom/pyproject.toml"))
         self.assertEqual(captured["python_executable"], "/custom/python")
         self.assertEqual(captured["probe_timeout_s"], 7.5)
+        self.assertEqual(captured["probe_env"], {"TLLM_DISABLE_MPI": "1"})
         self.assertTrue(captured["probe_imports"])
 
 

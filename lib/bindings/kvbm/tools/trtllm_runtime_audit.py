@@ -65,10 +65,13 @@ def _read_repo_declared_trtllm_version(pyproject_path: Path) -> Optional[str]:
 
 
 def _package_surface(package_root: Path) -> dict[str, Any]:
+    disaggregation_root = package_root / "_torch" / "disaggregation"
+    disaggregation_probe_module = _resolve_disaggregation_probe_module(disaggregation_root)
     return {
         "package_root": str(package_root),
         "has_pyexecutor": (package_root / "_torch" / "pyexecutor").is_dir(),
-        "has_disaggregation": (package_root / "_torch" / "disaggregation").is_dir(),
+        "has_disaggregation": disaggregation_root.is_dir(),
+        "disaggregation_probe_module": disaggregation_probe_module,
     }
 
 
@@ -88,6 +91,7 @@ def _distribution_summary(distribution: Any) -> dict[str, Any]:
             "package_root": None,
             "has_pyexecutor": False,
             "has_disaggregation": False,
+            "disaggregation_probe_module": None,
             "requirements": [],
         }
 
@@ -151,6 +155,20 @@ def _library_summary(library_dirs: Iterable[Path]) -> dict[str, Any]:
     }
 
 
+def _resolve_disaggregation_probe_module(disaggregation_root: Path) -> Optional[str]:
+    candidates = (
+        ("transceiver.py", "tensorrt_llm._torch.disaggregation.transceiver"),
+        (
+            "native/py_cache_transceiver.py",
+            "tensorrt_llm._torch.disaggregation.native.py_cache_transceiver",
+        ),
+    )
+    for relative_path, module_name in candidates:
+        if (disaggregation_root / relative_path).is_file():
+            return module_name
+    return None
+
+
 def _normalize_subprocess_stream(value: Any) -> str:
     if value is None:
         return ""
@@ -178,9 +196,12 @@ def _probe_python_import(
     module: str,
     python_path: Optional[Path] = None,
     timeout_s: float = 20.0,
+    env_updates: Optional[dict[str, str]] = None,
     runner: Any = subprocess.run,
 ) -> dict[str, Any]:
     env = os.environ.copy()
+    if env_updates:
+        env.update(env_updates)
     if python_path is not None:
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
@@ -254,10 +275,10 @@ def _build_probe_targets(
                 "python_path": None,
             }
         )
-        if installed["has_disaggregation"]:
+        if installed["disaggregation_probe_module"] is not None:
             targets.append(
                 {
-                    "module": "tensorrt_llm._torch.disaggregation.transceiver",
+                    "module": installed["disaggregation_probe_module"],
                     "python_path": None,
                 }
             )
@@ -269,16 +290,21 @@ def _build_probe_targets(
             }
         )
 
+    checkout_probe_module = (
+        _resolve_disaggregation_probe_module(pinned_checkout / "_torch" / "disaggregation")
+        if pinned_checkout.is_dir()
+        else None
+    )
     installed_root = installed.get("package_root")
     checkout_root = str(pinned_checkout) if pinned_checkout.is_dir() else None
     if (
         pinned_checkout.is_dir()
-        and (pinned_checkout / "_torch" / "disaggregation").is_dir()
+        and checkout_probe_module is not None
         and checkout_root != installed_root
     ):
         targets.append(
             {
-                "module": "tensorrt_llm._torch.disaggregation.transceiver",
+                "module": checkout_probe_module,
                 "python_path": pinned_checkout.parent,
             }
         )
@@ -307,6 +333,7 @@ def build_runtime_report(
     probe_imports: bool = False,
     python_executable: str = sys.executable,
     probe_timeout_s: float = 20.0,
+    probe_env: Optional[dict[str, str]] = None,
     probe_runner: Any = subprocess.run,
 ) -> dict[str, Any]:
     distribution = _resolve_distribution("tensorrt_llm") if distribution is None else distribution
@@ -316,6 +343,7 @@ def build_runtime_report(
         "exists": pinned_checkout.is_dir(),
         "has_pyexecutor": False,
         "has_disaggregation": False,
+        "disaggregation_probe_module": None,
     }
     if pinned_checkout.is_dir():
         checkout.update(_package_surface(pinned_checkout))
@@ -333,6 +361,7 @@ def build_runtime_report(
             module=target["module"],
             python_path=target["python_path"],
             timeout_s=probe_timeout_s,
+            env_updates=probe_env,
             runner=probe_runner,
         )
         for target in _build_probe_targets(
@@ -358,6 +387,11 @@ def build_runtime_report(
             "installed tensorrt_llm package does not expose _torch.disaggregation, "
             "but the pinned checkout does"
         )
+    if installed["installed"] and installed["has_disaggregation"] and not installed["disaggregation_probe_module"]:
+        findings.append(
+            "installed tensorrt_llm package exposes _torch.disaggregation, "
+            "but neither transceiver.py nor native/py_cache_transceiver.py is present"
+        )
 
     expected_cuda_major = installed["expected_cuda_major"]
     if expected_cuda_major is not None and expected_cuda_major not in libraries["available_majors"]:
@@ -377,6 +411,7 @@ def build_runtime_report(
     return {
         "python_executable": python_executable,
         "probe_timeout_s": probe_timeout_s,
+        "probe_env": dict(probe_env or {}),
         "repo_declared_tensorrt_llm_version": repo_declared_version,
         "installed_tensorrt_llm": installed,
         "pinned_checkout": checkout,
@@ -436,12 +471,18 @@ def main() -> int:
         help="Run subprocess import probes for installed and pinned TRT-LLM modules",
     )
     parser.add_argument(
+        "--disable-mpi-for-probes",
+        action="store_true",
+        help="Set TLLM_DISABLE_MPI=1 in subprocess import probes",
+    )
+    parser.add_argument(
         "--fail-on-blocked",
         action="store_true",
         help="Return a non-zero exit status when the audit reports blocked",
     )
     args = parser.parse_args()
 
+    probe_env = {"TLLM_DISABLE_MPI": "1"} if args.disable_mpi_for_probes else None
     report = build_runtime_report(
         pinned_checkout=args.pinned_checkout,
         repo_pyproject=args.repo_pyproject,
@@ -449,6 +490,7 @@ def main() -> int:
         probe_imports=args.probe_imports,
         python_executable=args.python_executable,
         probe_timeout_s=args.probe_timeout_s,
+        probe_env=probe_env,
     )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))

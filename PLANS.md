@@ -1,88 +1,95 @@
 # KVBM TensorRT-LLM Integration Execution Plan
 
-Last updated: 2026-03-29 04:02:25 UTC
+Last updated: 2026-03-30 23:26:43 UTC
 
 Current run outcome:
 
 - Re-read the repo-local execution instructions in `Agents.md`, the
   user-provided `AGENTS.md` instructions, the current `PLANS.md`,
-  `docs/design-docs/kvbm-trtllm-integration.md`, and the active TRT-LLM seam:
-  - `lib/bindings/kvbm/python/kvbm/trtllm_integration/rust.py`
-  - `lib/bindings/kvbm/python/kvbm/trtllm_integration/kv_cache_manager.py`
-  - `lib/bindings/kvbm/tools/trtllm_runtime_audit.py`
-- Re-searched the active seam for repo-local follow-up work (`TODO`, `FIXME`,
-  permissive fallback behavior, unsupported-path drift, cleanup markers, and
-  stale docs). That review exposed one remaining repo-local cleanup worth
-  landing in this sandbox:
-  - `KvbmKVCacheManager._resolve_primary_pool_exports()` still re-probed
-    optional primary-pool layer-export shapes at runtime via `getattr(...)`
-    plus `inspect.signature(...)`
-  - that was looser than the now-explicit pinned TRT-LLM/KVBM seam and kept a
-    Python fallback path alive after the surrounding request/rust-loader
-    surfaces had already been tightened
-- Completed that remaining repo-local cleanup:
-  - the manager now accepts only the pinned primary-pool layer export seam
-    `primary_pool.layer_view(layer_idx)`
-  - the manager owns the `NHD` / `HND` reshaping itself on top of that fixed
-    export instead of dynamically probing for `kv_layout`-aware methods or the
-    legacy `get_layer_view(...)` symbol
-  - unit coverage was updated to lock the stricter contract in place and to
-    fail loudly when only the legacy symbol is present
-- Re-ran the full repo-local validation stack on 2026-03-29 UTC:
+  `docs/design-docs/kvbm-trtllm-integration.md`, and the active TRT-LLM seam.
+- Completed two remaining repo-local cleanup milestones that were still
+  executable in this sandbox:
+  - removed the vendored `jiff`/`jiff-*` `[patch.crates-io]` overrides from
+    both root `Cargo.toml` files and let `lib/bindings/kvbm/Cargo.lock`
+    resolve those crates from crates.io (`jiff 0.2.23`, `jiff-static 0.2.23`,
+    `jiff-tzdb 0.1.6`, `jiff-tzdb-platform 0.1.3`)
+  - tightened `lib/bindings/kvbm/tools/trtllm_runtime_audit.py` so it matches
+    the actual installed TRT-LLM `1.3.0rc9` Python seam on this machine:
+    - detects the real disaggregation Python entrypoint module by file shape
+      instead of assuming only `_torch.disaggregation.transceiver`
+    - supports probe-time environment overrides
+    - adds `--disable-mpi-for-probes` to drive subprocess probes with
+      `TLLM_DISABLE_MPI=1`
+    - reports a missing Python disaggregation entrypoint when the directory is
+      present but neither supported module file exists
+- Revalidated after those changes on 2026-03-30 UTC:
   - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
-    -> pass (`Ran 10 tests`, `OK`)
+    -> pass (`Ran 14 tests`, `OK`)
   - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
-    -> pass (`Ran 26 tests`, `OK`)
+    -> pass (`Ran 26 tests`, `OK`, `skipped=3`)
   - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
-    -> pass (`Ran 36 tests`, `OK`)
+    -> pass (`Ran 40 tests`, `OK`, `skipped=3`)
   - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
     -> pass
-  - `UV_CACHE_DIR=/tmp/uv-cache maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
+- Re-established the editable-install path in this repo:
+  - `python3 -m venv .venv` -> pass
+  - `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
     -> pass
   - `.venv/bin/python -c 'import kvbm, kvbm._core'`
     -> pass
-  - `.venv/bin/python lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --fail-on-blocked`
-    -> exit `1`, report `status: "blocked"`
-- installed package root:
-  `/workspace/model-performance/michaelfeil1209/mfdynamo/.venv/lib/python3.12/site-packages/tensorrt_llm`
-  - pinned checkout root: `/tmp/trtllm-latest/tensorrt_llm`
-  - repo-declared TRT-LLM extra version remains `1.3.0rc8`
-  - installed wheel version remains `1.2.0`
-- installed wheel still exposes `_torch/pyexecutor` but not
-  `_torch/disaggregation`
-- installed wheel metadata still expects CUDA major `13`
-- host/container still only exposes `libcublasLt.so.12*`
-- subprocess import of both installed `tensorrt_llm` and pinned-checkout
-  `tensorrt_llm._torch.disaggregation.transceiver` still aborts in Open MPI /
-  PMIx during import (`The PMIx server's listener thread failed to start`)
-- After that seam tightening plus revalidation, no additional repo-local
-  manager/product-code change is justified in this sandbox. The supported path
-  is still green in-repo; the remaining work is phase-7 validation on a
-  runtime-capable host with:
-  - a TRT-LLM install/source version aligned with the repo-declared seam
-  - a TRT-LLM install/source surface that includes `_torch/disaggregation`
-  - matching CUDA major user-space
-  - an MPI/PMIx environment that can import TRT-LLM without aborting
+- Confirmed the live runtime environment has changed materially versus the
+  older handoff:
+  - repo-declared TRT-LLM extra version is now `1.3.0rc9`
+  - system-installed `tensorrt_llm` is now `1.3.0rc9`
+  - CUDA 13 `libcublasLt` is present on the host
+  - `/tmp/trtllm-latest/tensorrt_llm` is absent in this sandbox
+  - the system wheel exposes `_torch/disaggregation`, but the real rc9 Python
+    entrypoint is
+    `tensorrt_llm._torch.disaggregation.native.py_cache_transceiver`
+    rather than `_torch.disaggregation.transceiver`
+- Re-ran the runtime audit against the actual system TRT-LLM install:
+  - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --fail-on-blocked`
+    -> exit `1`, both import probes timed out without
+      `TLLM_DISABLE_MPI=1`
+  - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
+    -> pass, report `status: "ok"`
+- Completed the first repo-local rc9 smoke path against the real installed
+  TRT-LLM Python sources using the system interpreter plus repo/`.venv`
+  `PYTHONPATH` and `TLLM_DISABLE_MPI=1`:
+  - imported `kvbm`, `kvbm._core`,
+    `tensorrt_llm._torch.disaggregation.resource.kv_extractor`, and
+    `tensorrt_llm._torch.disaggregation.native.py_cache_transceiver`
+  - built a real page table from `KvbmKVCacheManager` through the installed
+    TRT-LLM `build_page_table_from_manager(manager)` helper
+  - exercised the installed rc9 `PyNativeCacheTransceiver` control flow
+    (construction, `respond_and_send_async`, context-status completion,
+    `request_and_receive_async`, generation-status completion,
+    `prepare_context_requests`, `get_disaggregated_params`, `shutdown`)
+    with a fake `TransferWorker` backend
+  - observed the current rc9 rank-local page-table geometry for the exercised
+    `tp=2,pp=2` sample:
+    - `tokens_per_block=4`
+    - `slot_bytes=3072`
+    - buffer entries:
+      `[(0, 1, 0, 768), (0, 2, 768, 768), (1, 1, 1536, 768), (1, 2, 2304, 768)]`
+- After that rc9 audit retargeting, editable-install restore, and smoke-path
+  validation, there is no additional obvious repo-local compatibility cleanup
+  left to land before a real transfer-worker / multi-rank runtime attempt.
 
 Exact next steps if another run happens on this machine:
 
-- Do not spend another run searching for repo-local supported-path work unless
-  the environment changes first; this run's seam review plus validation stack
-  still did not expose another executable manager/product-code milestone.
-- Treat phase 7 as externally blocked until at least one of these changes:
-  - the installed TRT-LLM version matches the repo-declared `trtllm` extra
-    pin (`1.3.0rc8`) or the host intentionally imports from the pinned checkout
-  - the installed TRT-LLM wheel/source matches the pinned disaggregation seam
-  - CUDA 13 user-space libraries are available to the runtime
-  - TRT-LLM import no longer aborts in Open MPI / PMIx
-- If the environment does change, re-run this exact validation sequence first:
+- Do not spend another run reworking manager metadata or request shims first;
+  the repo-local rc9 Python seam is now green through the actual installed
+  `build_page_table_from_manager(...)` and `PyNativeCacheTransceiver` code.
+- Re-run this exact validation sequence first:
   - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
   - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
   - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
   - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
-  - `UV_CACHE_DIR=/tmp/uv-cache maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
+  - `python3 -m venv .venv`
+  - `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
   - `.venv/bin/python -c 'import kvbm, kvbm._core'`
-  - `.venv/bin/python lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --fail-on-blocked`
+  - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
 
 ## Objective
 
@@ -1631,33 +1638,23 @@ Implemented so far:
 
 ## Exact Next Step
 
-1. First command on the next runtime-capable host:
-   `.venv/bin/python lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --fail-on-blocked`
-2. Do not attempt the phase-7 smoke path until that audit reports all of:
-   - installed TRT-LLM version matches the repo-declared `trtllm` extra pin
-     (`1.3.0rc8`), or the host is intentionally importing from
-     `/tmp/trtllm-latest/tensorrt_llm`
-   - installed TRT-LLM surface includes `_torch/disaggregation`, or the host is
-     intentionally importing from `/tmp/trtllm-latest/tensorrt_llm`
-   - available `libcublasLt` major version matches the installed TRT-LLM wheel
-     expectation
-   - subprocess import of the targeted TRT-LLM module path no longer aborts in
-     Open MPI / PMIx during import
-3. Once the audit is clean, re-run the real TRT-LLM disaggregation smoke path.
-   The repo-local adapter already passes the pinned-source Python validations
-   for:
-   - `build_page_table_from_manager(manager)`
-   - `RankInfo.from_kv_cache_manager(...)`
-   - `KvCacheTransceiverV2` construction/send/receive/status/shutdown
-   So the next unresolved checkpoint is a real runtime import/transfer host,
-   not another known repo-local manager API mismatch.
-   If the audit stalls without printing a useful import failure signature on a
-   future host, re-run Step 1 with a larger timeout:
-   `--probe-timeout-s 60`
-4. In this sandbox, keep using the validated editable-install command before
-   any further runtime attempt:
-   `UV_CACHE_DIR=/tmp/uv-cache maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
-5. If a runtime-capable host exposes another missing manager field or storage
+1. First command on this machine or the next matching runtime host:
+   `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
+2. Keep using the validated editable-install path before any smoke or runtime
+   attempt:
+   `python3 -m venv .venv`
+   `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
+3. For real rc9 Python-surface smoke checks on this machine, use the system
+   interpreter with both the repo Python tree and `.venv` site-packages on
+   `PYTHONPATH`, because the isolated `.venv` interpreter does not include the
+   system TRT-LLM wheel:
+   `TLLM_DISABLE_MPI=1 PYTHONPATH=/workspace/trtllm/dynamo/.venv/lib/python3.12/site-packages:/workspace/trtllm/dynamo/lib/bindings/kvbm/python python3 ...`
+4. The next unresolved checkpoint is no longer page-table or Python
+   transceiver-shape compatibility; it is a real transfer-worker / peer runtime
+   exercise beyond the fake-worker smoke used in this run. Start from the
+   validated smoke skeleton in this file and replace the fake `TransferWorker`
+   with the real runtime wiring.
+5. If a future runtime attempt exposes another missing manager field or storage
    shape, touch this file first:
    `/workspace/model-performance/michaelfeil1209/mfdynamo/lib/bindings/kvbm/python/kvbm/trtllm_integration/kv_cache_manager.py`
    Then inspect and extend only the relevant metadata helpers:
@@ -1667,15 +1664,12 @@ Implemented so far:
    - `get_disagg_life_cycles()`
    - `get_layer_grouping()`
    - `_get_window_size_to_layers()`
-6. In this sandbox, do not spend more time reworking the manager until Step 1
-   is clean on a runtime-capable host:
-   - the installed `.venv` TRT-LLM wheel is still mismatched with the pinned
-     checkout surface
-   - the host still lacks the CUDA 13 user-space library expected by that
-     wheel (`libcublasLt.so.13`)
-   - the last remaining repo-local permissive primary-pool export seam is now
-     already tightened, so another repo-local cleanup pass is unlikely to find
-     useful work unless the runtime environment changes first
+6. Additional repo-local cleanup is not the critical path right now:
+   - the audit is green for the actual installed `1.3.0rc9` seam when probes
+     run with `TLLM_DISABLE_MPI=1`
+   - the editable install is working again
+   - the remaining gap is full real-runtime transfer execution, not another
+     known Python manager API mismatch
 
 # Wishes:
 - minimize python interface.
@@ -1692,11 +1686,12 @@ Implemented so far:
   - `UV_CACHE_DIR=/tmp/uv-cache maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
     succeeds and installs the editable package into `.venv`
 - there is no need for fallback e.g. when the interface breaks. if someone moves the trt-llm commit, and e.g. a typed object from trt-llm side has changed, that is ok. 
-- [patch.crates-io]
-jiff = { path = "third_party/cargo-vendor/jiff-0.2.22" }
-jiff-static = { path = "third_party/cargo-vendor/jiff-static-0.2.22" }
-jiff-tzdb = { path = "third_party/cargo-vendor/jiff-tzdb-0.1.5" }
-jiff-tzdb-platform = { path = "third_party/cargo-vendor/jiff-tzdb-platform-0.1.3" } should be removed, and i dont want the cargo vendor. Thanks.
+- `[patch.crates-io]` jiff vendor overrides should be removed.
+  Status: addressed in this run.
+  - removed from `/workspace/trtllm/dynamo/Cargo.toml`
+  - removed from `/workspace/trtllm/dynamo/lib/bindings/kvbm/Cargo.toml`
+  - `lib/bindings/kvbm/Cargo.lock` now resolves the `jiff` crates from
+    crates.io instead of `third_party/cargo-vendor`
 
 - trt lib/bindings/kvbm/python/kvbm/trtllm_integration/kv_cache_manager.py is a bit long, especially for python. Best to move more things to rust, if possible.
  let block_data = block.block_data_mut();
