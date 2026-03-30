@@ -163,16 +163,15 @@ external dependency that cannot be resolved from this machine.
   - the repo-local mixed-case `Agents.md` execution-plan file at repo root
 - The design source of truth is
   `docs/design-docs/kvbm-trtllm-integration.md`.
-- Local TensorRT-LLM checkout exists at `/tmp/trtllm-latest`.
+- Local TensorRT-LLM checkout at `/tmp/trtllm-latest` is not present in this
+  sandbox right now.
 - Pinned upstream TensorRT-LLM commit for this work:
   `3318aca3f4cabf71a323c6e2868f6586817d03cb`.
 - Current shell environment has `python3`, `cargo`, and `uv`.
-- Current shell environment does not have importable `torch`,
-  `tensorrt_llm`, or `pytest` on the default interpreter path.
-- Tests therefore need to prefer:
-  - Rust unit tests runnable with `cargo test`
-  - Python stdlib tests with stubbed modules
-  - compile/import checks that do not require the full TRT-LLM runtime
+- Current shell environment has importable `torch` and system-installed
+  `tensorrt_llm 1.3.0rc9` on the default interpreter path, but repo-local
+  validation still prefers stdlib Python tests plus targeted import/smoke
+  checks over a broad TRT-LLM runtime test matrix.
 
 ## Phase 0 Decisions
 
