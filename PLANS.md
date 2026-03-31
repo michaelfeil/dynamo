@@ -46,6 +46,22 @@ Current run outcome:
     - validates rank-local standard `get_unique_primary_pool()` and
       `get_buffers(..., kv_layout="NHD" | "HND")` exports on real CUDA tensors
     - validates baseline MLA export shaping on real CUDA tensors too
+- Extended `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` so this repo now
+  has a bounded real-transfer-worker probe in addition to the existing fake
+  worker smoke:
+  - default mode is unchanged and still uses the fake `TransferWorker`
+  - new `--real-transfer-worker` mode leaves TRT-LLM's native worker live but
+    captures failure state as structured JSON instead of requiring another
+    ad-hoc manual experiment
+  - the real-worker probe on 2026-03-31 UTC reproduced the native blocker with
+    better diagnostics:
+    - `status: "error"`
+    - `exception_type: "AttributeError"`
+    - `exception: "'NoneType' object has no attribute 'endpoint'"`
+    - `transfer_worker.rank_info_server_is_none: true`
+    - `transfer_worker.sender_endpoint: "tcp://172.17.0.4:38661"`
+    - still emits the host/runtime warning
+      `memory is detected as host, check that UCX is configured with CUDA support`
 - Revalidated after the DLPack compatibility fix on 2026-03-31 UTC:
   - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
     -> pass
@@ -61,6 +77,9 @@ Current run outcome:
     -> pass, confirmed direct raw export import on `cuda:0`
   - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
     -> pass
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py --real-transfer-worker`
+    -> structured `status: "error"` result capturing the same native
+    `_rank_info_server is None` blocker without crashing the repo-local tool
 - Remaining blocker did not change in this run:
   repo-local manager/page-table/export seams are now stronger against the live
   `torch 2.10.0a0` plus installed TRT-LLM `1.3.0rc9` runtime, but the next
@@ -328,9 +347,11 @@ Exact next steps if another run happens on this machine:
   - otherwise use the installed TRT-LLM `1.3.0rc9` runtime directly and retry a
     bounded real transfer-worker / multi-rank bring-up
   - first command to touch for that next runtime attempt:
-    inspect `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` and convert the
-    current fake-worker patching into a second tool or mode that leaves
-    `TransferWorker` real while keeping the same bounded manager/topology setup
+    `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py --real-transfer-worker`
+  - if it still reports `transfer_worker.rank_info_server_is_none: true`,
+    inspect the installed TRT-LLM native transfer-worker startup path around
+    `_rank_info_server` initialization rather than revisiting repo-local KVBM
+    page-table/export code first
 
 ## Objective
 
@@ -784,6 +805,9 @@ Implemented so far:
   `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` that exercises real
   TensorRT-LLM Python modules against the repo manager without starting the
   native transfer backend
+- extended that smoke tool with a bounded real-worker mode that captures the
+  current native startup blocker as structured JSON while keeping the safe fake
+  worker path intact for fast validation
 - added the second smoke tier that was called out previously:
   `lib/bindings/kvbm/tests/test_trtllm_torch_exports.py`
   - exercises raw Rust DLPack exports through live `torch`
@@ -881,6 +905,13 @@ Implemented so far:
   - the Rust exporters now accept the modern call shape directly
   - `lib/bindings/kvbm/tests/test_trtllm_torch_exports.py` covers raw export,
     standard rank-local exports, and baseline MLA exports on real CUDA tensors
+- Added a bounded real-transfer-worker runtime probe on top of the existing
+  fake-worker smoke:
+  - `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py --real-transfer-worker`
+    now leaves TRT-LLM's native worker live and returns structured error
+    details instead of requiring a one-off manual bring-up script
+  - current result on this machine still narrows to native transport startup:
+    `_rank_info_server` remains `None` even though `_sender.endpoint` is set
 - Inspected KVBM storage/layout internals and found the key phase-3 tension:
   `FullyContiguous` can provide a clean primary-pool slab, but the current
   DLPack helper only exports contiguous shapes, while TRTLLM also needs

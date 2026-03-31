@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from types import SimpleNamespace
+import traceback
 from typing import Any
 
 
@@ -32,7 +34,7 @@ def _state_name(value: Any) -> str:
     return str(value)
 
 
-def run_smoke() -> dict[str, Any]:
+def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionState, SessionStatus
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
         build_page_table_from_manager,
@@ -147,7 +149,19 @@ def run_smoke() -> dict[str, Any]:
 
     original_transfer_worker = transceiver_mod.TransferWorker
     original_current_device = transceiver_mod.torch.cuda.current_device
-    transceiver_mod.TransferWorker = _FakeTransferWorker
+
+    transfer_worker_type = _FakeTransferWorker
+    if not use_fake_transfer_worker:
+        class _RecordingTransferWorker(original_transfer_worker):
+            instances: list[Any] = []
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                type(self).instances.append(self)
+
+        transfer_worker_type = _RecordingTransferWorker
+
+    transceiver_mod.TransferWorker = transfer_worker_type
     transceiver_mod.torch.cuda.current_device = lambda: 0
     try:
         manager = KvbmKVCacheManager(
@@ -173,17 +187,46 @@ def run_smoke() -> dict[str, Any]:
         manager.add_dummy_requests([901], token_nums=[12])
         page_table = build_page_table_from_manager(manager)
 
-        transceiver = transceiver_mod.PyNativeCacheTransceiver(
-            manager.mapping,
-            _Dist(),
-            manager,
-            None,
-            SimpleNamespace(
-                kv_transfer_timeout_ms=7000,
-                kv_transfer_sender_future_timeout_ms=3000,
-            ),
-        )
-        worker = _FakeTransferWorker.instances[-1]
+        try:
+            transceiver = transceiver_mod.PyNativeCacheTransceiver(
+                manager.mapping,
+                _Dist(),
+                manager,
+                None,
+                SimpleNamespace(
+                    kv_transfer_timeout_ms=7000,
+                    kv_transfer_sender_future_timeout_ms=3000,
+                ),
+            )
+        except Exception as exc:
+            result: dict[str, Any] = {
+                "mode": "fake-transfer-worker" if use_fake_transfer_worker else "real-transfer-worker",
+                "status": "error",
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+                "traceback": traceback.format_exc().splitlines(),
+                "page_table": {
+                    "tokens_per_block": page_table.tokens_per_block,
+                    "pool_slots": page_table.pool_groups[0].pools[0].num_slots,
+                    "slot_bytes": page_table.pool_groups[0].pools[0].slot_bytes,
+                    "buffer_entries": page_table.layer_groups[0]
+                    .pool_views[0]
+                    .buffer_entries.tolist(),
+                },
+            }
+            instances = getattr(transfer_worker_type, "instances", [])
+            if instances:
+                worker = instances[-1]
+                rank_info_server = getattr(worker, "_rank_info_server", None)
+                sender = getattr(worker, "_sender", None)
+                result["transfer_worker"] = {
+                    "type": type(worker).__name__,
+                    "rank_info_server_is_none": rank_info_server is None,
+                    "rank_info_server_endpoint": getattr(rank_info_server, "endpoint", None),
+                    "sender_endpoint": getattr(sender, "endpoint", None),
+                }
+            return result
+        worker = transfer_worker_type.instances[-1]
         request = SimpleNamespace(
             request_id=901,
             py_request_id=901,
@@ -211,6 +254,8 @@ def run_smoke() -> dict[str, Any]:
         transceiver.prepare_context_requests([waiting_request])
 
         result = {
+            "mode": "fake-transfer-worker" if use_fake_transfer_worker else "real-transfer-worker",
+            "status": "ok",
             "page_table": {
                 "tokens_per_block": page_table.tokens_per_block,
                 "pool_slots": page_table.pool_groups[0].pools[0].num_slots,
@@ -248,8 +293,27 @@ def run_smoke() -> dict[str, Any]:
         transceiver_mod.torch.cuda.current_device = original_current_device
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--real-transfer-worker",
+        action="store_true",
+        help="Use the live TRT-LLM TransferWorker instead of the fake repo-local worker.",
+    )
+    parser.add_argument(
+        "--fail-on-error",
+        action="store_true",
+        help="Exit non-zero when the smoke result reports status=error.",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
-    print(json.dumps(run_smoke(), indent=2, sort_keys=True))
+    args = _parse_args()
+    result = run_smoke(use_fake_transfer_worker=not args.real_transfer_worker)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if args.fail_on_error and result.get("status") == "error":
+        return 1
     return 0
 
 
