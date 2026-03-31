@@ -1713,8 +1713,19 @@ class TrtllmIntegrationTest(unittest.TestCase):
         self.assertEqual((completed, failed), ([901], []))
         self.assertEqual(request.state, "ctx_complete")
 
-        transceiver.request_and_receive_async(request)
-        self.assertEqual(request.state, "gen_in_progress")
+        generation_request = types.SimpleNamespace(
+            request_id=901,
+            py_request_id=901,
+            py_disaggregated_params=types.SimpleNamespace(
+                ctx_request_id=request.context_phase_params.req_id,
+                ctx_dp_rank=request.context_phase_params.ctx_dp_rank,
+                ctx_info_endpoint=request.context_phase_params.disagg_info_endpoint,
+            ),
+            prompt_len=12,
+            state=None,
+        )
+        transceiver.request_and_receive_async(generation_request)
+        self.assertEqual(generation_request.state, "gen_in_progress")
         self.assertEqual(
             worker.rx_sessions[0].received_slices[0].block_ids_per_layer_groups,
             [[0, 1, 2]],
@@ -1722,7 +1733,7 @@ class TrtllmIntegrationTest(unittest.TestCase):
 
         completed, failed = transceiver.check_gen_transfer_status(1)
         self.assertEqual((completed, failed), ([901], []))
-        self.assertEqual(request.state, "gen_complete")
+        self.assertEqual(generation_request.state, "gen_complete")
         self.assertTrue(transceiver.check_gen_transfer_complete())
 
         waiting_request = types.SimpleNamespace(

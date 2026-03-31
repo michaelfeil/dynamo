@@ -6,6 +6,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
 from types import SimpleNamespace
 import traceback
 from typing import Any
@@ -34,7 +39,75 @@ def _state_name(value: Any) -> str:
     return str(value)
 
 
-def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
+def _make_dist(mapping: Any) -> Any:
+    class _Dist:
+        def __init__(self, mapping: Any) -> None:
+            self.rank = int(mapping.rank)
+            self.world_size = int(mapping.world_size)
+            self.tp_size = int(mapping.tp_size)
+            self.pp_size = int(mapping.pp_size)
+
+        def broadcast(self, value: Any, root: int) -> Any:
+            del root
+            return value if value is not None else "ctx-endpoint"
+
+        def allgather(self, value: Any) -> list[Any]:
+            return [value for _ in range(self.world_size)]
+
+        def pp_allgather(self, value: Any) -> list[Any]:
+            return [value for _ in range(self.pp_size)]
+
+        def tp_allgather(self, value: Any) -> list[Any]:
+            return [list(value) for _ in range(self.tp_size)]
+
+    return _Dist(mapping)
+
+
+def _build_generation_request(*, context_request: Any, module: Any) -> Any:
+    params = module.DisaggregatedParams(
+        request_type="generation_only",
+        ctx_request_id=context_request.context_phase_params.req_id,
+        ctx_dp_rank=context_request.context_phase_params.ctx_dp_rank,
+        ctx_info_endpoint=context_request.context_phase_params.disagg_info_endpoint,
+    )
+    return SimpleNamespace(
+        request_id=context_request.request_id,
+        py_request_id=context_request.py_request_id,
+        py_disaggregated_params=params,
+        prompt_len=context_request.prompt_len,
+        state=None,
+    )
+
+
+def _manager_kwargs(*, use_fake_transfer_worker: bool) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "tokens_per_block": 4,
+        "dtype": "float16",
+        "head_dim": 16,
+        "pp_layers": [4, 5],
+        "total_num_kv_heads_per_layer": [8, 8, 8, 8, 6, 6],
+        "max_seq_len": 128,
+        "num_blocks": 12,
+        "primary_pool": _FakeTensor(
+            shape=(12, 2, 2, 4, 6, 16),
+            strides=(1536, 768, 384, 96, 16, 1),
+            ptr=12288,
+        ),
+        "world_size": 4,
+        "tp_size": 2,
+        "pp_size": 2,
+    }
+    if use_fake_transfer_worker:
+        kwargs.update(device_id=2, tp_rank=1, pp_rank=1)
+    else:
+        # Keep the bounded native probe on a leader rank so it can expose a
+        # real rank-info server endpoint instead of a fake placeholder.
+        kwargs.update(device_id=0, tp_rank=0, pp_rank=0)
+    return kwargs
+
+
+def _run_smoke_once(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
+    import tensorrt_llm.disaggregated_params as disaggregated_params_mod
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionState, SessionStatus
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
         build_page_table_from_manager,
@@ -130,23 +203,6 @@ def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
         def shutdown(self) -> None:
             self.shutdown_calls += 1
 
-    class _Dist:
-        rank = 0
-        tp_size = 2
-
-        def broadcast(self, value: Any, root: int) -> Any:
-            del root
-            return value if value is not None else "broadcast-value"
-
-        def allgather(self, value: Any) -> list[Any]:
-            return [value, value]
-
-        def pp_allgather(self, value: Any) -> list[Any]:
-            return [value, value]
-
-        def tp_allgather(self, value: Any) -> list[Any]:
-            return [list(value), list(value)]
-
     original_transfer_worker = transceiver_mod.TransferWorker
     original_current_device = transceiver_mod.torch.cuda.current_device
 
@@ -164,33 +220,15 @@ def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
     transceiver_mod.TransferWorker = transfer_worker_type
     transceiver_mod.torch.cuda.current_device = lambda: 0
     try:
-        manager = KvbmKVCacheManager(
-            tokens_per_block=4,
-            dtype="float16",
-            head_dim=16,
-            pp_layers=[4, 5],
-            total_num_kv_heads_per_layer=[8, 8, 8, 8, 6, 6],
-            max_seq_len=128,
-            num_blocks=12,
-            primary_pool=_FakeTensor(
-                shape=(12, 2, 2, 4, 6, 16),
-                strides=(1536, 768, 384, 96, 16, 1),
-                ptr=12288,
-            ),
-            device_id=2,
-            world_size=4,
-            tp_size=2,
-            tp_rank=1,
-            pp_size=2,
-            pp_rank=1,
-        )
+        manager = KvbmKVCacheManager(**_manager_kwargs(use_fake_transfer_worker=use_fake_transfer_worker))
         manager.add_dummy_requests([901], token_nums=[12])
         page_table = build_page_table_from_manager(manager)
+        dist = _make_dist(manager.mapping)
 
         try:
             transceiver = transceiver_mod.PyNativeCacheTransceiver(
                 manager.mapping,
-                _Dist(),
+                dist,
                 manager,
                 None,
                 SimpleNamespace(
@@ -212,6 +250,10 @@ def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
                     "buffer_entries": page_table.layer_groups[0]
                     .pool_views[0]
                     .buffer_entries.tolist(),
+                },
+                "distributed": {
+                    "dist_rank": dist.rank,
+                    "mapping_rank": manager.mapping.rank,
                 },
             }
             instances = getattr(transfer_worker_type, "instances", [])
@@ -239,10 +281,79 @@ def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
             1, mark_complete=True
         )
         context_state = _state_name(request.state)
+        tx_sessions = getattr(worker, "tx_sessions", [])
+        rank_info_calls = getattr(
+            worker,
+            "rank_info_calls",
+            [
+                {
+                    "endpoints": dist.allgather(getattr(worker._sender, "endpoint", None)),
+                    "layer_num_per_pp": dist.pp_allgather(len(manager.pp_layers)),
+                }
+            ],
+        )
 
-        transceiver.request_and_receive_async(request)
+        if not use_fake_transfer_worker:
+            unique_endpoints = sorted(set(rank_info_calls[0]["endpoints"]))
+            if len(unique_endpoints) == 1 and manager.world_size > 1:
+                transceiver.shutdown()
+                return {
+                    "mode": "real-transfer-worker",
+                    "status": "blocked",
+                    "reason": (
+                        "single-process smoke cannot emulate distinct remote TRT-LLM peers; "
+                        "all gathered sender endpoints collapse to the same live worker"
+                    ),
+                    "blocked_phase": "generation_transfer",
+                    "native_observation": (
+                        "installed TRT-LLM NIXL transport reaches real rank-info server bring-up "
+                        "and context send startup, but generation receive would self-connect to "
+                        "the local agent in this one-process harness"
+                    ),
+                    "page_table": {
+                        "tokens_per_block": page_table.tokens_per_block,
+                        "pool_slots": page_table.pool_groups[0].pools[0].num_slots,
+                        "slot_bytes": page_table.pool_groups[0].pools[0].slot_bytes,
+                        "buffer_entries": page_table.layer_groups[0]
+                        .pool_views[0]
+                        .buffer_entries.tolist(),
+                    },
+                    "context": {
+                        "completed": completed_ctx,
+                        "failed": failed_ctx,
+                        "state": context_state,
+                        "ctx_dp_rank": request.context_phase_params.ctx_dp_rank,
+                        "ctx_info_endpoint": request.context_phase_params.disagg_info_endpoint,
+                        "ctx_request_id": request.context_phase_params.req_id,
+                        "sent_block_ids": (
+                            tx_sessions[0].sent_slices[0].block_ids_per_layer_groups
+                            if tx_sessions
+                            else None
+                        ),
+                    },
+                    "distributed": {
+                        "dist_rank": dist.rank,
+                        "mapping_rank": manager.mapping.rank,
+                    },
+                    "rank_info_calls": rank_info_calls,
+                    "transfer_worker": {
+                        "type": type(worker).__name__,
+                        "sender_endpoint": getattr(worker._sender, "endpoint", None),
+                        "rank_info_server_endpoint": getattr(
+                            getattr(worker, "_rank_info_server", None), "endpoint", None
+                        ),
+                    },
+                    "shutdown_calls": getattr(worker, "shutdown_calls", None),
+                }
+
+        generation_request = _build_generation_request(
+            context_request=request,
+            module=disaggregated_params_mod,
+        )
+        transceiver.request_and_receive_async(generation_request)
         transceiver.check_gen_transfer_status(1)
-        generation_state = _state_name(request.state)
+        generation_state = _state_name(generation_request.state)
+        rx_sessions = getattr(worker, "rx_sessions", [])
 
         waiting_request = SimpleNamespace(
             request_id=902,
@@ -270,20 +381,23 @@ def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
                 "state": context_state,
                 "ctx_dp_rank": request.context_phase_params.ctx_dp_rank,
                 "ctx_info_endpoint": request.context_phase_params.disagg_info_endpoint,
-                "sent_block_ids": worker.tx_sessions[0]
-                .sent_slices[0]
-                .block_ids_per_layer_groups,
+                "ctx_request_id": request.context_phase_params.req_id,
+                "sent_block_ids": tx_sessions[0].sent_slices[0].block_ids_per_layer_groups,
             },
             "generation": {
                 "state": generation_state,
                 "complete": transceiver.check_gen_transfer_complete(),
-                "received_block_ids": worker.rx_sessions[0]
-                .received_slices[0]
-                .block_ids_per_layer_groups,
+                "ctx_request_id": generation_request.py_disaggregated_params.ctx_request_id,
+                "ctx_info_endpoint": generation_request.py_disaggregated_params.ctx_info_endpoint,
+                "received_block_ids": rx_sessions[0].received_slices[0].block_ids_per_layer_groups,
             },
             "waiting_request_state": _state_name(waiting_request.state),
             "disagg_params": transceiver.get_disaggregated_params(),
-            "rank_info_calls": worker.rank_info_calls,
+            "distributed": {
+                "dist_rank": dist.rank,
+                "mapping_rank": manager.mapping.rank,
+            },
+            "rank_info_calls": rank_info_calls,
         }
         transceiver.shutdown()
         result["shutdown_calls"] = worker.shutdown_calls
@@ -293,12 +407,70 @@ def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
         transceiver_mod.torch.cuda.current_device = original_current_device
 
 
+def _extract_json(stdout: str) -> dict[str, Any] | None:
+    for index in range(len(stdout) - 1, -1, -1):
+        if stdout[index] != "{":
+            continue
+        try:
+            return json.loads(stdout[index:])
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _run_real_transfer_worker_subprocess() -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--real-transfer-worker-internal",
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    parsed = _extract_json(completed.stdout)
+    if parsed is not None:
+        return parsed
+
+    signal_name = None
+    if completed.returncode < 0:
+        try:
+            signal_name = signal.Signals(-completed.returncode).name
+        except ValueError:
+            signal_name = f"SIG{-completed.returncode}"
+
+    return {
+        "mode": "real-transfer-worker",
+        "status": "error",
+        "phase": "native-transfer-worker-startup",
+        "reason": "native TRT-LLM worker exited before emitting structured JSON",
+        "subprocess_returncode": completed.returncode,
+        "signal": signal_name,
+        "stdout_tail": completed.stdout.splitlines()[-40:],
+        "stderr_tail": completed.stderr.splitlines()[-40:],
+    }
+
+
+def run_smoke(*, use_fake_transfer_worker: bool = True) -> dict[str, Any]:
+    if use_fake_transfer_worker:
+        return _run_smoke_once(use_fake_transfer_worker=True)
+    return _run_real_transfer_worker_subprocess()
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--real-transfer-worker",
         action="store_true",
         help="Use the live TRT-LLM TransferWorker instead of the fake repo-local worker.",
+    )
+    parser.add_argument(
+        "--real-transfer-worker-internal",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fail-on-error",
@@ -310,7 +482,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    result = run_smoke(use_fake_transfer_worker=not args.real_transfer_worker)
+    if args.real_transfer_worker_internal:
+        result = _run_smoke_once(use_fake_transfer_worker=False)
+    else:
+        result = run_smoke(use_fake_transfer_worker=not args.real_transfer_worker)
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.fail_on_error and result.get("status") == "error":
         return 1

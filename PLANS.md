@@ -1,8 +1,97 @@
 # KVBM TensorRT-LLM Integration Execution Plan
 
-Last updated: 2026-03-31 00:29:34 UTC
+Last updated: 2026-03-31 00:38:41 UTC
 
 Current run outcome:
+
+- Re-read `Agents.md`, `PLANS.md`,
+  `docs/design-docs/kvbm-trtllm-integration.md`, and the active repo-local
+  TRT-LLM integration files before making changes in this run.
+- Revalidated the current repo-local baseline on 2026-03-31 UTC before further
+  changes:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
+    -> pass (`Ran 14 tests`, `OK`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 27 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_torch_exports`
+    -> pass (`Ran 3 tests`, `OK`)
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `python3 -m venv .venv`
+    -> pass
+  - `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `.venv/bin/python -c 'import kvbm, kvbm._core'`
+    -> pass
+  - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
+    -> pass, report `status: "ok"`
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+    -> pass
+  - old `--real-transfer-worker` smoke still failed at the start of this run
+    with the previously recorded `_rank_info_server is None` report
+- Fixed two incorrect assumptions in
+  `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` and aligned the repo tests
+  with the real TRT-LLM control flow:
+  - the smoke harness had been mixing `dist.rank == 0` with
+    `manager.mapping.rank == 3`, which made the old real-worker probe report a
+    false `_rank_info_server is None` blocker even though that worker was being
+    instantiated as a non-leader rank
+  - the smoke harness had also been calling
+    `request_and_receive_async(...)` with a request whose
+    `py_disaggregated_params` were still `None`; the real installed TRT-LLM
+    path expects generation requests to be seeded from the earlier
+    `context_phase_params`
+  - added helper regression coverage in
+    `lib/bindings/kvbm/tests/test_trtllm_disagg_smoke.py`
+  - updated
+    `lib/bindings/kvbm/tests/test_trtllm_integration.py` so the pinned-source
+    transceiver smoke also constructs a generation request from
+    `context_phase_params` instead of reusing the context request directly
+- Hardened the repo-local installed-wheel smoke tool so the real-worker probe
+  is now bounded even when native UCX/NIXL crashes:
+  - `--real-transfer-worker` now runs the live native-worker attempt in a
+    subprocess and returns structured JSON even if the child dies by signal
+  - the tool now records `dist_rank` versus `mapping_rank`, carries the
+    generated `ctx_request_id`, and keeps the fake-worker path on the corrected
+    context-to-generation flow too
+- Revalidated after those smoke-tool/test changes on 2026-03-31 UTC:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_disagg_smoke lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 30 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
+    -> pass (`Ran 14 tests`, `OK`)
+  - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
+    -> pass (`Ran 47 tests`, `OK`, `skipped=3`)
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+    -> pass, now reports a corrected fake-worker flow with
+    `distributed.dist_rank == distributed.mapping_rank == 3`
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py --real-transfer-worker`
+    -> exit `0` with structured `status: "error"` instead of crashing the repo
+    command; current report captures:
+    - `phase: "native-transfer-worker-startup"`
+    - `signal: "SIGSEGV"`
+    - `subprocess_returncode: -11`
+    - UCX stack frames rooted in `uct_mm_iface_recv_desc_init`,
+      `ucp_worker_create`, and
+      `tensorrt_llm::executor::kv_cache::NixlTransferAgent::NixlTransferAgent(...)`
+- Current remaining blocker is now clearer and is external to the repo-local
+  KVBM manager/page-table/export seam:
+  - the old `_rank_info_server is None` report was a smoke-harness bug and is
+    no longer the real blocker
+  - on this host, the installed TRT-LLM `1.3.0rc9` native UCX/NIXL startup can
+    segfault inside transport initialization before the probe reaches a stable
+    multi-rank transfer phase
+  - because the real-worker probe now survives that crash and writes the
+    native stack signature to JSON, the next useful work is host/runtime
+    diagnosis rather than more repo-local KVBM API cleanup
+- Exact next step if another run happens on this machine:
+  - re-run:
+    `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py --real-transfer-worker`
+  - if it still reports `signal: "SIGSEGV"`, inspect the host UCX/NIXL setup
+    outside this repo first; focus on the UCX shared-memory worker path shown
+    in the captured stack (`uct_mm_iface_recv_desc_init` / `ucp_worker_create`)
+    and only return to repo-local code if a new Python-visible seam appears
 
 - Re-read `Agents.md`, `PLANS.md`,
   `docs/design-docs/kvbm-trtllm-integration.md`, and the active repo-local
