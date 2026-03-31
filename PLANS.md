@@ -1,8 +1,172 @@
 # KVBM TensorRT-LLM Integration Execution Plan
 
-Last updated: 2026-03-31 01:04:17 UTC
+Last updated: 2026-03-31 01:19:54 UTC
 
 Current run outcome:
+
+- Switched to branch `mf/kvbm-g4`.
+- Scope for this run stayed planning-only. Do not treat this section as a code
+  change summary; treat it as instructions for the next subagent that will do
+  the implementation.
+- Existing handoff assets already present on this branch:
+  - `PLANS.md`
+  - `codex_run.sh` (this repo does not contain a separate tracked
+    `run_codex` file)
+  - `docs/design-docs/kvbm-g4-nvme-raid-plan.md`
+
+## Subagent Start Here
+
+If you are the next subagent picking up `mf/kvbm-g4`, start with the smallest
+useful vertical slice. Do not begin by designing a full distributed storage
+system.
+
+First read these files in this order:
+
+1. `docs/design-docs/kvbm-g4-nvme-raid-plan.md`
+2. `lib/llm/src/block_manager/distributed/worker.rs`
+3. `lib/llm/src/block_manager/distributed/transfer.rs`
+4. `lib/llm/src/block_manager/offload/pending.rs`
+5. `lib/llm/src/block_manager/storage/disk.rs`
+6. `lib/llm/src/block_manager/state/local.rs`
+7. `lib/llm/src/block_manager/v2/physical/layout/builder.rs`
+8. `lib/llm/src/block_manager/block/transfer/strategy.rs`
+
+After reading those files, implement only the first-pass single-owner path.
+Do not start with redundancy for the first `N` blocks. Do not start with event
+publication. Do not start with repair. Do not start with a new global metadata
+service.
+
+## First-Pass Goal
+
+Land the smallest G4 worker/storage-agent path that satisfies all of these:
+
+1. Block identity is keyed by `sequence_hash`.
+2. Ownership is computed deterministically from the live storage-worker set.
+3. A worker can `query`, `put`, and `fetch` exact blocks from the owning G4
+   worker.
+4. The storage-agent payload path sits on top of NVMe RAID-backed disk storage.
+5. The implementation reuses the existing disk allocation and transfer helpers
+   as much as possible.
+6. On timeout, not-found, or transfer failure, the caller treats the result as
+   a cache miss and falls back to recompute.
+
+## Implementation Advice
+
+Start in `lib/llm/src/block_manager/distributed/worker.rs`. The preferred first
+move is to extend the existing distributed worker path, not to create a new
+standalone service tree.
+
+The next likely touchpoint is
+`lib/llm/src/block_manager/distributed/transfer.rs`. Reuse the existing
+`BlockTransferHandler` shape and `TransferContext` assumptions before inventing
+new copy plumbing.
+
+For the first pass, keep the G4 API block-centric:
+
+1. `query_blocks(sequence_hashes)`
+2. `fetch_blocks(sequence_hashes)`
+3. `put_blocks(blocks)`
+
+If payload sizing becomes awkward, it is acceptable to split writes into a
+metadata-first plus bytes-second flow later:
+
+1. `put(meta)`
+2. `put_bytes(ticket, bytes)`
+
+Do not make the API request-centric. Do not add `has_request()`.
+
+## Reuse Requirements
+
+Do not add a parallel G4-specific disk writer if the existing utilities already
+cover the write path. Reuse these pieces first and only add new code around
+them when absolutely necessary:
+
+- `lib/llm/src/block_manager/storage/disk.rs`
+  - `DiskStorage::new(...)`
+  - `DiskStorage::new_at(...)`
+- `lib/llm/src/block_manager/v2/physical/layout/builder.rs`
+  - `PhysicalLayoutBuilder::allocate_disk(...)`
+  - `allocate_disk_entry(...)`
+- `lib/llm/src/block_manager/state/local.rs`
+  - `LocalBlockDataFactories::new(...)`
+  - `create_layout(...)`
+- `lib/llm/src/block_manager/block/transfer/strategy.rs`
+  - existing `WriteToStrategy<DiskStorage>` / `ReadFromStrategy<_>` mappings
+- `lib/llm/src/block_manager/offload/pending.rs`
+  - `LocalTransferManager::enqueue_transfer(...)`
+  - existing `.write_to(..., transfer_ctx)` usage
+- `lib/llm/src/block_manager/distributed/transfer.rs`
+  - `BlockTransferHandler`
+  - `begin_transfer(...)`
+  - `execute_transfer_direct(...)`
+
+The practical bias should be:
+
+1. allocate disk-backed storage using the current `DiskStorage` and layout code
+2. move bytes using the current `write_to(...)` / transfer-context path
+3. only then add the smallest wrapper needed for worker-to-agent routing
+
+## What Not To Do First
+
+Do not start with these in the first patch:
+
+1. early-block redundancy for the first `N` blocks
+2. repair or background healing
+3. event-plane-first correctness
+4. a radix tree or prefix index
+5. a global per-block metadata store
+6. direct GPU-to-remote-disk optimizations
+
+Those may be valid later, but they are not the correct entry point for the
+first coding pass.
+
+## Transfer Guidance
+
+Use pinned-host staging on the storage agent as the first transfer model.
+That means:
+
+1. read block payload from NVMe RAID-backed storage on the agent side
+2. stage through pinned host memory
+3. reuse the current transfer machinery where possible
+4. let the caller onboard locally after fetch
+
+Do not start with a bespoke direct-to-device remote path unless the existing
+transfer stack forces it.
+
+## Validation Target
+
+Before expanding scope, make sure the first patch can support or cleanly unit
+test all of the following:
+
+1. deterministic owner selection from a live worker set
+2. exact-block `query/fetch/put` behavior keyed by `sequence_hash`
+3. disk-backed allocation via reused storage helpers
+4. transfer path coverage that exercises the reused `write_to(...)` flow
+5. failure handling for timeout, not-found, and checksum/content-validation
+   mismatch
+
+## Definition Of Done For The First Patch
+
+The first G4 patch is good enough if it does all of the following:
+
+1. introduces a basic G4 worker/storage-agent path
+2. keeps the design single-owner and exact-block only
+3. reuses the current disk/transfer utilities rather than duplicating them
+4. leaves redundancy, repair, and event-plane fallback for later follow-up
+
+## Exact Next Files To Touch
+
+Start with:
+
+1. `lib/llm/src/block_manager/distributed/worker.rs`
+2. `lib/llm/src/block_manager/distributed/transfer.rs`
+
+If a new G4-specific module is genuinely required, keep it under:
+
+1. `lib/llm/src/block_manager/distributed/`
+
+- No tests were run in this planning-only pass because the scope was limited to
+  branch setup plus `PLANS.md` updates.
 
 - Re-read `Agents.md`, `PLANS.md`,
   `docs/design-docs/kvbm-trtllm-integration.md`, and the active repo-local

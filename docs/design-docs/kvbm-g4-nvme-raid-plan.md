@@ -10,8 +10,8 @@ title: KVBM G4 NVMe RAID Plan
 
 This document proposes a first `G4` implementation for KVBM using NVMe RAID-backed storage agents. The design intentionally favors a simple cache architecture over a fully distributed storage system:
 
-- one deterministic owner per block
-- no redundancy
+- deterministic ownership per block
+- selective redundancy for hot prefix blocks
 - no background repair
 - worker-to-agent direct query and fetch
 - event plane used only as optional fallback or metadata hinting, not as the primary lookup path
@@ -29,6 +29,7 @@ The key idea is:
 3. Workers query the owner directly for exact block existence.
 4. On hit, workers fetch the block payload from that owner and onboard it locally.
 5. On miss or transfer failure, workers treat the block as a cache miss and recompute.
+6. The first `N` blocks of a sequence may be replicated to two owners to absorb disproportionate read and write load on very hot prefix blocks.
 
 ## Design Goals
 
@@ -37,15 +38,33 @@ The key idea is:
 3. **Deterministic routing** - Workers can compute block ownership locally without a global per-block metadata service.
 4. **Low coordination overhead** - No cross-agent lookup gossip or background replica repair in the hot path.
 5. **Incremental integration** - The first version should fit the existing KVBM architecture without requiring a full rework of `OffloadManager`.
+6. **Hot-prefix load spreading** - Very early blocks should be able to use limited redundancy so reads and puts for common prefixes do not overload a single agent.
 
 ## Non-Goals
 
-- No block redundancy in the first version
 - No background repair
 - No prefix-tree or radix-tree lookup as a primary requirement
 - No event-plane dependence for correctness
 - No shared POSIX mount as the main data path
 - No attempt to make `G4` a strongly consistent distributed database
+
+## Selective Redundancy Policy
+
+The first version should support limited redundancy for the first `N` blocks of a sequence.
+
+Recommended starting policy:
+
+- `N = 64`
+- redundancy factor `2` for positions `0..63`
+- redundancy factor `1` for all later positions
+
+Rationale:
+
+- the earliest blocks in a sequence are the most likely to be reused across requests
+- those same blocks can attract disproportionate read load and repeated `put()` traffic
+- selective redundancy limits read and write amplification to the high-value portion of the prefix while keeping storage and coordination costs bounded
+
+This does **not** imply a repair mechanism. If one replica disappears, the system may continue with the surviving copy or refill the block later from recompute or a future `put()`.
 
 ## Architecture
 
@@ -66,6 +85,7 @@ Suggested local metadata record:
 struct G4BlockMeta {
     sequence_hash: u64,
     block_hash: u64,
+    position: u64,
     size_bytes: usize,
     checksum: Option<[u8; 32]>,
     disk_path: String,
@@ -98,17 +118,36 @@ For `G4`, the primary lookup key should be `sequence_hash`.
 
 Checksums are separate from identity. They should be treated as transfer-validation metadata, not as the canonical KVBM block key.
 
+### Optional Content Hash Validation
+
+`xxh3`-based block and sequence hashes are already fast enough to serve as the main identity path. The `G4` plan should also allow optional content-hash validation on transfers.
+
+Recommended policy:
+
+- identity key: `sequence_hash`
+- auxiliary content field: `block_hash`
+- optional transfer validation field: stronger content checksum or content hash, validated on both sides when enabled
+
+This allows the system to stay fast by default while preserving the option to enable stricter validation for debugging, canary deployments, or corruption-sensitive environments.
+
 ## Routing and Ownership
 
 ### Ownership Rule
 
-Each block has exactly one `G4` owner:
+Each block has either one or two owners depending on sequence position:
 
 ```text
-owner = rendezvous_hash(sequence_hash, active_storage_agents)
+owners = top_k_rendezvous_hash(sequence_hash, active_storage_agents, k)
 ```
 
-Rendezvous hashing is preferred because it is simple to compute locally and handles membership changes cleanly.
+Where:
+
+- `k = 2` for the first `N` blocks of a sequence
+- `k = 1` for all later blocks
+
+Rendezvous hashing is preferred because it is simple to compute locally, naturally supports top-`k` owner selection, and handles membership changes cleanly.
+
+For normal reads, the worker may try either owner for the redundant prefix blocks. For writes, the worker may write to both owners for the redundant prefix region and to a single owner for the non-redundant suffix.
 
 ### Discovery Dependency
 
@@ -163,6 +202,7 @@ struct G4BlockHit {
 struct G4PutBlock {
     sequence_hash: u64,
     block_hash: u64,
+    position: u64,
     size_bytes: usize,
     bytes: bytes::Bytes,
     checksum: Option<[u8; 32]>,
@@ -170,6 +210,17 @@ struct G4PutBlock {
 ```
 
 The API intentionally does not include `has_request()`. Requests are transient scheduler concepts; reusable cache state is block-based.
+
+If payload sizing or flow control becomes a problem, `put()` may be split into a metadata-first and bytes-second flow:
+
+```rust
+trait G4StorageAgent {
+    async fn put(&self, block: G4PutBlockMeta) -> Result<PutTicket>;
+    async fn put_bytes(&self, ticket: PutTicket, bytes: bytes::Bytes) -> Result<()>;
+}
+```
+
+This keeps the plan flexible without forcing a two-phase write path from day one.
 
 ## Transfer Plan
 
@@ -180,6 +231,7 @@ For the first version, remote block transfer should use:
 - **Control plane:** direct RPC-style query and fetch requests to the owning storage agent
 - **Data plane:** NIXL over UCX
 - **Staging model:** storage agent reads from NVMe RAID into pinned host memory, then transfers to the worker
+- **Initiation model:** transfer may be initiated from either side depending on what fits KVBM integration best
 
 The recommended read path is:
 
@@ -190,6 +242,13 @@ NVMe RAID file -> pinned host buffer on storage agent -> NIXL/UCX transfer -> wo
 This is intentionally conservative.
 
 The first version should not depend on direct remote-disk-to-device transfer. Pinned-host staging is the simpler and safer starting point.
+
+Transfer initiation should remain flexible:
+
+- **pull-style**: worker requests bytes and the storage agent sends them
+- **push-style**: worker provides transfer descriptors or targets and the storage agent pushes into them
+
+KVBM already has abstractions where either side can conceptually drive transfer setup. The `G4` integration should preserve that flexibility instead of hard-coding a single initiator model.
 
 ### Why This Transfer Path
 
@@ -205,11 +264,11 @@ The first version should not depend on direct remote-disk-to-device transfer. Pi
 When a worker produces a registered block that should be materialized in `G4`:
 
 1. Worker computes `sequence_hash`.
-2. Worker computes the owning storage agent from discovery membership.
-3. Worker sends `put_blocks()` to that owner.
-4. Owner persists the payload to local NVMe RAID storage and records metadata locally.
+2. Worker computes one or two owning storage agents from discovery membership, depending on position.
+3. Worker sends `put_blocks()` to the selected owner set.
+4. Owners persist the payload to local NVMe RAID storage and record metadata locally.
 5. On success, the block is available in `G4`.
-6. On failure, the block is simply not cached remotely.
+6. On failure, the block is simply not cached remotely on the failed target.
 
 This write path is best-effort. Since `G4` is a cache, write failure does not affect inference correctness.
 
@@ -218,8 +277,8 @@ This write path is best-effort. Since `G4` is a cache, write failure does not af
 When a worker wants to reuse blocks from `G4`:
 
 1. Worker derives candidate `sequence_hash` values locally from token blocks.
-2. Worker computes the owner for each hash.
-3. Worker sends `query_blocks()` to the owner.
+2. Worker computes one or two owners for each hash, depending on position.
+3. Worker sends `query_blocks()` to one owner, or to either owner in the redundant prefix region.
 4. For hits, worker sends `fetch_blocks()`.
 5. The storage agent reads the block from NVMe RAID into pinned host memory.
 6. The storage agent transfers the payload using NIXL/UCX.
@@ -246,10 +305,11 @@ But the primary lookup path is direct worker-to-owner query.
 If the owning storage agent is unavailable:
 
 - `query_blocks()` fails or times out
+- for redundant prefix blocks, the worker may query the second owner
 - worker treats the block as a cache miss
 - worker recomputes locally
 
-No retry to alternate owners is needed because the first version uses a single owner and no redundancy.
+No background repair is required. If a redundant prefix block is missing from one owner, the system may continue using the other owner or refill it on a future `put()`.
 
 ### Transfer Failure
 
@@ -266,8 +326,9 @@ The system should not mark the block as successfully fetched unless the full pay
 If `put_blocks()` fails:
 
 - the block remains absent from `G4`
+- for redundant prefix blocks, one owner may succeed while the other fails
 - no repair is attempted
-- later reads fall back to recompute
+- later reads use whatever copy exists, or fall back to recompute
 
 ## Metadata Store Choice
 
@@ -309,6 +370,8 @@ Payload bytes should live on local NVMe-backed files as immutable blobs. The met
 - Define hashing and ownership rules
 - Define local disk layout and metadata schema
 - Define the pinned-host transfer path and checksum validation rules
+- Define the selective redundancy policy for the first `N` blocks
+- Decide whether the first implementation uses `put_blocks()` only or supports `put()` + `put_bytes()`
 
 ### Phase 2: Storage Agent Bring-Up
 
@@ -317,6 +380,7 @@ Payload bytes should live on local NVMe-backed files as immutable blobs. The met
 - Add `query_blocks()`, `fetch_blocks()`, and `put_blocks()`
 - Persist block payloads to NVMe RAID-backed local storage
 - Add pinned-host buffer management for fetch responses
+- Add support for dual-owner writes for the first `N` blocks
 
 ### Phase 3: Worker Integration
 
@@ -324,27 +388,30 @@ Payload bytes should live on local NVMe-backed files as immutable blobs. The met
 - Add owner routing based on discovery membership
 - Add direct query/fetch before local recompute
 - Onboard fetched blocks into local KVBM tiers
+- Add alternate-owner fallback for the redundant prefix region
 
 ### Phase 4: Policy and Observability
 
 - Decide when blocks should be written to `G4`
 - Add metrics for query hit rate, fetch latency, put latency, and transfer failures
 - Optionally subscribe to event-plane updates as a secondary metadata source
+- Add metrics split by early-prefix redundant region versus non-redundant suffix
 
 ## Open Questions
 
 - Should `put_blocks()` happen immediately on block registration, or only after an offload threshold is reached?
+- Should the first `N` blocks be replicated synchronously to both owners, or best-effort to the second owner?
+- Should content-hash validation be off by default and enabled only for selected clusters or debug modes?
 - Should workers always fetch into host pinned memory first, or should the interface allow later direct device-target transfer?
 - How should membership churn be handled during long fetches: strict epoch check, or best-effort with retry?
 - Should `G4` materialization be tied to KVBM offload policy, or managed by a separate backend policy layer?
 
 ## Future Work
 
-- Add redundancy and alternate-owner reads
-- Add optional asynchronous write replication
 - Add prefix-aware lookup if exact-block probing proves too expensive
 - Add local block compaction and disk-space-aware eviction
 - Add direct device-target remote transfer when transport and capability checks are mature enough
+- Add configurable redundancy windows beyond the initial first-`N` policy
 
 ## References
 
