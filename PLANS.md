@@ -1,8 +1,71 @@
 # KVBM TensorRT-LLM Integration Execution Plan
 
-Last updated: 2026-03-31 00:14:44 UTC
+Last updated: 2026-03-31 00:25:33 UTC
 
 Current run outcome:
+
+- Re-read `Agents.md`, `PLANS.md`,
+  `docs/design-docs/kvbm-trtllm-integration.md`, and the active repo-local
+  TRT-LLM integration files before making changes in this run.
+- Re-ran the recorded green baseline on 2026-03-31 UTC and confirmed it still
+  holds before additional work:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
+    -> pass (`Ran 14 tests`, `OK`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 27 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
+    -> pass (`Ran 41 tests`, `OK`, `skipped=3`) before the new smoke tests in
+    this run
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `python3 -m venv .venv`
+    -> pass
+  - `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `.venv/bin/python -c 'import kvbm, kvbm._core'`
+    -> pass
+  - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
+    -> pass, report `status: "ok"`
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+    -> pass
+- Landed the planned real torch-backed export smoke milestone instead of doing
+  more broad repo-local cleanup:
+  - found one concrete runtime seam while probing the live export path:
+    current `torch.utils.dlpack.from_dlpack(...)` now calls exported objects
+    with `max_version=...`, but the KVBM Rust DLPack exporters rejected that
+    keyword with `NotImplementedError: max_version argument is not supported`
+  - fixed the manager's lazy torch bridge to retry via the raw DLPack capsule
+    when an older exporter still rejects `max_version`
+  - fixed the Rust `__dlpack__` implementations for block, block-list, and
+    layer exports to tolerate `max_version` instead of rejecting modern torch
+    callers
+  - added `lib/bindings/kvbm/tests/test_trtllm_torch_exports.py` as the new
+    opt-in real-torch smoke layer
+    - validates raw `create_primary_pool(...)` DLPack import through modern
+      torch
+    - validates rank-local standard `get_unique_primary_pool()` and
+      `get_buffers(..., kv_layout="NHD" | "HND")` exports on real CUDA tensors
+    - validates baseline MLA export shaping on real CUDA tensors too
+- Revalidated after the DLPack compatibility fix on 2026-03-31 UTC:
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 27 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_torch_exports`
+    -> pass (`Ran 3 tests`, `OK`)
+  - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
+    -> pass (`Ran 44 tests`, `OK`, `skipped=3`)
+  - `PYTHONPATH=lib/bindings/kvbm/python python3 -c 'from kvbm import _core; import torch; pool = _core._trtllm_integration.create_primary_pool(num_blocks=2, num_layers=1, kv_factor=2, page_size=4, inner_dim=128, dtype=\"float16\", device_id=0); tensor = torch.utils.dlpack.from_dlpack(pool); print(tuple(tensor.shape), tuple(tensor.stride()), tensor.device, tensor.dtype)'`
+    -> pass, confirmed direct raw export import on `cuda:0`
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+    -> pass
+- Remaining blocker did not change in this run:
+  repo-local manager/page-table/export seams are now stronger against the live
+  `torch 2.10.0a0` plus installed TRT-LLM `1.3.0rc9` runtime, but the next
+  unresolved step is still real native NIXL/UCX transfer-worker bring-up where
+  `_rank_info_server` stayed `None` during the last bounded live attempt.
 
 - After landing the checked-in smoke tool, attempted a bounded real native
   transfer-worker bring-up on 2026-03-31 UTC using the live installed
@@ -256,11 +319,18 @@ Exact next steps if another run happens on this machine:
   - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
 - If that sequence stays green, spend the next run on a real external runtime
   exercise rather than more repo-local cleanup:
+  - re-run
+    `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_torch_exports`
+    too; this now guards the real torch/DLPack export seam and should stay
+    green before another runtime attempt
   - restore `/tmp/trtllm-latest/tensorrt_llm` only if a checkout-vs-installed
     seam comparison is required
-  - otherwise use the installed TRT-LLM `1.3.0rc9` runtime directly and attempt
-    a real transfer-worker / multi-rank bring-up or equivalent end-to-end
-    smoke path
+  - otherwise use the installed TRT-LLM `1.3.0rc9` runtime directly and retry a
+    bounded real transfer-worker / multi-rank bring-up
+  - first command to touch for that next runtime attempt:
+    inspect `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` and convert the
+    current fake-worker patching into a second tool or mode that leaves
+    `TransferWorker` real while keeping the same bounded manager/topology setup
 
 ## Objective
 
@@ -714,9 +784,15 @@ Implemented so far:
   `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` that exercises real
   TensorRT-LLM Python modules against the repo manager without starting the
   native transfer backend
-- confirmed the current manager/test seam is ready for a second smoke tier that
-  uses real torch-backed exported tensors in addition to the existing fake
-  shape/stride/data_ptr tensor shims
+- added the second smoke tier that was called out previously:
+  `lib/bindings/kvbm/tests/test_trtllm_torch_exports.py`
+  - exercises raw Rust DLPack exports through live `torch`
+  - exercises manager-shaped standard and MLA exports on real CUDA tensors
+- fixed the Rust/Python DLPack seam for current torch:
+  - manager fallback now retries via raw DLPack capsule if an exporter still
+    rejects `max_version`
+  - Rust block / block-list / layer `__dlpack__` implementations now tolerate
+    `max_version` from modern torch callers
 
 ## Progress Log
 
@@ -792,11 +868,19 @@ Implemented so far:
 - Hardened the phase-7 Python surface after re-reading the pinned TRT-LLM
   helpers:
   - normalized request access through `_RequestSnapshot` instead of scattered
-  fallback lookups
+    fallback lookups
   - added explicit compatibility shims for window-size grouping and PP-rank
     predicates
   - validated the adapter against the pinned TRT-LLM `kv_extractor.py` and
     `rank_info.py` sources directly, using stub-only dependencies
+- Added a real torch-backed export smoke layer and fixed the DLPack protocol
+  seam it exposed:
+  - modern `torch.utils.dlpack.from_dlpack(...)` was passing `max_version`
+    into KVBM's Rust exporters
+  - the manager now falls back through a raw DLPack capsule when needed
+  - the Rust exporters now accept the modern call shape directly
+  - `lib/bindings/kvbm/tests/test_trtllm_torch_exports.py` covers raw export,
+    standard rank-local exports, and baseline MLA exports on real CUDA tensors
 - Inspected KVBM storage/layout internals and found the key phase-3 tension:
   `FullyContiguous` can provide a clean primary-pool slab, but the current
   DLPack helper only exports contiguous shapes, while TRTLLM also needs

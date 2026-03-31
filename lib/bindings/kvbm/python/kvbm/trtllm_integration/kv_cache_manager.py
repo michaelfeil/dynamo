@@ -607,7 +607,12 @@ class KvbmKVCacheManager:
             import torch
         except ImportError:
             return value
-        return torch.utils.dlpack.from_dlpack(value)
+        try:
+            return torch.utils.dlpack.from_dlpack(value)
+        except NotImplementedError as exc:
+            if "max_version" not in str(exc):
+                raise
+            return torch.utils.dlpack.from_dlpack(value.__dlpack__())
 
     def _reshape_layer_export(self, value: Any, layer_offset: int, kv_layout: str) -> Any:
         tensor = self._torch_from_dlpack(value)

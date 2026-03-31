@@ -51,11 +51,7 @@ impl Layer {
                 "stream argument is not supported",
             ));
         }
-        if max_version.is_some() {
-            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "max_version argument is not supported",
-            ));
-        }
+        let _ = max_version;
         if dl_device.is_some() {
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "dl_device argument is not supported",
