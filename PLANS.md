@@ -1,8 +1,67 @@
 # KVBM TensorRT-LLM Integration Execution Plan
 
-Last updated: 2026-03-30 23:59:54 UTC
+Last updated: 2026-03-31 00:24:12 UTC
 
 Current run outcome:
+
+- Re-read `Agents.md`, the current `PLANS.md`,
+  `docs/design-docs/kvbm-trtllm-integration.md`, and the active repo-local
+  TRT-LLM integration files before changing anything in this run.
+- Re-ran the exact validation sequence from this plan on 2026-03-31 UTC and
+  confirmed it is still green:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
+    -> pass (`Ran 14 tests`, `OK`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 26 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
+    -> pass (`Ran 40 tests`, `OK`, `skipped=3`)
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `python3 -m venv .venv`
+    -> pass
+  - `. .venv/bin/activate && UV_CACHE_DIR=/tmp/uv-cache uv tool run maturin develop --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `.venv/bin/python -c 'import kvbm, kvbm._core'`
+    -> pass
+  - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
+    -> pass, report `status: "ok"`
+- Converted the previously ad-hoc installed-wheel disaggregation exercise into a
+  checked-in repo-local tool:
+  - added `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+  - the tool uses the live installed TRT-LLM `1.3.0rc9` Python modules plus
+    the repo `KvbmKVCacheManager`
+  - it monkeypatches only the transfer backend (`TransferWorker`) and current
+    CUDA device lookup so the Python-side disaggregation control flow can be
+    exercised safely on this host without trying to start the native transport
+- Ran that new smoke tool successfully on 2026-03-31 UTC with
+  `TLLM_DISABLE_MPI=1` and repo/`.venv` `PYTHONPATH`:
+  - imported live installed `tensorrt_llm._torch.disaggregation.resource.kv_extractor`
+    and `tensorrt_llm._torch.disaggregation.native.py_cache_transceiver`
+  - built a real installed-wheel page table from `KvbmKVCacheManager`
+  - exercised live installed `PyNativeCacheTransceiver` control flow for:
+    `respond_and_send_async`, `check_context_transfer_status`,
+    `request_and_receive_async`, `check_gen_transfer_status`,
+    `prepare_context_requests`, `get_disaggregated_params`, and `shutdown`
+  - confirmed the current installed rc9 sample still emits the expected local
+    page-table geometry and block IDs:
+    - `tokens_per_block=4`
+    - `slot_bytes=3072`
+    - buffer entries:
+      `[(0, 1, 0, 768), (0, 2, 768, 768), (1, 1, 1536, 768), (1, 2, 2304, 768)]`
+    - transferred block IDs:
+      `[[0, 1, 2]]`
+- Narrowed the remaining Phase 7 blocker on this machine:
+  - repo-local manager/page-table/transceiver Python compatibility is now
+    validated against the installed TRT-LLM `1.3.0rc9` wheel
+  - the remaining unvalidated step is real native transfer-worker /
+    multi-rank bring-up, which still depends on external runtime capability
+    beyond the safe repo-local fake-worker smoke path
+- Exact next step if another run happens on this machine:
+  - re-run the green validation sequence above
+  - re-run
+    `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+  - if both stay green, spend the next run on a real native transfer-worker or
+    multi-rank disaggregation bring-up instead of more repo-local API cleanup
 
 - Re-read the repo-local execution instructions in `Agents.md`, then re-read
   the current `PLANS.md` before making changes in this run.
@@ -489,7 +548,7 @@ Implemented so far:
 
 ### Phase 7: Disaggregated serving convergence
 
-Status: blocked on external runtime validation
+Status: blocked on native transfer-worker / multi-rank runtime validation
 
 Goal:
 
@@ -497,20 +556,25 @@ Goal:
   KV memory via KVBM while also exposing KVBM storage tiers and transfer hooks
   to TRT-LLM's disaggregation runtime.
 
-Current blockers identified from the pinned TRT-LLM disaggregation surface:
+Current blockers identified from the active installed TRT-LLM disaggregation
+surface:
 
-- The repo-local manager now satisfies the pinned Python page-table and
-  rank-info builders, but actual `.venv` TRT-LLM disaggregation imports still
-  abort in Open MPI / PMIx before `KvCacheTransceiverV2` setup can be exercised
-  on this machine.
-- The installed `.venv` TensorRT-LLM wheel is not the same Python surface as
-  the pinned local checkout:
-  - installed wheel: `tensorrt_llm 1.2.0`
-  - installed package has `_torch/pyexecutor` but no `_torch/disaggregation`
-  - pinned checkout at `/tmp/trtllm-latest/tensorrt_llm` has both
-    `_torch/pyexecutor` and `_torch/disaggregation`
-  This means the remaining phase-7 runtime validation cannot succeed against
-  the current `.venv` wheel as-is, even before CUDA/MPI issues are resolved.
+- The machine-local Python seam is no longer the blocker:
+  - installed runtime is now `tensorrt_llm 1.3.0rc9`
+  - installed package exposes both `_torch/pyexecutor` and
+    `_torch/disaggregation`
+  - live imports of `tensorrt_llm` and
+    `tensorrt_llm._torch.disaggregation.native.py_cache_transceiver` complete
+    successfully under `TLLM_DISABLE_MPI=1`
+  - live installed-wheel `build_page_table_from_manager(manager)` and
+    `PyNativeCacheTransceiver` control flow are now exercised repo-locally via
+    `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+- The remaining runtime gap is below that Python seam:
+  - the checked-in smoke path still monkeypatches `TransferWorker` instead of
+    bringing up the real native transport
+  - a real external runtime attempt still needs native transfer-worker /
+    multi-rank execution capability and may require MPI / network coordination
+    beyond what has been safely exercised repo-locally here
 - The current adapter still models only one GPU-resident life cycle / pool
   group for the supported path; if real transfer-worker startup demands richer
   storage-tier detail, that mapping work remains to be done.
