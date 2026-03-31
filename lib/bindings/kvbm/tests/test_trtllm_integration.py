@@ -203,7 +203,16 @@ class TrtllmIntegrationTest(unittest.TestCase):
         sys.modules["tensorrt_llm._utils"] = utils_mod
 
         bindings_mod = types.ModuleType("tensorrt_llm.bindings")
-        bindings_mod.DataType = type("DataType", (), {"NVFP4": object()})
+        bindings_mod.DataType = type(
+            "DataType",
+            (),
+            {
+                "NVFP4": object(),
+                "HALF": object(),
+                "BF16": object(),
+                "FLOAT": object(),
+            },
+        )
         sys.modules["tensorrt_llm.bindings"] = bindings_mod
 
         kv_cache_manager_v2 = types.ModuleType("tensorrt_llm.runtime.kv_cache_manager_v2")
@@ -547,6 +556,32 @@ class TrtllmIntegrationTest(unittest.TestCase):
             manager.host_kv_cache_block_offsets[0][0][0][:4],
             [-1, -1, -1, -1],
         )
+
+    def test_manager_normalizes_runtime_dtype_when_bindings_are_available(self) -> None:
+        bindings_mod = types.ModuleType("tensorrt_llm.bindings")
+        bindings_mod.DataType = type(
+            "DataType",
+            (),
+            {
+                "HALF": object(),
+                "BF16": object(),
+                "FLOAT": object(),
+            },
+        )
+        sys.modules["tensorrt_llm.bindings"] = bindings_mod
+        integration = importlib.import_module("kvbm.trtllm_integration")
+        manager = integration.KvbmKVCacheManager(
+            tokens_per_block=4,
+            dtype="float16",
+            head_dim=16,
+            pp_layers=[0],
+            total_num_kv_heads_per_layer=[8],
+            max_seq_len=32,
+            num_blocks=4,
+        )
+
+        self.assertIs(manager.dtype, bindings_mod.DataType.HALF)
+        self.assertEqual(manager._normalize_dtype_name(), "float16")
 
     def test_manager_requires_explicit_tensor_export_wiring(self) -> None:
         manager_mod = importlib.import_module(

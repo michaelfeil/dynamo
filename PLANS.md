@@ -1,8 +1,49 @@
 # KVBM TensorRT-LLM Integration Execution Plan
 
-Last updated: 2026-03-31 00:24:12 UTC
+Last updated: 2026-03-31 00:14:44 UTC
 
 Current run outcome:
+
+- After landing the checked-in smoke tool, attempted a bounded real native
+  transfer-worker bring-up on 2026-03-31 UTC using the live installed
+  TRT-LLM `1.3.0rc9` `PyNativeCacheTransceiver` instead of the fake worker.
+- Found and fixed one real repo-local runtime seam before transport startup:
+  `KvbmKVCacheManager.dtype` was still kept as the string `"float16"`, but the
+  installed rc9 `TransferWorker` path calls
+  `tensorrt_llm._utils.get_size_in_bytes(..., manager.dtype)` and expects a
+  `tensorrt_llm.bindings.DataType` enum.
+  - normalized manager dtype exposure to installed TRT-LLM binding enums when
+    `tensorrt_llm.bindings` is already loaded
+  - kept the unit-test path hermetic by resolving those enums from
+    `sys.modules` only, without importing the real TRT-LLM package in stdlib
+    tests
+  - added regression coverage in
+    `lib/bindings/kvbm/tests/test_trtllm_integration.py`
+- Revalidated after that dtype fix on 2026-03-31 UTC:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
+    -> pass (`Ran 14 tests`, `OK`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 27 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
+    -> pass (`Ran 41 tests`, `OK`, `skipped=3`)
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+    -> pass
+- Re-ran the bounded real native-worker attempt after the dtype fix and got
+  materially farther into runtime startup:
+  - KVBM manager now presents `dtype=DataType.HALF` to the installed runtime
+  - live TRT-LLM starts the UCX-backed `NixlTransferAgent`
+  - the attempt now fails later during native worker initialization because
+    `transfer_worker._rank_info_server` remains `None`, so
+    `PyNativeCacheTransceiver.__init__` aborts with
+    `AttributeError: 'NoneType' object has no attribute 'endpoint'`
+  - the same attempt also emits the current host/runtime warning:
+    `memory is detected as host, check that UCX is configured with CUDA support`
+- The remaining blocker on this machine is therefore narrowed again:
+  repo-local manager metadata is no longer stopping native worker startup;
+  the next unresolved seam is inside live NIXL/UCX transfer-worker bring-up
+  and rank-info server initialization.
 
 - Re-read `Agents.md`, the current `PLANS.md`,
   `docs/design-docs/kvbm-trtllm-integration.md`, and the active repo-local
@@ -50,6 +91,17 @@ Current run outcome:
       `[(0, 1, 0, 768), (0, 2, 768, 768), (1, 1, 1536, 768), (1, 2, 2304, 768)]`
     - transferred block IDs:
       `[[0, 1, 2]]`
+- The repo-local test surface is now strong enough to grow beyond pure fake
+  tensor metadata shims:
+  - the manager already reshapes DLPack exports through torch lazily when a
+    real consumer is present
+  - targeted tests can now add a real `torch`-tensor-backed seam for:
+    - `get_unique_primary_pool()`
+    - `get_buffers(..., kv_layout="NHD" | "HND")`
+    - live installed-wheel page-table / transceiver smoke paths
+  - keep the current stdlib-only fake-tensor tests as the fast contract layer,
+    then add a smaller opt-in smoke layer that exercises real torch-backed
+    exports
 - Narrowed the remaining Phase 7 blocker on this machine:
   - repo-local manager/page-table/transceiver Python compatibility is now
     validated against the installed TRT-LLM `1.3.0rc9` wheel
@@ -60,8 +112,10 @@ Current run outcome:
   - re-run the green validation sequence above
   - re-run
     `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
-  - if both stay green, spend the next run on a real native transfer-worker or
-    multi-rank disaggregation bring-up instead of more repo-local API cleanup
+  - if both stay green, add a small torch-backed export smoke next to the
+    existing fake-tensor coverage, then spend the following run on a real
+    native transfer-worker or multi-rank disaggregation bring-up instead of
+    more repo-local API cleanup
 
 - Re-read the repo-local execution instructions in `Agents.md`, then re-read
   the current `PLANS.md` before making changes in this run.
@@ -571,10 +625,16 @@ surface:
     `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
 - The remaining runtime gap is below that Python seam:
   - the checked-in smoke path still monkeypatches `TransferWorker` instead of
-    bringing up the real native transport
-  - a real external runtime attempt still needs native transfer-worker /
-    multi-rank execution capability and may require MPI / network coordination
-    beyond what has been safely exercised repo-locally here
+    bringing up the real native transport end to end
+  - a bounded real startup attempt now gets through dtype normalization and
+    into UCX/NIXL initialization, then fails because
+    `transfer_worker._rank_info_server` stays `None`, so
+    `PyNativeCacheTransceiver.__init__` aborts when it tries to read
+    `.endpoint`
+  - the same live attempt reports
+    `memory is detected as host, check that UCX is configured with CUDA support`,
+    so the remaining blocker is now native transport / UCX / rank-info-server
+    bring-up rather than manager metadata or Python-surface mismatch
 - The current adapter still models only one GPU-resident life cycle / pool
   group for the supported path; if real transfer-worker startup demands richer
   storage-tier detail, that mapping work remains to be done.
@@ -650,6 +710,13 @@ Implemented so far:
     checkout succeeds against the KVBM-backed manager
   - `RankInfo.from_kv_cache_manager(...)` from the pinned local TRT-LLM
     checkout succeeds and round-trips through serialization
+- added a live installed-wheel smoke path in
+  `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` that exercises real
+  TensorRT-LLM Python modules against the repo manager without starting the
+  native transfer backend
+- confirmed the current manager/test seam is ready for a second smoke tier that
+  uses real torch-backed exported tensors in addition to the existing fake
+  shape/stride/data_ptr tensor shims
 
 ## Progress Log
 
@@ -1664,6 +1731,28 @@ Implemented so far:
   - mapping KVBM storage tiers onto TRT-LLM life cycles / pool groups
   - preserving Rust-owned lifecycle and residency guarantees through actual
     transfer-worker flows if the runtime reveals more than the current adapter
+- Add a second repo-local smoke tier for real torch-backed exports:
+  - keep `lib/bindings/kvbm/tests/test_trtllm_integration.py` as the fast
+    stdlib-only contract suite
+  - add a smaller opt-in smoke that materializes real torch tensors from the
+    manager's DLPack-backed exports and checks:
+    - primary-pool shape/stride
+    - per-layer `NHD` / `HND` reshape behavior
+    - installed-wheel page-table construction from those exports
+  - use `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` as the starting point
+    for live TRT-LLM Python-surface validation
+- Move more of the NVIDIA TRT-LLM manager seam from Python into Rust where the
+  behavior is now stable enough:
+  - request lifecycle and allocation decisions are already partly native via
+    `TrtllmStateManager`; extend that direction rather than growing new Python
+    state
+  - best next Rust candidates are:
+    - padded block-row / host block-offset row generation
+    - dummy-request allocation helpers for both main and draft views
+    - KV-cache stats / block-geometry accounting
+    - disaggregation metadata primitives derived from the primary-pool layout
+  - keep Python as the thin compatibility layer for TRT-LLM-facing object
+    shapes, argument normalization, and any torch-only reshape glue
 - External blocker remains: add a runtime-capable validation path for the Rust
   test binary once the local PyO3/Python link environment is fixed; until then
   rely on `cargo check` plus Python contract tests on this machine.
@@ -1775,7 +1864,10 @@ Implemented so far:
    exercise beyond the fake-worker smoke used in this run. Start from the
    validated smoke skeleton in this file and replace the fake `TransferWorker`
    with the real runtime wiring.
-5. If a future runtime attempt exposes another missing manager field or storage
+5. Before that real transfer-worker step, the most useful incremental smoke is
+   a real torch-backed export check layered on top of the existing fake-tensor
+   tests and installed-wheel smoke path.
+6. If a future runtime attempt exposes another missing manager field or storage
    shape, touch this file first:
    `/workspace/model-performance/michaelfeil1209/mfdynamo/lib/bindings/kvbm/python/kvbm/trtllm_integration/kv_cache_manager.py`
    Then inspect and extend only the relevant metadata helpers:
@@ -1785,7 +1877,10 @@ Implemented so far:
    - `get_disagg_life_cycles()`
    - `get_layer_grouping()`
    - `_get_window_size_to_layers()`
-6. Additional repo-local cleanup is not the critical path right now:
+7. If another repo-local implementation milestone is needed before full runtime
+   transfer validation, bias that work toward Rust rather than expanding the
+   long-term Python manager state surface.
+8. Additional repo-local cleanup is not the critical path right now:
    - the audit is green for the actual installed `1.3.0rc9` seam when probes
      run with `TLLM_DISABLE_MPI=1`
    - the editable install is working again

@@ -22,6 +22,48 @@ from . import rust as rust_bindings
 BAD_PAGE_INDEX = -1
 
 
+def _normalize_dtype_name(value: Any) -> Optional[str]:
+    enum_name = getattr(value, "name", None)
+    if isinstance(enum_name, str):
+        lowered = enum_name.lower()
+        if lowered in {"half", "float16", "fp16"}:
+            return "float16"
+        if lowered in {"bf16", "bfloat16"}:
+            return "bfloat16"
+        if lowered in {"float", "float32", "fp32"}:
+            return "float32"
+
+    lowered = str(value).lower()
+    if lowered in {"float16", "torch.float16", "fp16"}:
+        return "float16"
+    if lowered in {"bfloat16", "torch.bfloat16", "bf16"}:
+        return "bfloat16"
+    if lowered in {"float32", "torch.float32", "fp32"}:
+        return "float32"
+    return None
+
+
+def _resolve_runtime_dtype(dtype: Any, dtype_name: Optional[str]) -> Any:
+    if dtype_name is None:
+        return dtype
+    trtllm_bindings = sys.modules.get("tensorrt_llm.bindings")
+    if trtllm_bindings is None:
+        return dtype
+
+    data_type = getattr(trtllm_bindings, "DataType", None)
+    if data_type is None:
+        return dtype
+
+    attr_name = {
+        "float16": "HALF",
+        "bfloat16": "BF16",
+        "float32": "FLOAT",
+    }.get(dtype_name)
+    if attr_name is None:
+        return dtype
+    return getattr(data_type, attr_name, dtype)
+
+
 @dataclass
 class KvCacheStats:
     allocated_bytes: int = 0
@@ -283,7 +325,8 @@ class KvbmKVCacheManager:
             raise ValueError(f"Unsupported cache_mode: {cache_mode}")
 
         self.tokens_per_block = tokens_per_block
-        self.dtype = dtype
+        self.dtype_name = _normalize_dtype_name(dtype)
+        self.dtype = _resolve_runtime_dtype(dtype, self.dtype_name)
         self.head_dim = head_dim
         self.pp_layers = list(pp_layers)
         self.num_local_layers = len(self.pp_layers)
@@ -504,14 +547,7 @@ class KvbmKVCacheManager:
         return first
 
     def _normalize_dtype_name(self) -> Optional[str]:
-        value = str(self.dtype).lower()
-        if value in {"float16", "torch.float16", "fp16"}:
-            return "float16"
-        if value in {"bfloat16", "torch.bfloat16", "bf16"}:
-            return "bfloat16"
-        if value in {"float32", "torch.float32", "fp32"}:
-            return "float32"
-        return None
+        return self.dtype_name
 
     def _dtype_size_bytes(self) -> int:
         dtype_name = self._normalize_dtype_name()
