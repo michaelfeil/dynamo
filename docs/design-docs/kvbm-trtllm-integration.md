@@ -39,16 +39,16 @@ This is a direct manager replacement, not a sidecar extension.
 
 The first implementation should support only:
 
-- one pinned TensorRT-LLM version
-- single GPU
+- one pinned TensorRT-LLM version 1.3.9rc0
 - beam width 1
 - one attention backend
 - one KV layout path
 - aggregated execution only
+- ideally tp and pp.
 
 The architecture must still leave room for one-model speculative decoding, especially MTP, because that is a required follow-on capability for the PyTorch backend.
 
-The first implementation should not support:
+The first implementation ideally should support:
 
 - pipeline parallelism
 - tensor parallelism

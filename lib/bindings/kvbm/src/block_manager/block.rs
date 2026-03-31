@@ -7,8 +7,8 @@ use super::*;
 use dynamo_llm::block_manager::block::BlockDataExt;
 use dynamo_llm::block_manager::block::BlockDataProviderMut;
 use pyo3::{
-    types::{PyList, PyTuple},
     PyObject, PyResult, Python,
+    types::{PyList, PyTuple},
 };
 use std::sync::{Arc, Mutex};
 

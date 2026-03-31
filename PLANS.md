@@ -1,8 +1,89 @@
 # KVBM TensorRT-LLM Integration Execution Plan
 
-Last updated: 2026-03-31 00:38:41 UTC
+Last updated: 2026-03-31 01:04:17 UTC
 
 Current run outcome:
+
+- Re-read `Agents.md`, `PLANS.md`,
+  `docs/design-docs/kvbm-trtllm-integration.md`, and the active repo-local
+  TRT-LLM integration files before closing out this run.
+- Treated this run as finish-and-handover validation for the already-landed
+  native primary-pool layout export work instead of opening a new repo-local
+  feature branch of changes.
+- Revalidated the current repo-local state on 2026-03-31 01:04:17 UTC:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_runtime_audit`
+    -> pass (`Ran 14 tests`, `OK`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 28 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_torch_exports`
+    -> pass (`Ran 3 tests`, `OK`)
+  - `python3 -m unittest discover -s lib/bindings/kvbm/tests -p 'test_*.py'`
+    -> pass (`Ran 48 tests`, `OK`, `skipped=3`)
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+  - `.venv/bin/python -c 'import kvbm, kvbm._core'`
+    -> pass
+  - `python3 lib/bindings/kvbm/tools/trtllm_runtime_audit.py --json --probe-imports --disable-mpi-for-probes --fail-on-blocked`
+    -> pass, report `status: "ok"`
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py`
+    -> pass, report `status: "ok"`
+  - `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py --real-transfer-worker`
+    -> exit `0` with structured `status: "blocked"`
+- Confirmed the native primary-pool metadata seam is now covered end-to-end in
+  the checked-in tree:
+  - Rust `BlockList` primary-pool exports now expose shape/stride/element-size
+    and base-address facts directly
+  - `kvbm.trtllm_integration.kv_cache_manager` now prefers that native
+    metadata when building TRT-LLM disaggregation storage metadata
+  - repo-local regression coverage now checks both the fake native layout path
+    and the real torch-backed primary-pool export surface
+- The remaining blocker is narrower than the earlier `_rank_info_server is
+  None` and UCX crash reports:
+  - on this host, the bounded real-worker probe now reaches real
+    rank-info-server bring-up and context-transfer startup
+  - generation receive still cannot be validated in the checked-in
+    one-process smoke because every gathered sender endpoint collapses to the
+    same live local worker
+  - current structured block reason:
+    `single-process smoke cannot emulate distinct remote TRT-LLM peers; all gathered sender endpoints collapse to the same live worker`
+- What was completed in this run:
+  - full repo-local validation of the current KVBM/TRT-LLM seam
+  - refreshed runtime-audit result against installed TRT-LLM `1.3.0rc9`
+  - refreshed fake-worker and bounded real-worker smoke results for handover
+- What remains after this run:
+  - validate generation-side disaggregated transfer with distinct TRT-LLM
+    peers instead of the one-process smoke harness
+  - if that real multi-peer attempt exposes a new Python-visible seam, patch
+    the repo-local smoke/integration layer around it; otherwise treat the next
+    issue as external runtime bring-up work
+- Exact next command or file to touch:
+  - command:
+    `TLLM_DISABLE_MPI=1 PYTHONPATH=lib/bindings/kvbm/python:.venv/lib/python3.12/site-packages python3 lib/bindings/kvbm/tools/trtllm_disagg_smoke.py --real-transfer-worker`
+    but only from a setup that can provide distinct TRT-LLM peers/ranks
+  - if that setup is not available yet, the next file to touch is
+    `lib/bindings/kvbm/tools/trtllm_disagg_smoke.py` to add a true
+    multi-process harness instead of extending repo-local metadata shims
+
+- Re-read `components/src/dynamo/sglang/AGENTS.md`,
+  `docs/backends/sglang/agents.md`, and the current `PLANS.md` before
+  continuing this run.
+- Revalidated the repo-local baseline again on 2026-03-31 00:52:04 UTC before
+  new edits:
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_integration`
+    -> pass (`Ran 27 tests`, `OK`, `skipped=3`)
+  - `python3 -m unittest lib.bindings.kvbm.tests.test_trtllm_torch_exports`
+    -> pass (`Ran 3 tests`, `OK`)
+  - `cargo check --manifest-path lib/bindings/kvbm/Cargo.toml`
+    -> pass
+- Chosen next executable repo-local milestone for this run:
+  reduce the Python-side TRT-LLM disaggregation metadata seam by letting the
+  native KVBM primary-pool export report its own tensor layout metadata
+  directly, instead of forcing the manager to depend on torch-backed tensor
+  reconstruction just to read shape/stride/base-address facts.
+- Exact next step in this run:
+  patch the Rust primary-pool export surface, teach
+  `kvbm.trtllm_integration.kv_cache_manager` to prefer that native metadata,
+  then rerun the targeted TRT-LLM integration tests plus `cargo check`.
 
 - Re-read `Agents.md`, `PLANS.md`,
   `docs/design-docs/kvbm-trtllm-integration.md`, and the active repo-local

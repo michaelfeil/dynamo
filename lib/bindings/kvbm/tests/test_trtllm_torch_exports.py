@@ -52,6 +52,13 @@ class TrtllmTorchExportSmokeTest(unittest.TestCase):
         self.assertEqual(tuple(tensor.stride()), (1024, 1024, 512, 128, 1))
         self.assertEqual(tensor.device, self.torch.device("cuda", self.device_id))
         self.assertEqual(tensor.dtype, self.torch.float16)
+        self.assertEqual(tuple(primary_pool.shape), (2, 1, 2, 4, 128))
+        self.assertEqual(
+            tuple(primary_pool.stride(dim) for dim in range(len(primary_pool.shape))),
+            (1024, 1024, 512, 128, 1),
+        )
+        self.assertEqual(primary_pool.element_size(), 2)
+        self.assertGreater(primary_pool.data_ptr(), 0)
 
     def test_standard_rank_local_exports_round_trip_through_torch(self) -> None:
         manager = self.KvbmKVCacheManager(

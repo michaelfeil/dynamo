@@ -350,4 +350,5 @@ There are two components of the interface:
 
 - [KVBM Overview](../components/kvbm/README.md)
 - [KVBM Guide](../components/kvbm/kvbm-guide.md)
+- [KVBM G4 NVMe RAID Plan](./kvbm-g4-nvme-raid-plan.md)
 - [NIXL Documentation](https://github.com/ai-dynamo/nixl/blob/main/docs/nixl.md)

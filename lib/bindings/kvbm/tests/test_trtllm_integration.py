@@ -1442,6 +1442,53 @@ class TrtllmIntegrationTest(unittest.TestCase):
         self.assertEqual(storage._buffer_attr[(1, "key")].offset, 1536)
         self.assertEqual(storage._buffer_attr[(1, "value")].offset, 2304)
 
+    def test_manager_exposes_fake_v2_disagg_metadata_from_native_pool_layout(self) -> None:
+        integration = importlib.import_module("kvbm.trtllm_integration")
+
+        class _NativePool:
+            shape = (8, 2, 2, 4, 96)
+
+            @staticmethod
+            def stride(dim: int) -> int:
+                return (1536, 768, 384, 96, 1)[dim]
+
+            @staticmethod
+            def element_size() -> int:
+                return 2
+
+            @staticmethod
+            def data_ptr() -> int:
+                return 4096
+
+        manager = integration.KvbmKVCacheManager(
+            tokens_per_block=4,
+            dtype="float16",
+            head_dim=16,
+            pp_layers=[2, 3],
+            total_num_kv_heads_per_layer=[6, 6, 6, 6],
+            max_seq_len=64,
+            num_blocks=8,
+            primary_pool=_NativePool(),
+            device_id=2,
+            world_size=4,
+            tp_size=2,
+            tp_rank=1,
+            pp_size=2,
+            pp_rank=1,
+        )
+
+        storage = manager.get_disagg_storage_metadata()
+        pool = storage._levels[0].storage._pool_groups[0]._pools[0]
+
+        self.assertEqual(pool.base_address, 4096)
+        self.assertEqual(pool.slot_size, 3072)
+        self.assertEqual(pool.num_slots, 8)
+        self.assertEqual(storage._buffer_attr[(0, "key")].offset, 0)
+        self.assertEqual(storage._buffer_attr[(0, "key")].size, 768)
+        self.assertEqual(storage._buffer_attr[(0, "value")].offset, 768)
+        self.assertEqual(storage._buffer_attr[(1, "key")].offset, 1536)
+        self.assertEqual(storage._buffer_attr[(1, "value")].offset, 2304)
+
     def test_manager_exposes_key_only_disagg_metadata_for_mla(self) -> None:
         integration = importlib.import_module("kvbm.trtllm_integration")
 

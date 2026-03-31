@@ -6,7 +6,7 @@
 use super::*;
 use dynamo_llm::block_manager::block::BlockDataExt;
 use dynamo_llm::block_manager::block::BlockDataProviderMut;
-use pyo3::{types::PyTuple, PyObject, PyResult, Python};
+use pyo3::{PyObject, PyResult, Python, types::PyTuple};
 use std::sync::{Arc, Mutex};
 
 // Layer struct that represents a layer within a block
@@ -73,26 +73,30 @@ impl Layer {
             ptr = match &mut *mutable_block {
                 block::BlockType::Pinned(block) => {
                     let block_data = block.block_data_mut();
-                    let mut layer_view_mut =
-                        block_data.layer_view_mut(self.layer_idx, 0).map_err(to_pyerr)?;
+                    let mut layer_view_mut = block_data
+                        .layer_view_mut(self.layer_idx, 0)
+                        .map_err(to_pyerr)?;
                     (unsafe { layer_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
                 }
                 block::BlockType::PinnedOwned(block) => {
                     let block_data = block.block_data_mut();
-                    let mut layer_view_mut =
-                        block_data.layer_view_mut(self.layer_idx, 0).map_err(to_pyerr)?;
+                    let mut layer_view_mut = block_data
+                        .layer_view_mut(self.layer_idx, 0)
+                        .map_err(to_pyerr)?;
                     (unsafe { layer_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
                 }
                 block::BlockType::Device(block) => {
                     let block_data = block.block_data_mut();
-                    let mut layer_view_mut =
-                        block_data.layer_view_mut(self.layer_idx, 0).map_err(to_pyerr)?;
+                    let mut layer_view_mut = block_data
+                        .layer_view_mut(self.layer_idx, 0)
+                        .map_err(to_pyerr)?;
                     (unsafe { layer_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
                 }
                 block::BlockType::DeviceOwned(block) => {
                     let block_data = block.block_data_mut();
-                    let mut layer_view_mut =
-                        block_data.layer_view_mut(self.layer_idx, 0).map_err(to_pyerr)?;
+                    let mut layer_view_mut = block_data
+                        .layer_view_mut(self.layer_idx, 0)
+                        .map_err(to_pyerr)?;
                     (unsafe { layer_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
                 }
             };

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use pyo3::{prelude::*, wrap_pymodule};
 #[cfg(not(test))]
 use pyo3::wrap_pyfunction;
+use pyo3::{prelude::*, wrap_pymodule};
 
 use std::collections::HashMap;
 
@@ -220,10 +220,12 @@ impl TrtllmStateManager {
 
     fn prepare_context(&mut self, request_id: u64, is_first_context_chunk: bool) -> PyResult<bool> {
         if is_first_context_chunk {
-            self.request_state.entry(request_id).or_insert(RequestState {
-                active: true,
-                ..Default::default()
-            });
+            self.request_state
+                .entry(request_id)
+                .or_insert(RequestState {
+                    active: true,
+                    ..Default::default()
+                });
         } else {
             self.request_state_for(request_id)?;
         }
@@ -252,7 +254,11 @@ impl TrtllmStateManager {
         Ok(resized)
     }
 
-    fn try_allocate_generation(&mut self, request_id: u64, draft_token_len: usize) -> PyResult<bool> {
+    fn try_allocate_generation(
+        &mut self,
+        request_id: u64,
+        draft_token_len: usize,
+    ) -> PyResult<bool> {
         let Some(state) = self.request_state.get_mut(&request_id) else {
             return Ok(false);
         };
@@ -411,10 +417,12 @@ impl TrtllmStateManager {
     }
 
     fn add_dummy_request(&mut self, request_id: u64, target_capacity: usize) -> PyResult<bool> {
-        self.request_state.entry(request_id).or_insert(RequestState {
-            active: true,
-            ..Default::default()
-        });
+        self.request_state
+            .entry(request_id)
+            .or_insert(RequestState {
+                active: true,
+                ..Default::default()
+            });
         self.slot_for(request_id)?;
         self.request_state_for_mut(request_id)?.active = true;
         self.resize_state(request_id, target_capacity)
@@ -469,7 +477,8 @@ fn create_primary_pool_inner(
         .build()
         .map_err(to_pyerr)?;
     let allocator = DeviceAllocator::new(device_id).map_err(to_pyerr)?;
-    let layout = FullyContiguous::<DeviceStorage>::allocate(config, &allocator).map_err(to_pyerr)?;
+    let layout =
+        FullyContiguous::<DeviceStorage>::allocate(config, &allocator).map_err(to_pyerr)?;
     let blocks = Blocks::<_, BasicMetadata>::new(layout, 0, 0)
         .map_err(to_pyerr)?
         .into_blocks()
@@ -479,7 +488,9 @@ fn create_primary_pool_inner(
         .map(block::BlockType::DeviceOwned)
         .collect();
 
-    Ok(block_list::BlockList::from_rust(block_list, dtype, device_id))
+    Ok(block_list::BlockList::from_rust(
+        block_list, dtype, device_id,
+    ))
 }
 
 #[cfg(not(test))]
@@ -495,13 +506,7 @@ fn create_primary_pool(
     device_id: usize,
 ) -> PyResult<block_list::BlockList> {
     create_primary_pool_inner(
-        num_blocks,
-        num_layers,
-        kv_factor,
-        page_size,
-        inner_dim,
-        dtype,
-        device_id,
+        num_blocks, num_layers, kv_factor, page_size, inner_dim, dtype, device_id,
     )
 }
 

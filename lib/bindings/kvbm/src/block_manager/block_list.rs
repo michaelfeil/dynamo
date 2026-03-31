@@ -6,7 +6,10 @@
 use super::*;
 use dynamo_llm::block_manager::block::BlockDataExt;
 use dynamo_llm::block_manager::block::BlockDataProviderMut;
-use pyo3::{types::{PyList, PyTuple}, PyObject, PyResult, Python};
+use pyo3::{
+    PyObject, PyResult, Python,
+    types::{PyList, PyTuple},
+};
 use std::sync::{Arc, Mutex};
 
 fn primary_pool_shape(
@@ -17,6 +20,27 @@ fn primary_pool_shape(
     inner_dim: i64,
 ) -> Vec<i64> {
     vec![num_blocks, num_layers, num_outer_dims, page_size, inner_dim]
+}
+
+fn primary_pool_strides(
+    num_blocks: i64,
+    num_layers: i64,
+    num_outer_dims: i64,
+    page_size: i64,
+    inner_dim: i64,
+) -> Vec<i64> {
+    let _ = num_blocks;
+    let layer_stride = num_outer_dims * page_size * inner_dim;
+    let outer_stride = page_size * inner_dim;
+    let page_stride = inner_dim;
+
+    vec![
+        num_layers * layer_stride,
+        layer_stride,
+        outer_stride,
+        page_stride,
+        1,
+    ]
 }
 
 fn layer_pool_shape_and_strides(
@@ -64,9 +88,7 @@ impl BlockList {
         }
     }
 
-    fn first_block_dims(
-        &self,
-    ) -> PyResult<(i64, i64, i64, i64)> {
+    fn first_block_dims(&self) -> PyResult<(i64, i64, i64, i64)> {
         let block = self
             .inner
             .first()
@@ -107,28 +129,28 @@ impl BlockList {
             .first()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("BlockList is empty"))?;
         let mut mutable_block = block.lock().unwrap();
-            let ptr = match &mut *mutable_block {
-                block::BlockType::Pinned(block) => {
-                    let block_data = block.block_data_mut();
-                    let mut block_view_mut = block_data.block_view_mut().map_err(to_pyerr)?;
-                    (unsafe { block_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
-                }
-                block::BlockType::PinnedOwned(block) => {
-                    let block_data = block.block_data_mut();
-                    let mut block_view_mut = block_data.block_view_mut().map_err(to_pyerr)?;
-                    (unsafe { block_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
-                }
-                block::BlockType::Device(block) => {
-                    let block_data = block.block_data_mut();
-                    let mut block_view_mut = block_data.block_view_mut().map_err(to_pyerr)?;
-                    (unsafe { block_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
-                }
-                block::BlockType::DeviceOwned(block) => {
-                    let block_data = block.block_data_mut();
-                    let mut block_view_mut = block_data.block_view_mut().map_err(to_pyerr)?;
-                    (unsafe { block_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
-                }
-            };
+        let ptr = match &mut *mutable_block {
+            block::BlockType::Pinned(block) => {
+                let block_data = block.block_data_mut();
+                let mut block_view_mut = block_data.block_view_mut().map_err(to_pyerr)?;
+                (unsafe { block_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
+            }
+            block::BlockType::PinnedOwned(block) => {
+                let block_data = block.block_data_mut();
+                let mut block_view_mut = block_data.block_view_mut().map_err(to_pyerr)?;
+                (unsafe { block_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
+            }
+            block::BlockType::Device(block) => {
+                let block_data = block.block_data_mut();
+                let mut block_view_mut = block_data.block_view_mut().map_err(to_pyerr)?;
+                (unsafe { block_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
+            }
+            block::BlockType::DeviceOwned(block) => {
+                let block_data = block.block_data_mut();
+                let mut block_view_mut = block_data.block_view_mut().map_err(to_pyerr)?;
+                (unsafe { block_view_mut.as_mut_ptr() }) as *mut std::ffi::c_void
+            }
+        };
         Ok(ptr)
     }
 }
@@ -159,6 +181,43 @@ impl BlockList {
         }
         let block = block::Block::from_rust(self.inner[index].clone(), self.dtype, self.device_id);
         Ok(block)
+    }
+
+    #[getter]
+    fn shape(&self) -> PyResult<Vec<i64>> {
+        let (num_layers, num_outer_dims, page_size, inner_dim) = self.first_block_dims()?;
+        Ok(primary_pool_shape(
+            self.inner.len() as i64,
+            num_layers,
+            num_outer_dims,
+            page_size,
+            inner_dim,
+        ))
+    }
+
+    fn stride(&self, dim: usize) -> PyResult<i64> {
+        let (num_layers, num_outer_dims, page_size, inner_dim) = self.first_block_dims()?;
+        let strides = primary_pool_strides(
+            self.inner.len() as i64,
+            num_layers,
+            num_outer_dims,
+            page_size,
+            inner_dim,
+        );
+        strides.get(dim).copied().ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!(
+                "Stride dimension {dim} out of range for BlockList with {} dims",
+                strides.len()
+            ))
+        })
+    }
+
+    fn element_size(&self) -> usize {
+        self.dtype.size_in_bytes()
+    }
+
+    fn data_ptr(&self) -> PyResult<usize> {
+        Ok(self.first_block_ptr()? as usize)
     }
 
     fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
@@ -265,10 +324,9 @@ pub struct BlockListLayerView {
 
 impl BlockListLayerView {
     fn layer_ptr_and_dims(&self) -> PyResult<(*mut std::ffi::c_void, i64, i64, i64, i64)> {
-        let block = self
-            .inner
-            .first()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("BlockListLayerView is empty"))?;
+        let block = self.inner.first().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("BlockListLayerView is empty")
+        })?;
         let mut mutable_block = block.lock().unwrap();
         let ptr = match &mut *mutable_block {
             block::BlockType::Pinned(block) => {
@@ -380,10 +438,9 @@ impl BlockListLayerView {
 
     #[pyo3(signature = ())]
     fn __dlpack_device__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let first_block = self
-            .inner
-            .first()
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("BlockListLayerView is empty"))?;
+        let first_block = self.inner.first().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("BlockListLayerView is empty")
+        })?;
         dlpack::dlpack_device(py, first_block.clone(), self.device_id)
     }
 }
@@ -395,6 +452,14 @@ mod tests {
     #[test]
     fn primary_pool_shape_matches_block_first_layout() {
         assert_eq!(primary_pool_shape(4, 2, 3, 16, 8), vec![4, 2, 3, 16, 8]);
+    }
+
+    #[test]
+    fn primary_pool_strides_match_contiguous_block_first_layout() {
+        assert_eq!(
+            primary_pool_strides(4, 2, 3, 16, 8),
+            vec![768, 384, 128, 8, 1]
+        );
     }
 
     #[test]

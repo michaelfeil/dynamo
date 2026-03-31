@@ -19,8 +19,8 @@ mod block;
 mod block_list;
 mod cache_stats;
 mod controller;
-mod dlpack;
 mod distributed;
+mod dlpack;
 mod layer;
 
 pub mod trtllm;

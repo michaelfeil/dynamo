@@ -447,8 +447,14 @@ class KvbmKVCacheManager:
             window_size_to_layers.setdefault(life_cycle.window_size, []).extend(layers)
         return window_size_to_layers
 
-    def _build_disagg_metadata(self) -> dict[str, Any]:
-        pool = self.get_unique_primary_pool()
+    def _get_primary_pool_layout_source(self) -> Any:
+        pool = self.primary_pool
+        required_attrs = ("shape", "stride", "data_ptr", "element_size")
+        if pool is not None and all(hasattr(pool, attr) for attr in required_attrs):
+            return pool
+        return self.get_unique_primary_pool()
+
+    def _read_primary_pool_layout(self, pool: Any) -> tuple[tuple[int, ...], tuple[int, ...], int, int]:
         required_attrs = ("shape", "data_ptr", "element_size")
         if any(not hasattr(pool, attr) for attr in required_attrs):
             raise NotImplementedError(
@@ -460,19 +466,27 @@ class KvbmKVCacheManager:
                 "Primary-pool export is missing stride metadata needed for TRTLLM "
                 "disaggregation page-table construction"
             )
+
         shape = tuple(int(dim) for dim in pool.shape)
-        if len(shape) != 6:
+        strides = tuple(int(pool.stride(dim)) for dim in range(len(shape)))
+        element_size = int(pool.element_size())
+        base_address = int(pool.data_ptr())
+        return shape, strides, element_size, base_address
+
+    def _build_disagg_metadata(self) -> dict[str, Any]:
+        pool = self._get_primary_pool_layout_source()
+        shape, strides, element_size, base_address = self._read_primary_pool_layout(pool)
+        if len(shape) not in {5, 6}:
             raise NotImplementedError(
                 "Disaggregation metadata expects primary pool layout "
+                "[blocks, layers, kv_factor, page_size, inner_dim] or "
                 "[blocks, layers, kv_factor, page_size, num_heads, head_dim]"
             )
 
-        element_size = int(pool.element_size())
-        slot_bytes = int(pool.stride(0)) * element_size
-        layer_stride = int(pool.stride(1)) * element_size
-        role_stride = int(pool.stride(2)) * element_size
+        slot_bytes = strides[0] * element_size
+        layer_stride = strides[1] * element_size
+        role_stride = strides[2] * element_size
         buffer_size = role_stride
-        base_address = int(pool.data_ptr())
 
         role_key = "key"
         role_value = "value"

@@ -7,7 +7,7 @@
 
 use super::*;
 use dlpark::prelude::{DataType, Device, ManagerCtx, ShapeAndStrides, ToTensor};
-use pyo3::{ffi::c_str, prelude::IntoPy, types::PyTuple, PyObject, PyResult, Python};
+use pyo3::{PyObject, PyResult, Python, ffi::c_str, prelude::IntoPy, types::PyTuple};
 use std::sync::{Arc, Mutex};
 
 enum DlPackOwner {
@@ -86,12 +86,10 @@ impl ToTensor for DlPackTensor {
                 let ndim = values.len() / 2;
                 ShapeAndStrides::new_with_strides(values[..ndim].iter(), values[ndim..].iter())
             }
-            ShapeAndStrides::Borrowed { .. } => {
-                ShapeAndStrides::new_borrowed(
-                    self.shape_and_strides.shape(),
-                    self.shape_and_strides.strides(),
-                )
-            }
+            ShapeAndStrides::Borrowed { .. } => ShapeAndStrides::new_borrowed(
+                self.shape_and_strides.shape(),
+                self.shape_and_strides.strides(),
+            ),
         }
     }
 }
