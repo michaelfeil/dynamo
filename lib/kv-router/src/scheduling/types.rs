@@ -83,6 +83,7 @@ pub struct SchedulingResponse {
     pub best_worker: WorkerWithDpRank,
     pub effective_overlap_blocks: f64,
     pub cached_tokens: usize,
+    pub dp_strict_rank: bool,
 }
 
 pub struct SchedulingRequest {

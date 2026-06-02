@@ -14,12 +14,50 @@
 
 use crate::kv_router::b10hotreloadablecm;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
-use dynamo_kv_router::protocols::{WorkerId, WorkerSelectionResult};
+use dynamo_kv_router::protocols::{WorkerId, WorkerSelectionResult, WorkerWithDpRank};
 use dynamo_kv_router::scheduling::{
     KvSchedulerError, RoutingEligibility, SchedulingRequest, WorkerEligibilityError,
 };
 use dynamo_kv_router::selector::WorkerSelector;
 use std::collections::HashMap;
+
+/// Returns whether DP routing should be strict for the already-selected DP rank.
+///
+/// Lower scores are better. Strict routing is used when the selected rank is
+/// materially better than the worst same-worker alternative; otherwise routing
+/// can relax the rank with limited expected impact.
+fn b10_filter_dp_score(
+    all_scores: impl IntoIterator<Item = (WorkerWithDpRank, f64)>,
+    worker: WorkerWithDpRank,
+) -> bool {
+    const DP_ROUTING_THRESHOLD_PCT: f64 = 0.05;
+
+    let mut selected_score = None;
+    let mut worst_alternative = f64::NEG_INFINITY;
+
+    for (candidate, score) in all_scores {
+        if candidate.worker_id != worker.worker_id {
+            continue;
+        }
+        if candidate == worker {
+            selected_score = Some(score);
+        } else {
+            worst_alternative = worst_alternative.max(score);
+        }
+    }
+
+    let Some(selected_score) = selected_score else {
+        return false;
+    };
+    if !selected_score.is_finite() || !worst_alternative.is_finite() {
+        return false;
+    }
+
+    let denominator = selected_score.abs().max(1e-9);
+    let advantage_vs_worst = worst_alternative - selected_score;
+
+    advantage_vs_worst > DP_ROUTING_THRESHOLD_PCT * denominator
+}
 
 /// B10 Worker Selector that uses hot-reloadable configuration.
 #[derive(Debug, Default)]
@@ -135,13 +173,16 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                 required_blocks: request_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                dp_strict_rank: true,
             });
         }
 
         let mut best_worker = None;
         let mut best_logit = f64::INFINITY;
+        let mut worker_logits = Vec::new();
         eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
             let score = score_worker(worker);
+            worker_logits.push((worker, score));
             if score < best_logit {
                 best_logit = score;
                 best_worker = Some(worker);
@@ -165,6 +206,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             required_blocks: request_blocks,
             effective_overlap_blocks,
             cached_tokens,
+            dp_strict_rank: b10_filter_dp_score(worker_logits, best_worker),
         })
     }
 }

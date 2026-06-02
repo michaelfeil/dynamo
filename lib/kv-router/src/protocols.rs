@@ -463,6 +463,8 @@ pub enum RouterResponse {
         #[serde(default)]
         dp_rank: DpRank,
         overlap_blocks: u32,
+        #[serde(default)]
+        dp_strict_rank: bool,
     },
     Backpressure {
         reason: RouterBackpressureReason,
@@ -497,6 +499,10 @@ pub struct WorkerSelectionResult {
 
     /// Approximate cached-token count derived from the weighted cache hit.
     pub cached_tokens: usize,
+
+    /// Whether routing should remain strict on the selected data-parallel rank.
+    /// Default false means relaxed routing is acceptable.
+    pub dp_strict_rank: bool,
 }
 
 /// Active load metrics for a worker, used for overload detection.

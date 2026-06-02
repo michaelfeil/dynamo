@@ -354,6 +354,7 @@ impl KvPushRouter {
                 effective_overlap_blocks,
                 cached_tokens,
                 routing_hashes,
+                ..
             } => Ok(WorkerSelection {
                 instance_id: worker.worker_id,
                 dp_rank: worker.dp_rank,

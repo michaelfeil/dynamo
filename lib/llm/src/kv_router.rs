@@ -84,6 +84,7 @@ pub enum FindBestMatchOutcome {
         overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
+        dp_strict_rank: bool,
         routing_hashes: Option<RoutingDecisionHashes>,
     },
     Backpressure {
@@ -547,6 +548,7 @@ where
             overlap_blocks: response.effective_overlap_blocks.round() as u32,
             effective_overlap_blocks: response.effective_overlap_blocks,
             cached_tokens: response.cached_tokens,
+            dp_strict_rank: response.dp_strict_rank,
             routing_hashes,
         })
     }
@@ -1003,11 +1005,13 @@ where
                     Ok(FindBestMatchOutcome::Routed {
                         worker,
                         overlap_blocks,
+                        dp_strict_rank,
                         ..
                     }) => RouterResponse::New {
                         worker_id: worker.worker_id,
                         dp_rank: worker.dp_rank,
                         overlap_blocks,
+                        dp_strict_rank,
                     },
                     Ok(FindBestMatchOutcome::Backpressure {
                         reason,
@@ -1157,6 +1161,7 @@ mod tests {
                 required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
                 effective_overlap_blocks: 0.0,
                 cached_tokens: 0,
+                dp_strict_rank: false,
             })
         }
     }
