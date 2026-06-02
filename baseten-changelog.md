@@ -627,8 +627,8 @@ and `thinking`. This follows v1.1's "validate-or-400, never silently drop"
 decision for Baseten-maintained fields: invalid `dynamic_temperature` keys,
 values, or `thinking.type` variants fail during deserialization. Unlike v1.1,
 this slice intentionally kept the target branch's stricter unknown-field
-validation instead of changing all unknown parameters to warn-and-ignore; that
-broader compatibility decision should be made separately with client tests.
+validation instead of changing all unknown parameters to warn-and-ignore; later
+validation kept that stricter target behavior.
 
 The Anthropic conformance slice follows v1.1 commit `d493fef1d` closely because
 all three behaviors are externally visible API compatibility requirements:
@@ -679,9 +679,10 @@ monitor examples. It dropped Python selector support and
 `9cfeeb5e2` later restored JSON publisher/subscriber bindings after they became
 EventPlane-backed and safe to use without NATS.
 
-For v1.2, do not follow the Python-selector drop. Preserve B10 router bindings,
-Python selector/plugin callable support, `PyWorkerSelectionResult`, and JSON
-pub/sub if planner or routing code still depends on it. Keep first-token
+For v1.2, follow the Python-selector drop. Preserve B10 router bindings through
+`RouterConfig(..., algo_selector="B10")`, preserve JSON pub/sub if planner or
+routing code still depends on it, but do not restore arbitrary Python
+selector/plugin callable support or `PyWorkerSelectionResult`. Keep first-token
 webserver behavior as a design requirement, but port through the target
 frontend/backend APIs rather than copying old binding code.
 
