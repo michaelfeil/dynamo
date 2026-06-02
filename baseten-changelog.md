@@ -1,0 +1,859 @@
+# Baseten Dynamo Fork Patch Changelog
+
+Source branch: `main-v1.0.0`
+
+Comparison base: `origin/upstream/v1.0.0`
+
+Target rebase base reviewed: `bed9f269312151481cd67a8d21b70e0f52424c2b`
+from `https://github.com/ai-dynamo/dynamo`.
+
+Branch head covered:
+
+```text
+c9bf0c4ed fix: Make router active replicas hot configurable (#251)
+```
+
+This file is the long-term patch ledger for rebasing the Baseten Dynamo fork
+onto a newer upstream release such as `main-v1.2.0`.
+
+The entries below are intentionally grouped by replay unit, not by original PR
+or commit. Each group should be treated as one functional area to audit, port,
+test, and either keep or drop during an upgrade.
+
+Status values:
+
+- `keep`: likely Baseten-specific or still required.
+- `review-upstream`: check the target upstream release before replaying.
+- `upstream-sync`: local branch intentionally copied an upstream/main change.
+- `mixed`: contains both Baseten-specific work and changes that may already be
+  upstream.
+- `redesign`: the old behavior may still matter, but the target branch already
+  changed the subsystem enough that the old patch should not be replayed
+  directly.
+- `drop`: do not preserve the old fork behavior on the target branch.
+- `reverted`: historical context only; do not replay as-is.
+
+## Target Base Validation
+
+The SHA `bed9f269312151481cd67a8d21b70e0f52424c2b` is a valid upstream Dynamo
+commit:
+
+```text
+bed9f269312151481cd67a8d21b70e0f52424c2b feat(mocker): add AIC forward-pass engine perf shim (#10150)
+```
+
+I could not fetch an upstream branch or tag literally named `main-v1.2.0` or
+`v1.2.0`. The precise plan should therefore be: create a local Baseten
+`main-v1.2.0` branch from the upstream SHA above.
+
+```bash
+git fetch https://github.com/ai-dynamo/dynamo bed9f269312151481cd67a8d21b70e0f52424c2b
+git switch -c main-v1.2.0 bed9f269312151481cd67a8d21b70e0f52424c2b
+```
+
+## Target Decision Summary
+
+| Patch | Target decision | Reason |
+| --- | --- | --- |
+| `PATCH-001` CI/container | Keep, retarget branch names | Fork image publishing and CI still need Baseten-specific wiring. |
+| `PATCH-002` runtime/shutdown | Keep behavior, port manually | Shutdown/drain invariants still matter; target code has moved. |
+| `PATCH-003` NATS/JetStream/discovery | Mostly discard or minimize | Target has P2P standalone-indexer recovery; NATS is less central. Keep only object-store/client-access needs that still exist. |
+| `PATCH-004` router core/queueing | Redesign, do not replay old queue stack | Target already has tiered ISL queue config and P2P recovery. Preserve only missing Baseten policy knobs after testing. |
+| `PATCH-005` metrics/tracing | Keep | Added metrics should be preserved across versions. |
+| `PATCH-006` protocols | Mixed: follow v1.1 by default, test exceptions | Target still rejects `stream_options` without streaming, and that is acceptable. Target has modern tool/reasoning parsing; port only Baseten/client-facing gaps found by tests. |
+| `PATCH-007` Python APIs | Keep relevant API behavior | Holding streams until first token for Python webserver engines remains a useful design. |
+| `PATCH-008` model/parser/vLLM | Mostly review-upstream | Target already has broad parser/reasoning support; do not replay old version bumps blindly. |
+| `PATCH-009` validation/limits | Mixed | TCP limit is configurable upstream, but default is 32 MiB at target SHA. Preserve 256 MiB by env/config or carry a default change. |
+| `PATCH-010` logging | Keep structured logging | Preserve request correlation and structured fields; avoid old noisy level churn. |
+| `PATCH-011` upstream syncs | Drop as direct patches | Use only as audit hints; many behaviors are already represented upstream. |
+| `PATCH-012` reverted experiments | Drop | Historical context only. |
+
+## Alignment with `main-v1.1.0`
+
+The refreshed Baseten `main-v1.1.0` branch follows the same strategy this
+ledger recommends: advance to upstream first, then replay Baseten changes as a
+short series of logical commits instead of preserving the old raw commit
+sequence. After upstream commit `cc5b2cd29` (`chore: bump version references to
+v1.1.0`), the Baseten replay is distilled into these groups:
+
+| `main-v1.1.0` replay commit | Ledger group |
+| --- | --- |
+| `9e5806c82` CI/fork-survival workflows, build script, version stamping | `PATCH-001` |
+| `14e94a0f9` runtime resilience, lifecycle ordering, transport hardening | `PATCH-002`, `PATCH-009`, `PATCH-010` |
+| `ce5dfa1c9` OTel exporter env handling | `PATCH-005`, `PATCH-010` |
+| `1de204080` B10 worker selector, hot-reloadable config, snapshot toggle | `PATCH-004`, `PATCH-005` |
+| `a3f024b40` hot-reloadable queue threshold, queue metrics, `respond` result | `PATCH-004`, `PATCH-005` |
+| `6f36f18d4` OpenAI protocol extensions, `baseten_ext`, B10 health/rate-limit | `PATCH-006` |
+| `d493fef1d` Anthropic protocol conformance | `PATCH-006` |
+| `9adbfdc64` B10 router and service pipeline Python bindings | `PATCH-007` |
+| `9cfeeb5e2` `JsonPublisher` / `JsonSubscriberIter` Python bindings | `PATCH-003`, `PATCH-007` |
+| `e127637c2` dispatchable BIS Dynamo Image Push workflow | `PATCH-001` |
+
+What is the same:
+
+- The replay unit is a behavior area, not a historical commit.
+- CI/image publishing is carried as fork-specific infrastructure.
+- Runtime resilience, observability, router policy, protocol compatibility, and
+  Python API surfaces remain the major Baseten-owned areas.
+- The branch keeps source commit intent alive while producing a cleaner patch
+  queue.
+
+What differs for `main-v1.2.0`:
+
+- The target SHA already has P2P standalone-indexer recovery and tiered ISL
+  queueing, so the `main-v1.1.0` router/NATS replay should be treated as audit
+  evidence first, not copied wholesale.
+- The target has newer tool/reasoning parsing and first-token APIs, so the
+  OpenAI/Anthropic/Python patches should be test-driven deltas rather than a
+  direct port of the v1.1 commits.
+- The TCP message-size default remains a concrete Baseten delta: target
+  upstream is configurable but defaults to 32 MiB, while Baseten wants 256 MiB.
+- The `465795594` WIP data snapshot on `main-v1.1.0` is not a model for the
+  long-term patch ledger; preserve it only if those profiler artifacts are
+  intentionally required.
+
+## Recommended First Wave for `main-v1.2.0`
+
+For the target SHA reviewed here, the maintainable patch queue should be much
+smaller than the historical commit list. Start with concrete Baseten deltas and
+use tests to prove whether broader subsystems still need work:
+
+1. Carry the small TCP default patch from `PATCH-009`: target upstream exposes
+   `DYN_TCP_MAX_MESSAGE_SIZE`, but defaults to 32 MiB. Baseten should default
+   to 256 MiB unless deployment config is guaranteed to set the env var.
+2. Port `PATCH-001` CI/container changes that are still branch- and
+   registry-specific. Retarget branch literals to `main-v1.2.0`.
+3. Preserve structured logging and request correlation from `PATCH-010`, but
+   only add fields or level changes that are missing on the target.
+4. Build a metric inventory for `PATCH-005` and port missing metric names or
+   labels that dashboards depend on.
+5. Test target runtime shutdown/drain behavior before porting `PATCH-002`; keep
+   only missing invariants.
+6. Follow the v1.1 protocol decisions by default, then test protocol and
+   Python first-token behavior before porting `PATCH-006` or `PATCH-007`; the
+   target already has newer tool/reasoning parsing and first-token APIs.
+7. Treat `PATCH-003` and most of `PATCH-004` as audit-only initially. The
+   target has P2P recovery and tiered ISL queueing, so only carry forward
+   Baseten-specific knobs that remain absent after testing.
+
+## Historical Ledger Order
+
+1. `PATCH-001`: Fork CI, release, and container build infrastructure
+2. `PATCH-002`: Runtime lifecycle, transport resilience, and graceful shutdown
+3. `PATCH-003`: NATS, JetStream, and discovery compatibility
+4. `PATCH-004`: Baseten router core, hot reload, scheduling, and queueing
+5. `PATCH-005`: Router metrics, tracing, and observability
+6. `PATCH-006`: OpenAI, Anthropic, and Baseten protocol compatibility
+7. `PATCH-007`: Python bindings and service-facing APIs
+8. `PATCH-008`: Model, parser, vLLM, and multimodal compatibility
+9. `PATCH-009`: Validation, limits, and operational compatibility knobs
+10. `PATCH-010`: Logging policy and production signal cleanup
+11. `PATCH-011`: Upstream syncs and likely already-upstream patches
+12. `PATCH-012`: Reverted or do-not-replay experiments
+
+Use this order for reading the ledger and understanding dependencies. For the
+actual `main-v1.2.0` replay, use the smaller first-wave order above and only
+expand into these groups when tests show a concrete gap.
+
+## PATCH-001: Fork CI, Release, and Container Build Infrastructure
+
+Status: `keep`
+
+Source commits:
+
+- `f2076864a` chore: CI cleanup, build environment, and infrastructure setup
+- `396e5a58b` chore: skip fern docs release-version job on fork
+- `24c32bf91` ci: target main-v1.0.0 instead of main for pre-merge push triggers (#161)
+- `88319e629` ci: add post-merge build for framework=none image (#162)
+- `2546311a1` ci: use depot runner for post-merge build (#163)
+- `1309b86da` feat(container): stamp dynamo version into image (#215)
+- `0e3ac0d0e` ci: add dispatchable BIS Dynamo Image Push workflow (#252)
+- `b76d509d2` container: skip stale vllm hotfix on newer versions
+
+Purpose:
+
+Make upstream Dynamo build, test, and image workflows usable for the Baseten
+fork and release branches. This includes removing irrelevant upstream workflows,
+retargeting CI to release branch names, adding post-merge image builds, stamping
+image versions, adding BIS image push dispatch, and avoiding stale container
+hotfixes on newer dependency versions.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade kept this as fork-owned infrastructure. Commit `9e5806c82`
+removed upstream-only workflows, retargeted CI to `main-v1.1.0`, restored the
+fork `container/build.sh`, added `.version-base` and `tools/version-stamp.sh`,
+and kept container-template changes needed for Baseten image builds. Commit
+`e127637c2` then added the dispatchable BIS Dynamo Image Push workflow.
+
+For v1.2, follow the v1.1 strategy: keep the fork CI/image/versioning layer and
+retarget all branch literals to `main-v1.2.0`. Re-audit one-off v1.1 fixes such
+as LFS fixture removal, stale dependency workarounds, and clippy workarounds
+instead of carrying them mechanically.
+
+Replay notes:
+
+Port this first so the new branch has a working CI and image path. Retarget all
+branch-name literals, for example from `main-v1.0.0` to `main-v1.2.0`. Do not
+blindly replay old dependency workarounds; keep only the ones still needed by
+the target container stack.
+
+## PATCH-002: Runtime Lifecycle, Transport Resilience, and Graceful Shutdown
+
+Status: `keep`
+
+Source commits:
+
+- `4a97a52bf` feat: runtime resilience and transport hardening
+- `eda65f1ba` fix: bump instance-down log levels to info for production observability
+- `5f0d465aa` fix: spawn health heartbeat before blocking on worker discovery (#165)
+- `a36209650` fix(runtime): prevent NATS/ETCD teardown during HTTP request drain (#184)
+- `98ee65835` Merge pull request #247 from basetenlabs/trid/graceful-dyn10
+- `6f49732b7` runtime: drain inflight requests before stopping push endpoints
+- `e1574723e` runtime: unpublish draining endpoints from discovery
+- `59a6c1582` network host parameter (makes dev on vultr more consistent)
+- `0bf331f55` Merge pull request #244 from basetenlabs/aracharl/network-host-param
+
+Purpose:
+
+Harden runtime lifecycle behavior for production serving. This group adds
+structured context stop/kill reasons, graceful request draining, health
+heartbeat startup ordering, push endpoint shutdown behavior, discovery
+unpublication while draining, runtime dependency lifetime fixes during HTTP
+drain, network host configurability, and less noisy instance-down reporting.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade kept runtime hardening in `14e94a0f9`. That replay preserved
+graceful drain behavior, stop/kill reason APIs, shutdown ordering fixes, health
+heartbeat startup ordering, etcd reconnect/watch recovery, NATS
+NoResponders/auto-resubscribe handling, the 256 MiB TCP framing default,
+worker-pool default bumps, and selected runtime log cleanup. Where upstream
+v1.1 already had shared TCP max-message-size helpers, the fork dropped older
+duplicated helper code and kept upstream structure.
+
+For v1.2, split this decision. Keep the 256 MiB TCP default. Test target
+startup, drain, endpoint unpublication, and shutdown behavior before porting
+lifecycle code. Do not preserve NATS recovery pieces as an objective; the
+v1.2 direction follows the no-NATS/P2P recovery path unless a concrete
+non-P2P production gap is found.
+
+Replay notes:
+
+Port behavior, not necessarily implementation. Upstream may have refactored
+runtime ownership, endpoint lifecycle, or discovery. The important invariant is:
+stop advertising before shutdown, allow in-flight work to drain, keep required
+runtime dependencies alive during drain, and expose enough lifecycle signal to
+debug shutdowns.
+
+Validation:
+
+Exercise startup health, request drain, endpoint unpublication, NATS/ETCD
+lifetime during drain, and forced shutdown timeout behavior.
+
+## PATCH-003: NATS, JetStream, and Discovery Compatibility
+
+Status: `redesign`
+
+Source commits:
+
+- `3d09914c7` Merge pull request #160 from basetenlabs/blarson/backport-release-0.6.0
+- `b7ce2ca07` feat(nats): expose JetStream object store to Python for large embedding offload
+- `481029400` revive lost commits
+- `5ed0b1400` fix config stomping issue
+- `a45d0585f` fix: regenerate python bindings Cargo.lock for --locked CI
+- `aea5b6af7` fix: add nats_client accessor and update Cargo.lock
+- `a1f8300a9` nats getter
+- `9d34e2fee` dedupe
+- `102c7b07b` fix: pin cudarc to =0.19.3 to fix cuda.rs compilation
+- `d75aaad45` fix(kv-router): prevent router NATS consumers from deleting each other on simultaneous startup (#173)
+- `45c78f781` fix(kv-router): restore etcd-based alive registry for orphan cleanup (#179)
+- `bfd4d0772` feat: sync upstream PR #143 and #146 - snapshot metrics + NATS stream config (#149)
+
+Purpose:
+
+Keep discovery, NATS, and JetStream behavior stable for Baseten deployments.
+This includes JetStream object store exposure, NATS client accessors, stream
+configuration update behavior, default retention tuning, consumer startup race
+fixes, and etcd-based alive registry behavior for orphan cleanup.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade mostly dropped NATS-centric router recovery and JetStream
+recovery patches under the no-NATS direction. The important exception was
+`9cfeeb5e2`: v1.1 restored `JsonPublisher` and `JsonSubscriberIter` after those
+APIs were rewritten on the upstream EventPlane abstraction, making them
+transport-agnostic rather than NATS-only.
+
+For v1.2, keep the v1.1 no-NATS decision. Preserve only transport-agnostic
+JSON pub/sub or object-store/client-access behavior that current Baseten code
+still uses. Do not restore router recovery mechanisms whose only purpose was
+NATS/JetStream correctness if target P2P/EventPlane paths cover the need.
+
+Replay notes:
+
+This group has mixed provenance. Some changes were backports or upstream syncs,
+so the target upstream release may already contain them. Audit first, then port
+only remaining Baseten requirements: object store access from Python, consumer
+isolation, alive registry semantics, and stream retention behavior.
+
+Editorial notes:
+
+NATS may be increasingly less needed because the primary recovery mechanism is
+moving toward Local Router Trie peer-to-peer recovery.
+
+Target assessment:
+
+The target SHA has standalone-indexer P2P recovery paths, including tests that
+launch a second indexer with `--peers` and pre-seeded `--workers`. That validates
+the editorial note: do not replay NATS-centric recovery work by default. Keep
+only concrete remaining needs, such as Python JetStream object-store access or
+specific NATS client accessors, if current Baseten deployments still depend on
+them.
+
+Validation:
+
+Run router startup with multiple instances, stream reconfiguration against an
+existing JetStream stream, object store access through Python, and orphan worker
+cleanup.
+
+## PATCH-004: Baseten Router Core, Hot Reload, Scheduling, and Queueing
+
+Status: `redesign`
+
+Source commits:
+
+- `e6a947a52` feat: KV router enhancements for production serving
+- `055e6a1d7` fix: address PR review comments on KV router
+- `6a0dd058c` Merge pull request #180 from basetenlabs/blarson/best_overlap_blocks
+- `21c31b138` wip
+- `2e571f9d3` field order
+- `2448517f2` fix: populate active request counts before selection (#185)
+- `a996149fc` Merge pull request #196 from basetenlabs/mf/fix-dp-routing
+- `51b6fb545` fix dp routing stats
+- `618215bb4` Merge pull request #212 from basetenlabs/blarson/flexible_queue_algo
+- `2fbc428b9` feat(router): export queue metrics from router, add queue wait logging
+- `964b49307` feat(router): refresh overlap scores at dequeue time
+- `3a51601b0` refactor(router): pluggable queue admission policy
+- `1d8715e4d` fix(kv-router): enable metrics feature by default
+- `d9b41f280` feat(router): hot-reload router_queue_threshold via B10 config
+- `c78ff5755` refactor(router): rate-limit queue threshold hot-reload to every 10s
+- `8afa24f06` fix(tests): replace Some(0.0) threshold with Some(f64::EPSILON) in queue tests
+- `f910229fa` refactor(router): review fixes for hot-reload threshold
+- `a7f06652d` chore(router): remove logging from queue hot path
+- `0a8e69660` Merge pull request #218 from basetenlabs/blarson/router-queue
+- `7f2ce7561` fix(kv-router): prevent ghost sequences and ensure expiry triggers queue drain
+- `55ecf1995` refactor(kv-router): respond() returns Result<(), RespondError> instead of bool
+- `3f9c998c5` kv-router: cap pending queue depth to prevent mark_free deadlock
+- `de0b0d1da` kv-router: hot-reload queue threshold only when explicitly configured
+- `70d7bba89` Merge pull request #219 from basetenlabs/blarson/router-queueing
+- `d852cdedc` kv-router: fix TCP starvation of mark_free and add queue timeout safety net
+- `c09131020` kv-router: add instrumentation logs for queue starvation diagnosis
+- `c8e21dff1` kv-router: remove debug-only logs, keep prod-observable fix signals
+- `96d4adc4f` kv-router: remove queue wait timeout (covered by pending_cancellations)
+- `c2df02e4d` kv-router: reduce TCP pool defaults, plug pending_cancellations leak
+- `61b4d1cb8` kv-router: log cleanup - suppress tcp client-drop warn, info for slot cancellation
+- `c7c708b91` kv-router: downgrade noisy warn logs to info
+- `b52a41cb7` kv-router: remove noisy mark_free not-in-tracker log
+- `729a81cd6` kv-router: log cleanup - mark_free info, remove pool utilization, simplify queue-full msg
+- `c9bf0c4ed` fix: Make router active replicas hot configurable (#251)
+
+Purpose:
+
+This is the main Baseten router patch. It adds production serving behavior:
+lazy worker removal, Baseten worker selection, hot-reloadable router config,
+snapshot controls, best-overlap response fields, active request counts before
+selection, DP routing stats, pluggable queue admission, queue metrics, overlap
+refresh at dequeue time, queue threshold hot reload, ghost sequence prevention,
+pending queue caps, caller disconnect handling, TCP starvation fixes, and active
+replica hot configuration.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade split router work into `1de204080` and `a3f024b40`. It kept a
+simplified `B10WorkerSelector`, hot-reloadable B10 config, runtime DP/TP sizing
+from that config, `PotentialLoads`, queue-threshold hot reload, queue metrics,
+and `respond() -> Result` cleanup. It deliberately dropped Python selector
+support, `PyWorkerSelectionResult`, `dp_strict_rank`, DP-heavy active-request
+scoring, softmax sampling, and old NATS request-plane changes.
+
+For v1.2, do not follow those v1.1 router drops. Preserve the B10 selector as
+production behavior. Restore Python selector/plugin callable support, including
+`PyWorkerSelectionResult`. Preserve `dp_strict_rank` through the router
+request/response/scheduling path so B10 and Python selectors can request strict
+DP-rank routing. Still follow v1.1 on dropping NATS recovery and avoid replaying
+the old queue stack where target tiered ISL queueing already provides the
+queueing mechanism. Dp routing + routing policy is hard to test, so its better to 
+preserve it. 
+
+Replay notes:
+
+Treat this as one coherent router subsystem port. Do not cherry-pick the commits
+one by one unless the target upstream code is very close. Start by porting the
+configuration model, then worker selection, then queue/admission behavior, then
+bug fixes, then metrics/logging surfaces. Preserve final behavior and ignore
+intermediate churn.
+
+Editorial notes:
+
+Because the main recovery path is moving to peer-to-peer mode, the old
+NATS-backed router recovery patches are expected to be less relevant. Router
+queueing also has tiered ISL queues upstream. The old DP routing stats fix does
+not need to be replayed as a standalone patch if actual values can come from
+MDC/configmap.
+
+Target assessment:
+
+The target SHA already has `router_queue_by_incoming_missing_isl`,
+`router_queue_policy`, and P2P recovery coverage. Do not replay the old router
+queue stack wholesale. Re-test target upstream behavior first, then port only
+missing Baseten requirements such as specific hot-reload knobs, active-replica
+configuration, or selection/response fields that are still absent. Do not carry
+the DP routing stats patch unless target deployments prove they cannot source
+the same values through MDC/configmap.
+
+Validation:
+
+Run router unit tests plus manual or integration coverage for: hot config
+reload, queue threshold changes, cancellation, caller disconnect, queue-full
+behavior, `mark_free`/`add_request` races, DP routing, active replica changes,
+and best-overlap response fields.
+
+## PATCH-005: Router Metrics, Tracing, and Observability
+
+Status: `keep`
+
+Source commits:
+
+- `40b1a7aed` feat: add kv_router.select_worker tracing event with routing metrics (#153)
+- `3723174f5` refactor(kv-router): migrate select_worker span event to span attributes (#182)
+- `05ecb882f` fix: restore missing router and indexer metrics on ComponentMetricsServer (#169)
+- `36133139e` Merge pull request #223 from basetenlabs/blarson/router_metrics
+- `d17293eeb` feat(kv-router): add orphan-expired metric, fix indexer ops gaps
+- `2b5248db0` trim: drop speculative instrumentation
+- `b0c38598e` cleanup: store metrics on ConcurrentRadixTree, rename to force_expired_request_count
+- `8e575bd55` rename: force_expired_request_count -> force_expired_requests
+- `bd3531d98` remove redundant section header above KvRouterReliabilityMetrics
+- `ce3a100d8` cargo fmt
+- `24c048a47` fix(dynamo): Make OTel log exporter opt-in to prevent BatchLogProcessor errors (#157)
+- `316432aa1` fix(dynamo): Fall back to OTEL_EXPORTER_OTLP_ENDPOINT for trace export (#171)
+
+Purpose:
+
+Preserve Baseten's production observability surface. This includes router
+selection span attributes, router and indexer metrics restoration, indexer ops
+metric coverage, orphan/force-expired reliability metrics, and OTel defaults
+that avoid noisy log exporter errors while honoring standard trace endpoint
+configuration.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade kept only concrete observability surfaces. Router/indexer
+Prometheus constants landed in `1de204080`, queue wait metrics landed in
+`a3f024b40`, and OTel exporter environment behavior landed in `ce5dfa1c9`.
+Speculative or unconsumed instrumentation was not preserved.
+
+For v1.2, follow that filtering rule. Preserve metric names, labels, and trace
+fields that dashboards or production debugging depend on. Add a metric inventory
+before replaying code, and avoid carrying metrics that have no known consumer.
+
+Editorial notes:
+
+All metrics that Baseten added should be preserved across versions.
+
+
+Replay notes:
+
+Port after PATCH-004 so metric sources exist. Keep final metric names and labels
+stable unless dashboards are updated at the same time. Check target upstream for
+equivalent OTel defaults before replaying the OTel pieces.
+
+Validation:
+
+Confirm Prometheus scrape output, dashboard metric names, router selection trace
+attributes, and OTel behavior with and without explicit log exporter settings.
+
+## PATCH-006: OpenAI, Anthropic, and Baseten Protocol Compatibility
+
+Status: `mixed`
+
+Source commits:
+
+- `5a08107e1` feat: OpenAI protocol extensions and HTTP service enhancements
+- `da9d51d0e` fix: address PR review comments on HTTP service and publisher
+- `402f5b47f` fix: silently ignore stream_options when stream is not true (#168)
+- `863caa9b2` fix(dynamo): Replace strict unknown parameter rejection with warn-and-ignore (#174)
+- `ccc31c543` fix(aggregator): accumulate tool call arguments across incremental streaming chunks (#188)
+- `603bd5e09` fix: remove double reasoning parse from Anthropic streaming handler (#193)
+- `2829d154b` Merge pull request #199 from basetenlabs/trid/anthropic-thinking-v1.0.0
+- `0b2ff53fa` dyn1.0.0 mirror changes ant thinking, optional reasoning, move thinking from chat.rs to baseten
+- `6d828bb89` dyn1.0.0 mirror changes ant thinking, optional reasoning, move thinking from chat.rs to baseten
+- `f1bec62b2` Merge pull request #201 from basetenlabs/mf/v1.0-logprobs-dynamic-temperature
+- `fce8920c3` backport logprobs token ids and typed dynamic temperature
+- `06f715be8` small patches
+- `550606875` small patches
+- `bc6fb7455` Merge pull request #203 from basetenlabs/mf/v1.0-b10-extension-required
+- `788b55c90` added stuff around extnesion
+- `9b279389a` small patches
+- `fa3f07ad1` fix tests
+- `25ce09585` fix(anthropic): [DONE] leak, toolu_ id prefix, and engine-error status (#208)
+- `01841858f` feat(async-openai): OpenAI protocol compatibility fixes for agentic workloads (#221)
+- `3e42842b0` feat(async-openai): widen ReasoningEffort for DeepSeek V4 (#220)
+- `d104200bf` fix(anthropic): gate inline tool_use stop on parseable accumulated args (#232)
+- `d637b3f39` Adding reasoning block for openai requests (#243)
+
+Purpose:
+
+Preserve Baseten and OpenAI/Anthropic compatibility behavior at the HTTP and
+protocol layers. This includes Baseten request/billing/priority extensions,
+rate limiting, health checks, endpoint activation controls, tolerant validation,
+`stream_options` tolerance, grammar response formats, reasoning fields,
+Anthropic thinking blocks, dynamic temperature, logprobs token IDs, streamed
+tool-call argument accumulation, Anthropic stream correctness, async-openai type
+compatibility, and DeepSeek V4 reasoning effort support.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade kept the Baseten protocol surface in `6f36f18d4`: `baseten_ext`
+fields, B10 health, B10 rate limiting, selective endpoint activation, required
+Baseten extension validation, and warn-and-ignore handling for unsupported
+fields. It dropped old `async-openai` fork edits, old aggregator tool-call merge
+patches, grammar/structural response format variants, token-id/logprobs response
+variants, and request-id flavoring that no longer matched upstream. Commit
+`d493fef1d` kept Anthropic conformance fixes: no OpenAI `[DONE]` sentinel on
+Anthropic streams, `toolu_` IDs, and backend status passthrough.
+
+For v1.2, follow v1.1 more closely by default. Preserve `baseten_ext`, health,
+rate limiting, and required extension validation if those are still
+client-facing. Prefer target/upstream protocol behavior for old
+`stream_options`, parser, grammar, logprobs, and response-shape differences.
+Reopen only specific dropped behaviors that fail client or compatibility tests.
+
+Replay notes:
+
+This group must be audited against target upstream before porting. Many of
+these are likely upstreamable protocol fixes or may already exist in modified
+form. Preserve Baseten extension behavior and client-facing response shapes;
+drop exact copies of generic compatibility fixes if upstream already implements
+them.
+
+Editorial notes:
+
+`stream_options` tolerance does not need to be preserved. Tool-calling
+aggregation is brittle and should be tested; ideally preserve any Baseten fixes
+that still fail against the target upstream implementation.
+
+Target assessment:
+
+The target SHA still validates that `stream_options` is only allowed when
+`stream=true`; accept that upstream behavior and drop the old tolerant
+`stream_options` patch. The target also has a much newer frontend parsing stack
+for reasoning and tool calls, including buffered post-reasoning tool text and
+parity fixtures. Run the brittle tool-calling tests against target first, then
+port only failing cases.
+
+
+Validation:
+
+Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,
+tool-calling, reasoning/thinking fields, logprobs, dynamic temperature,
+Baseten extension validation, `stream_options`, and unknown-parameter handling.
+
+## PATCH-007: Python Bindings and Service-Facing APIs
+
+Status: `keep`
+
+Source commits:
+
+- `72c26adb8` feat: Python bindings, examples, and service pipeline
+
+Purpose:
+
+Expose Baseten runtime, router, KV cache, JSON pub/sub, HTTP service controls,
+and decorator behavior through Python bindings and stubs. Adds router examples
+and an OpenAI service pipeline example.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade kept B10 router and service pipeline bindings in `9adbfdc64`.
+It added B10 health/rate-limit Python wrappers, context binding additions,
+shutdown decorator arguments, service pipeline examples, and shared-memory
+monitor examples. It dropped Python selector support and
+`PyWorkerSelectionResult` along with the old Python selector example. Commit
+`9cfeeb5e2` later restored JSON publisher/subscriber bindings after they became
+EventPlane-backed and safe to use without NATS.
+
+For v1.2, do not follow the Python-selector drop. Preserve B10 router bindings,
+Python selector/plugin callable support, `PyWorkerSelectionResult`, and JSON
+pub/sub if planner or routing code still depends on it. Keep first-token
+webserver behavior as a design requirement, but port through the target
+frontend/backend APIs rather than copying old binding code.
+
+Replay notes:
+
+Replay after the Rust APIs from PATCH-002, PATCH-003, PATCH-004, and PATCH-006
+exist on the target branch. Regenerate or manually update `_core.pyi`,
+`Cargo.lock`, and examples after API conflicts are resolved.
+
+Editorial notes:
+
+The Python side requires holding the stream until the first token for the
+webserver. The current implementation does this for webserver Python engines
+only. This design likely makes sense in future Dynamo versions too.
+
+Target assessment:
+
+Keep this behavior as a design requirement, but port it through the target
+frontend/backend API shape instead of copying the old bindings mechanically.
+The target has rewritten frontend processors, so the implementation point may
+move.
+
+Validation:
+
+Compile Python bindings, import `dynamo.runtime`, validate type stubs, and run
+or smoke-test the router and OpenAI service examples.
+
+## PATCH-008: Model, Parser, vLLM, and Multimodal Compatibility
+
+Status: `mixed`
+
+Source commits:
+
+- `a7da3a65d` chore: bump vLLM to 0.19.0 for Dynamo fork compatibility (#194)
+- `650305287` feat(vllm): bump fork to 0.20.0 for DeepSeek V4 + KV-router group_idx filter (#214)
+- `860351213` chore(frontend): Add Gemma 4 parser support + Test Cases (#8852) (#222)
+- `40a9b2b63` Merge pull request #235 from basetenlabs/dyo/gemma4-default-thinking-off
+- `f098125d3` fix(preprocessor): default Gemma 4 reasoning OFF when chat_template_args omits flag
+- `04c67b9b2` Merge pull request #164 from basetenlabs/fix/remove-missing-lfs-video
+- `6e22e7a30` fix(llm): remove missing LFS video fixture
+
+Purpose:
+
+Keep model support aligned with Baseten requirements. This includes vLLM fork
+compatibility, DeepSeek V4 support, KV-router group index filtering, Gemma 4
+tool-calling and reasoning parsers, Gemma 4 default reasoning behavior, and
+test fixture cleanup for missing LFS media.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade mostly accepted upstream parser, model, and recipe movement
+instead of replaying old version bumps as Baseten patches. Gemma/parser and
+tool-call related work appeared primarily in upstream commits before the
+Baseten replay stack, not as a separate Baseten port. The v1.1 CI/container
+commit also carried a narrow missing-LFS-media cleanup where needed.
+
+For v1.2, follow the same rule: do not replay dependency or parser version
+bumps blindly. Carry only parser/model behavior that target tests or the
+Baseten support matrix prove is missing.
+
+Replay notes:
+
+Do not replay version numbers blindly. Choose the target vLLM version from the
+new Dynamo branch and Baseten support matrix, then port only remaining
+compatibility behavior. Check whether upstream already has Gemma 4 parser
+support and whether the missing LFS fixture is still referenced.
+
+Validation:
+
+Run parser tests, Gemma 4 chat template tests, vLLM integration smoke tests, and
+any multimodal tests that previously depended on the removed fixture.
+
+## PATCH-009: Validation, Limits, and Operational Compatibility Knobs
+
+Status: `mixed`
+
+Source commits:
+
+- `52a13feeb` Merge pull request #197 from basetenlabs/mf/warning-disable-option
+- `43ad6e23a` disable warning flag
+- `b6817ba7d` Merge pull request #205 from basetenlabs/mf/add-256mb-limit-tcp
+- `5ddff62f4` add 256 mb limit
+- `9ea89daa1` add 256 mb limit
+
+Purpose:
+
+Preserve operational knobs that keep Baseten deployments compatible with real
+traffic: warning suppression or disablement behavior and a 256 MB TCP payload
+limit for large payloads.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade kept the 256 MiB TCP framing default inside `14e94a0f9` even
+though upstream exposed shared max-message-size plumbing. It also kept Baseten
+extension validation behavior inside `6f36f18d4`: fork-maintained extension
+fields should validate explicitly instead of being silently ignored.
+
+For v1.2, keep both decisions where the related features remain. Change the
+target TCP default from 32 MiB to 256 MiB unless all deployments are guaranteed
+to set `DYN_TCP_MAX_MESSAGE_SIZE`. Preserve required-field validation for any
+`baseten_ext` fields that are carried forward.
+
+Editorial notes:
+
+The TCP limit work was contributed upstream, but the target SHA still needs an
+explicit decision on the default size used by Baseten deployments.
+
+Target assessment:
+
+The target SHA has configurable TCP max message size via
+`DYN_TCP_MAX_MESSAGE_SIZE`, but its default is `32 * 1024 * 1024`, while
+`main-v1.0.0` carries `256 * 1024 * 1024`. If Baseten needs 256 MiB by default,
+carry a small default-value patch unless deployment config is guaranteed to set
+the environment variable everywhere.
+
+Editorial notes:
+
+Prefer a tiny code fix that defaults to 256 MiB.
+
+
+Replay notes:
+
+Inspect the new upstream configuration surfaces before copying these changes.
+If upstream exposes cleaner options for warning behavior or transport limits,
+map Baseten defaults onto those instead.
+
+Validation:
+
+Test payloads near and above the expected TCP limit, warning-flag behavior, and
+failure modes for oversized payloads.
+
+## PATCH-010: Logging Policy and Production Signal Cleanup
+
+Status: `keep`
+
+Source commits:
+
+- `f05fff4ca` Merge pull request #191 from basetenlabs/blarson/dyn1_error_log_debug
+- `f2284d808` debug(logging): add request_id to shutdown noise and downgrade log levels
+- `a12782956` fix(context): suppress duplicate stop/kill logs for child context propagation
+- `7f66d2b5e` fix(context): suppress duplicate stop/kill logs for child context propagation
+- `fa42386ca` fix(etcd): downgrade watch task exit logs from error/warn to info
+- `0bdbc29b3` fix(logging): downgrade channel-closed log to info (not debug)
+- `6c0a14499` fix(process_stream): exit immediately on context stop, add lifecycle logs
+- `87597be69` restore warn
+- `b51d61315` Merge pull request #195 from basetenlabs/blarson/log_improvements
+- `8a9312239` BIS logging improvements: dynamo
+- `86ec76b88` Add unified_model_logs to graceful shutdown lifecycle logs
+- `8b72cb8aa` argh
+
+Purpose:
+
+Keep production logs useful under high-volume serving. This reduces duplicate
+or misleading cancellation, context, etcd, channel, stream, queue, and shutdown
+logs while adding request IDs and Baseten unified model log fields where they
+help operations.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade kept logging changes only where they had operational value.
+`14e94a0f9` carried selected runtime log cleanup and instance-down signal
+changes, `ce5dfa1c9` made OTel log export opt-in and trace endpoint fallback
+spec-compliant, and `6f36f18d4` preserved Baseten structured model/request log
+fields. It did not preserve every historical log-level tweak.
+
+For v1.2, follow v1.1: keep structured request/model fields and OTel behavior,
+then port only log-level changes tied to known false alarms or missing
+debugging signal.
+
+Editorial notes:
+
+Keep structured logging.
+
+Target assessment:
+
+Keep structured request correlation and Baseten log fields. The target already
+has request-id propagation and frontend tracing tests, so port only missing
+structured fields and avoid replaying old log-level churn without evidence.
+
+
+Replay notes:
+
+Replay selectively after functional runtime and router patches are in place.
+Avoid preserving every historical log-level tweak if upstream changed the log
+site. Preserve the Baseten log schema fields and the intent: fewer false alarms,
+better correlation, and enough lifecycle signal for debugging.
+
+Validation:
+
+Review logs during normal startup, graceful shutdown, cancellation, etcd watch
+restart, client disconnect, and queue pressure.
+
+## PATCH-011: Upstream Syncs and Likely Already-Upstream Patches
+
+Status: `drop`
+
+Source commits:
+
+- `bfd4d0772` feat: sync upstream PR #143 and #146 - snapshot metrics + NATS stream config (#149)
+- `40b1a7aed` feat: add kv_router.select_worker tracing event with routing metrics (#153)
+- `402f5b47f` fix: silently ignore stream_options when stream is not true (#168)
+- `603bd5e09` fix: remove double reasoning parse from Anthropic streaming handler (#193)
+- `01841858f` feat(async-openai): OpenAI protocol compatibility fixes for agentic workloads (#221)
+- `860351213` chore(frontend): Add Gemma 4 parser support + Test Cases (#8852) (#222)
+
+Purpose:
+
+Track changes that are especially likely to have landed upstream exactly or in
+modified form. These commits are also listed under their functional patch groups
+above because they affect replay behavior.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 upgrade repeatedly used upstream equivalence as a reason to drop old
+fork hunks. Examples include accepting upstream router queue structure, parser
+changes, async-openai/protocol restructuring, and indexer/router metric work
+where the target branch had already absorbed the behavior in a different shape.
+
+For v1.2, keep this section as audit evidence only. Do not replay these commits
+directly; use them to verify whether each functional patch has already been
+satisfied by the target SHA.
+
+Replay notes:
+
+Before replaying onto a newer upstream tag, search upstream history for these
+behaviors by commit title, PR number, changed file, and code behavior. If the
+target upstream release already has the behavior, mark the corresponding
+functional item as satisfied and do not replay the Baseten commit.
+
+Useful commands:
+
+```bash
+TARGET_UPSTREAM=bed9f269312151481cd67a8d21b70e0f52424c2b
+git cherry -v "$TARGET_UPSTREAM" main-v1.0.0
+git log "$TARGET_UPSTREAM" --grep '<distinctive title words>'
+git log "$TARGET_UPSTREAM" -- <path>
+git blame "$TARGET_UPSTREAM" -- <path>
+```
+
+## PATCH-012: Reverted or Do-Not-Replay Experiments
+
+Status: `reverted`
+
+Source commits:
+
+- `0fe453f52` Merge pull request #234 from basetenlabs/dyo/kvrouter-gemma4-accept-all-groups
+- `67eee7334` fix(kv-router): accept all kv_cache_group_id events for hybrid-attention models
+- `59b0132bd` Revert "fix(mp): accept all kv_cache_group_id events for hybrid-attention models" (#234)
+- `df55350e3` Revert "Merge pull request #234 from basetenlabs/dyo/kvrouter-gemma4-accept-all-groups"
+
+Purpose:
+
+Record the attempted hybrid-attention KV cache group handling change and its
+revert so it is not accidentally replayed from history.
+
+1.0 -> 1.1 behavior:
+
+The v1.1 branch also contains `465795594`, a WIP data snapshot that removed
+profiler `.npz` artifacts before a dev-box restart. That commit is not a stable
+fork-upgrade decision and should not be treated as part of the replay pattern.
+The reverted hybrid-attention KV cache group experiment remained historical
+context only.
+
+For v1.2, drop these by default. Preserve profiler artifacts or redesign
+hybrid-attention KV behavior only if there is an explicit current requirement.
+
+Replay notes:
+
+Do not replay as-is. If hybrid-attention KV cache group behavior is still
+needed, redesign and validate it against the target upstream router and model
+support code.
