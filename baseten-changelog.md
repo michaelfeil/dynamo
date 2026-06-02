@@ -191,6 +191,15 @@ retarget all branch literals to `main-v1.2.0`. Re-audit one-off v1.1 fixes such
 as LFS fixture removal, stale dependency workarounds, and clippy workarounds
 instead of carrying them mechanically.
 
+v1.2 implementation note:
+
+The fork CI/image layer was replayed as a branch-retargeted infrastructure
+patch. The branch carries Baseten workflow filtering, post-merge image build
+wiring, BIS image push dispatch, `.version-base`, `tools/version-stamp.sh`,
+`container/build.sh`, and container template version stamping. Upstream-only
+workflow churn was not preserved as a Baseten patch unless it affected fork
+builds.
+
 Replay notes:
 
 Port this first so the new branch has a working CI and image path. Retarget all
@@ -237,6 +246,15 @@ startup, drain, endpoint unpublication, and shutdown behavior before porting
 lifecycle code. Do not preserve NATS recovery pieces as an objective; the
 v1.2 direction follows the no-NATS/P2P recovery path unless a concrete
 non-P2P production gap is found.
+
+v1.2 implementation note:
+
+The concrete v1.2 runtime replays are intentionally narrow so far: the TCP
+request-plane max message default is restored to 256 MiB, and target shutdown
+lifecycle logs now carry the `unified_model_logs` marker at the lifecycle points
+that still exist. The broader v1.0/v1.1 NATS recovery stack is not a replay
+objective for v1.2. Additional drain/unpublication behavior should only be
+ported after a target-specific failing test or production gap is identified.
 
 Replay notes:
 
@@ -312,6 +330,13 @@ the editorial note: do not replay NATS-centric recovery work by default. Drop
 needed for large embedding offload, and Baseten no longer uses JetStream
 offloading. Keep the existing EventPlane-backed JSON publisher/subscriber
 bindings, but do not add new Python NATS bucket storage.
+
+v1.2 implementation note:
+
+The transport-agnostic JSON publisher/subscriber Python bindings were restored
+through the current EventPlane-backed implementation. NATS bucket/object-store
+Python access was explicitly not restored because JetStream offloading is no
+longer used.
 
 Validation:
 
@@ -477,6 +502,15 @@ Speculative or unconsumed instrumentation was not preserved.
 For v1.2, follow that filtering rule. Preserve metric names, labels, and trace
 fields that dashboards or production debugging depend on. Add a metric inventory
 before replaying code, and avoid carrying metrics that have no known consumer.
+
+v1.2 implementation note:
+
+The OTel exporter environment behavior from v1.1 was restored: trace export
+falls back from `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to the standard
+`OTEL_EXPORTER_OTLP_ENDPOINT`, and log export remains opt-in through a dedicated
+logs endpoint so enabling tracing does not create noisy BatchLogProcessor
+errors. Router queue and selector observability are carried through the B10 and
+queue-threshold replay slices; no separate speculative metrics patch was added.
 
 Editorial notes:
 
