@@ -161,8 +161,14 @@ const fn default_data_parallel_start_rank() -> u32 {
     0
 }
 
-const fn default_data_parallel_size() -> u32 {
-    1
+fn default_data_parallel_size() -> u32 {
+    // Baseten: use the hot-reloadable config to get data_parallel_size
+    crate::kv_router::b10hotreloadablecm::get_data_parallel_size()
+        .map(|v| v as u32)
+        .unwrap_or_else(|| {
+            tracing::warn!("B10WorkerSelector: failed to get data_parallel_size from hot-reloadable config, defaulting to 1");
+            1
+        })
 }
 
 const fn default_local_indexer() -> bool {

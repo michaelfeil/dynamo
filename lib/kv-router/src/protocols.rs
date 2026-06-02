@@ -433,6 +433,9 @@ pub enum RouterRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
+    PotentialLoads {
+        tokens: Vec<Token>,
+    },
 }
 
 impl Default for RouterRequest {
@@ -473,7 +476,12 @@ pub enum RouterResponse {
     FreeMarked {
         success: bool,
     },
+    PotentialLoads {
+        loads: Vec<PotentialLoad>,
+    },
 }
+
+pub use crate::scheduling::PotentialLoad;
 
 #[derive(Debug)]
 pub struct WorkerSelectionResult {

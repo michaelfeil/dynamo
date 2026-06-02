@@ -42,6 +42,8 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+pub mod b10_worker_selector;
+pub mod b10hotreloadablecm;
 pub mod indexer;
 pub mod metrics;
 pub mod prefill_router;
@@ -1030,6 +1032,11 @@ where
                 RouterResponse::FreeMarked {
                     success: self.free(request_id).await.is_ok(),
                 }
+            }
+            RouterRequest::PotentialLoads { tokens: _ } => {
+                // Potential-load probing is not implemented for the in-process
+                // KvRouter; remote/serve-indexer paths handle this elsewhere.
+                RouterResponse::PotentialLoads { loads: Vec::new() }
             }
         };
 

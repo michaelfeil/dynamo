@@ -1,0 +1,583 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Hot-reloadable configuration for B10 KV Router
+//!
+//! This module provides automatic reloading of router configuration from a YAML file
+//! specified by the DYN_LLMAPI_CONFIG_PATH environment variable, typically pointing to
+//! /configs/llm_api_config_router.yaml.
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use std::collections::HashMap;
+
+const DEFAULT_CONFIG_PATH: &str = "/configs/llm_api_config_router.yaml";
+const RELOAD_INTERVAL_SECS: u64 = 15; // Reload every 15 seconds
+
+/// Partial override structure for B10 routing config, we can't reuse the B10RoutingConfig struct because of the default values
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct B10RoutingConfigOverride {
+    router_temperature: Option<f64>,
+    router_overlap_score_weight: Option<f64>,
+    router_prefill_token_discount: Option<f64>,
+    router_decode_token_discount: Option<f64>,
+    router_active_request_weight: Option<f64>,
+    router_cache_miss_weight: Option<f64>,
+    router_cache_miss_min_isl: Option<usize>,
+}
+
+/// B10 Routing configuration parameters
+/// subset of Pytorch B10 routing config. Keep in sync with `B10RoutingConfig` pydantic model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct B10RoutingConfig {
+    #[serde(default = "default_router_temperature")]
+    pub router_temperature: f64,
+
+    #[serde(default = "default_router_overlap_score_weight")]
+    pub router_overlap_score_weight: f64,
+
+    #[serde(default = "default_router_prefill_token_discount")]
+    pub router_prefill_token_discount: f64,
+
+    #[serde(default = "default_router_decode_token_discount")]
+    pub router_decode_token_discount: f64,
+
+    #[serde(default = "default_router_active_request_weight")]
+    pub router_active_request_weight: f64,
+
+    #[serde(default = "default_router_cache_miss_weight")]
+    pub router_cache_miss_weight: f64,
+
+    #[serde(default = "default_router_cache_miss_min_isl")]
+    pub router_cache_miss_min_isl: usize,
+}
+
+impl B10RoutingConfig {
+    fn apply_override(&mut self, overrides: &B10RoutingConfigOverride) {
+        if let Some(value) = overrides.router_temperature {
+            self.router_temperature = value;
+        }
+        if let Some(value) = overrides.router_overlap_score_weight {
+            self.router_overlap_score_weight = value;
+        }
+        if let Some(value) = overrides.router_prefill_token_discount {
+            self.router_prefill_token_discount = value;
+        }
+        if let Some(value) = overrides.router_decode_token_discount {
+            self.router_decode_token_discount = value;
+        }
+        if let Some(value) = overrides.router_active_request_weight {
+            self.router_active_request_weight = value;
+        }
+        if let Some(value) = overrides.router_cache_miss_weight {
+            self.router_cache_miss_weight = value;
+        }
+        if let Some(value) = overrides.router_cache_miss_min_isl {
+            self.router_cache_miss_min_isl = value;
+        }
+    }
+}
+
+impl Default for B10RoutingConfig {
+    fn default() -> Self {
+        Self {
+            router_temperature: default_router_temperature(),
+            router_overlap_score_weight: default_router_overlap_score_weight(),
+            router_prefill_token_discount: default_router_prefill_token_discount(),
+            router_decode_token_discount: default_router_decode_token_discount(),
+            router_active_request_weight: default_router_active_request_weight(),
+            router_cache_miss_weight: default_router_cache_miss_weight(),
+            router_cache_miss_min_isl: default_router_cache_miss_min_isl(),
+        }
+    }
+}
+
+fn default_router_temperature() -> f64 {
+    std::env::var("KV_ROUTER_TEMPERATURE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.15)
+}
+
+fn default_router_overlap_score_weight() -> f64 {
+    std::env::var("KV_ROUTER_OVERLAP_SCORE_WEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3.5)
+}
+
+fn default_router_prefill_token_discount() -> f64 {
+    std::env::var("B10_KV_ROUTER_PREFILL_TOKEN_DISCOUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.5)
+}
+
+fn default_router_decode_token_discount() -> f64 {
+    std::env::var("B10_KV_ROUTER_DECODE_TOKEN_DISCOUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.8)
+}
+
+fn default_router_active_request_weight() -> f64 {
+    std::env::var("B10_KV_ROUTER_ACTIVE_REQUEST_WEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
+}
+
+fn default_router_cache_miss_weight() -> f64 {
+    std::env::var("B10_KV_ROUTER_CACHE_MISS_WEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
+}
+
+fn default_router_cache_miss_min_isl() -> usize {
+    std::env::var("B10_KV_ROUTER_CACHE_MISS_MIN_ISL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        // a new worker coming up does not have the system prompt. If a isl is only 512 tokens, its around system prompt.
+        .unwrap_or(512)
+}
+
+/// Override configuration structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OverrideConfig {
+    #[serde(default)]
+    b10_routing_config: Option<B10RoutingConfigOverride>,
+
+    #[serde(default)]
+    tensor_parallel_size: Option<usize>,
+
+    #[serde(default)]
+    enable_attention_dp: Option<bool>,
+}
+
+/// Root configuration structure for parsing YAML
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LLMConfig {
+    #[serde(default)]
+    b10_routing_config: B10RoutingConfig,
+
+    #[serde(default)]
+    override_args: Option<HashMap<String, OverrideConfig>>,
+
+    // Runtime config fields
+    #[serde(default)]
+    tensor_parallel_size: Option<usize>,
+
+    #[serde(default)]
+    enable_attention_dp: Option<bool>,
+}
+
+/// Runtime configuration fields from llm_api_config_router.yaml
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LLMRuntimeConfig {
+    pub tensor_parallel_size: Option<usize>,
+    pub enable_attention_dp: Option<bool>,
+}
+
+impl LLMRuntimeConfig {
+    // Compute data_parallel_size based on the rules:
+    // - If enable_attention_dp is Some(true), return tensor_parallel_size
+    // if enable_attention_dp is true, in trt, will use size 1 dp ranks, so data_parallel_size = tensor_parallel_size
+    // - Otherwise, return 1
+    pub fn compute_data_parallel_size(&self) -> Option<usize> {
+        match self.enable_attention_dp {
+            Some(true) => self.tensor_parallel_size,
+            _ => Some(1),
+        }
+    }
+}
+
+/// Convenience function to get data parallel size
+/// Returns the computed value based on enable_attention_dp and tensor_parallel_size
+pub fn get_data_parallel_size() -> Option<usize> {
+    let runtime = &get_config().get().runtime;
+    runtime.compute_data_parallel_size()
+}
+
+/// Unified config containing both routing and runtime configuration
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UnifiedConfig {
+    pub routing: B10RoutingConfig,
+    pub runtime: LLMRuntimeConfig,
+}
+
+/// Hot-reloadable config manager with unified config
+pub struct HotReloadableConfig {
+    config: Arc<RwLock<UnifiedConfig>>,
+    config_path: PathBuf,
+}
+
+impl Default for HotReloadableConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HotReloadableConfig {
+    /// Create a new hot-reloadable config manager
+    pub fn new() -> Self {
+        let config_path_env = std::env::var("DYN_LLMAPI_CONFIG_PATH");
+
+        let (initial_config, config_path) = if let Ok(path_str) = config_path_env {
+            let config_path = PathBuf::from(path_str);
+            // Only load from file if env var is set
+            let config = Self::load_config(&config_path).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Failed to load config from {:?}: {:?}, using defaults",
+                    config_path,
+                    e
+                );
+                UnifiedConfig::default()
+            });
+            (config, config_path)
+        } else {
+            // No env var set - use fast defaults and default path
+            tracing::warn!("DYN_LLMAPI_CONFIG_PATH not set, using default UnifiedConfig values");
+            (UnifiedConfig::default(), PathBuf::from(DEFAULT_CONFIG_PATH))
+        };
+
+        Self {
+            config: Arc::new(RwLock::new(initial_config)),
+            config_path,
+        }
+    }
+
+    fn validate_config(path: &PathBuf) -> Option<LLMConfig> {
+        if !path.exists() || !path.is_file() {
+            tracing::warn!("Config file {:?} does not exist or is not a file", path);
+            return None;
+        }
+
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to read config file {:?}: {:?}", path, e);
+                return None;
+            }
+        };
+        match serde_yaml::from_str(&contents) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                tracing::warn!("Failed to parse YAML config from {:?}: {:?}", path, e);
+                None
+            }
+        }
+    }
+
+    /// Load config from file
+    fn load_config(path: &PathBuf) -> Result<UnifiedConfig> {
+        let root_config = Self::validate_config(path);
+
+        if root_config.is_none() {
+            return Err(anyhow::anyhow!(
+                "Failed to load or validate config from {:?}",
+                path
+            ));
+        }
+
+        let mut root_config = root_config.unwrap();
+
+        // Apply overrides if present
+        if let Ok(override_group) = std::env::var("ENGINE_ARGS_OVERRIDE_GROUP")
+            && !override_group.is_empty()
+            && let Some(overrides) = &root_config.override_args
+            && let Some(group_config) = overrides.get(&override_group)
+        {
+            tracing::info!("Applying override group '{}'", override_group);
+            if let Some(routing_override) = &group_config.b10_routing_config {
+                root_config
+                    .b10_routing_config
+                    .apply_override(routing_override);
+            }
+            if let Some(tp) = group_config.tensor_parallel_size {
+                root_config.tensor_parallel_size = Some(tp);
+            }
+            if let Some(adp) = group_config.enable_attention_dp {
+                root_config.enable_attention_dp = Some(adp);
+            }
+        }
+
+        // Build UnifiedConfig with separate routing and runtime configs
+        let runtime_config = LLMRuntimeConfig {
+            tensor_parallel_size: root_config.tensor_parallel_size,
+            enable_attention_dp: root_config.enable_attention_dp,
+        };
+
+        let unified_config = UnifiedConfig {
+            routing: root_config.b10_routing_config,
+            runtime: runtime_config,
+        };
+
+        // Compute data_parallel_size for logging
+        let data_parallel_size = unified_config.runtime.compute_data_parallel_size();
+
+        tracing::info!(
+            "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
+            path,
+            unified_config.routing.router_prefill_token_discount,
+            unified_config.routing.router_decode_token_discount,
+            unified_config.routing.router_temperature,
+            unified_config.runtime.tensor_parallel_size,
+            unified_config.runtime.enable_attention_dp,
+            data_parallel_size
+        );
+
+        Ok(unified_config)
+    }
+
+    /// Get a clone of the current config
+    pub fn get(&self) -> UnifiedConfig {
+        self.config.read().unwrap().clone()
+    }
+
+    /// Start background task to reload config periodically
+    pub fn start_reloader(self: Arc<Self>) {
+        std::thread::spawn(move || {
+            tracing::info!(
+                "Starting B10RouterConfig hot-reloader thread, monitoring {:?}",
+                self.config_path
+            );
+            loop {
+                match Self::load_config(&self.config_path) {
+                    Ok(new_config) => {
+                        if let Ok(mut config) = self.config.write() {
+                            let config_changed = *config != new_config;
+                            *config = new_config;
+
+                            tracing::info!(
+                                "B10RouterConfig hot-reload {}: {:?}",
+                                if config_changed {
+                                    "(HAS CHANGED!)"
+                                } else {
+                                    "(no change)"
+                                },
+                                config
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to hot-reload b10 router config: {:?}", e);
+                    }
+                }
+                // Sleep after each reload attempt
+                std::thread::sleep(Duration::from_secs(RELOAD_INTERVAL_SECS));
+            }
+        });
+    }
+}
+
+/// Global config instance
+static CONFIG: std::sync::LazyLock<Arc<HotReloadableConfig>> = std::sync::LazyLock::new(|| {
+    let config = Arc::new(HotReloadableConfig::new());
+    config.clone().start_reloader();
+    config
+});
+
+/// Get the global config instance
+pub fn get_config() -> Arc<HotReloadableConfig> {
+    CONFIG.clone()
+}
+
+/// Convenience function to get prefill token discount
+pub fn get_prefill_token_discount() -> f64 {
+    get_config().get().routing.router_prefill_token_discount
+}
+
+/// Convenience function to get decode token discount
+pub fn get_decode_token_discount() -> f64 {
+    get_config().get().routing.router_decode_token_discount
+}
+
+/// Convenience function to get router temperature
+pub fn get_router_temperature() -> f64 {
+    get_config().get().routing.router_temperature
+}
+
+/// Convenience function to get router overlap score weight
+pub fn get_router_overlap_score_weight() -> f64 {
+    get_config().get().routing.router_overlap_score_weight
+}
+
+/// Convenience function to get router active request weight
+pub fn get_active_request_weight() -> f64 {
+    get_config().get().routing.router_active_request_weight
+}
+
+/// Convenience function to get router cache miss weight
+pub fn get_router_cache_miss_weight() -> f64 {
+    get_config().get().routing.router_cache_miss_weight
+}
+
+/// Convenience function to get router cache miss min isl
+pub fn get_router_cache_miss_min_isl() -> usize {
+    get_config().get().routing.router_cache_miss_min_isl
+}
+
+/// Convenience function to get tensor parallel size
+pub fn get_tensor_parallel_size() -> Option<usize> {
+    get_config().get().runtime.tensor_parallel_size
+}
+
+/// Convenience function to get enable attention dp
+pub fn get_enable_attention_dp() -> Option<bool> {
+    get_config().get().runtime.enable_attention_dp
+}
+
+pub fn validate_config() -> bool {
+    // gets result of validation + starts lazy reloader if not already started
+    HotReloadableConfig::validate_config(&CONFIG.config_path).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = HotReloadableConfig::default();
+        let unified_config = config.get();
+
+        assert_eq!(unified_config.routing.router_temperature, 0.15);
+        assert_eq!(unified_config.routing.router_overlap_score_weight, 3.5);
+        assert_eq!(unified_config.routing.router_prefill_token_discount, 0.5);
+        assert_eq!(unified_config.routing.router_decode_token_discount, 0.8);
+    }
+
+    #[test]
+    fn test_config_access() {
+        let prefill_discount = get_prefill_token_discount();
+        let decode_discount = get_decode_token_discount();
+        assert!(prefill_discount >= 0.0);
+        assert!(decode_discount >= 0.0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_override_args_applied() {
+        use std::io::Write;
+
+        // Create a temp config file
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_temperature: 0.15
+  router_overlap_score_weight: 3.5
+tensor_parallel_size: 8
+enable_attention_dp: true
+
+override_args:
+  test_group:
+    b10_routing_config:
+      router_temperature: 0.99
+      router_overlap_score_weight: 1.0
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        // Set env vars
+        unsafe {
+            std::env::set_var("ENGINE_ARGS_OVERRIDE_GROUP", "test_group");
+        }
+
+        // Load config
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        // Check overrides applied
+        assert_eq!(config.routing.router_temperature, 0.99);
+        assert_eq!(config.routing.router_overlap_score_weight, 1.0);
+        // Check runtime config and computed data_parallel_size
+        assert_eq!(config.runtime.tensor_parallel_size, Some(8));
+        assert_eq!(config.runtime.enable_attention_dp, Some(true));
+        assert_eq!(config.runtime.compute_data_parallel_size(), Some(8)); // Because enable_attention_dp=true returns tensor_parallel_size
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_override_args_not_applied_when_env_missing() {
+        use std::io::Write;
+
+        // Create a temp config file
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_temperature: 0.15
+  router_overlap_score_weight: 3.5
+
+override_args:
+  test_group:
+    b10_routing_config:
+      router_temperature: 0.99
+      router_overlap_score_weight: 1.0
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        // Ensure env var is NOT set
+        // Note: We need a mutex to ensure tests don't trample on each other's env vars
+        // but for this specific test file, we can just ensure we clear it.
+        unsafe {
+            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
+        }
+
+        // Load config
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        // Check overrides NOT applied
+        assert_eq!(config.routing.router_temperature, 0.15);
+        assert_eq!(config.routing.router_overlap_score_weight, 3.5);
+    }
+
+    #[test]
+    fn test_data_parallel_size_computation() {
+        // Test case 1: enable_attention_dp = Some(true), tp = Some(8) -> should return Some(8)
+        let config1 = LLMRuntimeConfig {
+            tensor_parallel_size: Some(8),
+            enable_attention_dp: Some(true),
+        };
+        assert_eq!(config1.compute_data_parallel_size(), Some(8));
+
+        // Test case 2: enable_attention_dp = Some(false), tp = Some(8) -> should return Some(1)
+        let config2 = LLMRuntimeConfig {
+            tensor_parallel_size: Some(8),
+            enable_attention_dp: Some(false),
+        };
+        assert_eq!(config2.compute_data_parallel_size(), Some(1));
+
+        // Test case 3: enable_attention_dp = None, tp = Some(4) -> should return Some(1)
+        let config3 = LLMRuntimeConfig {
+            tensor_parallel_size: Some(4),
+            enable_attention_dp: None,
+        };
+        assert_eq!(config3.compute_data_parallel_size(), Some(1));
+
+        // Test case 4: enable_attention_dp = Some(true), tp = None -> should return None
+        let config4 = LLMRuntimeConfig {
+            tensor_parallel_size: None,
+            enable_attention_dp: Some(true),
+        };
+        assert_eq!(config4.compute_data_parallel_size(), None);
+
+        // Test case 5: both None -> should return Some(1) (default when enable_attention_dp is not true)
+        let config5 = LLMRuntimeConfig {
+            tensor_parallel_size: None,
+            enable_attention_dp: None,
+        };
+        assert_eq!(config5.compute_data_parallel_size(), Some(1));
+    }
+}

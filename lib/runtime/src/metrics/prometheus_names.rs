@@ -702,6 +702,14 @@ pub mod transport {
 pub mod kvrouter {
     /// Number of KV cache events applied to the index (including status)
     pub const KV_CACHE_EVENTS_APPLIED: &str = "kv_cache_events_applied";
+    /// Count of KV indexer operations by type
+    pub const KV_INDEXER_OPERATIONS_COUNT: &str = "kv_indexer_ops_count";
+    /// Total duration of KV indexer operations in seconds (sum, not histogram)
+    pub const KV_INDEXER_OPERATIONS_LATENCY_TOTAL: &str = "kv_indexer_ops_latency_total";
+    /// Unix timestamp (seconds) of the last successful snapshot (gauge, only set on secondary routers).
+    /// Compute age as `time() - kv_router_last_snapshot_timestamp_seconds` in PromQL.
+    pub const KV_ROUTER_LAST_SNAPSHOT_TIMESTAMP_SECONDS: &str =
+        "kv_router_last_snapshot_timestamp_seconds";
 }
 
 /// KV Publisher metrics

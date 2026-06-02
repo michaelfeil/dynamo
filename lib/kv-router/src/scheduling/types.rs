@@ -203,22 +203,27 @@ impl SchedulingRequest {
         PrefillTokenDeltas::new(self.isl_tokens, by_worker)
     }
 
-    pub(crate) fn effective_cached_tokens_for(&self, worker: WorkerWithDpRank) -> usize {
+    pub fn effective_cached_tokens_for(&self, worker: WorkerWithDpRank) -> usize {
         self.effective_cached_tokens
             .get(&worker)
             .copied()
             .unwrap_or(0)
     }
 
-    pub(crate) fn effective_overlap_blocks_for(&self, worker: WorkerWithDpRank) -> f64 {
+    pub fn effective_overlap_blocks_for(&self, worker: WorkerWithDpRank) -> f64 {
         self.effective_overlap_blocks
             .get(&worker)
             .copied()
             .unwrap_or(0.0)
     }
 
-    #[cfg(test)]
-    pub(crate) fn prefill_tokens_for(&self, worker: WorkerWithDpRank) -> usize {
+    pub fn is_worker_allowed(&self, worker_id: WorkerId) -> bool {
+        self.allowed_worker_ids
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&worker_id))
+    }
+
+    pub fn prefill_tokens_for(&self, worker: WorkerWithDpRank) -> usize {
         let default_prefill_tokens = if self.track_prefill_tokens {
             self.isl_tokens
         } else {
@@ -244,8 +249,24 @@ impl SchedulingRequest {
         }
     }
 
-    pub(crate) fn request_blocks(&self, block_size: u32) -> u64 {
+    pub fn request_blocks(&self, block_size: u32) -> u64 {
         self.isl_tokens.div_ceil(block_size as usize) as u64
+    }
+
+    pub fn validate_worker_constraints(&self) -> Result<(), KvSchedulerError> {
+        let Some(pinned_worker) = self.pinned_worker else {
+            return Ok(());
+        };
+        let Some(allowed_worker_ids) = self.allowed_worker_ids.as_ref() else {
+            return Ok(());
+        };
+        if allowed_worker_ids.contains(&pinned_worker.worker_id) {
+            return Ok(());
+        }
+
+        Err(KvSchedulerError::PinnedWorkerNotAllowed {
+            worker_id: pinned_worker.worker_id,
+        })
     }
 
     pub fn respond(&mut self, result: Result<SchedulingResponse, KvSchedulerError>) {
