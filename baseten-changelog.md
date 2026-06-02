@@ -604,6 +604,17 @@ backend/OpenAI tool-call IDs, and Anthropic backend errors preserve the backend
 HTTP status while rewriting `max_completion_tokens` wording to `max_tokens`.
 This intentionally does not reopen unrelated v1.0 protocol tolerance patches.
 
+Validated the remaining PATCH-006 tolerance/parser decisions on v1.2. Keep the
+old warn-and-ignore unknown-field patch dropped: target tests still reject
+unsupported chat/completion fields, and that is the intended stricter behavior
+unless a client test proves otherwise. Keep the old non-streaming
+`stream_options` tolerance dropped as documented above. Keep the old
+incremental tool-call aggregation patch dropped as a separate replay item: the
+target's current streaming parser suite passes across GPT-OSS/Harmony,
+DeepSeek, Kimi, Qwen, and Nemotron captures. The GPT-OSS tests require the
+`openai_harmony` tokenizer vocab to be cached or downloadable; without network
+access they fail before exercising Dynamo behavior.
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,
