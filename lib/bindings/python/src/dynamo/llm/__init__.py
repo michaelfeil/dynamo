@@ -15,6 +15,7 @@ from dynamo._core import FpmEventRelay as FpmEventRelay
 from dynamo._core import FpmEventSubscriber as FpmEventSubscriber
 from dynamo._core import HttpAsyncEngine as HttpAsyncEngine
 from dynamo._core import HttpService as HttpService
+from dynamo._core import JsonSubscriberIter as JsonSubscriberIter
 from dynamo._core import KserveGrpcService as KserveGrpcService
 from dynamo._core import KvEventPublisher as KvEventPublisher
 from dynamo._core import KvRouter as KvRouter
@@ -29,6 +30,7 @@ from dynamo._core import ModelRuntimeConfig as ModelRuntimeConfig
 from dynamo._core import ModelType as ModelType
 from dynamo._core import OverlapScores as OverlapScores
 from dynamo._core import PlannerReplayBridge as PlannerReplayBridge
+from dynamo._core import PyJsonPublisher as JsonPublisher
 from dynamo._core import PythonAsyncEngine as PythonAsyncEngine
 from dynamo._core import RadixTree as RadixTree
 from dynamo._core import ReasoningConfig as ReasoningConfig

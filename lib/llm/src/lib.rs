@@ -17,6 +17,8 @@ pub mod fpm_publisher;
 pub mod grpc;
 pub mod http;
 pub mod hub;
+pub mod json_publisher;
+pub mod json_subscriber;
 // pub mod key_value_store;
 pub mod audit;
 pub mod kv_router;

@@ -26,6 +26,8 @@ use super::*;
 pub mod aic_callback;
 #[cfg(feature = "aic-forward-pass")]
 pub mod engine_perf;
+pub mod b10_json_publisher;
+pub mod b10_json_subscriber;
 pub mod entrypoint;
 pub mod fpm;
 pub mod kv;
