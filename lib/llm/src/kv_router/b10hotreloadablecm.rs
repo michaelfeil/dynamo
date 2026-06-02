@@ -28,6 +28,7 @@ struct B10RoutingConfigOverride {
     router_active_request_weight: Option<f64>,
     router_cache_miss_weight: Option<f64>,
     router_cache_miss_min_isl: Option<usize>,
+    router_queue_threshold: Option<Option<f64>>,
 }
 
 /// B10 Routing configuration parameters
@@ -54,6 +55,11 @@ pub struct B10RoutingConfig {
 
     #[serde(default = "default_router_cache_miss_min_isl")]
     pub router_cache_miss_min_isl: usize,
+
+    /// Queue admission threshold fraction of max_num_batched_tokens.
+    /// None means "not configured here"; use 0 to explicitly disable queueing.
+    #[serde(default)]
+    pub router_queue_threshold: Option<f64>,
 }
 
 impl B10RoutingConfig {
@@ -79,6 +85,9 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_cache_miss_min_isl {
             self.router_cache_miss_min_isl = value;
         }
+        if let Some(value) = overrides.router_queue_threshold {
+            self.router_queue_threshold = value;
+        }
     }
 }
 
@@ -92,6 +101,7 @@ impl Default for B10RoutingConfig {
             router_active_request_weight: default_router_active_request_weight(),
             router_cache_miss_weight: default_router_cache_miss_weight(),
             router_cache_miss_min_isl: default_router_cache_miss_min_isl(),
+            router_queue_threshold: None,
         }
     }
 }
@@ -422,6 +432,10 @@ pub fn get_router_cache_miss_min_isl() -> usize {
     get_config().get().routing.router_cache_miss_min_isl
 }
 
+pub fn get_router_queue_threshold() -> Option<f64> {
+    get_config().get().routing.router_queue_threshold
+}
+
 /// Convenience function to get tensor parallel size
 pub fn get_tensor_parallel_size() -> Option<usize> {
     get_config().get().runtime.tensor_parallel_size
@@ -473,6 +487,7 @@ mod tests {
 b10_routing_config:
   router_temperature: 0.15
   router_overlap_score_weight: 3.5
+  router_queue_threshold: 0.25
 tensor_parallel_size: 8
 enable_attention_dp: true
 
@@ -481,6 +496,7 @@ override_args:
     b10_routing_config:
       router_temperature: 0.99
       router_overlap_score_weight: 1.0
+      router_queue_threshold: 0
 "#;
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
@@ -496,6 +512,7 @@ override_args:
         // Check overrides applied
         assert_eq!(config.routing.router_temperature, 0.99);
         assert_eq!(config.routing.router_overlap_score_weight, 1.0);
+        assert_eq!(config.routing.router_queue_threshold, Some(0.0));
         // Check runtime config and computed data_parallel_size
         assert_eq!(config.runtime.tensor_parallel_size, Some(8));
         assert_eq!(config.runtime.enable_attention_dp, Some(true));
@@ -518,6 +535,7 @@ override_args:
 b10_routing_config:
   router_temperature: 0.15
   router_overlap_score_weight: 3.5
+  router_queue_threshold: 0.25
 
 override_args:
   test_group:
@@ -541,6 +559,7 @@ override_args:
         // Check overrides NOT applied
         assert_eq!(config.routing.router_temperature, 0.15);
         assert_eq!(config.routing.router_overlap_score_weight, 3.5);
+        assert_eq!(config.routing.router_queue_threshold, Some(0.25));
     }
 
     #[test]

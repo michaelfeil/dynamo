@@ -13,6 +13,7 @@ pub use dynamo_kv_router::scheduling::{
 pub use dynamo_kv_router::selector::DefaultWorkerSelector;
 use dynamo_kv_router::selector::WorkerSelector as WorkerSelectorTrait;
 
+use super::b10hotreloadablecm;
 use super::metrics::ROUTER_QUEUE_METRICS;
 use super::sequence::{
     RuntimeSequencePublisher, SequenceError, SequenceRequest, create_multi_worker_sequences,
@@ -118,6 +119,8 @@ where
         let mut queue_updates = inner.subscribe_queue_updates();
         tokio::spawn(async move {
             let mut recheck_interval = tokio::time::interval(Duration::from_secs(60));
+            let mut hot_reload_interval = tokio::time::interval(Duration::from_secs(10));
+            hot_reload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ROUTER_QUEUE_METRICS.set_pending(worker_type, metrics_scheduler.pending_count());
             ROUTER_QUEUE_METRICS
                 .set_pending_isl_tokens(worker_type, metrics_scheduler.pending_isl_tokens());
@@ -142,6 +145,18 @@ where
                             worker_type,
                             metrics_scheduler.pending_isl_tokens(),
                         );
+                    }
+                    _ = hot_reload_interval.tick() => {
+                        if let Some(v) = b10hotreloadablecm::get_router_queue_threshold() {
+                            let threshold = if v > 0.0 { Some(v) } else { None };
+                            metrics_scheduler.update_router_queue_threshold(threshold).await;
+                            ROUTER_QUEUE_METRICS
+                                .set_pending(worker_type, metrics_scheduler.pending_count());
+                            ROUTER_QUEUE_METRICS.set_pending_isl_tokens(
+                                worker_type,
+                                metrics_scheduler.pending_isl_tokens(),
+                            );
+                        }
                     }
                 }
             }

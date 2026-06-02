@@ -98,12 +98,14 @@ conformance from `d493fef1d` has also been ported because it is direct API
 surface area: no OpenAI `[DONE]` marker on Anthropic streams, Anthropic-native
 `toolu_` IDs, and backend status passthrough for Anthropic errors. The remaining
 Python HTTP-engine first-yield gate from `9adbfdc64` has been restored through
-the target `HttpAsyncEngine` shape. The remaining protocol work should stay
-split into smaller follow-up decisions: selective endpoint activation and any
-parser or response-shape compatibility only if tests prove the target still
-regressed a Baseten client expectation. The v1.1 warn-and-ignore behavior for
-generic unknown fields was not ported in the `baseten_ext` slice; keep that as
-a separate client-test decision.
+the target `HttpAsyncEngine` shape. B10 `router_queue_threshold` hot reload from
+`a3f024b40` has been restored through the target actor-based router queue rather
+than the old v1.1 queue lock. The remaining protocol work should stay split into
+smaller follow-up decisions: selective endpoint activation and any parser or
+response-shape compatibility only if tests prove the target still regressed a
+Baseten client expectation. The v1.1 warn-and-ignore behavior for generic
+unknown fields was not ported in the `baseten_ext` slice; keep that as a
+separate client-test decision.
 
 ## Definitions
 

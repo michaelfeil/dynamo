@@ -72,6 +72,10 @@ enum AdmissionCommand {
     Update {
         ack_tx: oneshot::Sender<()>,
     },
+    UpdateThreshold {
+        threshold_frac: Option<f64>,
+        ack_tx: oneshot::Sender<()>,
+    },
 }
 
 struct SchedulerQueueActor<
@@ -118,8 +122,6 @@ pub struct SchedulerQueue<
     pending_isl_tokens: Arc<AtomicUsize>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
-    /// Cached threshold fraction; None means queueing is disabled.
-    threshold_frac: Option<f64>,
     supports_overlap_refresh: bool,
     _marker: PhantomData<(S, Sel, RF)>,
 }
@@ -193,7 +195,6 @@ impl<
             pending_isl_tokens,
             slots,
             workers_with_configs,
-            threshold_frac,
             supports_overlap_refresh: overlap_refresh_after.is_some(),
             _marker: PhantomData,
         }
@@ -337,14 +338,27 @@ impl<
     /// Each scheduled request updates active_tokens via add_request, so the prefill-busy check
     /// sees fresh state on the next iteration.
     pub async fn update(&self) {
-        if self.threshold_frac.is_none() {
-            return;
-        }
-
         let (ack_tx, ack_rx) = oneshot::channel();
         if self
             .admission_tx
             .send(AdmissionCommand::Update { ack_tx })
+            .await
+            .is_ok()
+        {
+            let _ = ack_rx.await;
+        }
+    }
+
+    /// Hot-reload the queue admission threshold.
+    /// `None` or non-positive values disable queueing.
+    pub async fn update_router_queue_threshold(&self, threshold_frac: Option<f64>) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .admission_tx
+            .send(AdmissionCommand::UpdateThreshold {
+                threshold_frac,
+                ack_tx,
+            })
             .await
             .is_ok()
         {
@@ -398,6 +412,13 @@ impl<
                 }
                 AdmissionCommand::Update { ack_tx } => {
                     self.handle_update().await;
+                    let _ = ack_tx.send(());
+                }
+                AdmissionCommand::UpdateThreshold {
+                    threshold_frac,
+                    ack_tx,
+                } => {
+                    self.handle_threshold_update(threshold_frac).await;
                     let _ = ack_tx.send(());
                 }
             }
@@ -564,6 +585,44 @@ impl<
             }
             tracing::debug!("scheduling request from pending queue");
             self.admit_one(request, admit_now);
+        }
+    }
+
+    async fn handle_threshold_update(&mut self, threshold_frac: Option<f64>) {
+        let new_value = threshold_frac.filter(|t| *t > 0.0);
+        if self.threshold_frac == new_value {
+            return;
+        }
+
+        tracing::info!(
+            previous = ?self.threshold_frac,
+            next = ?new_value,
+            "router_queue_threshold hot-reload"
+        );
+        self.threshold_frac = new_value;
+
+        if self.threshold_frac.is_some() {
+            self.handle_update().await;
+            return;
+        }
+
+        while let Some(entry) = self.pending.pop() {
+            let current_pending_count = self.pending_count.load(AtomicOrdering::Relaxed);
+            debug_assert!(
+                current_pending_count > 0,
+                "pending_count underflow on threshold disable"
+            );
+            self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
+            let current_pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
+            debug_assert!(
+                current_pending_isl_tokens >= entry.request.isl_tokens,
+                "pending_isl_tokens underflow: pending={} request_isl_tokens={}",
+                current_pending_isl_tokens,
+                entry.request.isl_tokens
+            );
+            self.pending_isl_tokens
+                .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
+            self.admit_one(entry.request, Instant::now());
         }
     }
 
@@ -1377,6 +1436,30 @@ mod tests {
             response,
             Err(KvSchedulerError::SubscriberShutdown)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_threshold_hot_reload_disable_drains_pending() {
+        let block_size = 16;
+        let isl = 512;
+        let (queue, _slots) = make_queue(1, block_size, isl, Some(0.0));
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        rx1.await
+            .expect("first response sender dropped")
+            .expect("first request should be scheduled");
+
+        let (req2, rx2) = make_request("req-2", isl);
+        queue.enqueue(req2).await;
+        assert_eq!(queue.pending_count(), 1);
+
+        queue.update_router_queue_threshold(None).await;
+
+        rx2.await
+            .expect("hot-reloaded response sender dropped")
+            .expect("queued request should be scheduled after disabling queueing");
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

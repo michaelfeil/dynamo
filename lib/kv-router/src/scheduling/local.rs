@@ -318,6 +318,13 @@ where
         self.queue.supports_overlap_refresh()
     }
 
+    pub async fn update_router_queue_threshold(&self, threshold_frac: Option<f64>) {
+        self.queue
+            .update_router_queue_threshold(threshold_frac)
+            .await;
+        let _ = self.queue_updates.send(());
+    }
+
     pub fn worker_type(&self) -> &'static str {
         self.worker_type
     }

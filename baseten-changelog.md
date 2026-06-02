@@ -386,6 +386,17 @@ the old queue stack where target tiered ISL queueing already provides the
 queueing mechanism. Dp routing + routing policy is hard to test, so its better to 
 preserve it. 
 
+v1.2 implementation note:
+
+Followed v1.1 for `router_queue_threshold` hot reload, adapted to the target's
+new actor-based router queue instead of copying the old `RwLock` queue shape.
+The B10 config map now accepts root and override-group `router_queue_threshold`
+values; the scheduler polls the hot-reloadable B10 config every 10 seconds and
+updates the queue actor without restart. Positive values enable queueing at the
+new threshold, while `0` or `None` disables queueing. When queueing is disabled
+after requests are already pending, the actor drains them immediately so the
+target queue cannot strand requests behind a now-disabled threshold.
+
 Replay notes:
 
 Treat this as one coherent router subsystem port. Do not cherry-pick the commits
