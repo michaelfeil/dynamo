@@ -116,8 +116,9 @@ from PATCH-003 remains dropped because Baseten no longer performs JetStream
 offloading. The remaining protocol work should stay split into smaller
 follow-up decisions for parser, response-shape, or tolerance compatibility only
 if tests prove the target still regressed a Baseten client expectation. The
-v1.1 warn-and-ignore behavior for generic unknown fields was not ported in the
-`baseten_ext` slice; keep that as a separate client-test decision.
+v1.1 warn-and-ignore behavior for generic unknown fields was validated and kept
+dropped: current chat/completion tests reject unsupported fields, and that
+stricter target behavior remains the v1.2 decision.
 
 ## Definitions
 

@@ -57,7 +57,7 @@ git switch -c main-v1.2.0 bed9f269312151481cd67a8d21b70e0f52424c2b
 | --- | --- | --- |
 | `PATCH-001` CI/container | Keep, retarget branch names | Fork image publishing and CI still need Baseten-specific wiring. |
 | `PATCH-002` runtime/shutdown | Keep behavior, port manually | Shutdown/drain invariants still matter; target code has moved. |
-| `PATCH-003` NATS/JetStream/discovery | Mostly discard or minimize | Target has P2P standalone-indexer recovery; NATS is less central. Keep only object-store/client-access needs that still exist. |
+| `PATCH-003` NATS/JetStream/discovery | Mostly discard or minimize | Target has P2P standalone-indexer recovery; NATS is less central. Keep JSON pub/sub, but drop Python JetStream object storage because offload is no longer used. |
 | `PATCH-004` router core/queueing | Redesign, do not replay old queue stack | Target already has tiered ISL queue config and P2P recovery. Preserve only missing Baseten policy knobs after testing. |
 | `PATCH-005` metrics/tracing | Keep | Added metrics should be preserved across versions. |
 | `PATCH-006` protocols | Mixed: follow v1.1 by default, test exceptions | Target still rejects `stream_options` without streaming, and that is acceptable. Target has modern tool/reasoning parsing; port only Baseten/client-facing gaps found by tests. |
