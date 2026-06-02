@@ -309,7 +309,7 @@ impl Runtime {
 
     /// Shuts down the [`Runtime`] instance
     pub fn shutdown(&self) {
-        tracing::info!("Runtime shutdown initiated");
+        tracing::info!(unified_model_logs = true, "Runtime shutdown initiated");
 
         // Spawn the shutdown coordination task BEFORE cancelling tokens
         let tracker = self.graceful_shutdown_tracker.clone();
@@ -335,6 +335,7 @@ impl Runtime {
 
             // Phase 3: Now connections will be disconnected to backend services (e.g. NATS/ETCD) by cancelling the main token
             tracing::info!(
+                unified_model_logs = true,
                 "Phase 3: All endpoints ended gracefully. Connections to backend services will now be disconnected"
             );
             main_token.cancel();

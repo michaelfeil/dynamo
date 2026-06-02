@@ -101,12 +101,14 @@ Python HTTP-engine first-yield gate from `9adbfdc64` has been restored through
 the target `HttpAsyncEngine` shape. B10 `router_queue_threshold` hot reload from
 `a3f024b40` has been restored through the target actor-based router queue rather
 than the old v1.1 queue lock. The v1.1 B10 config-map warning suppression flag
-has also been restored. The remaining protocol work should stay split into
-smaller follow-up decisions: selective endpoint activation and any parser or
-response-shape compatibility only if tests prove the target still regressed a
-Baseten client expectation. The v1.1 warn-and-ignore behavior for generic
-unknown fields was not ported in the `baseten_ext` slice; keep that as a
-separate client-test decision.
+has also been restored. Runtime shutdown lifecycle logs now carry the v1.1
+`unified_model_logs` marker where the target still has matching lifecycle
+points. The remaining protocol work should stay split into smaller follow-up
+decisions: selective endpoint activation and any parser or response-shape
+compatibility only if tests prove the target still regressed a Baseten client
+expectation. The v1.1 warn-and-ignore behavior for generic unknown fields was
+not ported in the `baseten_ext` slice; keep that as a separate client-test
+decision.
 
 ## Definitions
 

@@ -823,6 +823,16 @@ Keep structured request correlation and Baseten log fields. The target already
 has request-id propagation and frontend tracing tests, so port only missing
 structured fields and avoid replaying old log-level churn without evidence.
 
+v1.2 implementation note:
+
+Restored the v1.1 `unified_model_logs = true` marker for the current
+`Runtime::shutdown()` lifecycle points: shutdown initiation and the final phase
+where backend service connections are disconnected. Signal-handler shutdown
+logs already carried the marker on the target branch, and the old
+`Runtime::initiate_shutdown()` hunk no longer applies because that API is not
+present in the target. The broader context reason/log-level churn remains
+unported unless a current false alarm or missing operational signal is proven.
+
 
 Replay notes:
 
