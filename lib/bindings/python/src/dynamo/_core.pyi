@@ -1261,6 +1261,14 @@ class PythonAsyncEngine:
         """Wrap a Python generator and event loop for use with Dynamo services."""
         ...
 
+    def block_until_stream_item(self, enabled: bool) -> None:
+        """Wait for the first stream item before returning the response stream."""
+        ...
+
+    def set_logging_label(self, label: str) -> None:
+        """Set the label used in structured engine lifecycle logs."""
+        ...
+
 
 
 class HttpAsyncEngine:
@@ -1270,7 +1278,11 @@ class HttpAsyncEngine:
     converts them to the Rust version of HttpError
     """
 
-    ...
+    def __init__(self, generator: Any, event_loop: Any) -> None: ...
+
+    def block_until_stream_item(self, enabled: bool) -> None:
+        """Wait for the first stream item before returning the response stream."""
+        ...
 
 class KserveGrpcService:
     """

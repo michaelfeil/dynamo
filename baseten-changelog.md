@@ -636,6 +636,17 @@ frontend/backend API shape instead of copying the old bindings mechanically.
 The target has rewritten frontend processors, so the implementation point may
 move.
 
+v1.2 implementation note:
+
+Followed v1.1 for the HTTP Python-engine first-yield gate. `HttpAsyncEngine`
+now enables `PythonAsyncEngine.block_until_stream_item(true)` by default, so
+HTTP service registration waits for the Python generator's first item before
+returning the Rust response stream. This preserves the webserver/disaggregated
+decode invariant without restoring the v1.1-dropped Python worker selector
+abstraction. B10 routing remains exposed through `RouterConfig(...,
+algo_selector="B10")`, and JSON publisher/subscriber bindings were already
+restored in the earlier PATCH-003/PATCH-007 overlap slice.
+
 Validation:
 
 Compile Python bindings, import `dynamo.runtime`, validate type stubs, and run

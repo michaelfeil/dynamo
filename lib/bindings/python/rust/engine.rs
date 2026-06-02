@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::{Error, Result};
+use futures::{StreamExt as FuturesStreamExt, stream};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use pyo3::{PyAny, PyErr};
@@ -11,7 +12,7 @@ use pyo3_async_runtimes::TaskLocals;
 use pythonize::{depythonize, pythonize};
 pub use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
@@ -66,6 +67,12 @@ pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[derive(Clone)]
 pub struct PythonAsyncEngine(PythonServerStreamingEngine);
 
+impl PythonAsyncEngine {
+    pub fn set_logging_label(&mut self, label: impl AsRef<str>) {
+        self.0.set_logging_label(label);
+    }
+}
+
 #[pymethods]
 impl PythonAsyncEngine {
     /// Create a new instance of the PythonAsyncEngine
@@ -87,6 +94,15 @@ impl PythonAsyncEngine {
             Arc::new(event_loop),
         )))
     }
+
+    pub fn block_until_stream_item(&mut self, enabled: bool) {
+        self.0.block_until_stream_item(enabled);
+    }
+
+    #[pyo3(name = "set_logging_label")]
+    pub fn set_logging_label_py(&mut self, label: String) {
+        self.set_logging_label(label);
+    }
 }
 
 #[async_trait::async_trait]
@@ -106,6 +122,8 @@ pub struct PythonServerStreamingEngine {
     generator: Arc<PyObject>,
     event_loop: Arc<PyObject>,
     has_context: bool,
+    block_until_stream_item: bool,
+    logging_label: String,
 }
 
 impl PythonServerStreamingEngine {
@@ -124,7 +142,17 @@ impl PythonServerStreamingEngine {
             generator,
             event_loop,
             has_context,
+            block_until_stream_item: false,
+            logging_label: "Worker".to_string(),
         }
+    }
+
+    pub fn block_until_stream_item(&mut self, enabled: bool) {
+        self.block_until_stream_item = enabled;
+    }
+
+    pub fn set_logging_label(&mut self, logging_label: impl AsRef<str>) {
+        self.logging_label = logging_label.as_ref().to_string();
     }
 }
 
@@ -168,6 +196,7 @@ where
         let ctx_python = ctx.clone();
         let has_context = self.has_context;
         let metadata = context.metadata().clone();
+        let logging_label = self.logging_label.clone();
 
         // Acquiring the GIL is similar to acquiring a standard lock/mutex
         // Performing this in an tokio async task could block the thread for an undefined amount of time
@@ -182,6 +211,7 @@ where
         let stream = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| {
                 let py_request = pythonize(py, &request)?;
+                let id = ctx_python.id().to_string();
 
                 // Create context with trace information
                 let py_ctx = Py::new(
@@ -198,6 +228,11 @@ where
                     // Legacy: No `context` arg
                     generator.call1(py, (py_request,))
                 }?;
+                tracing::info!(
+                    unified_model_logs = true,
+                    "{}: Processing request {id}",
+                    logging_label
+                );
 
                 let locals = TaskLocals::new(event_loop.bind(py).clone());
                 pyo3_async_runtimes::tokio::into_stream_with_locals_v1(
@@ -208,13 +243,49 @@ where
         })
         .await??;
 
-        let stream = Box::pin(stream);
-
         // process the stream
         // any error thrown in the stream will be caught and complete the processing task
         // errors are captured by a task that is watching the processing task
         // the error will be emitted as an annotated error
         let request_id = id.clone();
+        let mut stream = Box::pin(stream);
+
+        let stream = if self.block_until_stream_item {
+            let first_item = match FuturesStreamExt::next(&mut stream).await {
+                Some(Ok(item)) => item,
+                Some(Err(e)) => {
+                    if e.to_string().contains("CancelledError") {
+                        tracing::info!(
+                            request_id,
+                            "Python async generator stream cancelled before first iteration"
+                        );
+                    } else {
+                        tracing::warn!(
+                            unified_model_logs = true,
+                            request_id,
+                            "Python exception occurred before finish of first iteration: {}",
+                            e
+                        );
+                    }
+                    return Err(Error::new(e));
+                }
+                None => {
+                    tracing::warn!(
+                        request_id,
+                        "Python async generator stream ended before processing started"
+                    );
+                    return Err(Error::new(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Python async generator stream ended before processing started",
+                    )));
+                }
+            };
+            stream::once(async move { Ok(first_item) })
+                .chain(stream)
+                .boxed()
+        } else {
+            stream
+        };
 
         tokio::spawn(async move {
             tracing::debug!(
@@ -225,7 +296,7 @@ where
             let mut stream = stream;
             let mut count = 0;
 
-            while let Some(item) = stream.next().await {
+            while let Some(item) = FuturesStreamExt::next(&mut stream).await {
                 count += 1;
                 tracing::trace!(
                     request_id,
