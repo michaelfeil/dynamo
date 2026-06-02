@@ -36,7 +36,7 @@ use ingress::push_handler::WorkHandlerMetrics;
 use prometheus::{CounterVec, Histogram, IntCounter, IntCounterVec, IntGauge};
 
 /// Shared default maximum TCP message size across request-plane components.
-pub(crate) const DEFAULT_TCP_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
+pub(crate) const DEFAULT_TCP_MAX_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 
 static TCP_MAX_MESSAGE_SIZE: OnceLock<usize> = OnceLock::new();
 
