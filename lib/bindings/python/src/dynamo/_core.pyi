@@ -1473,6 +1473,22 @@ class RouterConfig:
         """
         ...
 
+def set_health(healthy: bool, reason: str = "") -> None:
+    """Set the B10 health-file readiness state."""
+    ...
+
+def is_healthy() -> bool:
+    """Return the current B10 health-file readiness state."""
+    ...
+
+def set_poisoned() -> None:
+    """Mark the B10 health-file readiness state as unrecoverably unhealthy."""
+    ...
+
+def set_rate_limit_level(level: float) -> None:
+    """Set the B10 global HTTP rate-limit level."""
+    ...
+
 class AicPerfConfig:
     def __init__(
         self,

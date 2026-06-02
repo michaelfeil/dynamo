@@ -778,6 +778,7 @@ async fn create_kv_router_from_endpoint(
             &endpoint.inner,
             block_size as u32,
             kv_router_config,
+            llm_rs::entrypoint::RouterSelector::Default,
             prefill_load_estimator,
             worker_type,
             model_name,

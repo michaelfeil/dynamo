@@ -71,6 +71,8 @@ impl From<RouterMode> for RsRouterMode {
     }
 }
 
+mod b10_health;
+mod b10_rate_limiter;
 mod backend;
 mod context;
 mod engine;
@@ -169,6 +171,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(llm::entrypoint::run_input, m)?)?;
+    m.add_function(wrap_pyfunction!(b10_health::set_health, m)?)?;
+    m.add_function(wrap_pyfunction!(b10_health::is_healthy, m)?)?;
+    m.add_function(wrap_pyfunction!(b10_health::set_poisoned, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        b10_rate_limiter::set_rate_limit_level,
+        m
+    )?)?;
 
     m.add_class::<DistributedRuntime>()?;
     m.add_class::<Endpoint>()?;

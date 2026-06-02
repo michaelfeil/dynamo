@@ -89,6 +89,14 @@ contains newer router recovery, tiered queueing, parser/tool-call handling, and
 first-token infrastructure, so the v1.1 replay commits should be treated as
 evidence and tests before they are treated as patches to port.
 
+Current `main-v1.2.0` replay status: the B10 health-file and header rate-limit
+portion of `6f36f18d4` has been ported because it is client/platform-facing and
+not replaced by upstream. The rest of that protocol commit should stay split
+into smaller follow-up decisions: `baseten_ext` and required-extension
+validation first, then Anthropic conformance, then any remaining parser or
+response-shape compatibility only if tests prove the target still regressed a
+Baseten client expectation.
+
 ## Definitions
 
 - **Upstream base**: The clean Dynamo release or commit that Baseten originally

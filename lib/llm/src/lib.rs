@@ -7,6 +7,7 @@
 //! distributed LLM inference solutions.
 
 pub mod agents;
+pub mod b10_health;
 pub mod backend;
 pub mod common;
 pub mod discovery;

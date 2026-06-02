@@ -552,6 +552,17 @@ for reasoning and tool calls, including buffered post-reasoning tool text and
 parity fixtures. Run the brittle tool-calling tests against target first, then
 port only failing cases.
 
+v1.2 implementation note:
+
+Followed v1.1 for the B10 health and rate-limit subset. The branch now carries
+the standalone B10 health heartbeat/poison state, the `/health_file` route, the
+header-driven B10 rate limiter, and Python functions `set_health`,
+`is_healthy`, `set_poisoned`, and `set_rate_limit_level`. The rate limiter was
+attached to the same endpoint classes v1.1 gated first: completions, chat
+completions, and embeddings. Broader protocol work remains open: `baseten_ext`,
+required extension validation, selective endpoint activation, and Anthropic
+conformance should be handled in later focused slices after comparing target
+upstream tests.
 
 Validation:
 

@@ -593,6 +593,7 @@ impl HttpServiceConfigBuilder {
             },
             super::health::health_check_router(state.clone(), var(HTTP_SVC_HEALTH_PATH_ENV).ok()),
             super::health::live_check_router(state.clone(), var(HTTP_SVC_LIVE_PATH_ENV).ok()),
+            super::health_b10::add_health_file_router(None),
             super::busy_threshold::busy_threshold_router(state.clone(), None),
         ];
         let mut system_router = axum::Router::new();

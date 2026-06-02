@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     RouteDoc,
+    b10_rate_limiter::check_rate_limit,
     disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
     error::HttpError,
     metadata::extract_metadata_from_http,
@@ -470,6 +471,27 @@ fn copy_x_request_id<T: Send + Sync + 'static, U: Send + Sync + 'static>(
     }
 }
 
+fn b10_rate_limit_request(
+    headers: &HeaderMap,
+    request_id: &str,
+) -> Option<axum::response::Response> {
+    if let Some((rate_limit_msg, _)) = check_rate_limit(headers) {
+        tracing::info!("Request {} is rate limited: {}", request_id, rate_limit_msg);
+        let response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorMessage {
+                message: rate_limit_msg,
+                error_type: map_error_code_to_error_type(StatusCode::TOO_MANY_REQUESTS),
+                code: StatusCode::TOO_MANY_REQUESTS.as_u16(),
+            }),
+        )
+            .into_response();
+        Some(response)
+    } else {
+        None
+    }
+}
+
 /// OpenAI Completions Request Handler
 ///
 /// This method will handle the incoming request for the `/v1/completions endpoint`. The endpoint is a "source"
@@ -490,6 +512,9 @@ async fn handler_completions(
 
     // create the context for the request
     let request_id = get_or_create_request_id(&headers);
+    if let Some(response) = b10_rate_limit_request(&headers, &request_id) {
+        return Ok(response);
+    }
     let streaming = request.inner.stream.unwrap_or(false);
     let cancellation_labels = CancellationLabels {
         model: state
@@ -914,6 +939,9 @@ async fn embeddings(
     check_ready(&state)?;
 
     let request_id = get_or_create_request_id(&headers);
+    if let Some(response) = b10_rate_limit_request(&headers, &request_id) {
+        return Ok(response);
+    }
     let request = context_from_headers(request, request_id, &headers)?;
     let request_id = request.id().to_string();
 
@@ -1075,6 +1103,9 @@ async fn handler_chat_completions(
 
     // create the context for the request
     let request_id = get_or_create_request_id(&headers);
+    if let Some(response) = b10_rate_limit_request(&headers, &request_id) {
+        return Ok(response);
+    }
     let streaming = request.inner.stream.unwrap_or(false);
     let resolved_model = resolve_request_model(&request.inner.model, template.as_ref());
     let cancellation_labels = CancellationLabels {

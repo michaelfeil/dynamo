@@ -42,12 +42,16 @@ from dynamo._core import WorkerMetricsPublisher as WorkerMetricsPublisher
 from dynamo._core import WorkerType as WorkerType
 from dynamo._core import compute_block_hash_for_seq as compute_block_hash_for_seq
 from dynamo._core import fetch_model as fetch_model
+from dynamo._core import is_healthy as is_healthy
 from dynamo._core import lora_name_to_id as lora_name_to_id
 from dynamo._core import make_engine
 from dynamo._core import register_model as register_model
 from dynamo._core import run_input
 from dynamo._core import run_kv_indexer as run_kv_indexer
 from dynamo._core import run_mocker_trace_replay as _run_mocker_trace_replay
+from dynamo._core import set_health as set_health
+from dynamo._core import set_poisoned as set_poisoned
+from dynamo._core import set_rate_limit_level as set_rate_limit_level
 from dynamo._core import unregister_model as unregister_model
 
 from .exceptions import HttpError
