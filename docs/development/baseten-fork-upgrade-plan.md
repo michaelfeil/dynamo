@@ -103,12 +103,15 @@ the target `HttpAsyncEngine` shape. B10 `router_queue_threshold` hot reload from
 than the old v1.1 queue lock. The v1.1 B10 config-map warning suppression flag
 has also been restored. Runtime shutdown lifecycle logs now carry the v1.1
 `unified_model_logs` marker where the target still has matching lifecycle
-points. The remaining protocol work should stay split into smaller follow-up
-decisions: selective endpoint activation and any parser or response-shape
-compatibility only if tests prove the target still regressed a Baseten client
-expectation. The v1.1 warn-and-ignore behavior for generic unknown fields was
-not ported in the `baseten_ext` slice; keep that as a separate client-test
-decision.
+points. The Gemma 4 parser stack from PATCH-008 was not replayed wholesale
+because the target already has broad Gemma 4 support, but the v1.1
+default-thinking-off decision was kept: `gemma4` and `gemma-4` disable reasoning
+parsing unless `chat_template_args.enable_thinking` is explicitly true. The
+remaining protocol work should stay split into smaller follow-up decisions:
+selective endpoint activation and any parser or response-shape compatibility
+only if tests prove the target still regressed a Baseten client expectation. The
+v1.1 warn-and-ignore behavior for generic unknown fields was not ported in the
+`baseten_ext` slice; keep that as a separate client-test decision.
 
 ## Definitions
 

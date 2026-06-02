@@ -703,6 +703,16 @@ new Dynamo branch and Baseten support matrix, then port only remaining
 compatibility behavior. Check whether upstream already has Gemma 4 parser
 support and whether the missing LFS fixture is still referenced.
 
+v1.2 implementation note:
+
+The target already includes broad Gemma 4 parser and chat-template support, so
+the old parser-support commits are not replayed wholesale. Keep the narrow
+Baseten v1.1 decision from `f098125d3`: Gemma 4 reasoning parsing is disabled
+unless `chat_template_args.enable_thinking` is explicitly true. This matches the
+Gemma 4 template behavior, where omitting the flag does not emit reasoning
+channel markers, and prevents the parser from running in a mode that can only
+fall through. The hyphen alias `gemma-4` receives the same treatment.
+
 Validation:
 
 Run parser tests, Gemma 4 chat template tests, vLLM integration smoke tests, and
