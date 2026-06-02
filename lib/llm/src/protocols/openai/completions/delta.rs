@@ -341,6 +341,7 @@ mod tests {
         NvCreateCompletionRequest {
             inner,
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
@@ -387,6 +388,7 @@ mod tests {
         NvCreateCompletionRequest {
             inner,
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: Some(
                 crate::protocols::openai::nvext::NvExt::builder()
                     .extra_fields(fields)

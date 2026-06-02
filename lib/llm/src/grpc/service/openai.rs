@@ -346,6 +346,7 @@ impl TryFrom<inference::ModelInferRequest> for NvCreateCompletionRequest {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,

@@ -12,6 +12,7 @@ use crate::protocols::openai::common_ext::CommonExtProvider;
 use crate::types::TokenIdType;
 
 pub mod audios;
+pub mod baseten_ext;
 pub mod chat_completions;
 pub mod common_ext;
 pub mod completions;

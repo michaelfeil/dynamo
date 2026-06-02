@@ -11,6 +11,9 @@ use crate::preprocessor::media::MediaDecoder;
 
 use super::{
     OpenAIOutputOptionsProvider, OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider,
+    baseten_ext::{
+        BasetenExt, BasetenExtProvider, validate_request_fields as validate_baseten_request_fields,
+    },
     common_ext::{CommonExt, CommonExtProvider},
     nvext::NvExt,
     nvext::NvExtProvider,
@@ -88,6 +91,9 @@ pub struct NvCreateChatCompletionRequest {
 
     #[serde(flatten, default)]
     pub common: CommonExt,
+
+    #[serde(flatten, default, skip_serializing_if = "BasetenExt::is_empty")]
+    pub baseten_ext: BasetenExt,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvext: Option<NvExt>,
@@ -172,6 +178,12 @@ impl AnnotationsProvider for NvCreateChatCompletionRequest {
             .and_then(|nvext| nvext.annotations.as_ref())
             .map(|annotations| annotations.contains(&annotation.to_string()))
             .unwrap_or(false)
+    }
+}
+
+impl BasetenExtProvider for NvCreateChatCompletionRequest {
+    fn baseten_ext(&self) -> Option<&BasetenExt> {
+        (!self.baseten_ext.is_empty()).then_some(&self.baseten_ext)
     }
 }
 
@@ -387,6 +399,7 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
 /// allowing us to validate the data.
 impl ValidateRequest for NvCreateChatCompletionRequest {
     fn validate(&self) -> Result<(), anyhow::Error> {
+        validate_baseten_request_fields(&self.baseten_ext)?;
         validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
         validate::validate_messages(&self.inner.messages)?;
         validate::validate_model(&self.inner.model)?;

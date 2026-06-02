@@ -89,6 +89,7 @@ fn create_mock_chat_completion_request() -> NvCreateChatCompletionRequest {
     NvCreateChatCompletionRequest {
         inner,
         common: CommonExt::default(),
+        baseten_ext: Default::default(),
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,

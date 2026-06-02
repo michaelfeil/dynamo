@@ -141,6 +141,7 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
                 top_k: req.top_k.map(|k| k as i32),
                 ..Default::default()
             },
+            baseten_ext: Default::default(),
             nvext: None,
             // chat_template_args may be augmented by the Anthropic handler
             // (anthropic.rs) after conversion — e.g., setting enable_thinking=true

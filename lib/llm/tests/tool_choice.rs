@@ -37,6 +37,7 @@ fn create_test_request() -> NvCreateChatCompletionRequest {
             ..Default::default()
         },
         common: Default::default(),
+        baseten_ext: Default::default(),
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,

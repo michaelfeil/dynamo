@@ -259,6 +259,7 @@ impl Request {
         NvCreateChatCompletionRequest {
             inner,
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -700,6 +701,7 @@ mod context_length_validation {
         NvCreateChatCompletionRequest {
             inner,
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,

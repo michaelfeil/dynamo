@@ -401,6 +401,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -491,6 +492,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: Some(
                 crate::protocols::openai::nvext::NvExt::builder()
                     .extra_fields(fields)

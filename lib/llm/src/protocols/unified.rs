@@ -546,6 +546,7 @@ mod tests {
                 ..Default::default()
             },
             common: CommonExt::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,

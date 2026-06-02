@@ -4,6 +4,7 @@
 use dynamo_llm::protocols::{
     common::StopConditionsProvider,
     openai::{
+        baseten_ext::ThinkingType,
         chat_completions::NvCreateChatCompletionRequest,
         common_ext::{CommonExt, CommonExtProvider},
         completions::NvCreateCompletionRequest,
@@ -66,6 +67,7 @@ fn test_sampling_parameters_include_stop_str_in_output_extraction() {
             .include_stop_str_in_output(true)
             .build()
             .unwrap(),
+        baseten_ext: Default::default(),
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
@@ -294,6 +296,7 @@ fn test_serialization_preserves_structure() {
             min_tokens: Some(100),
             ..Default::default()
         },
+        baseten_ext: Default::default(),
         nvext: Some(NvExt {
             greed_sampling: Some(false),
             ..Default::default()
@@ -350,6 +353,7 @@ fn test_sampling_parameters_extraction() {
             .repetition_penalty(1.3)
             .build()
             .unwrap(),
+        baseten_ext: Default::default(),
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
@@ -361,4 +365,52 @@ fn test_sampling_parameters_extraction() {
 
     assert_eq!(sampling_options.top_k, Some(42));
     assert_eq!(sampling_options.repetition_penalty, Some(1.3));
+}
+
+#[test]
+fn test_b10_thinking_field_deserialization() {
+    let json_str = r#"{
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "thinking": {"type": "enabled"}
+    }"#;
+    let req: NvCreateChatCompletionRequest = serde_json::from_str(json_str).unwrap();
+    let thinking = req.baseten_ext.thinking.as_ref().unwrap();
+    assert_eq!(thinking.thinking_type, ThinkingType::Enabled);
+
+    let json_str = r#"{
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "thinking": {"type": "disabled"}
+    }"#;
+    let req: NvCreateChatCompletionRequest = serde_json::from_str(json_str).unwrap();
+    let thinking = req.baseten_ext.thinking.as_ref().unwrap();
+    assert_eq!(thinking.thinking_type, ThinkingType::Disabled);
+}
+
+#[test]
+fn test_b10_invalid_dynamic_temperature_is_not_silently_dropped() {
+    let json_str = r#"{
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "dynamic_temperature": {"": 1.0}
+    }"#;
+    let err = serde_json::from_str::<NvCreateChatCompletionRequest>(json_str)
+        .expect_err("invalid Baseten extension should fail deserialization");
+    assert!(err.to_string().contains("dynamic_temperature"));
+}
+
+#[test]
+fn test_b10_invalid_thinking_is_not_silently_dropped() {
+    let json_str = r#"{
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "thinking": {"type": "bogus"}
+    }"#;
+    let err = serde_json::from_str::<NvCreateChatCompletionRequest>(json_str)
+        .expect_err("invalid Baseten extension should fail deserialization");
+    let err_str = err.to_string();
+    assert!(err_str.contains("unknown variant"));
+    assert!(err_str.contains("enabled"));
+    assert!(err_str.contains("disabled"));
 }

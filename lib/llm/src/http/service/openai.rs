@@ -3173,6 +3173,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -3206,6 +3207,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -3245,6 +3247,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
@@ -3270,6 +3273,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
@@ -3294,6 +3298,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
@@ -3318,6 +3323,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
@@ -3344,6 +3350,7 @@ mod tests {
                 .repetition_penalty(-3.0)
                 .build()
                 .unwrap(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
@@ -3368,6 +3375,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: None,
             return_tokens_as_token_ids: None,
@@ -3396,6 +3404,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             metadata: json!({
                 "user": {"id": 1, "name": "user-1"},
@@ -3430,6 +3439,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -3461,6 +3471,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -3491,6 +3502,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -3521,6 +3533,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -3553,6 +3566,7 @@ mod tests {
                 .repetition_penalty(-3.0)
                 .build()
                 .unwrap(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
@@ -3583,6 +3597,7 @@ mod tests {
                 ..Default::default()
             },
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,

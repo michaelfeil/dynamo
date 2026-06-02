@@ -564,6 +564,15 @@ required extension validation, selective endpoint activation, and Anthropic
 conformance should be handled in later focused slices after comparing target
 upstream tests.
 
+The next v1.2 slice restored the typed root-level `baseten_ext` fields for chat
+and completion requests: `b10_cache_control`, `baseten`, `dynamic_temperature`,
+and `thinking`. This follows v1.1's "validate-or-400, never silently drop"
+decision for Baseten-maintained fields: invalid `dynamic_temperature` keys,
+values, or `thinking.type` variants fail during deserialization. Unlike v1.1,
+this slice intentionally kept the target branch's stricter unknown-field
+validation instead of changing all unknown parameters to warn-and-ignore; that
+broader compatibility decision should be made separately with client tests.
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,

@@ -91,11 +91,15 @@ evidence and tests before they are treated as patches to port.
 
 Current `main-v1.2.0` replay status: the B10 health-file and header rate-limit
 portion of `6f36f18d4` has been ported because it is client/platform-facing and
-not replaced by upstream. The rest of that protocol commit should stay split
-into smaller follow-up decisions: `baseten_ext` and required-extension
-validation first, then Anthropic conformance, then any remaining parser or
-response-shape compatibility only if tests prove the target still regressed a
-Baseten client expectation.
+not replaced by upstream. The typed root-level `baseten_ext` request fields
+have also been restored for chat/completions, with v1.1-style
+validate-or-error behavior for invalid Baseten-maintained fields. The remaining
+protocol work should stay split into smaller follow-up decisions: Anthropic
+conformance, selective endpoint activation, and any parser or response-shape
+compatibility only if tests prove the target still regressed a Baseten client
+expectation. The v1.1 warn-and-ignore behavior for generic unknown fields was
+not ported in the `baseten_ext` slice; keep that as a separate client-test
+decision.
 
 ## Definitions
 

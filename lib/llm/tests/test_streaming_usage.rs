@@ -194,6 +194,7 @@ fn create_chat_request(
     NvCreateChatCompletionRequest {
         inner,
         common: Default::default(),
+        baseten_ext: Default::default(),
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,
@@ -507,6 +508,7 @@ fn create_cmpl_request(include_usage: Option<bool>, stream: bool) -> NvCreateCom
     NvCreateCompletionRequest {
         inner,
         common: Default::default(),
+        baseten_ext: Default::default(),
         nvext: None,
         metadata: None,
         return_tokens_as_token_ids: None,
@@ -534,6 +536,7 @@ fn create_nonstreaming_chat_request() -> NvCreateChatCompletionRequest {
     NvCreateChatCompletionRequest {
         inner,
         common: Default::default(),
+        baseten_ext: Default::default(),
         nvext: None,
         chat_template_args: None,
         media_io_kwargs: None,

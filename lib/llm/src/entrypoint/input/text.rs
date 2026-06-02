@@ -112,6 +112,7 @@ async fn main_loop(
         let req = NvCreateChatCompletionRequest {
             inner,
             common: Default::default(),
+            baseten_ext: Default::default(),
             nvext: None,
             chat_template_args: None,
             media_io_kwargs: None,
