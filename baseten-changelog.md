@@ -286,16 +286,17 @@ APIs were rewritten on the upstream EventPlane abstraction, making them
 transport-agnostic rather than NATS-only.
 
 For v1.2, keep the v1.1 no-NATS decision. Preserve only transport-agnostic
-JSON pub/sub or object-store/client-access behavior that current Baseten code
-still uses. Do not restore router recovery mechanisms whose only purpose was
-NATS/JetStream correctness if target P2P/EventPlane paths cover the need.
+JSON pub/sub behavior that current Baseten code still uses. Do not restore
+router recovery mechanisms whose only purpose was NATS/JetStream correctness if
+target P2P/EventPlane paths cover the need.
 
 Replay notes:
 
 This group has mixed provenance. Some changes were backports or upstream syncs,
 so the target upstream release may already contain them. Audit first, then port
-only remaining Baseten requirements: object store access from Python, consumer
-isolation, alive registry semantics, and stream retention behavior.
+only remaining Baseten requirements. Python JetStream object-store access is not
+a remaining requirement for v1.2 because Baseten no longer performs JetStream
+offloading.
 
 Editorial notes:
 
@@ -306,16 +307,17 @@ Target assessment:
 
 The target SHA has standalone-indexer P2P recovery paths, including tests that
 launch a second indexer with `--peers` and pre-seeded `--workers`. That validates
-the editorial note: do not replay NATS-centric recovery work by default. Keep
-only concrete remaining needs, such as Python JetStream object-store access or
-specific NATS client accessors, if current Baseten deployments still depend on
-them.
+the editorial note: do not replay NATS-centric recovery work by default. Drop
+`b7ce2ca07` for v1.2: the Python JetStream bucket/object-store API was only
+needed for large embedding offload, and Baseten no longer uses JetStream
+offloading. Keep the existing EventPlane-backed JSON publisher/subscriber
+bindings, but do not add new Python NATS bucket storage.
 
 Validation:
 
-Run router startup with multiple instances, stream reconfiguration against an
-existing JetStream stream, object store access through Python, and orphan worker
-cleanup.
+Run router startup with multiple instances and verify P2P/EventPlane recovery
+paths. Do not run or add Python object-store offload tests unless JetStream
+offloading is reintroduced as a product requirement.
 
 ## PATCH-004: Baseten Router Core, Hot Reload, Scheduling, and Queueing
 

@@ -111,12 +111,13 @@ Selective endpoint activation is already present in the target Python
 `HttpService.enable_endpoint(...)` path, so it is treated as satisfied rather
 than replayed. Arbitrary Python worker selector callbacks remain dropped, in
 line with v1.1; Python users select the maintained Baseten policy through
-`RouterConfig(..., algo_selector="B10")`. The remaining protocol work should
-stay split into smaller follow-up decisions for parser, response-shape, or
-tolerance compatibility only if tests prove the target still regressed a
-Baseten client expectation. The v1.1 warn-and-ignore behavior for generic
-unknown fields was not ported in the `baseten_ext` slice; keep that as a
-separate client-test decision.
+`RouterConfig(..., algo_selector="B10")`. Python JetStream object-store access
+from PATCH-003 remains dropped because Baseten no longer performs JetStream
+offloading. The remaining protocol work should stay split into smaller
+follow-up decisions for parser, response-shape, or tolerance compatibility only
+if tests prove the target still regressed a Baseten client expectation. The
+v1.1 warn-and-ignore behavior for generic unknown fields was not ported in the
+`baseten_ext` slice; keep that as a separate client-test decision.
 
 ## Definitions
 
