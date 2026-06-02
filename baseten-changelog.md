@@ -573,6 +573,14 @@ this slice intentionally kept the target branch's stricter unknown-field
 validation instead of changing all unknown parameters to warn-and-ignore; that
 broader compatibility decision should be made separately with client tests.
 
+The Anthropic conformance slice follows v1.1 commit `d493fef1d` closely because
+all three behaviors are externally visible API compatibility requirements:
+Anthropic streams no longer receive the OpenAI-only `[DONE]` sentinel,
+Anthropic `tool_use.id` values are minted as `toolu_<uuid>` instead of exposing
+backend/OpenAI tool-call IDs, and Anthropic backend errors preserve the backend
+HTTP status while rewriting `max_completion_tokens` wording to `max_tokens`.
+This intentionally does not reopen unrelated v1.0 protocol tolerance patches.
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,

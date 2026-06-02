@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::types::{
     AnthropicDelta, AnthropicErrorBody, AnthropicMessageDeltaBody, AnthropicMessageResponse,
     AnthropicResponseContentBlock, AnthropicStopReason, AnthropicStreamEvent, AnthropicUsage,
+    new_tool_use_id,
 };
 use crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse;
 use crate::protocols::unified::AnthropicContext;
@@ -292,9 +293,8 @@ impl AnthropicStreamConverter {
                         });
                     }
 
-                    // Update id and name if provided
-                    if let Some(id) = &tc.id {
-                        self.tool_call_states[tc_index].id = id.clone();
+                    if tc.id.is_some() && self.tool_call_states[tc_index].id.is_empty() {
+                        self.tool_call_states[tc_index].id = new_tool_use_id();
                     }
                     if let Some(func) = &tc.function {
                         if let Some(name) = &func.name {
@@ -611,8 +611,8 @@ impl AnthropicStreamConverter {
                             stopped: false,
                         });
                     }
-                    if let Some(id) = &tc.id {
-                        self.tool_call_states[tc_index].id = id.clone();
+                    if tc.id.is_some() && self.tool_call_states[tc_index].id.is_empty() {
+                        self.tool_call_states[tc_index].id = new_tool_use_id();
                     }
                     if let Some(func) = &tc.function {
                         if let Some(name) = &func.name {
@@ -863,7 +863,9 @@ mod tests {
             } => {
                 assert_eq!(*index, 1);
                 match content_block {
-                    AnthropicResponseContentBlock::ToolUse { name, .. } => {
+                    AnthropicResponseContentBlock::ToolUse { id, name, .. } => {
+                        assert!(id.starts_with("toolu_"));
+                        assert!(!id.contains("call-1"));
                         assert_eq!(name, "Edit");
                     }
                     other => panic!("expected ToolUse, got {other:?}"),
@@ -878,6 +880,36 @@ mod tests {
             event_types(&end_events),
             vec!["message_delta", "message_stop"],
             "no block stops in end events (both text and tool already closed inline)"
+        );
+    }
+
+    #[test]
+    fn test_streaming_tool_use_id_is_rewritten_to_toolu_prefix() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let events = conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            Some("chatcmpl-tool-DEADBEEF"),
+            Some("Edit"),
+            Some("{\"file_path\":\"/tmp/test.txt\"}"),
+        ));
+
+        let id = events
+            .iter()
+            .find_map(|event| match &event.data {
+                AnthropicStreamEvent::ContentBlockStart {
+                    content_block: AnthropicResponseContentBlock::ToolUse { id, .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("expected tool_use content block start");
+        assert!(
+            id.starts_with("toolu_"),
+            "tool_use.id must start with toolu_, got {id}"
+        );
+        assert!(
+            !id.contains("chatcmpl-tool-"),
+            "upstream id format must not leak, got {id}"
         );
     }
 

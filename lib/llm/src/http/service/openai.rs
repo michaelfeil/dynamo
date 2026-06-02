@@ -154,6 +154,10 @@ fn find_dynamo_error_in_chain<'a>(
 }
 
 impl ErrorMessage {
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     /// Not Found Error
     pub fn model_not_found() -> ErrorResponse {
         let code = StatusCode::NOT_FOUND;
@@ -687,7 +691,7 @@ async fn completions_single(
                 // Transpose Result<Option<T>> -> Option<Result<T>>
                 future::ready(result.transpose())
             });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle, true);
 
         let mut sse_stream = Sse::new(stream);
 
@@ -882,7 +886,7 @@ async fn completions_batch(
                 // Transpose Result<Option<T>> -> Option<Result<T>>
                 future::ready(result.transpose())
             });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle, true);
 
         let mut sse_stream = Sse::new(stream);
 
@@ -1604,7 +1608,7 @@ async fn chat_completions(
             }
             stream::iter(events)
         });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle, true);
 
         let mut sse_stream = Sse::new(stream);
 
@@ -2042,7 +2046,7 @@ async fn responses(
 
         // Wrap with disconnect monitoring: detects client disconnects, cancels generation,
         // and defers inflight_guard.mark_ok() until the stream completes.
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle, true);
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {
@@ -2584,7 +2588,7 @@ async fn videos(
         // monitor_for_disconnects: arms stream_handle, pre-marks inflight Cancelled,
         // emits data:[DONE] on natural end, demotes to Internal on mid-stream Err,
         // and kills the engine context when the client disconnects.
-        let stream = monitor_for_disconnects(stream, ctx, inflight, stream_handle);
+        let stream = monitor_for_disconnects(stream, ctx, inflight, stream_handle, true);
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {

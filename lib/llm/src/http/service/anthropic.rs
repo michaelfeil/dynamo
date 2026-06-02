@@ -340,11 +340,7 @@ async fn anthropic_messages(
             );
         }
         inflight_guard.mark_error(super::metrics::ErrorType::Internal);
-        anthropic_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            &format!("Failed to generate completions: {}", e),
-        )
+        anthropic_error_from_anyhow(e, "Failed to generate completions")
     })?;
 
     let ctx = engine_stream.context();
@@ -432,7 +428,8 @@ async fn anthropic_messages(
         let full_stream = start_stream.chain(event_stream).chain(done_stream);
         let full_stream = full_stream.map(|result| result.map_err(axum::Error::new));
 
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle);
+        let stream =
+            monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle, false);
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {
@@ -443,16 +440,17 @@ async fn anthropic_messages(
     } else {
         // Non-streaming path: aggregate stream into single response
 
-        // Check first event for backend errors using the openai helper
+        // Check first event for backend errors using the openai helper.
+        // Preserve backend status codes rather than collapsing all errors to 500.
         let stream_with_check = super::openai::check_for_backend_error(engine_stream)
             .await
             .map_err(|(status, json_err)| {
                 tracing::error!(request_id, %status, ?json_err, "Backend error detected");
-                anthropic_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "api_error",
-                    "Backend error during generation",
-                )
+                let message = json_err
+                    .0
+                    .message()
+                    .replace("max_completion_tokens", "max_tokens");
+                anthropic_error(status, "api_error", &message)
             })?;
 
         let mut http_queue_guard = Some(http_queue_guard);
@@ -732,6 +730,22 @@ fn estimate_input_tokens(req: &AnthropicCreateMessageRequest) -> u32 {
         tools: req.tools.clone(),
     };
     count_req.estimate_tokens()
+}
+
+fn anthropic_error_from_anyhow(e: anyhow::Error, context: &str) -> Response {
+    if let Some(http_err) = e.downcast_ref::<crate::http::service::error::HttpError>() {
+        let status =
+            StatusCode::from_u16(http_err.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let message = http_err
+            .message
+            .replace("max_completion_tokens", "max_tokens");
+        return anthropic_error(status, "api_error", &message);
+    }
+    anthropic_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "api_error",
+        &format!("{}: {}", context, e),
+    )
 }
 
 /// Build an Anthropic-formatted error response.

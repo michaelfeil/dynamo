@@ -197,6 +197,7 @@ pub fn monitor_for_disconnects(
     context: Arc<dyn AsyncEngineContext>,
     mut inflight_guard: InflightGuard,
     mut stream_handle: ConnectionHandle,
+    emit_done_sentinel: bool,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
     stream_handle.arm();
 
@@ -236,7 +237,9 @@ pub fn monitor_for_disconnects(
                                 }
                             });
                             yield Event::default().data(err_json.to_string());
-                            yield Event::default().data("[DONE]");
+                            if emit_done_sentinel {
+                                yield Event::default().data("[DONE]");
+                            }
                             // Break to prevent any subsequent mark_ok() from overwriting the error
                             break;
                         }
@@ -247,7 +250,9 @@ pub fn monitor_for_disconnects(
 
                             // todo: if we yield a dynamo sentinel event, we need to do it before the done or the
                             // async-openai client will chomp it.
-                            yield Event::default().data("[DONE]");
+                            if emit_done_sentinel {
+                                yield Event::default().data("[DONE]");
+                            }
                             break;
                         }
                     }
@@ -393,7 +398,7 @@ mod tests {
         let (metrics, guard, context, handle) = setup_test(model, "req-zombie", "1");
         assert_eq!(metrics.get_inflight_count(model), 1);
 
-        let monitored = monitor_for_disconnects(hanging_stream(), context, guard, handle);
+        let monitored = monitor_for_disconnects(hanging_stream(), context, guard, handle, true);
         tokio::pin!(monitored);
 
         tokio::time::advance(Duration::from_secs(3)).await;
@@ -454,6 +459,7 @@ mod tests {
             ctx_1,
             guard_1,
             handle_1,
+            true,
         );
         tokio::pin!(monitored_1);
 
@@ -483,7 +489,7 @@ mod tests {
         let (tx_2, _rx_2) = tokio::sync::oneshot::channel();
         let handle_2 = ConnectionHandle::create_disabled(tx_2);
 
-        let monitored_2 = monitor_for_disconnects(hanging_stream(), ctx_2, guard_2, handle_2);
+        let monitored_2 = monitor_for_disconnects(hanging_stream(), ctx_2, guard_2, handle_2, true);
         tokio::pin!(monitored_2);
 
         // Config "5" → HTTP timeout 10s (2x multiplier). Advance past it.
@@ -603,6 +609,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_done_sentinel_can_be_suppressed() {
+        let (_metrics, guard, ctx, handle) = setup_test("anthropic-model", "req-anthropic", "0");
+        let stream = async_stream::try_stream! {
+            yield Event::default().event("message_stop").data("{}");
+        };
+        let monitored = monitor_for_disconnects(stream, ctx, guard, handle, false);
+        let body = collect_sse_body(monitored).await;
+        cleanup_env();
+        assert!(body.contains("event: message_stop"));
+        assert!(
+            !body.contains("data: [DONE]"),
+            "Anthropic streams must not emit OpenAI [DONE]"
+        );
+    }
+
     /// Upstream worker killed mid-stream → mpsc channel reports `Disconnected` to the
     /// HTTP layer. Client MUST receive structured error + `[DONE]`.
     #[tokio::test]
@@ -611,7 +634,7 @@ mod tests {
         let (_metrics, guard, ctx, handle) = setup_test("worker-kill-model", "req-wk", "0");
         let expected_message = "Disconnected: Stream ended before generation completed";
         let stream = simulate_mid_stream_error(3, expected_message);
-        let monitored = monitor_for_disconnects(stream, ctx, guard, handle);
+        let monitored = monitor_for_disconnects(stream, ctx, guard, handle, true);
         let body = collect_sse_body(monitored).await;
         cleanup_env();
         assert_fault_contract("worker_kill", &body, expected_message);
@@ -625,7 +648,7 @@ mod tests {
         let (_metrics, guard, ctx, handle) = setup_test("py-drop-model", "req-py", "0");
         let expected_message = "Failed to send response: SendError { .. }";
         let stream = simulate_mid_stream_error(3, expected_message);
-        let monitored = monitor_for_disconnects(stream, ctx, guard, handle);
+        let monitored = monitor_for_disconnects(stream, ctx, guard, handle, true);
         let body = collect_sse_body(monitored).await;
         cleanup_env();
         assert_fault_contract("python_consumer_drop", &body, expected_message);

@@ -458,6 +458,11 @@ fn convert_anthropic_tool_choice(tc: &AnthropicToolChoice) -> ChatCompletionTool
         }
     }
 }
+
+pub(crate) fn new_tool_use_id() -> String {
+    format!("toolu_{}", Uuid::new_v4().simple())
+}
+
 /// Convert a completed chat completion response into an Anthropic Messages response.
 pub fn chat_completion_to_anthropic_response(
     chat_resp: NvCreateChatCompletionResponse,
@@ -487,7 +492,7 @@ pub fn chat_completion_to_anthropic_response(
                 let input: serde_json::Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
                 content.push(AnthropicResponseContentBlock::ToolUse {
-                    id: tc.id,
+                    id: new_tool_use_id(),
                     name: tc.function.name,
                     input,
                 });
@@ -900,6 +905,73 @@ mod tests {
             }
             _ => panic!("expected text block"),
         }
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_tool_use_id_is_rewritten_to_toolu_prefix() {
+        let chat_resp = NvCreateChatCompletionResponse {
+            inner: dynamo_protocols::types::CreateChatCompletionResponse {
+                id: "chatcmpl-xyz".into(),
+                choices: vec![dynamo_protocols::types::ChatChoice {
+                    index: 0,
+                    message: dynamo_protocols::types::ChatCompletionResponseMessage {
+                        content: None,
+                        refusal: None,
+                        tool_calls: Some(vec![
+                            dynamo_protocols::types::ChatCompletionMessageToolCall {
+                                id: "chatcmpl-tool-DEADBEEF".into(),
+                                r#type: dynamo_protocols::types::FunctionType::Function,
+                                function: dynamo_protocols::types::FunctionCall {
+                                    name: "get_weather".into(),
+                                    arguments: r#"{"location":"SF"}"#.into(),
+                                },
+                            },
+                        ]),
+                        role: dynamo_protocols::types::Role::Assistant,
+                        function_call: None,
+                        audio: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: Some(dynamo_protocols::types::FinishReason::ToolCalls),
+                    logprobs: None,
+                }],
+                created: 1726000000,
+                model: "test-model".into(),
+                service_tier: None,
+                system_fingerprint: None,
+                object: "chat.completion".to_string(),
+                usage: Some(dynamo_protocols::types::CompletionUsage {
+                    prompt_tokens: 20,
+                    completion_tokens: 10,
+                    total_tokens: 30,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                }),
+            },
+            nvext: None,
+        };
+
+        let response = chat_completion_to_anthropic_response(chat_resp, "test-model", None);
+        let (id, name) = response
+            .content
+            .iter()
+            .find_map(|block| match block {
+                AnthropicResponseContentBlock::ToolUse { id, name, .. } => {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected a tool_use content block");
+        assert!(
+            id.starts_with("toolu_"),
+            "tool_use.id must start with toolu_, got {id}"
+        );
+        assert!(
+            !id.contains("chatcmpl-tool-"),
+            "upstream id format must not leak, got {id}"
+        );
+        assert_eq!(name, "get_weather");
     }
 
     #[test]
