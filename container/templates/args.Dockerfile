@@ -61,6 +61,11 @@ ARG LIBVPX_REF={{ context.dynamo.libvpx_ref }}
 ARG ENABLE_GPU_MEMORY_SERVICE={{ context[framework].enable_gpu_memory_service }}
 {% endif %}
 
+# Baseten version stamp (relative path inside the build context to a key=value
+# file produced by tools/version-stamp.sh; consumed by dynamo_runtime to write
+# /etc/baseten/version/dynamo into the image).
+ARG BASETEN_VERSION_FILE=""
+
 # SCCACHE configuration
 ARG USE_SCCACHE
 ARG SCCACHE_VERSION={{ context.dynamo.sccache_version }}

@@ -1,0 +1,90 @@
+name: BIS Dynamo Image Push
+
+# Dispatchable build+push of the Dynamo runtime image for the bis-deploy
+# service. The caller passes a branch; the workflow checks it out, builds+pushes
+# via the repo's standard `container/build.sh --framework none --push` (cf.
+# post-merge-build.yml) — using build.sh's default version-stamped tag
+# (e.g. baseten/dynamo-test:v1.2.0.dev.<sha>-none) — and publishes that exact
+# resolved ref as the `image-tag` artifact. The run-name carries `(prefix=…)`
+# so bis-deploy can correlate the dispatched run.
+
+run-name: "Dynamo image @ ${{ inputs.ref || github.ref_name }} (prefix=${{ inputs.image-tag-prefix }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch (or ref) to build."
+        type: string
+        default: ""
+      image-tag-prefix:
+        description: "Correlation prefix for the run name (bis-deploy injects bis-<hex>)."
+        type: string
+        default: ""
+      notify-on-failure:
+        description: "Post to #mp-ci-alerts on failure (needs MP_CI_SLACK_WEBHOOK_URL)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  push:
+    name: Build and push Dynamo image
+    runs-on: depot-ubuntu-24.04-64
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          fetch-depth: 0
+          lfs: 'true'
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        run: |
+          set -o pipefail
+          ./container/build.sh --framework none --push 2>&1 | tee build.log
+
+      - name: Publish image-tag artifact
+        run: |
+          set -euo pipefail
+          # build.sh prints `Building Dynamo Image: '<TAG>'` — capture that exact
+          # default version-stamped tag so the artifact matches what was pushed.
+          ref="$(sed -n "s/.*Building Dynamo Image: '\(.*\)'.*/\1/p" build.log | head -1)"
+          if [ -z "$ref" ]; then
+            echo "::error::could not resolve the built image tag from build.log"; exit 1
+          fi
+          echo -n "$ref" > image-tag.txt
+          echo "Resolved image ref: $ref"
+
+      - name: Upload tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag
+          path: image-tag.txt
+          if-no-files-found: error
+
+      - name: Notify Slack on failure
+        if: failure() && inputs.notify-on-failure
+        continue-on-error: true
+        uses: basetenlabs/action-slack@v3.0.0
+        with:
+          status: custom
+          fields: workflow,job,commit,repo,ref,author,took
+          custom_payload: |
+            {
+              "attachments": [{
+                "color": "danger",
+                "text": "❌ Dynamo image push failed on `${{ github.ref_name }}` @ `${{ github.sha }}`.\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run> · triggered by `${{ github.actor }}`"
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.MP_CI_SLACK_WEBHOOK_URL }}

@@ -461,7 +461,22 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
 
 FROM wheel_builder_base AS runtime_wheel_builder
 
-{% if target not in ("dev", "local-dev") %}
+{% if target == "local-dev" %}
+# local-dev targets do not have pre-built wheels or /workspace source code.
+# After you start the local-dev container, you will need to build from source:
+#   cargo build --features dynamo-llm/block-manager
+#   cd /workspace/lib/bindings/python && maturin develop --uv && cd /workspace
+#   uv pip install --no-deps -e /workspace
+# See container/launch_message/dev.txt for the full setup steps.
+
+# Create dist dir with a placeholder so downstream COPY --from=wheel_builder /opt/dynamo/dist/*.whl always has a match.
+RUN mkdir -p /opt/dynamo/dist ${CARGO_TARGET_DIR} && \
+    touch /opt/dynamo/dist/.placeholder.whl
+
+# local-dev skips the full COPY lib/ above, so copy gpu_memory_service source explicitly for the wheel build below
+COPY lib/gpu_memory_service/ /opt/dynamo/lib/gpu_memory_service/
+
+{% else %}
 # Copy source code (order matters for layer caching)
 COPY .cargo/ /opt/dynamo/.cargo/
 COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
@@ -475,7 +490,8 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
     --mount=type=cache,target=/root/.cargo/git,sharing=shared \
-    --mount=type=cache,target=/root/.cache/uv,sharing=shared \
+    --mount=type=cache,id=cargo-target-runtime,target=${CARGO_TARGET_DIR} \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export UV_CACHE_DIR=/root/.cache/uv && \
     export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
@@ -483,6 +499,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
         eval $(/tmp/use-sccache.sh setup-env cmake); \
     fi && \
     mkdir -p ${CARGO_TARGET_DIR} && \
+    echo "cargo target cache: $(find ${CARGO_TARGET_DIR} -name '*.rlib' -o -name '*.rmeta' 2>/dev/null | wc -l) artifacts" && \
     source ${VIRTUAL_ENV}/bin/activate && \
     cd /opt/dynamo && \
     uv build --wheel --out-dir /opt/dynamo/dist && \
@@ -493,21 +510,6 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
         maturin build --release --features "kv-indexer,lightseek-mm" --out /opt/dynamo/dist; \
     fi && \
     /tmp/use-sccache.sh show-stats "Dynamo Runtime"
-
-{% else %}
-# Dev/local-dev targets do not have pre-built wheels or /workspace source code.
-# After you start the local-dev/dev container, you will need to build from source:
-#   cargo build --features dynamo-llm/block-manager
-#   cd /workspace/lib/bindings/python && maturin develop --uv && cd /workspace
-#   uv pip install --no-deps -e /workspace
-# See container/launch_message/dev.txt for the full setup steps.
-
-# Create dist dir with a placeholder so downstream COPY --from=wheel_builder /opt/dynamo/dist/*.whl always has a match.
-RUN mkdir -p /opt/dynamo/dist ${CARGO_TARGET_DIR} && \
-    touch /opt/dynamo/dist/.placeholder.whl
-
-# Dev/local-dev skip the full COPY lib/ above, so copy gpu_memory_service source explicitly for the wheel build below
-COPY lib/gpu_memory_service/ /opt/dynamo/lib/gpu_memory_service/
 {% endif %}
 
 # Build gpu-memory-service wheel → /opt/dynamo/dist/gpu_memory_service*.whl (small C++ extension, fast build -- all targets, all frameworks)
@@ -613,7 +615,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     cd /workspace/nixl && \
     uv build . --wheel --out-dir /opt/dynamo/dist/nixl --python $PYTHON_VERSION
 
-{% if target not in ("dev", "local-dev") %}
+{% if target != "local-dev" %}
 # Copy source code (order matters for layer caching)
 COPY .cargo/ /opt/dynamo/.cargo/
 COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
@@ -626,7 +628,8 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
     --mount=type=cache,target=/root/.cargo/git,sharing=shared \
-    --mount=type=cache,target=/root/.cache/uv,sharing=shared \
+    --mount=type=cache,id=cargo-target-wheelbuilder,target=${CARGO_TARGET_DIR} \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export UV_CACHE_DIR=/root/.cache/uv && \
     export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
@@ -635,6 +638,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
         eval $(/tmp/use-sccache.sh setup-env cmake); \
     fi && \
     mkdir -p ${CARGO_TARGET_DIR} && \
+    echo "cargo target cache: $(find ${CARGO_TARGET_DIR} -name '*.rlib' -o -name '*.rmeta' 2>/dev/null | wc -l) artifacts" && \
     source ${VIRTUAL_ENV}/bin/activate && \
     if [ "$ENABLE_KVBM" = "true" ]; then \
         cd /opt/dynamo/lib/bindings/kvbm && \

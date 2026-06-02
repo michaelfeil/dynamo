@@ -16,15 +16,8 @@
 name: NVIDIA Test Lab Validation
 
 on:
-  push:
-    branches:
-      - main
-      - release/*.*.*
-      - "pull-request/[0-9]+"
-    # Skip docs only changes
-    paths-ignore:
-      - '**.md'
-      - '**.rst'
+  # Disabled: requires gitlab_ci_runners runner group not available in this fork
+  workflow_dispatch:
 
 jobs:
   mirror_repo:

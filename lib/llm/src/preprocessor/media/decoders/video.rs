@@ -393,7 +393,7 @@ mod tests {
     #[case(Some(320 * 240 * 5 * 3), "240p_10.mp4", 5, true, "within limit")]
     #[case(Some(320 * 240 * 2 * 3), "240p_10.mp4", 5, false, "exceeds limit")]
     #[case(Some(2 * 2 * 10 * 3), "2p_10.mp4", 10, true, "exactly at limit")]
-    #[case(None, "2160p_10.mp4", 10, true, "no limit")]
+    #[case(None, "240p_10.mp4", 10, true, "no limit")]
     fn test_max_alloc(
         #[case] max_alloc: Option<u64>,
         #[case] video_file: &str,

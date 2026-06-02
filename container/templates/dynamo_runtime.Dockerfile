@@ -60,6 +60,12 @@ COPY --chown=dynamo: --from=wheel_builder $CARGO_TARGET_DIR $CARGO_TARGET_DIR
 {% endif %}
 COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
 
+# Baseten version stamp — produced by tools/version-stamp.sh and passed in by
+# container/build.sh. Downstream images (e.g. mp/baseten_dynamo harness) copy
+# this file forward via `COPY --from=<dynamo image> /etc/baseten/version/dynamo`.
+ARG BASETEN_VERSION_FILE
+COPY --chown=dynamo: ${BASETEN_VERSION_FILE} /etc/baseten/version/dynamo
+
 # Install Python for framework=none runtime (cuda-dl-base doesn't include Python)
 # This is needed to create venv and install dynamo packages
 ARG PYTHON_VERSION

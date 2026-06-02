@@ -47,7 +47,7 @@ repos:
 # More details about these pre-commit hooks here:
 # https://pre-commit.com/hooks.html
 - repo: https://github.com/pre-commit/pre-commit-hooks
-  rev: v4.4.0
+  rev: v6.0.0
   hooks:
   - id: check-case-conflict
   - id: check-executables-have-shebangs
@@ -92,3 +92,32 @@ repos:
         - pyyaml
         - prometheus_client>=0.23.1
         - openai
+
+# Rust checks — matches pre-merge.yml CI across all workspace directories.
+# CI skips these (SKIP=cargo-fmt,cargo-check,cargo-clippy) because it runs
+# them in dedicated jobs with more parallelism; locally they catch issues
+# before push.
+    - id: cargo-fmt
+      name: cargo fmt
+      language: system
+      entry: >-
+        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm;
+        do echo "fmt $d" && (cd "$d" && cargo fmt -- --check) || exit 1; done'
+      pass_filenames: false
+      types: [rust]
+    - id: cargo-check
+      name: cargo check
+      language: system
+      entry: >-
+        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm;
+        do echo "check $d" && (cd "$d" && cargo check) || exit 1; done'
+      pass_filenames: false
+      types: [rust]
+    - id: cargo-clippy
+      name: cargo clippy
+      language: system
+      entry: >-
+        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm;
+        do echo "clippy $d" && (cd "$d" && cargo clippy --no-deps --all-targets -- -D warnings) || exit 1; done'
+      pass_filenames: false
+      types: [rust]

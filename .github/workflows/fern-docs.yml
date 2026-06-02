@@ -359,10 +359,11 @@ jobs:
 
   release-version:
     name: Release Version to docs-website
-    # Run on tag push OR manual dispatch with a tag specified
+    # Run on tag push OR manual dispatch with a tag specified (upstream repo only)
     if: |
-      github.ref_type == 'tag' ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.tag != null)
+      github.repository == 'ai-dynamo/dynamo' &&
+      (github.ref_type == 'tag' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && github.event.inputs.tag != null))
     runs-on: ubuntu-latest
     steps:
       - name: Determine version tag
