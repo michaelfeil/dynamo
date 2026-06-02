@@ -25,9 +25,9 @@ use dynamo_runtime::{
 };
 
 use crate::{
+    entrypoint::RouterSelector,
     kv_router::{
-        KvRouter, router_endpoint_id, scheduler::DefaultWorkerSelector,
-        shared_cache::HicacheSharedKvCache,
+        BasetenWorkerSelector, KvRouter, router_endpoint_id, shared_cache::HicacheSharedKvCache,
     },
     local_model::runtime_config::{DisaggregatedEndpoint, ModelRuntimeConfig, topology_taint},
     model_card::ModelDeploymentCard,
@@ -695,6 +695,7 @@ impl ModelManager {
         endpoint: &Endpoint,
         kv_cache_block_size: u32,
         kv_router_config: Option<KvRouterConfig>,
+        router_selector: RouterSelector,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         worker_type: &'static str,
         model_name: Option<String>,
@@ -725,7 +726,8 @@ impl ModelManager {
         // Get of create runtime config watcher for this endpoint
         let workers_with_configs = self.get_or_create_runtime_config_watcher(endpoint).await?;
 
-        let selector = DefaultWorkerSelector::new(kv_router_config.clone(), worker_type);
+        let selector =
+            BasetenWorkerSelector::new(router_selector, kv_router_config.clone(), worker_type);
 
         // Build shared cache client based on shared_cache_type.
         let shared_cache: Option<Box<dyn dynamo_kv_router::SharedKvCache>> = match kv_router_config

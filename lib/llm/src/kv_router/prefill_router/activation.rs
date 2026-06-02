@@ -137,6 +137,7 @@ impl PrefillRouter {
                     &endpoint,
                     kv_cache_block_size,
                     kv_router_config,
+                    crate::entrypoint::RouterSelector::Default,
                     prefill_load_estimator,
                     WORKER_TYPE_PREFILL,
                     Some(self.model_name.clone()),

@@ -1447,6 +1447,7 @@ class RouterConfig:
     """How to route the request"""
     router_mode: RouterMode
     kv_router_config: KvRouterConfig
+    algo_selector: Literal["Default", "B10"]
 
     def __init__(
         self,
@@ -1456,6 +1457,7 @@ class RouterConfig:
         active_prefill_tokens_threshold: Optional[int] = None,
         active_prefill_tokens_threshold_frac: Optional[float] = None,
         enforce_disagg: bool = False,
+        algo_selector: Literal["Default", "B10"] = "Default",
     ) -> None:
         """
         Create a RouterConfig.
@@ -1467,6 +1469,7 @@ class RouterConfig:
             active_prefill_tokens_threshold: Literal token count threshold for prefill busy detection
             active_prefill_tokens_threshold_frac: Fraction of max_num_batched_tokens for busy detection
             enforce_disagg: Strictly enforce disaggregated mode, failing requests if no prefill workers are available
+            algo_selector: Worker selector for KV routing ("Default" or "B10")
         """
         ...
 

@@ -71,7 +71,9 @@ use scheduler_inputs::{
 
 use crate::{
     discovery::RuntimeConfigWatch,
+    entrypoint::RouterSelector,
     kv_router::{
+        b10_worker_selector::B10WorkerSelector,
         scheduler::{DefaultWorkerSelector, KvScheduler, PotentialLoad},
         sequence::{SequenceError, SequenceRequest},
     },
@@ -113,6 +115,46 @@ pub const RADIX_STATE_FILE: &str = "radix-state";
 
 // for worker-local kvindexer query
 pub const WORKER_KV_INDEXER_BUFFER_SIZE: usize = 1024; // store 1024 most recent events in worker buffer
+
+#[derive(Debug)]
+pub enum BasetenWorkerSelector {
+    Default(DefaultWorkerSelector),
+    B10(B10WorkerSelector),
+}
+
+impl BasetenWorkerSelector {
+    pub fn new(
+        selector: RouterSelector,
+        kv_router_config: Option<KvRouterConfig>,
+        worker_type: &'static str,
+    ) -> Self {
+        match selector {
+            RouterSelector::Default => {
+                Self::Default(DefaultWorkerSelector::new(kv_router_config, worker_type))
+            }
+            RouterSelector::B10 => Self::B10(B10WorkerSelector::new()),
+        }
+    }
+}
+
+impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> for BasetenWorkerSelector {
+    fn select_worker(
+        &self,
+        workers: &HashMap<WorkerId, ModelRuntimeConfig>,
+        request: &dynamo_kv_router::scheduling::SchedulingRequest,
+        eligibility: dynamo_kv_router::scheduling::RoutingEligibility<'_>,
+        block_size: u32,
+    ) -> Result<dynamo_kv_router::protocols::WorkerSelectionResult, KvSchedulerError> {
+        match self {
+            Self::Default(selector) => {
+                selector.select_worker(workers, request, eligibility, block_size)
+            }
+            Self::B10(selector) => {
+                selector.select_worker(workers, request, eligibility, block_size)
+            }
+        }
+    }
+}
 
 fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
     if !error.is_overload() {
@@ -188,7 +230,7 @@ pub fn router_discovery_query(namespace: String, component: String) -> Discovery
 
 /// A KvRouter only decides which worker you should use. It doesn't send you there.
 /// TODO: Rename this to indicate it only selects a worker, it does not route.
-pub struct KvRouter<Sel = DefaultWorkerSelector>
+pub struct KvRouter<Sel = BasetenWorkerSelector>
 where
     Sel: dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig>,
 {

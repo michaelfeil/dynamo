@@ -16,7 +16,7 @@ use dynamo_kv_router::config::{
 };
 use dynamo_llm::discovery::LoadThresholdConfig as RsLoadThresholdConfig;
 use dynamo_llm::entrypoint::EngineConfig as RsEngineConfig;
-use dynamo_llm::entrypoint::RouterConfig as RsRouterConfig;
+use dynamo_llm::entrypoint::{RouterConfig as RsRouterConfig, RouterSelector as RsRouterSelector};
 use dynamo_llm::entrypoint::input::Input;
 use dynamo_llm::entrypoint::{ChatEngineFactoryCallback, PrefillRoutedEngine};
 use dynamo_llm::local_model::DEFAULT_HTTP_PORT;
@@ -39,6 +39,26 @@ use crate::engine::PythonAsyncEngine;
 
 fn validate_kv_router_config(config: &RsKvRouterConfig) -> PyResult<()> {
     config.validate_config().map_err(PyValueError::new_err)
+}
+
+fn parse_router_selector(algo_selector: &str) -> PyResult<RsRouterSelector> {
+    match algo_selector {
+        "Default" => Ok(RsRouterSelector::Default),
+        "B10" => Ok(RsRouterSelector::B10),
+        "Python" => Err(PyException::new_err(
+            "algo_selector='Python' is not available in the v1.2 RouterConfig path; use 'Default' or 'B10'",
+        )),
+        other => Err(PyException::new_err(format!(
+            "Invalid algo_selector: {other}; expected 'Default' or 'B10'"
+        ))),
+    }
+}
+
+fn router_selector_name(selector: RsRouterSelector) -> &'static str {
+    match selector {
+        RsRouterSelector::Default => "Default",
+        RsRouterSelector::B10 => "B10",
+    }
 }
 
 fn warn_overlap_score_weight_deprecated() {
@@ -346,6 +366,8 @@ pub struct RouterConfig {
     #[pyo3(get, set)]
     pub kv_router_config: KvRouterConfig,
 
+    router_selector: RsRouterSelector,
+
     /// Threshold for active decode blocks utilization (0.0-1.0)
     active_decode_blocks_threshold: Option<f64>,
     /// Threshold for active prefill tokens utilization (literal token count)
@@ -358,7 +380,7 @@ pub struct RouterConfig {
 #[pymethods]
 impl RouterConfig {
     #[new]
-    #[pyo3(signature = (mode, config=None, active_decode_blocks_threshold=None, active_prefill_tokens_threshold=None, active_prefill_tokens_threshold_frac=None, enforce_disagg=false))]
+    #[pyo3(signature = (mode, config=None, active_decode_blocks_threshold=None, active_prefill_tokens_threshold=None, active_prefill_tokens_threshold_frac=None, enforce_disagg=false, algo_selector="Default"))]
     pub fn new(
         mode: RouterMode,
         config: Option<KvRouterConfig>,
@@ -366,15 +388,29 @@ impl RouterConfig {
         active_prefill_tokens_threshold: Option<u64>,
         active_prefill_tokens_threshold_frac: Option<f64>,
         enforce_disagg: bool,
-    ) -> Self {
-        Self {
+        algo_selector: &str,
+    ) -> PyResult<Self> {
+        let router_selector = parse_router_selector(algo_selector)?;
+        Ok(Self {
             router_mode: mode,
             kv_router_config: config.unwrap_or_default(),
+            router_selector,
             active_decode_blocks_threshold,
             active_prefill_tokens_threshold,
             active_prefill_tokens_threshold_frac,
             enforce_disagg,
-        }
+        })
+    }
+
+    #[getter]
+    fn algo_selector(&self) -> &'static str {
+        router_selector_name(self.router_selector)
+    }
+
+    #[setter]
+    fn set_algo_selector(&mut self, value: &str) -> PyResult<()> {
+        self.router_selector = parse_router_selector(value)?;
+        Ok(())
     }
 }
 
@@ -383,6 +419,7 @@ impl From<RouterConfig> for RsRouterConfig {
         RsRouterConfig {
             router_mode: rc.router_mode.into(),
             kv_router_config: rc.kv_router_config.inner,
+            router_selector: rc.router_selector,
             load_threshold_config: RsLoadThresholdConfig {
                 active_decode_blocks_threshold: rc.active_decode_blocks_threshold,
                 active_prefill_tokens_threshold: rc.active_prefill_tokens_threshold,

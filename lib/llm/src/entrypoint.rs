@@ -41,10 +41,18 @@ pub type ChatEngineFactoryCallback = Arc<
         + Sync,
 >;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RouterSelector {
+    #[default]
+    Default,
+    B10,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouterConfig {
     pub router_mode: RouterMode,
     pub kv_router_config: KvRouterConfig,
+    pub router_selector: RouterSelector,
     /// Load threshold configuration for overload detection
     pub load_threshold_config: LoadThresholdConfig,
     pub enforce_disagg: bool,
@@ -55,6 +63,7 @@ impl RouterConfig {
         Self {
             router_mode,
             kv_router_config,
+            router_selector: RouterSelector::Default,
             load_threshold_config: LoadThresholdConfig::default(),
             enforce_disagg: false,
         }
@@ -67,6 +76,11 @@ impl RouterConfig {
 
     pub fn with_enforce_disagg(mut self, enforce_disagg: bool) -> Self {
         self.enforce_disagg = enforce_disagg;
+        self
+    }
+
+    pub fn with_router_selector(mut self, selector: RouterSelector) -> Self {
+        self.router_selector = selector;
         self
     }
 }
