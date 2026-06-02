@@ -45,14 +45,20 @@ pub mod logging {
 
     /// OTLP (OpenTelemetry Protocol) tracing and logging configuration
     pub mod otlp {
-        /// Enable OTLP export for traces and logs (set to "1" to enable)
+        /// Enable OTLP export for traces (set to "1" to enable).
+        /// Log export additionally requires OTEL_EXPORTER_OTLP_LOGS_ENDPOINT to be set.
         pub const OTEL_EXPORT_ENABLED: &str = "OTEL_EXPORT_ENABLED";
 
-        /// OTLP exporter endpoint URL for traces
+        /// Base OTLP exporter endpoint URL (fallback for signal-specific endpoints)
+        /// Spec: https://opentelemetry.io/docs/specs/otel/protocol/exporter/
+        pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+        /// OTLP exporter endpoint URL for traces (takes precedence over base endpoint)
         /// Spec: https://opentelemetry.io/docs/specs/otel/protocol/exporter/
         pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 
-        /// OTLP exporter endpoint URL for logs (defaults to traces endpoint if unset)
+        /// OTLP exporter endpoint URL for logs. Only when this is explicitly set will the
+        /// OTel log exporter be initialized. If unset, logs are written to stderr only.
         pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
 
         /// Service name for OTLP traces and logs
@@ -584,6 +590,7 @@ mod tests {
             logging::DYN_LOG_USE_LOCAL_TZ,
             logging::DYN_LOGGING_SPAN_EVENTS,
             logging::otlp::OTEL_EXPORT_ENABLED,
+            logging::otlp::OTEL_EXPORTER_OTLP_ENDPOINT,
             logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
             logging::otlp::OTEL_SERVICE_NAME,
             logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,

@@ -1004,9 +1004,8 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
             // Export enabled: create OTLP exporters with batch processors
             let traces_endpoint =
                 std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)
+                    .or_else(|_| std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_ENDPOINT))
                     .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
-            let logs_endpoint = std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT)
-                .unwrap_or_else(|_| traces_endpoint.clone());
 
             let resource = opentelemetry_sdk::Resource::builder_empty()
                 .with_service_name(service_name.clone())
@@ -1023,22 +1022,28 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
                 .with_resource(resource.clone())
                 .build();
 
-            // Initialize OTLP log exporter using gRPC (Tonic)
-            let log_exporter = opentelemetry_otlp::LogExporter::builder()
-                .with_tonic()
-                .with_endpoint(&logs_endpoint)
-                .build()?;
+            // Only initialize OTLP log exporter if a logs endpoint is explicitly configured.
+            // Without an explicit endpoint, the exporter would fall back to the traces endpoint,
+            // which typically doesn't implement the LogsService — causing BatchLogProcessor errors.
+            let logger_provider_opt = if let Ok(logs_endpoint) =
+                std::env::var(env_logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT)
+            {
+                let log_exporter = opentelemetry_otlp::LogExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(&logs_endpoint)
+                    .build()?;
 
-            let logger_provider = SdkLoggerProvider::builder()
-                .with_batch_exporter(log_exporter)
-                .with_resource(resource)
-                .build();
+                Some(
+                    SdkLoggerProvider::builder()
+                        .with_batch_exporter(log_exporter)
+                        .with_resource(resource)
+                        .build(),
+                )
+            } else {
+                None
+            };
 
-            (
-                tracer_provider,
-                Some(logger_provider),
-                Some(traces_endpoint),
-            )
+            (tracer_provider, logger_provider_opt, Some(traces_endpoint))
         } else {
             // No export - traces generated locally only (for logging/trace IDs)
             let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
@@ -1081,10 +1086,16 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
 
         // Log initialization status after subscriber is ready
         if let Some(endpoint) = endpoint_opt {
+            let signals = if logger_provider_opt.is_some() {
+                "traces and logs"
+            } else {
+                "traces"
+            };
             tracing::info!(
                 endpoint = %endpoint,
                 service = %service_name,
-                "OpenTelemetry OTLP export enabled (traces and logs)"
+                signals,
+                "OpenTelemetry OTLP export enabled"
             );
         } else {
             tracing::info!(
