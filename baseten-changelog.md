@@ -377,14 +377,17 @@ and `respond() -> Result` cleanup. It deliberately dropped Python selector
 support, `PyWorkerSelectionResult`, `dp_strict_rank`, DP-heavy active-request
 scoring, softmax sampling, and old NATS request-plane changes.
 
-For v1.2, do not follow those v1.1 router drops. Preserve the B10 selector as
-production behavior. Restore Python selector/plugin callable support, including
-`PyWorkerSelectionResult`. Preserve `dp_strict_rank` through the router
-request/response/scheduling path so B10 and Python selectors can request strict
-DP-rank routing. Still follow v1.1 on dropping NATS recovery and avoid replaying
-the old queue stack where target tiered ISL queueing already provides the
-queueing mechanism. Dp routing + routing policy is hard to test, so its better to 
-preserve it. 
+For v1.2, follow v1.1 on dropping the arbitrary Python selector/plugin bridge
+and `PyWorkerSelectionResult`. The maintained Python-facing selector surface is
+`RouterConfig(..., algo_selector="B10")`, which selects the Rust
+`B10WorkerSelector`; custom Python scheduling callbacks should not be restored
+without a separate product decision because the old bridge targeted a previous
+scheduler shape. Preserve `dp_strict_rank` through the router
+request/response/scheduling path so B10 can request strict DP-rank routing.
+Still follow v1.1 on dropping NATS recovery and avoid replaying the old queue
+stack where target tiered ISL queueing already provides the queueing mechanism.
+DP routing and routing policy are hard to test, so preserve the production
+policy where it is already wired through B10.
 
 v1.2 implementation note:
 
@@ -396,6 +399,11 @@ updates the queue actor without restart. Positive values enable queueing at the
 new threshold, while `0` or `None` disables queueing. When queueing is disabled
 after requests are already pending, the actor drains them immediately so the
 target queue cannot strand requests behind a now-disabled threshold.
+
+The current v1.2 branch also follows v1.1 on not restoring arbitrary Python
+worker selectors. B10 routing is exposed to Python through
+`RouterConfig(..., algo_selector="B10")`; `algo_selector="Python"` is rejected
+intentionally.
 
 Replay notes:
 
@@ -570,10 +578,12 @@ the standalone B10 health heartbeat/poison state, the `/health_file` route, the
 header-driven B10 rate limiter, and Python functions `set_health`,
 `is_healthy`, `set_poisoned`, and `set_rate_limit_level`. The rate limiter was
 attached to the same endpoint classes v1.1 gated first: completions, chat
-completions, and embeddings. Broader protocol work remains open: `baseten_ext`,
-required extension validation, selective endpoint activation, and Anthropic
-conformance should be handled in later focused slices after comparing target
-upstream tests.
+completions, and embeddings. The target already has selective endpoint
+activation through `HttpService.enable_endpoint(...)`, with Python tests using
+it to turn chat on explicitly; do not replay old endpoint activation code unless
+new endpoint-specific tests fail. Broader protocol work remains open only for
+response-shape or tolerance decisions not already covered by `baseten_ext` and
+Anthropic conformance slices.
 
 The next v1.2 slice restored the typed root-level `baseten_ext` fields for chat
 and completion requests: `b10_cache_control`, `baseten`, `dynamic_temperature`,
