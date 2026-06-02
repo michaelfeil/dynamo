@@ -10,13 +10,22 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use std::collections::HashMap;
 
 const DEFAULT_CONFIG_PATH: &str = "/configs/llm_api_config_router.yaml";
 const RELOAD_INTERVAL_SECS: u64 = 15; // Reload every 15 seconds
+
+fn is_warning_disabled() -> bool {
+    static DISABLE_WARNING: OnceLock<bool> = OnceLock::new();
+    *DISABLE_WARNING.get_or_init(|| {
+        std::env::var("B10_CONFIGMAP_DISABLE_WARNING")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
 
 /// Partial override structure for B10 routing config, we can't reuse the B10RoutingConfig struct because of the default values
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -241,17 +250,23 @@ impl HotReloadableConfig {
             let config_path = PathBuf::from(path_str);
             // Only load from file if env var is set
             let config = Self::load_config(&config_path).unwrap_or_else(|e| {
-                tracing::warn!(
-                    "Failed to load config from {:?}: {:?}, using defaults",
-                    config_path,
-                    e
-                );
+                if !is_warning_disabled() {
+                    tracing::warn!(
+                        "Failed to load config from {:?}: {:?}, using defaults",
+                        config_path,
+                        e
+                    );
+                }
                 UnifiedConfig::default()
             });
             (config, config_path)
         } else {
             // No env var set - use fast defaults and default path
-            tracing::warn!("DYN_LLMAPI_CONFIG_PATH not set, using default UnifiedConfig values");
+            if !is_warning_disabled() {
+                tracing::warn!(
+                    "DYN_LLMAPI_CONFIG_PATH not set, using default UnifiedConfig values"
+                );
+            }
             (UnifiedConfig::default(), PathBuf::from(DEFAULT_CONFIG_PATH))
         };
 
@@ -263,21 +278,27 @@ impl HotReloadableConfig {
 
     fn validate_config(path: &PathBuf) -> Option<LLMConfig> {
         if !path.exists() || !path.is_file() {
-            tracing::warn!("Config file {:?} does not exist or is not a file", path);
+            if !is_warning_disabled() {
+                tracing::warn!("Config file {:?} does not exist or is not a file", path);
+            }
             return None;
         }
 
         let contents = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("Failed to read config file {:?}: {:?}", path, e);
+                if !is_warning_disabled() {
+                    tracing::warn!("Failed to read config file {:?}: {:?}", path, e);
+                }
                 return None;
             }
         };
         match serde_yaml::from_str(&contents) {
             Ok(config) => Some(config),
             Err(e) => {
-                tracing::warn!("Failed to parse YAML config from {:?}: {:?}", path, e);
+                if !is_warning_disabled() {
+                    tracing::warn!("Failed to parse YAML config from {:?}: {:?}", path, e);
+                }
                 None
             }
         }
@@ -375,7 +396,9 @@ impl HotReloadableConfig {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to hot-reload b10 router config: {:?}", e);
+                        if !is_warning_disabled() {
+                            tracing::warn!("Failed to hot-reload b10 router config: {:?}", e);
+                        }
                     }
                 }
                 // Sleep after each reload attempt

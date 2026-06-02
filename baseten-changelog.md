@@ -755,6 +755,14 @@ Editorial notes:
 
 Prefer a tiny code fix that defaults to 256 MiB.
 
+v1.2 implementation note:
+
+The TCP default was already restored as a tiny 256 MiB default-value patch. The
+B10 config-map warning suppression knob from v1.1 was also restored:
+`B10_CONFIGMAP_DISABLE_WARNING=1` or `true` now suppresses warnings for absent,
+unreadable, unparsable, or failed hot-reload B10 router config maps while
+leaving the default-config fallback behavior unchanged.
+
 
 Replay notes:
 
