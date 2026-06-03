@@ -263,9 +263,9 @@ where
             let capped_max_wait = std::cmp::min(args.max_wait_seconds, 4 * 3600);
             let max_wait_seconds_half = std::cmp::max(capped_max_wait / 2, 1);
             let wait_time_secs = if elapsed >= max_wait_seconds_half {
-                1.0
+                0.5
             } else {
-                15.0 - (14.0 * elapsed as f64 / max_wait_seconds_half as f64)
+                7.0 - (6.0 * elapsed as f64 / max_wait_seconds_half as f64)
             };
             (wait_time_secs.max(0.5) * 1000.0) as u64
         };
