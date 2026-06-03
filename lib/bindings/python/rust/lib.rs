@@ -134,7 +134,9 @@ fn create_request_context(
                 // Let the server handle the cancellation for now since not all backends are
                 // properly handling request exceptions
                 // TODO: (DIS-830) Return an error if context is cancelled
-                child_ctx.context().stop_generating();
+                child_ctx
+                    .context()
+                    .stop_generating_with_reason(Some("parent_context_already_stopped_or_killed"));
             }
             child_ctx
         }
@@ -171,13 +173,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(llm::entrypoint::run_input, m)?)?;
+    m.add_function(wrap_pyfunction!(llm::b10_router::start_router, m)?)?;
     m.add_function(wrap_pyfunction!(b10_health::set_health, m)?)?;
     m.add_function(wrap_pyfunction!(b10_health::is_healthy, m)?)?;
     m.add_function(wrap_pyfunction!(b10_health::set_poisoned, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        b10_rate_limiter::set_rate_limit_level,
-        m
-    )?)?;
+    m.add_function(wrap_pyfunction!(b10_rate_limiter::set_rate_limit_level, m)?)?;
 
     m.add_class::<DistributedRuntime>()?;
     m.add_class::<Endpoint>()?;

@@ -274,6 +274,11 @@ impl Context {
         self.inner.stop_generating();
     }
 
+    #[pyo3(signature = (reason=None))]
+    fn stop_generating_with_reason(&self, reason: Option<&str>) {
+        self.inner.stop_generating_with_reason(reason);
+    }
+
     fn id(&self) -> &str {
         self.inner.id()
     }

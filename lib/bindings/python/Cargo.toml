@@ -60,6 +60,8 @@ tokio = { version = "1.46.0", features = ["full"] }
 tokio-stream = { version = "0" }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = { version = "0" }
+axum = { version = "=0.8.4", features = ["macros", "ws"] }
+rand = { version = "0.9.4" }
 # Authoritative pins live in the workspace root Cargo.toml. This crate is
 # excluded from the workspace (pyo3 build constraint) so we duplicate. Keep
 # these two versions in lockstep with the root — drift will show up as
@@ -69,7 +71,7 @@ opentelemetry = { version = "0.31.0", features = ["trace"] }
 uuid = { version = "1.18.1" }
 
 # kv-indexer / shared kv-router types
-dynamo-kv-router = { path = "../../kv-router", features = ["standalone-indexer"] }
+dynamo-kv-router = { path = "../../kv-router", features = ["standalone-indexer", "metrics", "runtime-protocols"] }
 clap = { version = "4.5", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 

@@ -1903,7 +1903,9 @@ impl OpenAIPreprocessor {
                                     e
                                 );
                                 inner.cancelled = true;
-                                inner.context.stop_generating();
+                                inner
+                                    .context
+                                    .stop_generating_with_reason(Some("error_processing_common_response"));
                             })
                             .map_err(|e| e.to_string())
                     });

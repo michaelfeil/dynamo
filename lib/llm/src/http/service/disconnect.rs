@@ -158,7 +158,7 @@ async fn connection_monitor(
                 metrics.inc_client_disconnect();
                 metrics.inc_cancellation(&cancellation_labels);
             }
-            engine_context.kill();
+            engine_context.kill_with_reason(Some("connection_closed_unexpectedly"));
         }
         Ok(ConnectionStatus::ClosedGracefully) => {
             tracing::trace!("Connection closed gracefully");
@@ -173,7 +173,7 @@ async fn connection_monitor(
                 metrics.inc_client_disconnect();
                 metrics.inc_cancellation(&cancellation_labels);
             }
-            engine_context.kill();
+            engine_context.kill_with_reason(Some("stream_closed_unexpectedly"));
         }
         Ok(ConnectionStatus::ClosedGracefully) => {
             tracing::trace!("Stream closed gracefully");
@@ -297,7 +297,7 @@ pub fn monitor_for_disconnects(
                         timeout_secs = ?inactivity_timeout.map(|d| d.as_secs()),
                         "backend stream inactivity timeout; killing engine context to release inflight gauge"
                     );
-                    context.kill();
+                    context.kill_with_reason(Some("backend_stream_inactivity_timeout"));
                     break;
                 }
             }

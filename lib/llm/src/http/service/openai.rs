@@ -71,6 +71,10 @@ use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 const X_REQUEST_ID_HEADER: &str = "x-request-id";
+const BASETEN_BILLING_ORG_ID_HEADER: &str = "x-baseten-billing-org-id";
+const BASETEN_REQUEST_ID_HEADER: &str = "x-baseten-request-id";
+const BASETEN_MODEL_VERSION_ID_HEADER: &str = "x-baseten-model-version-id";
+const BASETEN_CONTEXT_ID_EMPTY_PART: &str = "none";
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
@@ -380,16 +384,7 @@ pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> 
     }
 }
 
-/// Return the request ID for the current request.
-///
-/// The canonical request ID is set by `make_inference_request_span()` and stored
-/// in the `DistributedTraceContext` via `DistributedTraceIdLayer`. This function
-/// retrieves it, falling back to a validated `x-dynamo-request-id` header value
-/// (deprecated, DEP #7812) or a new UUID.
-///
-/// **Deprecation (DEP #7812):** The `x-dynamo-request-id` header is deprecated.
-/// Clients should rely on server-generated request IDs instead of supplying their own.
-pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
+fn get_or_create_request_suffix(headers: &HeaderMap) -> String {
     // Validate x-dynamo-request-id header if present, warn on invalid values.
     // DEP #7812: x-dynamo-request-id is deprecated — clients should rely on
     // server-generated request IDs instead of supplying their own.
@@ -429,6 +424,36 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
 
     // Fallback: use validated header for backwards compat, or generate new UUID
     validated_header.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Return the request ID for the current request.
+///
+/// Baseten workers parse context IDs as:
+/// `billing_org_id--request_id--billing_model_version`.
+/// Keep that 1.0-compatible shape at HTTP ingress so it propagates through
+/// `Context::id()` to Python workers. Missing Baseten values are represented as
+/// `none`, which the Python parser maps back to empty strings.
+///
+/// **Deprecation (DEP #7812):** The `x-dynamo-request-id` header is deprecated.
+/// Clients should rely on server-generated request IDs instead of supplying their own.
+pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
+    let billing_org_id = headers
+        .get(BASETEN_BILLING_ORG_ID_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or(BASETEN_CONTEXT_ID_EMPTY_PART);
+
+    let request_suffix = headers
+        .get(BASETEN_REQUEST_ID_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| get_or_create_request_suffix(headers));
+
+    let billing_model_version = headers
+        .get(BASETEN_MODEL_VERSION_ID_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or(BASETEN_CONTEXT_ID_EMPTY_PART);
+
+    format!("{billing_org_id}--{request_suffix}--{billing_model_version}")
 }
 
 fn attach_x_request_id<T: Send + Sync + 'static>(request: &mut Context<T>, headers: &HeaderMap) {
@@ -2940,6 +2965,61 @@ mod tests {
             },
             nvext: None,
         }
+    }
+
+    #[test]
+    fn test_get_or_create_request_id_uses_baseten_context_shape() {
+        let mut headers = HeaderMap::new();
+        headers.insert(BASETEN_BILLING_ORG_ID_HEADER, "org-123".parse().unwrap());
+        headers.insert(BASETEN_REQUEST_ID_HEADER, "req-456".parse().unwrap());
+        headers.insert(
+            BASETEN_MODEL_VERSION_ID_HEADER,
+            "model-version-789".parse().unwrap(),
+        );
+
+        assert_eq!(
+            get_or_create_request_id(&headers),
+            "org-123--req-456--model-version-789"
+        );
+    }
+
+    #[test]
+    fn test_get_or_create_request_id_defaults_baseten_context_parts_to_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(BASETEN_REQUEST_ID_HEADER, "req-456".parse().unwrap());
+
+        assert_eq!(get_or_create_request_id(&headers), "none--req-456--none");
+    }
+
+    #[test]
+    fn test_get_or_create_request_id_wraps_generated_uuid_in_baseten_context() {
+        let headers = HeaderMap::new();
+        let request_id = get_or_create_request_id(&headers);
+        let parts: Vec<&str> = request_id.split("--").collect();
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "none");
+        uuid::Uuid::parse_str(parts[1]).expect("middle context part should be a UUID");
+        assert_eq!(parts[2], "none");
+    }
+
+    #[test]
+    fn test_get_or_create_request_id_prefers_baseten_request_id_suffix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            BASETEN_REQUEST_ID_HEADER,
+            "baseten-request".parse().unwrap(),
+        );
+        headers.insert(X_REQUEST_ID_HEADER, "external-request".parse().unwrap());
+        headers.insert(
+            DYNAMO_REQUEST_ID_HEADER,
+            "67e55044-10b1-426f-9247-bb680e5fe0c8".parse().unwrap(),
+        );
+
+        assert_eq!(
+            get_or_create_request_id(&headers),
+            "none--baseten-request--none"
+        );
     }
 
     #[test]

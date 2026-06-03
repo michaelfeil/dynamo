@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import logging
 import os
+import signal
 import warnings
 from functools import wraps
 from typing import Any, AsyncGenerator, Callable, Optional, Type, Union
@@ -16,8 +18,27 @@ from dynamo._core import Context as Context
 from dynamo._core import DistributedRuntime as DistributedRuntime
 from dynamo._core import Endpoint as Endpoint
 
+logger = logging.getLogger(__name__)
 
-def dynamo_worker(enable_nats: Optional[bool] = None):
+
+def _b10_shutdown_handler(runtime: DistributedRuntime):
+    logger.info(
+        "Shutdown signal received, initiating graceful shutdown...",
+        extra={"unified_model_logs": True},
+    )
+    shutdown = getattr(runtime, "initiate_shutdown", runtime.shutdown)
+    shutdown()
+
+
+def b10_register_shutdown_signals(runtime: DistributedRuntime):
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: _b10_shutdown_handler(runtime))
+
+
+def dynamo_worker(
+    enable_nats: Optional[bool] = None, register_shutdown: bool = False
+):
     """
     Decorator that creates a DistributedRuntime and passes it to the worker function.
 
@@ -25,6 +46,7 @@ def dynamo_worker(enable_nats: Optional[bool] = None):
         enable_nats: Deprecated. NATS enablement is now determined automatically
             from the event-plane configuration. This parameter is accepted for
             backwards compatibility but will be removed in a future release.
+        register_shutdown: Whether to register signal handlers for graceful shutdown.
     """
     if enable_nats is not None:
         warnings.warn(
@@ -42,6 +64,9 @@ def dynamo_worker(enable_nats: Optional[bool] = None):
             request_plane = os.environ.get("DYN_REQUEST_PLANE", "tcp")
             discovery_backend = os.environ.get("DYN_DISCOVERY_BACKEND", "etcd")
             runtime = DistributedRuntime(loop, discovery_backend, request_plane)
+
+            if register_shutdown:
+                b10_register_shutdown_signals(runtime)
 
             await func(runtime, *args, **kwargs)
 

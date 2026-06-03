@@ -152,6 +152,26 @@ pub trait AsyncEngineContext: Send + Sync + Debug {
     /// specific and may not be supported by all engines.
     fn kill(&self);
 
+    /// Informs the [`AsyncEngine`] to stop producing results for this particular stream with a reason.
+    /// This method is idempotent. This method does not invalidate results current in the
+    /// stream. It might take some time for the engine to stop producing results. The caller
+    /// can decided to drain the stream or drop the stream.
+    fn stop_generating_with_reason(&self, _reason: Option<&str>) {
+        self.stop_generating();
+    }
+
+    /// See [`AsyncEngineContext::stop_generating_with_reason`].
+    fn stop_with_reason(&self, _reason: Option<&str>) {
+        self.stop();
+    }
+
+    /// Extends the [`AsyncEngineContext::stop_generating_with_reason`] also indicates a preference to
+    /// terminate without draining the remaining items in the stream. This is implementation
+    /// specific and may not be supported by all engines.
+    fn kill_with_reason(&self, _reason: Option<&str>) {
+        self.kill();
+    }
+
     /// Links child AsyncEngineContext to this AsyncEngineContext. If the `stop_generating`, `stop`
     /// or `kill` on this AsyncEngineContext is called, the same method is called on all linked
     /// child AsyncEngineContext, in the order they are linked, and then the method on this

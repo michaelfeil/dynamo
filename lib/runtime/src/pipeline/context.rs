@@ -310,12 +310,24 @@ impl AsyncEngineContext for StreamContext {
         self.controller.stop();
     }
 
+    fn stop_with_reason(&self, reason: Option<&str>) {
+        self.controller.stop_with_reason(reason);
+    }
+
     fn kill(&self) {
         self.controller.kill();
     }
 
+    fn kill_with_reason(&self, reason: Option<&str>) {
+        self.controller.kill_with_reason(reason);
+    }
+
     fn stop_generating(&self) {
         self.controller.stop_generating();
+    }
+
+    fn stop_generating_with_reason(&self, reason: Option<&str>) {
+        self.controller.stop_generating_with_reason(reason);
     }
 
     fn is_stopped(&self) -> bool {
@@ -428,6 +440,17 @@ impl AsyncEngineContext for Controller {
     }
 
     fn stop_generating(&self) {
+        self.stop_generating_with_reason(None);
+    }
+
+    fn stop_generating_with_reason(&self, reason: Option<&str>) {
+        let reason_str = reason.unwrap_or("unknown");
+        tracing::info!(
+            context_id = %self.id,
+            reason = reason_str,
+            "AsyncEngineContext stop_generating called"
+        );
+
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -437,13 +460,24 @@ impl AsyncEngineContext for Controller {
             .cloned()
             .collect::<Vec<_>>();
         for child in children {
-            child.stop_generating();
+            child.stop_generating_with_reason(reason);
         }
 
         let _ = self.tx.send(State::Stopped);
     }
 
     fn stop(&self) {
+        self.stop_with_reason(None);
+    }
+
+    fn stop_with_reason(&self, reason: Option<&str>) {
+        let reason_str = reason.unwrap_or("unknown");
+        tracing::info!(
+            context_id = %self.id,
+            reason = reason_str,
+            "AsyncEngineContext stop called"
+        );
+
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -453,13 +487,24 @@ impl AsyncEngineContext for Controller {
             .cloned()
             .collect::<Vec<_>>();
         for child in children {
-            child.stop();
+            child.stop_with_reason(reason);
         }
 
         let _ = self.tx.send(State::Stopped);
     }
 
     fn kill(&self) {
+        self.kill_with_reason(None);
+    }
+
+    fn kill_with_reason(&self, reason: Option<&str>) {
+        let reason_str = reason.unwrap_or("unknown");
+        tracing::info!(
+            context_id = %self.id,
+            reason = reason_str,
+            "AsyncEngineContext kill called"
+        );
+
         // Clone child Arcs to avoid deadlock if parent is accidentally linked under child
         let children = self
             .child_context
@@ -469,7 +514,7 @@ impl AsyncEngineContext for Controller {
             .cloned()
             .collect::<Vec<_>>();
         for child in children {
-            child.kill();
+            child.kill_with_reason(reason);
         }
 
         let _ = self.tx.send(State::Killed);

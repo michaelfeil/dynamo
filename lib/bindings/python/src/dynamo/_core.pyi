@@ -33,6 +33,20 @@ def get_reasoning_parser_names() -> list[str]:
     """Get list of available reasoning parser names."""
     ...
 
+def start_router(
+    namespace: str = "dynamo",
+    component_to_route: str = "TensorRTLLMWorker",
+    block_size: int = 32,
+    router_component_name: str = "Router",
+    max_active_routers: Optional[int] = None,
+    max_wait_seconds: int = ...,
+    kv_router_config: Optional["KvRouterConfig"] = None,
+    kv_router_metrics_port: int = 9091,
+    algo_selector: Literal["Default", "B10"] = "B10",
+) -> None:
+    """Starts the B10 KV router. This function does not return."""
+    ...
+
 async def parse_tool_calls_batch(
     parser_name: str,
     message: str,
@@ -462,6 +476,12 @@ class Context:
     def stop_generating(self) -> None:
         """
         Issue a stop generating signal to the context.
+        """
+        ...
+
+    def stop_generating_with_reason(self, reason: Optional[str] = None) -> None:
+        """
+        Issue a stop generating signal to the context with a reason.
         """
         ...
 
@@ -1716,6 +1736,7 @@ class KvRouterConfig:
         router_track_prefill_tokens: bool = True,
         router_prefill_load_model: str = "none",
         router_snapshot_threshold: Optional[int] = 1000000,
+        router_disable_snapshots_in_primary: bool = False,
         router_reset_states: bool = False,
         router_ttl_secs: float = 120.0,
         router_queue_threshold: Optional[float] = 16.0,
@@ -1758,6 +1779,9 @@ class KvRouterConfig:
                 "none" keeps static prompt load accounting.
                 "aic" decays the oldest active prefill request using AIC-predicted duration.
             router_snapshot_threshold: Number of messages before snapshot (default: 1000000)
+            router_disable_snapshots_in_primary: Disable snapshot upload after this
+                router becomes active. This should only be enabled when another
+                router replica can still snapshot.
             router_reset_states: Reset router state on startup (default: False)
             router_ttl_secs: TTL for blocks in seconds when not using KV events (default: 120.0)
             router_queue_threshold: Queue threshold fraction for prefill token capacity (default: 16.0).

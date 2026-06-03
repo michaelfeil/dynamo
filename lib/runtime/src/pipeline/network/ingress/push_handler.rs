@@ -184,7 +184,7 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
                 } else {
                     // Otherwise, this is an error.
                     tracing::error!("Failed to publish response for stream {}", context.id());
-                    context.stop_generating();
+                    context.stop_generating_with_reason(Some("failed_to_publish_response"));
                 }
                 // Account errors in all cases, including cancellation. Therefore this metric can be
                 // inflated.

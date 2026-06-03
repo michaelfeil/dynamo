@@ -25,14 +25,12 @@ BUILD_CONTEXT=$(dirname "$(readlink -f "$SOURCE_DIR")")
 # ---------------------------------------------------------------------------
 commit_id=${commit_id:-$(git rev-parse --short HEAD)}
 current_tag=${current_tag:-$(git describe --tags --exact-match 2>/dev/null | sed 's/^v//' || true)}
+BASETEN_VERSION_BASE=${BASETEN_VERSION_BASE:-$(tr -d '[:space:]' < "$BUILD_CONTEXT/.version-base" 2>/dev/null || true)}
 
-latest_release_branch=$(git branch -r 2>/dev/null | grep -E 'origin/release/[0-9]+\.[0-9]+\.[0-9]+$' | sed 's|.*/||' | sort -V | tail -1 || true)
-if [[ -n ${latest_release_branch} ]]; then
-    latest_tag=${latest_tag:-$latest_release_branch}
-    echo "INFO: Using version from latest release branch: ${latest_tag}"
-else
-    latest_tag=${latest_tag:-$(git tag --merged HEAD --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 | sed 's/^v//' || true)}
+if [[ "$BASETEN_VERSION_BASE" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    latest_tag=${latest_tag:-${BASH_REMATCH[1]}}
 fi
+latest_tag=${latest_tag:-$(git tag --merged HEAD --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 | sed 's/^v//' || true)}
 if [[ -z ${latest_tag} ]]; then
     latest_tag="0.0.1"
     echo "No git release tag or branch found, setting to unknown version: ${latest_tag}"
@@ -239,7 +237,6 @@ BUILD_ARGS+=" --build-arg DYNAMO_COMMIT_SHA=$DYNAMO_COMMIT_SHA"
 # ---------------------------------------------------------------------------
 BASETEN_VERSION_FILE_REL=".dynamo-version.env"
 BASETEN_VERSION_FILE_ABS="$BUILD_CONTEXT/$BASETEN_VERSION_FILE_REL"
-BASETEN_VERSION_BASE=$(tr -d '[:space:]' < "$BUILD_CONTEXT/.version-base" 2>/dev/null || true)
 if [[ -n "$BASETEN_VERSION_BASE" ]] \
    && "$BUILD_CONTEXT/tools/version-stamp.sh" \
         --base-ref "$BASETEN_VERSION_BASE" \

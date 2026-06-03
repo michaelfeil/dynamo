@@ -1,8 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::Result;
 use dynamo_kv_router::{config::KvRouterConfig, protocols::RouterEvent};
@@ -227,6 +233,7 @@ pub(crate) async fn start_kv_router_background(
     consumer_id: String,
     indexer: Indexer,
     kv_router_config: &KvRouterConfig,
+    dynamic_disable_snapshots: Arc<AtomicBool>,
 ) -> Result<()> {
     let cancellation_token = component.drt().primary_token();
     let router_snapshot_threshold = kv_router_config.router_snapshot_threshold;
@@ -375,6 +382,11 @@ pub(crate) async fn start_kv_router_background(
                     let Some(resources) = snapshot_resources.as_ref() else {
                         continue;
                     };
+
+                    if dynamic_disable_snapshots.load(Ordering::Relaxed) {
+                        tracing::debug!("KV router snapshots are disabled for this active router");
+                        continue;
+                    }
 
                     // Check total messages in the stream
                     let Ok(message_count) = nats_queue.get_stream_messages().await else {

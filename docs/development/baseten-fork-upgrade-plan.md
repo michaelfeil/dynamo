@@ -91,8 +91,12 @@ evidence and tests before they are treated as patches to port.
 
 Current `main-v1.2.0` replay status: the B10 health-file and header rate-limit
 portion of `6f36f18d4` has been ported because it is client/platform-facing and
-not replaced by upstream. The typed root-level `baseten_ext` request fields
-have also been restored for chat/completions, with v1.1-style
+not replaced by upstream. The v1.0 Baseten context-id shape has also been
+restored at HTTP ingress: `X-Baseten-Billing-Org-Id`,
+`X-Baseten-Request-Id`, and `X-Baseten-Model-Version-ID` populate
+`Context::id()` as `org--request--model_version`, with missing Baseten parts
+encoded as `none` for Python worker parsers. The typed root-level `baseten_ext`
+request fields have also been restored for chat/completions, with v1.1-style
 validate-or-error behavior for invalid Baseten-maintained fields. Anthropic
 conformance from `d493fef1d` has also been ported because it is direct API
 surface area: no OpenAI `[DONE]` marker on Anthropic streams, Anthropic-native

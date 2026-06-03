@@ -316,7 +316,9 @@ where
                                 // tell the python async generator to stop generating
                                 // right now, this is impossible as we are not passing the context to the python async generator
                                 // todo: add task-local context to the python async generator
-                                ctx.stop_generating();
+                                ctx.stop_generating_with_reason(Some(
+                                    "python_async_generator_deserialize_error",
+                                ));
                                 Annotated::from_error(format!(
                                     "critical error: invalid response object from python async generator; application-logic-mismatch: {}",
                                     e

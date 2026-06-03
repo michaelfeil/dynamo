@@ -429,6 +429,7 @@ struct KvRouterConfigSerde {
     router_track_prefill_tokens: bool,
     router_prefill_load_model: RouterPrefillLoadModel,
     router_snapshot_threshold: Option<u32>,
+    router_disable_snapshots_in_primary: bool,
     router_reset_states: bool,
     router_ttl_secs: f64,
     router_queue_threshold: Option<f64>,
@@ -463,6 +464,7 @@ impl Default for KvRouterConfigSerde {
             router_track_prefill_tokens: config.router_track_prefill_tokens,
             router_prefill_load_model: config.router_prefill_load_model,
             router_snapshot_threshold: config.router_snapshot_threshold,
+            router_disable_snapshots_in_primary: config.router_disable_snapshots_in_primary,
             router_reset_states: config.router_reset_states,
             router_ttl_secs: config.router_ttl_secs,
             router_queue_threshold: config.router_queue_threshold,
@@ -539,6 +541,11 @@ pub struct KvRouterConfig {
     /// Threshold for triggering snapshots. If None, no snapshots will be performed.
     #[validate(range(min = 1))]
     pub router_snapshot_threshold: Option<u32>,
+
+    /// Whether to disable snapshots after this router becomes the active primary.
+    /// This should only be enabled when another router replica can snapshot.
+    #[serde(default)]
+    pub router_disable_snapshots_in_primary: bool,
 
     /// Whether to reset the router state on startup (default: false)
     pub router_reset_states: bool,
@@ -642,6 +649,7 @@ impl Default for KvRouterConfig {
             router_track_prefill_tokens: default_track_prefill_tokens(),
             router_prefill_load_model: RouterPrefillLoadModel::default(),
             router_snapshot_threshold: Some(1000000),
+            router_disable_snapshots_in_primary: false,
             router_reset_states: false,
             router_ttl_secs: 120.0,
             router_queue_threshold: Some(16.0),
@@ -688,6 +696,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_track_prefill_tokens: compat.router_track_prefill_tokens,
             router_prefill_load_model: compat.router_prefill_load_model,
             router_snapshot_threshold: compat.router_snapshot_threshold,
+            router_disable_snapshots_in_primary: compat.router_disable_snapshots_in_primary,
             router_reset_states: compat.router_reset_states,
             router_ttl_secs: compat.router_ttl_secs,
             router_queue_threshold: compat.router_queue_threshold,
@@ -960,6 +969,17 @@ mod tests {
             serde_json::from_str(r#"{"router_predicted_ttl_secs":5.0}"#).unwrap();
 
         assert_eq!(config.router_predicted_ttl_secs, Some(5.0));
+    }
+
+    #[test]
+    fn test_kv_router_config_deserializes_disable_snapshots_in_primary() {
+        let default_config: KvRouterConfig = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!default_config.router_disable_snapshots_in_primary);
+
+        let config: KvRouterConfig =
+            serde_json::from_str(r#"{"router_disable_snapshots_in_primary":true}"#).unwrap();
+
+        assert!(config.router_disable_snapshots_in_primary);
     }
 
     #[test]

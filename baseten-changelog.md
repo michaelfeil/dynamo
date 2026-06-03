@@ -200,6 +200,11 @@ wiring, BIS image push dispatch, `.version-base`, `tools/version-stamp.sh`,
 workflow churn was not preserved as a Baseten patch unless it affected fork
 builds.
 
+The image tag resolver now also uses `.version-base` as the first fallback when
+the checkout has no merged semver tag or release branch. This keeps v1.2 branch
+builds on `v1.2.x.dev.<sha>-<suffix>` instead of falling back to
+`v0.0.1.dev.<sha>-<suffix>`.
+
 Replay notes:
 
 Port this first so the new branch has a working CI and image path. Retarget all
@@ -255,6 +260,11 @@ lifecycle logs now carry the `unified_model_logs` marker at the lifecycle points
 that still exist. The broader v1.0/v1.1 NATS recovery stack is not a replay
 objective for v1.2. Additional drain/unpublication behavior should only be
 ported after a target-specific failing test or production gap is identified.
+
+The Python `dynamo_worker` decorator also accepts the Baseten
+`register_shutdown` compatibility keyword again and wires it to SIGINT/SIGTERM
+runtime shutdown hooks. This is a narrow binding compatibility restore rather
+than a broader NATS lifecycle replay.
 
 Replay notes:
 
@@ -438,6 +448,22 @@ and `B10WorkerSelector`. The callback receives the worker map plus a
 chosen worker/rank against routing eligibility before returning a strict-DP
 selection result.
 
+The standalone B10 `start_router` binding was restored in the v1.1 shape rather
+than as Python router logic: Python cheaply reexports `dynamo._core.start_router`,
+and the Rust binding starts the current `KvRouter` with either
+`B10WorkerSelector` or `DefaultWorkerSelector`. The B10 config map again owns
+`router_active_replicas` at the root and override-group levels so router
+activation can be hot configured without a Python-side implementation.
+The v1.0 `router_disable_snapshots_in_primary` knob was also restored: the
+Python/Rust config accepts the flag, and the active B10 router disables its
+JetStream snapshot loop after winning the active-router gate.
+
+The v1.2 local-indexer worker-query recovery path now honors
+`skip_initial_worker_wait`: by default, the B10 router waits for the initial
+worker-query KV recovery to complete before registering the serving `generate`
+endpoint. This is intentionally scoped to the local-indexer/event-plane path;
+the deprecated JetStream recovery path is left unchanged.
+
 Replay notes:
 
 Treat this as one coherent router subsystem port. Do not cherry-pick the commits
@@ -517,6 +543,15 @@ falls back from `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to the standard
 logs endpoint so enabling tracing does not create noisy BatchLogProcessor
 errors. Router queue and selector observability are carried through the B10 and
 queue-threshold replay slices; no separate speculative metrics patch was added.
+
+The standalone B10 router path registers the global worker-load and router queue
+metrics against its component metrics registry so the explicit router metrics
+port exposes the same production counters and gauges expected by v1.1-era
+dashboards.
+
+Worker-based KV recovery now has a lightweight `RecoveryProcessLogger` that
+reports aggregate restore progress, recovered event counts, and the final
+initial-recovery completion summary used by router startup gating.
 
 Editorial notes:
 
@@ -626,6 +661,15 @@ it to turn chat on explicitly; do not replay old endpoint activation code unless
 new endpoint-specific tests fail. Broader protocol work remains open only for
 response-shape or tolerance decisions not already covered by `baseten_ext` and
 Anthropic conformance slices.
+
+The v1.0 Baseten context-id contract was restored at HTTP ingress because
+Python workers still parse `Context::id()` as
+`billing_org_id--request_id--billing_model_version`. The request ID helper now
+uses `X-Baseten-Billing-Org-Id`, `X-Baseten-Request-Id`, and
+`X-Baseten-Model-Version-ID`, defaulting missing Baseten parts to `none` so
+worker-side parsers map them back to empty strings. When
+`X-Baseten-Request-Id` is absent, the middle component still falls back through
+the target branch's distributed-tracing/deprecated-UUID path.
 
 The next v1.2 slice restored the typed root-level `baseten_ext` fields for chat
 and completion requests: `b10_cache_control`, `baseten`, `dynamic_temperature`,

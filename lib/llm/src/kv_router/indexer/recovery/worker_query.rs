@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -43,6 +46,327 @@ use dynamo_runtime::pipeline::{AsyncEngine, SingleIn};
 const RECOVERY_MAX_RETRIES: u32 = 8;
 const RECOVERY_INITIAL_BACKOFF_MS: u64 = 200;
 const RECOVERY_CONCURRENCY_LIMIT: usize = 16;
+const RECOVERY_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const INITIAL_RECOVERY_SETTLE_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Clone)]
+struct RecoveryProcessLogger {
+    inner: Arc<RecoveryProcessLoggerInner>,
+}
+
+struct RecoveryProcessLoggerInner {
+    started_at: Instant,
+    notify: tokio::sync::Notify,
+    scheduled: AtomicUsize,
+    in_flight: AtomicUsize,
+    succeeded: AtomicUsize,
+    failed: AtomicUsize,
+    skipped: AtomicUsize,
+    full_restores: AtomicUsize,
+    incremental_recoveries: AtomicUsize,
+    buffered_events: AtomicUsize,
+    tree_dump_events: AtomicUsize,
+    drained_events: AtomicUsize,
+}
+
+struct RecoveryProcessSnapshot {
+    scheduled: usize,
+    in_flight: usize,
+    succeeded: usize,
+    failed: usize,
+    skipped: usize,
+    full_restores: usize,
+    incremental_recoveries: usize,
+    buffered_events: usize,
+    tree_dump_events: usize,
+    drained_events: usize,
+    elapsed_secs: f64,
+}
+
+impl RecoveryProcessSnapshot {
+    fn total_recovered_events(&self) -> usize {
+        self.buffered_events + self.tree_dump_events + self.drained_events
+    }
+}
+
+impl RecoveryProcessLogger {
+    fn spawn(cancellation_token: tokio_util::sync::CancellationToken) -> Self {
+        let logger = Self {
+            inner: Arc::new(RecoveryProcessLoggerInner {
+                started_at: Instant::now(),
+                notify: tokio::sync::Notify::new(),
+                scheduled: AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+                succeeded: AtomicUsize::new(0),
+                failed: AtomicUsize::new(0),
+                skipped: AtomicUsize::new(0),
+                full_restores: AtomicUsize::new(0),
+                incremental_recoveries: AtomicUsize::new(0),
+                buffered_events: AtomicUsize::new(0),
+                tree_dump_events: AtomicUsize::new(0),
+                drained_events: AtomicUsize::new(0),
+            }),
+        };
+
+        let periodic_logger = logger.clone();
+        tokio::spawn(async move {
+            periodic_logger.run_periodic(cancellation_token).await;
+        });
+
+        logger
+    }
+
+    fn snapshot(&self) -> RecoveryProcessSnapshot {
+        RecoveryProcessSnapshot {
+            scheduled: self.inner.scheduled.load(Ordering::Relaxed),
+            in_flight: self.inner.in_flight.load(Ordering::Relaxed),
+            succeeded: self.inner.succeeded.load(Ordering::Relaxed),
+            failed: self.inner.failed.load(Ordering::Relaxed),
+            skipped: self.inner.skipped.load(Ordering::Relaxed),
+            full_restores: self.inner.full_restores.load(Ordering::Relaxed),
+            incremental_recoveries: self.inner.incremental_recoveries.load(Ordering::Relaxed),
+            buffered_events: self.inner.buffered_events.load(Ordering::Relaxed),
+            tree_dump_events: self.inner.tree_dump_events.load(Ordering::Relaxed),
+            drained_events: self.inner.drained_events.load(Ordering::Relaxed),
+            elapsed_secs: self.inner.started_at.elapsed().as_secs_f64(),
+        }
+    }
+
+    fn start_task(&self, key: RecoveryKey, start_event_id: Option<u64>) -> RecoveryProcessGuard {
+        self.inner.scheduled.fetch_add(1, Ordering::Relaxed);
+        self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
+        if start_event_id.is_some() {
+            self.inner
+                .incremental_recoveries
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner.full_restores.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.notify.notify_waiters();
+
+        RecoveryProcessGuard {
+            logger: self.clone(),
+            key,
+            start_event_id,
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    async fn wait_for_initial_recovery(
+        &self,
+        cancellation_token: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        tracing::info!("Waiting for initial worker KV recovery before serving traffic");
+
+        while self.snapshot().scheduled == 0 {
+            tokio::select! {
+                biased;
+
+                _ = cancellation_token.cancelled() => {
+                    anyhow::bail!("cancelled before initial worker KV recovery started");
+                }
+
+                _ = self.inner.notify.notified() => {}
+
+                _ = tokio::time::sleep(RECOVERY_PROGRESS_LOG_INTERVAL) => {
+                    tracing::info!("Waiting for first worker KV recovery task");
+                }
+            }
+        }
+
+        loop {
+            let snapshot = self.snapshot();
+            if snapshot.in_flight == 0 {
+                tokio::select! {
+                    biased;
+
+                    _ = cancellation_token.cancelled() => {
+                        anyhow::bail!("cancelled before initial worker KV recovery completed");
+                    }
+
+                    _ = tokio::time::sleep(INITIAL_RECOVERY_SETTLE_DELAY) => {}
+                }
+
+                let settled = self.snapshot();
+                if settled.in_flight == 0 && settled.scheduled == snapshot.scheduled {
+                    self.log_initial_complete(&settled);
+                    return Ok(());
+                }
+                continue;
+            }
+
+            self.log_waiting(&snapshot);
+            tokio::select! {
+                biased;
+
+                _ = cancellation_token.cancelled() => {
+                    anyhow::bail!("cancelled before initial worker KV recovery completed");
+                }
+
+                _ = self.inner.notify.notified() => {}
+
+                _ = tokio::time::sleep(RECOVERY_PROGRESS_LOG_INTERVAL) => {}
+            }
+        }
+    }
+
+    async fn run_periodic(self, cancellation_token: tokio_util::sync::CancellationToken) {
+        let mut interval = tokio::time::interval(RECOVERY_PROGRESS_LOG_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = cancellation_token.cancelled() => break,
+
+                _ = interval.tick() => {
+                    let snapshot = self.snapshot();
+                    if snapshot.in_flight > 0 {
+                        self.log_progress(&snapshot);
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_task(&self, outcome: RecoveryProcessOutcome) {
+        match outcome {
+            RecoveryProcessOutcome::Succeeded => {
+                self.inner.succeeded.fetch_add(1, Ordering::Relaxed);
+            }
+            RecoveryProcessOutcome::Failed => {
+                self.inner.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            RecoveryProcessOutcome::Skipped => {
+                self.inner.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.inner.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.inner.notify.notify_waiters();
+    }
+
+    fn log_progress(&self, snapshot: &RecoveryProcessSnapshot) {
+        tracing::info!(
+            scheduled = snapshot.scheduled,
+            in_flight = snapshot.in_flight,
+            succeeded = snapshot.succeeded,
+            failed = snapshot.failed,
+            skipped = snapshot.skipped,
+            full_restores = snapshot.full_restores,
+            incremental_recoveries = snapshot.incremental_recoveries,
+            buffered_events = snapshot.buffered_events,
+            tree_dump_events = snapshot.tree_dump_events,
+            drained_events = snapshot.drained_events,
+            total_recovered_events = snapshot.total_recovered_events(),
+            elapsed_secs = snapshot.elapsed_secs,
+            "Worker KV recovery progress"
+        );
+    }
+
+    fn log_waiting(&self, snapshot: &RecoveryProcessSnapshot) {
+        tracing::info!(
+            scheduled = snapshot.scheduled,
+            in_flight = snapshot.in_flight,
+            succeeded = snapshot.succeeded,
+            failed = snapshot.failed,
+            skipped = snapshot.skipped,
+            total_recovered_events = snapshot.total_recovered_events(),
+            elapsed_secs = snapshot.elapsed_secs,
+            "Waiting for initial worker KV recovery"
+        );
+    }
+
+    fn log_initial_complete(&self, snapshot: &RecoveryProcessSnapshot) {
+        tracing::info!(
+            scheduled = snapshot.scheduled,
+            succeeded = snapshot.succeeded,
+            failed = snapshot.failed,
+            skipped = snapshot.skipped,
+            full_restores = snapshot.full_restores,
+            incremental_recoveries = snapshot.incremental_recoveries,
+            buffered_events = snapshot.buffered_events,
+            tree_dump_events = snapshot.tree_dump_events,
+            drained_events = snapshot.drained_events,
+            total_recovered_events = snapshot.total_recovered_events(),
+            elapsed_secs = snapshot.elapsed_secs,
+            "Initial worker KV recovery completed before serving traffic"
+        );
+    }
+}
+
+struct RecoveryProcessGuard {
+    logger: RecoveryProcessLogger,
+    key: RecoveryKey,
+    start_event_id: Option<u64>,
+    started_at: Instant,
+    finished: bool,
+}
+
+impl RecoveryProcessGuard {
+    fn record_buffered_events(&self, count: usize) {
+        self.logger
+            .inner
+            .buffered_events
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_tree_dump_events(&self, count: usize) {
+        self.logger
+            .inner
+            .tree_dump_events
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn record_drained_event(&self) {
+        self.logger
+            .inner
+            .drained_events
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish_success(mut self) {
+        self.finish(RecoveryProcessOutcome::Succeeded);
+    }
+
+    fn finish_failed(mut self) {
+        self.finish(RecoveryProcessOutcome::Failed);
+    }
+
+    fn finish_skipped(mut self) {
+        self.finish(RecoveryProcessOutcome::Skipped);
+    }
+
+    fn finish(&mut self, outcome: RecoveryProcessOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.logger.finish_task(outcome);
+        tracing::debug!(
+            worker_id = self.key.0,
+            dp_rank = self.key.1,
+            start_event_id = self.start_event_id,
+            elapsed_secs = self.started_at.elapsed().as_secs_f64(),
+            "Worker KV recovery task finished"
+        );
+    }
+}
+
+impl Drop for RecoveryProcessGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(RecoveryProcessOutcome::Failed);
+        }
+    }
+}
+
+enum RecoveryProcessOutcome {
+    Succeeded,
+    Failed,
+    Skipped,
+}
 
 /// Router-side client for querying worker local KV indexers.
 ///
@@ -64,6 +388,7 @@ pub struct WorkerQueryClient {
     worker_states: DashMap<WorkerId, Arc<Mutex<WorkerState>>>,
     query_endpoints: WorkerQueryEndpointDirectory,
     recovery_semaphore: Arc<Semaphore>,
+    recovery_process_logger: RecoveryProcessLogger,
 }
 
 impl WorkerQueryClient {
@@ -72,6 +397,7 @@ impl WorkerQueryClient {
         indexer: Indexer,
         transport: Arc<dyn WorkerQueryTransport>,
     ) -> Arc<Self> {
+        let recovery_process_logger = RecoveryProcessLogger::spawn(component.drt().primary_token());
         Arc::new(Self {
             component,
             transport,
@@ -79,6 +405,7 @@ impl WorkerQueryClient {
             worker_states: DashMap::new(),
             query_endpoints: WorkerQueryEndpointDirectory::default(),
             recovery_semaphore: Arc::new(Semaphore::new(RECOVERY_CONCURRENCY_LIMIT)),
+            recovery_process_logger,
         })
     }
 
@@ -100,6 +427,15 @@ impl WorkerQueryClient {
         });
 
         Ok(client)
+    }
+
+    pub(crate) async fn wait_for_initial_recovery(
+        &self,
+        cancellation_token: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        self.recovery_process_logger
+            .wait_for_initial_recovery(cancellation_token)
+            .await
     }
 
     /// Background loop: watches ComponentEndpoints and schedules worker-coordinated recovery.
@@ -360,6 +696,7 @@ impl WorkerQueryClient {
         end_event_id: Option<u64>,
     ) {
         let client = self.clone();
+        let recovery_guard = self.recovery_process_logger.start_task(key, start_event_id);
 
         tokio::spawn(async move {
             // Add jitter only for full-restore (start_event_id is None)
@@ -377,7 +714,9 @@ impl WorkerQueryClient {
             let result = client
                 .fetch_recovery_response(key.0, key.1, start_event_id, end_event_id)
                 .await;
-            client.finish_recovery_task(key, epoch, result).await;
+            client
+                .finish_recovery_task(key, epoch, result, recovery_guard)
+                .await;
         });
     }
 
@@ -386,8 +725,10 @@ impl WorkerQueryClient {
         key: RecoveryKey,
         epoch: u64,
         result: Result<WorkerKvQueryResponse>,
+        recovery_guard: RecoveryProcessGuard,
     ) {
         let Some(worker_state) = self.worker_states.get(&key.0).map(|entry| entry.clone()) else {
+            recovery_guard.finish_skipped();
             return;
         };
         let mut worker_state = worker_state.lock().await;
@@ -397,10 +738,12 @@ impl WorkerQueryClient {
                 key.0,
                 key.1
             );
+            recovery_guard.finish_skipped();
             return;
         }
 
         let Some(mut new_cursor) = worker_state.rank_cursor(key.1) else {
+            recovery_guard.finish_skipped();
             return;
         };
 
@@ -417,6 +760,7 @@ impl WorkerQueryClient {
                     key.1,
                     count = events.len()
                 );
+                recovery_guard.record_buffered_events(events.len());
                 for event in events {
                     let event_id = event.event.event_id;
                     if matches!(&event.event.data, KvCacheEventData::Cleared) {
@@ -442,6 +786,7 @@ impl WorkerQueryClient {
                     events.len(),
                     last_event_id
                 );
+                recovery_guard.record_tree_dump_events(events.len());
                 self.apply_tree_dump_replace_locked(key.0, key.1, events)
                     .await;
                 new_cursor = new_cursor.advance_to(last_event_id);
@@ -487,6 +832,7 @@ impl WorkerQueryClient {
             loop {
                 match worker_state.next_pending_drain_action(key.1) {
                     PendingDrainAction::Apply(event) => {
+                        recovery_guard.record_drained_event();
                         self.indexer.apply_event(event).await;
                     }
                     PendingDrainAction::RecoverFrom(start_event_id) => {
@@ -504,6 +850,11 @@ impl WorkerQueryClient {
 
         if let Some(start_event_id) = follow_up_start {
             self.spawn_recovery_task(key, follow_up_epoch, Some(start_event_id), None);
+        }
+        if successful_response {
+            recovery_guard.finish_success();
+        } else {
+            recovery_guard.finish_failed();
         }
     }
 
@@ -850,6 +1201,53 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("condition not met before timeout");
+    }
+
+    #[tokio::test]
+    async fn test_initial_recovery_wait_blocks_until_worker_restore_finishes() {
+        let (client, transport, kv_indexer) = make_test_client("initial-recovery-wait").await;
+        let key = (1, 0);
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        transport.push_action(
+            key,
+            MockQueryAction {
+                started: Some(started.clone()),
+                release: Some(release.clone()),
+                response: Ok(WorkerKvQueryResponse::TreeDump {
+                    events: vec![make_store_event(key.0, key.1, 1)],
+                    last_event_id: 1,
+                }),
+            },
+        );
+
+        client.handle_discovered_worker(key.0, key.1).await;
+        started.notified().await;
+
+        let cancellation_token = CancellationToken::new();
+        let wait_client = client.clone();
+        let wait_cancellation_token = cancellation_token.clone();
+        let wait_task = tokio::spawn(async move {
+            wait_client
+                .wait_for_initial_recovery(&wait_cancellation_token)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !wait_task.is_finished(),
+            "initial recovery wait returned before restore completed"
+        );
+
+        release.notify_waiters();
+        wait_task
+            .await
+            .expect("wait task should join")
+            .expect("initial recovery wait should succeed");
+
+        kv_indexer.flush().await;
+        let events = kv_indexer.dump_events().await.unwrap();
+        assert_eq!(stored_block_hashes(&events), vec![1]);
     }
 
     fn rank_state_matches<F>(client: &Arc<WorkerQueryClient>, key: RecoveryKey, check: F) -> bool

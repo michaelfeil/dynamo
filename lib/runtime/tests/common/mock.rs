@@ -398,7 +398,7 @@ where
 
                     // cancel the request
                     if let Some(tx) = state.remove(&id) {
-                        tx.stop_generating();
+                        tx.stop_generating_with_reason(Some("mock_network_control_cancel"));
                     }
                 }
             }

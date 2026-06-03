@@ -172,6 +172,9 @@ struct OverrideConfig {
     b10_routing_config: Option<B10RoutingConfigOverride>,
 
     #[serde(default)]
+    router_active_replicas: Option<usize>,
+
+    #[serde(default)]
     tensor_parallel_size: Option<usize>,
 
     #[serde(default)]
@@ -183,6 +186,9 @@ struct OverrideConfig {
 struct LLMConfig {
     #[serde(default)]
     b10_routing_config: B10RoutingConfig,
+
+    #[serde(default = "default_router_active_replicas")]
+    router_active_replicas: usize,
 
     #[serde(default)]
     override_args: Option<HashMap<String, OverrideConfig>>,
@@ -223,10 +229,25 @@ pub fn get_data_parallel_size() -> Option<usize> {
 }
 
 /// Unified config containing both routing and runtime configuration
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UnifiedConfig {
     pub routing: B10RoutingConfig,
+    pub router_active_replicas: usize,
     pub runtime: LLMRuntimeConfig,
+}
+
+impl Default for UnifiedConfig {
+    fn default() -> Self {
+        Self {
+            routing: B10RoutingConfig::default(),
+            router_active_replicas: default_router_active_replicas(),
+            runtime: LLMRuntimeConfig::default(),
+        }
+    }
+}
+
+fn default_router_active_replicas() -> usize {
+    1
 }
 
 /// Hot-reloadable config manager with unified config
@@ -329,6 +350,9 @@ impl HotReloadableConfig {
                     .b10_routing_config
                     .apply_override(routing_override);
             }
+            if let Some(router_active_replicas) = group_config.router_active_replicas {
+                root_config.router_active_replicas = router_active_replicas;
+            }
             if let Some(tp) = group_config.tensor_parallel_size {
                 root_config.tensor_parallel_size = Some(tp);
             }
@@ -345,6 +369,7 @@ impl HotReloadableConfig {
 
         let unified_config = UnifiedConfig {
             routing: root_config.b10_routing_config,
+            router_active_replicas: root_config.router_active_replicas,
             runtime: runtime_config,
         };
 
@@ -352,11 +377,12 @@ impl HotReloadableConfig {
         let data_parallel_size = unified_config.runtime.compute_data_parallel_size();
 
         tracing::info!(
-            "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
+            "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
             path,
             unified_config.routing.router_prefill_token_discount,
             unified_config.routing.router_decode_token_discount,
             unified_config.routing.router_temperature,
+            unified_config.router_active_replicas,
             unified_config.runtime.tensor_parallel_size,
             unified_config.runtime.enable_attention_dp,
             data_parallel_size
@@ -469,6 +495,11 @@ pub fn get_enable_attention_dp() -> Option<bool> {
     get_config().get().runtime.enable_attention_dp
 }
 
+/// Convenience function to get router active replicas.
+pub fn get_router_active_replicas() -> usize {
+    get_config().get().router_active_replicas
+}
+
 pub fn validate_config() -> bool {
     // gets result of validation + starts lazy reloader if not already started
     HotReloadableConfig::validate_config(&CONFIG.config_path).is_some()
@@ -489,6 +520,7 @@ mod tests {
         assert_eq!(unified_config.routing.router_overlap_score_weight, 3.5);
         assert_eq!(unified_config.routing.router_prefill_token_discount, 0.5);
         assert_eq!(unified_config.routing.router_decode_token_discount, 0.8);
+        assert_eq!(unified_config.router_active_replicas, 1);
     }
 
     #[test]
@@ -513,6 +545,7 @@ b10_routing_config:
   router_queue_threshold: 0.25
 tensor_parallel_size: 8
 enable_attention_dp: true
+router_active_replicas: 2
 
 override_args:
   test_group:
@@ -520,6 +553,7 @@ override_args:
       router_temperature: 0.99
       router_overlap_score_weight: 1.0
       router_queue_threshold: 0
+    router_active_replicas: 3
 "#;
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
@@ -536,12 +570,46 @@ override_args:
         assert_eq!(config.routing.router_temperature, 0.99);
         assert_eq!(config.routing.router_overlap_score_weight, 1.0);
         assert_eq!(config.routing.router_queue_threshold, Some(0.0));
+        assert_eq!(config.router_active_replicas, 3);
         // Check runtime config and computed data_parallel_size
         assert_eq!(config.runtime.tensor_parallel_size, Some(8));
         assert_eq!(config.runtime.enable_attention_dp, Some(true));
         assert_eq!(config.runtime.compute_data_parallel_size(), Some(8)); // Because enable_attention_dp=true returns tensor_parallel_size
 
         // Cleanup
+        unsafe {
+            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_override_args_preserve_root_router_active_replicas_when_missing() {
+        use std::io::Write;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_temperature: 0.15
+router_active_replicas: 4
+
+override_args:
+  test_group:
+    b10_routing_config:
+      router_temperature: 0.99
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        unsafe {
+            std::env::set_var("ENGINE_ARGS_OVERRIDE_GROUP", "test_group");
+        }
+
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        assert_eq!(config.routing.router_temperature, 0.99);
+        assert_eq!(config.router_active_replicas, 4);
+
         unsafe {
             std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
         }
@@ -559,6 +627,7 @@ b10_routing_config:
   router_temperature: 0.15
   router_overlap_score_weight: 3.5
   router_queue_threshold: 0.25
+router_active_replicas: 2
 
 override_args:
   test_group:
@@ -583,6 +652,7 @@ override_args:
         assert_eq!(config.routing.router_temperature, 0.15);
         assert_eq!(config.routing.router_overlap_score_weight, 3.5);
         assert_eq!(config.routing.router_queue_threshold, Some(0.25));
+        assert_eq!(config.router_active_replicas, 2);
     }
 
     #[test]

@@ -237,7 +237,10 @@ impl
                             tracing::error!("Failed to process token_ids for choice {choice_idx}: {e}");
                             state.finished_choices.insert(choice_idx);
                             if state.finished_choices.len() >= state.decoders.len() {
-                                state.stream.context().stop_generating();
+                                state
+                                    .stream
+                                    .context()
+                                    .stop_generating_with_reason(Some("decode_error"));
                                 state.finished = true;
                             }
                             let mut output = output;
@@ -291,7 +294,10 @@ impl
                     if finish_reason.is_some() && data.finish_reason.is_none() {
                         state.finished_choices.insert(choice_idx);
                         if state.finished_choices.len() >= state.decoders.len() {
-                            state.stream.context().stop_generating();
+                            state
+                                .stream
+                                .context()
+                                .stop_generating_with_reason(Some("upstream_missing_finish_reason"));
                             state.finished = true;
                         }
                     }

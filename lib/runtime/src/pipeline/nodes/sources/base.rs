@@ -42,7 +42,7 @@ impl<In: PipelineIO, Out: PipelineIO + AsyncEngineContextProvider> Sink<Out> for
             .remove(ctx.id())
             .ok_or(PipelineError::DetachedStreamReceiver)
             .inspect_err(|_| {
-                ctx.stop_generating();
+                ctx.stop_generating_with_reason(Some("detached_stream_receiver_remove_failed"));
             })?;
         drop(sinks);
 
@@ -50,7 +50,7 @@ impl<In: PipelineIO, Out: PipelineIO + AsyncEngineContextProvider> Sink<Out> for
             .send(data)
             .map_err(|_| PipelineError::DetachedStreamReceiver)
             .inspect_err(|_| {
-                ctx.stop_generating();
+                ctx.stop_generating_with_reason(Some("detached_stream_receiver_send_failed"));
             })?)
     }
 }

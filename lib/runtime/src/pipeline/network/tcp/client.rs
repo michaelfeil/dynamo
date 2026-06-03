@@ -284,7 +284,7 @@ async fn handle_reader(
                                             "invalid control message, closing connection"
                                         );
                                         cancellation_seen = true;
-                                        context.kill();
+                                        context.kill_with_reason(Some("invalid_control_message"));
                                         break;
                                     }
                                 };
@@ -298,18 +298,18 @@ async fn handle_reader(
                                 match msg {
                                     ControlMessage::Stop => {
                                         cancellation_seen = true;
-                                        context.stop();
+                                        context.stop_with_reason(Some("control_message_stop"));
                                     }
                                     ControlMessage::Kill => {
                                         cancellation_seen = true;
-                                        context.kill();
+                                        context.kill_with_reason(Some("control_message_kill"));
                                     }
                                     ControlMessage::Sentinel => {
                                         tracing::warn!(
                                             "unexpected sentinel on client reader, closing connection"
                                         );
                                         cancellation_seen = true;
-                                        context.kill();
+                                        context.kill_with_reason(Some("unexpected_sentinel_control_message"));
                                         break;
                                     }
                                 }
@@ -319,7 +319,7 @@ async fn handle_reader(
                                     "unexpected non-control message on client reader, closing connection"
                                 );
                                 cancellation_seen = true;
-                                context.kill();
+                                context.kill_with_reason(Some("unexpected_non_control_message"));
                                 break;
                            }
                         }
@@ -329,7 +329,7 @@ async fn handle_reader(
                         // generating responses that can no longer be delivered.
                         tracing::warn!(err = ?e, "tcp stream read error, closing connection");
                         cancellation_seen = true;
-                        context.kill();
+                        context.kill_with_reason(Some("tcp_stream_read_error"));
                         break;
                     }
                     None => {

@@ -3,7 +3,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -258,6 +261,7 @@ where
     client: Client,
     is_eagle: bool,
     _served_indexer_handle: Option<ServedIndexerHandle>,
+    dynamic_disable_snapshots: Arc<AtomicBool>,
     /// Optional external shared KV cache pool. When present, `find_best_match`
     /// queries it in parallel with the indexer and factors shared hits into scoring.
     shared_cache: Option<Box<dyn SharedKvCache>>,
@@ -286,6 +290,7 @@ where
         let component = endpoint.component();
         let cancellation_token = component.drt().primary_token();
         let min_initial_workers = min_initial_workers_from_env()?;
+        let dynamic_disable_snapshots = Arc::new(AtomicBool::new(false));
 
         let indexer = Indexer::new(
             component,
@@ -335,8 +340,13 @@ where
         if kv_router_config.use_remote_indexer {
             tracing::info!("Skipping KV event subscription (using remote indexer)");
         } else if kv_router_config.should_subscribe_to_kv_events() {
-            indexer::start_subscriber(component.clone(), &kv_router_config, indexer.clone())
-                .await?;
+            indexer::start_subscriber(
+                component.clone(),
+                &kv_router_config,
+                indexer.clone(),
+                dynamic_disable_snapshots.clone(),
+            )
+            .await?;
         } else {
             tracing::info!(
                 "Skipping KV event subscription (use_kv_events={}, overlap_score_credit={})",
@@ -374,6 +384,7 @@ where
             client,
             is_eagle,
             _served_indexer_handle: served_indexer_handle,
+            dynamic_disable_snapshots,
             shared_cache,
         })
     }
@@ -393,6 +404,12 @@ where
 
     pub fn is_eagle(&self) -> bool {
         self.is_eagle
+    }
+
+    pub fn disable_snapshots(&self) {
+        tracing::info!("Disabling KV router snapshots for this active router");
+        self.dynamic_disable_snapshots
+            .store(true, Ordering::Relaxed);
     }
 
     fn cache_hit_estimates_from_tiered_matches(

@@ -45,9 +45,10 @@ impl RoutedEngine {
             let child_controller = child_context.context();
             parent_context.link_child(child_controller.clone());
             if parent_context.is_killed() {
-                child_controller.kill();
+                child_controller.kill_with_reason(Some("parent_context_already_killed"));
             } else if parent_context.is_stopped() {
-                child_controller.stop_generating();
+                child_controller
+                    .stop_generating_with_reason(Some("parent_context_already_stopped"));
             }
             child_context
         } else {
@@ -64,7 +65,7 @@ impl RoutedEngine {
                 loop {
                     let response = tokio::select! {
                         _ = tx.closed() => {
-                            task_context.stop_generating();
+                            task_context.stop_generating_with_reason(Some("python_response_stream_closed"));
                             break;
                         }
                         response = stream.next() => response,
@@ -83,7 +84,9 @@ impl RoutedEngine {
                     });
 
                     if tx.send(py_response).await.is_err() {
-                        task_context.stop_generating();
+                        task_context.stop_generating_with_reason(Some(
+                            "python_response_stream_send_failed",
+                        ));
                         break;
                     }
                 }

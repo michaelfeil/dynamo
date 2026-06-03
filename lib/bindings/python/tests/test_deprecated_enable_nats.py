@@ -149,6 +149,14 @@ def test_dynamo_worker_accepts_enable_nats_kwarg():
     assert param.default is None
 
 
+def test_dynamo_worker_accepts_register_shutdown_kwarg():
+    """dynamo_worker() should accept register_shutdown for Baseten worker compatibility."""
+    sig = inspect.signature(dynamo_worker)
+    assert "register_shutdown" in sig.parameters
+    param = sig.parameters["register_shutdown"]
+    assert param.default is False
+
+
 def test_dynamo_worker_enable_nats_true_emits_warning():
     """@dynamo_worker(enable_nats=True) should emit a DeprecationWarning."""
     with warnings.catch_warnings(record=True) as caught:
@@ -197,6 +205,26 @@ def test_dynamo_worker_returns_working_decorator():
             pass
 
     assert inspect.iscoroutinefunction(_sample_worker)
+
+
+@patch("dynamo.runtime.b10_register_shutdown_signals")
+@patch("dynamo.runtime.DistributedRuntime")
+def test_dynamo_worker_register_shutdown_registers_handler(
+    mock_runtime_cls, mock_register_shutdown
+):
+    """@dynamo_worker(register_shutdown=True) should register graceful shutdown hooks."""
+    runtime = MagicMock()
+    mock_runtime_cls.return_value = runtime
+    seen = []
+
+    @dynamo_worker(register_shutdown=True)
+    async def _sample_worker(runtime):
+        seen.append(runtime)
+
+    asyncio.run(_sample_worker())
+
+    mock_register_shutdown.assert_called_once_with(runtime)
+    assert seen == [runtime]
 
 
 # ---------------------------------------------------------------------------

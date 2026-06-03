@@ -245,7 +245,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<service_v2::State>) {
     // Cancel any in-flight engine work, then drop the sender so the engine's
     // input stream completes; outbound picks up the close-reason left in the
     // shared slot (or NORMAL on natural completion).
-    resp_ctx.stop_generating();
+    resp_ctx.stop_generating_with_reason(Some("realtime_inbound_loop_ended"));
     drop(req_tx);
 
     // Wait for outbound to finish flushing.

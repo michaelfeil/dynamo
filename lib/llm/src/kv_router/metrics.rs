@@ -334,6 +334,35 @@ pub fn register_router_queue_metrics(
     Ok(())
 }
 
+/// Registers global worker-load and queue metrics with a component so they
+/// appear on the router's metrics port in addition to the frontend HTTP metrics
+/// endpoint.
+pub fn register_global_metrics_with_component(component: &Component) {
+    let registry = component.get_metrics_registry();
+    let m = &*WORKER_LOAD_METRICS;
+    registry.add_metric_or_warn(
+        Box::new(m.active_decode_blocks.clone()),
+        "worker_active_decode_blocks",
+    );
+    registry.add_metric_or_warn(
+        Box::new(m.active_prefill_tokens.clone()),
+        "worker_active_prefill_tokens",
+    );
+    let q = &*ROUTER_QUEUE_METRICS;
+    registry.add_metric_or_warn(
+        Box::new(q.pending_requests.clone()),
+        "router_queue_pending_requests",
+    );
+    registry.add_metric_or_warn(
+        Box::new(q.pending_isl_tokens.clone()),
+        "router_queue_pending_isl_tokens",
+    );
+    registry.add_metric_or_warn(
+        Box::new(q.backpressure_total.clone()),
+        "router_queue_backpressure_total",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Routing overhead metrics (histograms)
 // ---------------------------------------------------------------------------

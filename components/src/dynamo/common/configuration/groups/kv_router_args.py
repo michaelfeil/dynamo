@@ -38,6 +38,7 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_track_prefill_tokens",
     "router_prefill_load_model",
     "router_snapshot_threshold",
+    "router_disable_snapshots_in_primary",
     "router_reset_states",
     "router_ttl_secs",
     "router_queue_threshold",
@@ -118,6 +119,7 @@ class KvRouterConfigBase(ConfigBase):
     router_track_prefill_tokens: bool
     router_prefill_load_model: str
     router_snapshot_threshold: int
+    router_disable_snapshots_in_primary: bool = False
     router_reset_states: bool
     router_ttl_secs: float
     router_queue_threshold: Optional[float]
@@ -315,6 +317,16 @@ class KvRouterArgGroup(ArgGroup):
             default=1000000,
             help="KV Router: Number of messages in stream before triggering a snapshot.",
             arg_type=int,
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--router-disable-snapshots-in-primary",
+            env_var="DYN_ROUTER_DISABLE_SNAPSHOTS_IN_PRIMARY",
+            default=False,
+            help=(
+                "KV Router: Disable snapshot upload after this router becomes active. "
+                "Only enable when another router replica can still snapshot."
+            ),
         )
         add_negatable_bool_argument(
             g,

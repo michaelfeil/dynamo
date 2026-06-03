@@ -369,6 +369,18 @@ def test_kv_router_kwargs_uses_unbounded_queue_cap_by_default() -> None:
     assert kwargs["router_queue_by_incoming_missing_isl"] is None
 
 
+def test_kv_router_kwargs_preserves_disable_snapshots_in_primary() -> None:
+    parser = argparse.ArgumentParser()
+    KvRouterArgGroup().add_arguments(parser)
+
+    args = parser.parse_args(["--router-disable-snapshots-in-primary"])
+
+    config = KvRouterConfigBase.from_cli_args(args)
+    kwargs = config.kv_router_kwargs()
+
+    assert kwargs["router_disable_snapshots_in_primary"] is True
+
+
 def test_load_aware_clears_predicted_ttl() -> None:
     parser = argparse.ArgumentParser()
     KvRouterArgGroup().add_arguments(parser)
