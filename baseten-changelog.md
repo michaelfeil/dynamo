@@ -61,7 +61,7 @@ git switch -c main-v1.2.0 bed9f269312151481cd67a8d21b70e0f52424c2b
 | `PATCH-004` router core/queueing | Redesign, do not replay old queue stack | Target already has tiered ISL queue config and P2P recovery. Preserve only missing Baseten policy knobs after testing. |
 | `PATCH-005` metrics/tracing | Keep | Added metrics should be preserved across versions. |
 | `PATCH-006` protocols | Mixed: follow v1.1 by default, test exceptions | Target still rejects `stream_options` without streaming, and that is acceptable. Target has modern tool/reasoning parsing; port only Baseten/client-facing gaps found by tests. |
-| `PATCH-007` Python APIs | Keep relevant API behavior | Holding streams until first token for Python webserver engines remains a useful design. |
+| `PATCH-007` Python APIs | Keep relevant API behavior | Holding streams until first token for Python webserver engines remains useful; restore the custom Python worker selector because routing still has the trait hook. |
 | `PATCH-008` model/parser/vLLM | Mostly review-upstream | Target already has broad parser/reasoning support; do not replay old version bumps blindly. |
 | `PATCH-009` validation/limits | Mixed | TCP limit is configurable upstream, but default is 32 MiB at target SHA. Preserve 256 MiB by env/config or carry a default change. |
 | `PATCH-010` logging | Keep structured logging | Preserve request correlation and structured fields; avoid old noisy level churn. |
@@ -404,17 +404,19 @@ and `respond() -> Result` cleanup. It deliberately dropped Python selector
 support, `PyWorkerSelectionResult`, `dp_strict_rank`, DP-heavy active-request
 scoring, softmax sampling, and old NATS request-plane changes.
 
-For v1.2, follow v1.1 on dropping the arbitrary Python selector/plugin bridge
-and `PyWorkerSelectionResult`. The maintained Python-facing selector surface is
-`RouterConfig(..., algo_selector="B10")`, which selects the Rust
-`B10WorkerSelector`; custom Python scheduling callbacks should not be restored
-without a separate product decision because the old bridge targeted a previous
-scheduler shape. Preserve `dp_strict_rank` through the router
-request/response/scheduling path so B10 can request strict DP-rank routing.
-Still follow v1.1 on dropping NATS recovery and avoid replaying the old queue
-stack where target tiered ISL queueing already provides the queueing mechanism.
-DP routing and routing policy are hard to test, so preserve the production
-policy where it is already wired through B10.
+For v1.2, follow v1.1 on keeping B10 as the maintained Rust selector, but
+diverge from v1.1 by restoring arbitrary Python worker selector callbacks.
+The target scheduler still routes through the
+`WorkerSelector<ModelRuntimeConfig>` trait, so the clean v1.2 shape is a custom
+trait-object selector variant rather than Python-specific logic in the router.
+`RouterConfig(..., algo_selector="B10")` selects the Rust `B10WorkerSelector`;
+`RouterConfig(..., algo_selector="Python", python_worker_selector=...)` selects
+the Python bridge. Preserve `dp_strict_rank` through the router
+request/response/scheduling path so B10 and Python callbacks can request strict
+DP-rank routing. Still follow v1.1 on dropping NATS recovery and avoid replaying
+the old queue stack where target tiered ISL queueing already provides the
+queueing mechanism. DP routing and routing policy are hard to test, so preserve
+the production policy where it is already wired through B10.
 
 v1.2 implementation note:
 
@@ -427,10 +429,14 @@ new threshold, while `0` or `None` disables queueing. When queueing is disabled
 after requests are already pending, the actor drains them immediately so the
 target queue cannot strand requests behind a now-disabled threshold.
 
-The current v1.2 branch also follows v1.1 on not restoring arbitrary Python
-worker selectors. B10 routing is exposed to Python through
-`RouterConfig(..., algo_selector="B10")`; `algo_selector="Python"` is rejected
-intentionally.
+The current v1.2 branch restores arbitrary Python worker selectors after review.
+This intentionally differs from v1.1. The implementation keeps the bridge in a
+separate Python-binding module and connects it to the Rust router through the
+same `WorkerSelector<ModelRuntimeConfig>` trait used by `DefaultWorkerSelector`
+and `B10WorkerSelector`. The callback receives the worker map plus a
+`PySchedulingRequest` and returns `PyWorkerSelectionResult`; Rust validates the
+chosen worker/rank against routing eligibility before returning a strict-DP
+selection result.
 
 Replay notes:
 
@@ -679,12 +685,18 @@ monitor examples. It dropped Python selector support and
 `9cfeeb5e2` later restored JSON publisher/subscriber bindings after they became
 EventPlane-backed and safe to use without NATS.
 
-For v1.2, follow the Python-selector drop. Preserve B10 router bindings through
-`RouterConfig(..., algo_selector="B10")`, preserve JSON pub/sub if planner or
-routing code still depends on it, but do not restore arbitrary Python
-selector/plugin callable support or `PyWorkerSelectionResult`. Keep first-token
-webserver behavior as a design requirement, but port through the target
-frontend/backend APIs rather than copying old binding code.
+For v1.2, restore the Python selector surface despite the v1.1 drop. The reason
+is that the target router still has a clean selector trait boundary, and the
+product requirement is to support `algo_selector="Python"` for arbitrary Python
+selection logic. Keep it separate from `entrypoint.rs`: the binding entrypoint
+only parses `algo_selector`, while the Python callback adapter lives in its own
+module and implements `WorkerSelector<ModelRuntimeConfig>`. Preserve B10 router
+bindings through `RouterConfig(..., algo_selector="B10")`, preserve JSON
+pub/sub if planner or routing code still depends on it, but keep Python
+JetStream object storage dropped because Baseten no longer performs JetStream
+offloading. Keep first-token webserver behavior as a design requirement, but
+port through the target frontend/backend APIs rather than copying old binding
+code.
 
 Replay notes:
 

@@ -109,8 +109,11 @@ default-thinking-off decision was kept: `gemma4` and `gemma-4` disable reasoning
 parsing unless `chat_template_args.enable_thinking` is explicitly true.
 Selective endpoint activation is already present in the target Python
 `HttpService.enable_endpoint(...)` path, so it is treated as satisfied rather
-than replayed. Arbitrary Python worker selector callbacks remain dropped, in
-line with v1.1; Python users select the maintained Baseten policy through
+than replayed. Arbitrary Python worker selector callbacks have been restored,
+diverging from v1.1, because the target router still has a clean
+`WorkerSelector<ModelRuntimeConfig>` trait boundary and Baseten still needs
+`RouterConfig(..., algo_selector="Python", python_worker_selector=...)`.
+Python users can also select the maintained Baseten Rust policy through
 `RouterConfig(..., algo_selector="B10")`. Python JetStream object-store access
 from PATCH-003 remains dropped because Baseten no longer performs JetStream
 offloading. The remaining protocol work should stay split into smaller

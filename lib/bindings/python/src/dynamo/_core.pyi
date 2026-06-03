@@ -1459,7 +1459,7 @@ class RouterConfig:
     """How to route the request"""
     router_mode: RouterMode
     kv_router_config: KvRouterConfig
-    algo_selector: Literal["Default", "B10"]
+    algo_selector: Literal["Default", "B10", "Python"]
 
     def __init__(
         self,
@@ -1469,7 +1469,10 @@ class RouterConfig:
         active_prefill_tokens_threshold: Optional[int] = None,
         active_prefill_tokens_threshold_frac: Optional[float] = None,
         enforce_disagg: bool = False,
-        algo_selector: Literal["Default", "B10"] = "Default",
+        algo_selector: Literal["Default", "B10", "Python"] = "Default",
+        python_worker_selector: Optional[
+            Callable[[Dict[int, Any], "PySchedulingRequest"], "PyWorkerSelectionResult"]
+        ] = None,
     ) -> None:
         """
         Create a RouterConfig.
@@ -1481,8 +1484,31 @@ class RouterConfig:
             active_prefill_tokens_threshold: Literal token count threshold for prefill busy detection
             active_prefill_tokens_threshold_frac: Fraction of max_num_batched_tokens for busy detection
             enforce_disagg: Strictly enforce disaggregated mode, failing requests if no prefill workers are available
-            algo_selector: Worker selector for KV routing ("Default" or "B10")
+            algo_selector: Worker selector for KV routing ("Default", "B10", or "Python")
+            python_worker_selector: Callable used when algo_selector="Python"; it receives
+                workers and a PySchedulingRequest and must return PyWorkerSelectionResult
         """
+        ...
+
+class PySchedulingRequest:
+    """Scheduling inputs passed to Python worker selectors."""
+    request_id: Optional[str]
+    isl_tokens: int
+    block_size: int
+    pinned_worker: Optional[Tuple[int, int]]
+    allowed_worker_ids: Optional[List[int]]
+    overlaps: Dict[Tuple[int, int], float]
+    effective_overlap_blocks: Dict[Tuple[int, int], float]
+    effective_cached_tokens: Dict[Tuple[int, int], int]
+    decode_blocks: Dict[Tuple[int, int], int]
+    prefill_tokens: Dict[Tuple[int, int], int]
+
+class PyWorkerSelectionResult:
+    """Worker choice returned by Python worker selectors."""
+    worker_id: int
+    dp_rank: int
+
+    def __init__(self, worker_id: int, dp_rank: int) -> None:
         ...
 
 def set_health(healthy: bool, reason: str = "") -> None:

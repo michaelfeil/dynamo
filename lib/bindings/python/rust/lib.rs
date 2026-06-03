@@ -190,6 +190,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<llm::entrypoint::AicPerfConfig>()?;
     m.add_class::<llm::entrypoint::RouterConfig>()?;
     m.add_class::<llm::entrypoint::KvRouterConfig>()?;
+    m.add_class::<llm::python_worker_selector::PySchedulingRequest>()?;
+    m.add_class::<llm::python_worker_selector::PyWorkerSelectionResult>()?;
     m.add_class::<llm::replay::ReasoningConfig>()?;
     m.add_class::<llm::replay::SglangArgs>()?;
     m.add_class::<llm::replay::MockEngineArgs>()?;

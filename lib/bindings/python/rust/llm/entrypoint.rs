@@ -16,9 +16,9 @@ use dynamo_kv_router::config::{
 };
 use dynamo_llm::discovery::LoadThresholdConfig as RsLoadThresholdConfig;
 use dynamo_llm::entrypoint::EngineConfig as RsEngineConfig;
-use dynamo_llm::entrypoint::{RouterConfig as RsRouterConfig, RouterSelector as RsRouterSelector};
 use dynamo_llm::entrypoint::input::Input;
 use dynamo_llm::entrypoint::{ChatEngineFactoryCallback, PrefillRoutedEngine};
+use dynamo_llm::entrypoint::{RouterConfig as RsRouterConfig, RouterSelector as RsRouterSelector};
 use dynamo_llm::local_model::DEFAULT_HTTP_PORT;
 use dynamo_llm::local_model::{LocalModel, LocalModelBuilder};
 use dynamo_llm::mocker::make_mocker_engine;
@@ -27,6 +27,7 @@ use dynamo_llm::types::openai::chat_completions::OpenAIChatCompletionsStreamingE
 use dynamo_mocker::common::perf_model::PerfModel;
 
 use super::aic_callback::{create_aic_callback, create_aic_prefill_load_estimator};
+use super::python_worker_selector::PythonWorkerSelector;
 use super::replay::MockEngineArgs as PyMockEngineArgs;
 use dynamo_mocker::common::protocols::MockEngineArgs as RsMockEngineArgs;
 use dynamo_runtime::discovery::ModelCardInstanceId as RsModelCardInstanceId;
@@ -41,23 +42,34 @@ fn validate_kv_router_config(config: &RsKvRouterConfig) -> PyResult<()> {
     config.validate_config().map_err(PyValueError::new_err)
 }
 
-fn parse_router_selector(algo_selector: &str) -> PyResult<RsRouterSelector> {
+fn parse_router_selector(
+    algo_selector: &str,
+    python_worker_selector: Option<Py<PyAny>>,
+) -> PyResult<RsRouterSelector> {
     match algo_selector {
         "Default" => Ok(RsRouterSelector::Default),
         "B10" => Ok(RsRouterSelector::B10),
-        "Python" => Err(PyException::new_err(
-            "algo_selector='Python' is not available in the v1.2 RouterConfig path; use 'Default' or 'B10'",
-        )),
+        "Python" => {
+            let Some(selector) = python_worker_selector else {
+                return Err(PyException::new_err(
+                    "algo_selector='Python' requires python_worker_selector",
+                ));
+            };
+            Ok(RsRouterSelector::Custom(Arc::new(PythonWorkerSelector::new(
+                selector,
+            ))))
+        }
         other => Err(PyException::new_err(format!(
-            "Invalid algo_selector: {other}; expected 'Default' or 'B10'"
+            "Invalid algo_selector: {other}; expected 'Default', 'B10', or 'Python'"
         ))),
     }
 }
 
-fn router_selector_name(selector: RsRouterSelector) -> &'static str {
+fn router_selector_name(selector: &RsRouterSelector) -> &'static str {
     match selector {
         RsRouterSelector::Default => "Default",
         RsRouterSelector::B10 => "B10",
+        RsRouterSelector::Custom(_) => "Python",
     }
 }
 
@@ -380,7 +392,7 @@ pub struct RouterConfig {
 #[pymethods]
 impl RouterConfig {
     #[new]
-    #[pyo3(signature = (mode, config=None, active_decode_blocks_threshold=None, active_prefill_tokens_threshold=None, active_prefill_tokens_threshold_frac=None, enforce_disagg=false, algo_selector="Default"))]
+    #[pyo3(signature = (mode, config=None, active_decode_blocks_threshold=None, active_prefill_tokens_threshold=None, active_prefill_tokens_threshold_frac=None, enforce_disagg=false, algo_selector="Default", python_worker_selector=None))]
     pub fn new(
         mode: RouterMode,
         config: Option<KvRouterConfig>,
@@ -389,8 +401,9 @@ impl RouterConfig {
         active_prefill_tokens_threshold_frac: Option<f64>,
         enforce_disagg: bool,
         algo_selector: &str,
+        python_worker_selector: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        let router_selector = parse_router_selector(algo_selector)?;
+        let router_selector = parse_router_selector(algo_selector, python_worker_selector)?;
         Ok(Self {
             router_mode: mode,
             kv_router_config: config.unwrap_or_default(),
@@ -404,12 +417,12 @@ impl RouterConfig {
 
     #[getter]
     fn algo_selector(&self) -> &'static str {
-        router_selector_name(self.router_selector)
+        router_selector_name(&self.router_selector)
     }
 
     #[setter]
     fn set_algo_selector(&mut self, value: &str) -> PyResult<()> {
-        self.router_selector = parse_router_selector(value)?;
+        self.router_selector = parse_router_selector(value, None)?;
         Ok(())
     }
 }

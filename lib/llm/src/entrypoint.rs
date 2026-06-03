@@ -12,13 +12,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dynamo_kv_router::{PrefillLoadEstimator, config::KvRouterConfig};
+use dynamo_kv_router::{PrefillLoadEstimator, config::KvRouterConfig, selector::WorkerSelector};
 use dynamo_runtime::{discovery::ModelCardInstanceId, pipeline::RouterMode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    backend::ExecutionContext, discovery::LoadThresholdConfig, engines::StreamingEngine,
-    local_model::LocalModel, model_card::ModelDeploymentCard,
+    backend::ExecutionContext,
+    discovery::LoadThresholdConfig,
+    engines::StreamingEngine,
+    local_model::{LocalModel, runtime_config::ModelRuntimeConfig},
+    model_card::ModelDeploymentCard,
     types::openai::chat_completions::OpenAIChatCompletionsStreamingEngine,
 };
 
@@ -41,11 +44,52 @@ pub type ChatEngineFactoryCallback = Arc<
         + Sync,
 >;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub type CustomWorkerSelector = Arc<dyn WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static>;
+
+#[derive(Clone, Default)]
 pub enum RouterSelector {
     #[default]
     Default,
     B10,
+    Custom(CustomWorkerSelector),
+}
+
+impl std::fmt::Debug for RouterSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => f.write_str("Default"),
+            Self::B10 => f.write_str("B10"),
+            Self::Custom(_) => f.write_str("Custom"),
+        }
+    }
+}
+
+impl Serialize for RouterSelector {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Default => serializer.serialize_str("Default"),
+            Self::B10 => serializer.serialize_str("B10"),
+            Self::Custom(_) => serializer.serialize_str("Custom"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RouterSelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "Default" => Ok(Self::Default),
+            "B10" => Ok(Self::B10),
+            other => Err(serde::de::Error::custom(format!(
+                "unsupported router selector '{other}'"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -35,5 +35,6 @@ pub mod local_model;
 pub mod lora;
 pub mod model_card;
 pub mod preprocessor;
+pub mod python_worker_selector;
 pub mod replay;
 pub mod routed_engine;

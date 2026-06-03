@@ -767,7 +767,7 @@ impl ModelWatcher {
                                 &endpoint,
                                 card.kv_cache_block_size,
                                 Some(router_config.kv_router_config.clone()),
-                                router_config.router_selector,
+                                router_config.router_selector.clone(),
                                 self.prefill_load_estimator.clone(),
                                 WORKER_TYPE_DECODE, // This is the decode router
                                 Some(card.display_name.clone()),

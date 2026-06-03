@@ -116,10 +116,20 @@ pub const RADIX_STATE_FILE: &str = "radix-state";
 // for worker-local kvindexer query
 pub const WORKER_KV_INDEXER_BUFFER_SIZE: usize = 1024; // store 1024 most recent events in worker buffer
 
-#[derive(Debug)]
 pub enum BasetenWorkerSelector {
     Default(DefaultWorkerSelector),
     B10(B10WorkerSelector),
+    Custom(crate::entrypoint::CustomWorkerSelector),
+}
+
+impl std::fmt::Debug for BasetenWorkerSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default(_) => f.write_str("Default"),
+            Self::B10(_) => f.write_str("B10"),
+            Self::Custom(_) => f.write_str("Custom"),
+        }
+    }
 }
 
 impl BasetenWorkerSelector {
@@ -133,6 +143,7 @@ impl BasetenWorkerSelector {
                 Self::Default(DefaultWorkerSelector::new(kv_router_config, worker_type))
             }
             RouterSelector::B10 => Self::B10(B10WorkerSelector::new()),
+            RouterSelector::Custom(selector) => Self::Custom(selector),
         }
     }
 }
@@ -150,6 +161,9 @@ impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> for BasetenW
                 selector.select_worker(workers, request, eligibility, block_size)
             }
             Self::B10(selector) => {
+                selector.select_worker(workers, request, eligibility, block_size)
+            }
+            Self::Custom(selector) => {
                 selector.select_worker(workers, request, eligibility, block_size)
             }
         }
