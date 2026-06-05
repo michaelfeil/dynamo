@@ -1,9 +1,10 @@
 name: Post-Merge Build (framework=none)
 
 on:
+  workflow_dispatch:
   push:
     branches:
-      - main-v1.2.0
+      - main-v1.2.0 # add whatever branch is main for this, consider in future upsteads 1.3 etc.
 
 permissions:
   contents: read
