@@ -373,9 +373,12 @@ where
             decay_now,
         );
 
+        let active_requests = self.slots.active_request_counts();
+
         let mut workers: FxHashSet<WorkerWithDpRank> = FxHashSet::default();
         workers.extend(decode_blocks.keys().copied());
         workers.extend(prefill_tokens.keys().copied());
+        workers.extend(active_requests.keys().copied());
 
         let mut loads = Vec::with_capacity(workers.len());
         for worker in workers {
@@ -387,6 +390,7 @@ where
                     .copied()
                     .unwrap_or(isl_tokens),
                 potential_decode_blocks: decode_blocks.get(&worker).copied().unwrap_or(0),
+                active_requests: active_requests.get(&worker).copied().unwrap_or(0),
             });
         }
 
@@ -1146,6 +1150,7 @@ mod tests {
                 dp_rank: worker.dp_rank,
                 potential_prefill_tokens: prefill_tokens.get(worker).copied().unwrap_or(128),
                 potential_decode_blocks: decode_blocks.get(worker).copied().unwrap_or(0),
+                active_requests: 0,
             })
             .collect();
         expected.sort_by_key(|load| (load.worker_id, load.dp_rank));
@@ -1212,6 +1217,7 @@ mod tests {
         let loads = scheduler.get_potential_loads(None, 0, HashMap::new(), true);
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].potential_prefill_tokens, 40);
+        assert_eq!(loads[0].active_requests, 1);
 
         cancel_token.cancel();
     }
@@ -1309,6 +1315,7 @@ mod tests {
         let loads = scheduler.get_potential_loads(None, 64, HashMap::new(), false);
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].potential_prefill_tokens, 64);
+        assert_eq!(loads[0].active_requests, 1);
 
         cancel_token.cancel();
     }

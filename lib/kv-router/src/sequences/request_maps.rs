@@ -91,6 +91,14 @@ impl RequestIndex {
         counts
     }
 
+    pub(super) fn active_request_counts(&self) -> HashMap<WorkerWithDpRank, usize> {
+        let mut counts = HashMap::new();
+        for entry in self.request_to_worker.iter() {
+            *counts.entry(*entry.value()).or_insert(0) += 1;
+        }
+        counts
+    }
+
     #[cfg(any(test, feature = "bench"))]
     pub(super) fn is_empty(&self) -> bool {
         self.request_to_worker.is_empty() && self.request_to_lora.is_empty()

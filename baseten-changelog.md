@@ -469,6 +469,8 @@ The router bookkeeping protocol now accepts a `request_id` payload override for
 context id cannot be used. `PotentialLoads` responses also report the current
 router queue backlog through `pending_count` and `pending_isl_tokens`, so callers
 can inspect both worker load projections and queued-work pressure in one request.
+Each `PotentialLoad` row also carries the worker's `active_requests` count,
+matching the v1.0 bookkeeping surface used by autoscaling consumers.
 
 Replay notes:
 

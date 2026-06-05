@@ -1603,6 +1603,35 @@ mod tests {
     }
 
     #[test]
+    fn test_potential_load_active_requests_required_for_deserialization() {
+        let result = serde_json::from_str::<PotentialLoad>(
+            r#"{"worker_id":1,"dp_rank":0,"potential_prefill_tokens":16,"potential_decode_blocks":4}"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_potential_load_active_requests_serialization() {
+        let load = PotentialLoad {
+            worker_id: 1,
+            dp_rank: 0,
+            potential_prefill_tokens: 16,
+            potential_decode_blocks: 4,
+            active_requests: 2,
+        };
+
+        let serialized = serde_json::to_string(&load).unwrap();
+        let deserialized: PotentialLoad = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"worker_id":1,"dp_rank":0,"potential_prefill_tokens":16,"potential_decode_blocks":4,"active_requests":2}"#
+        );
+        assert_eq!(deserialized.active_requests, 2);
+    }
+
+    #[test]
     fn test_router_response_potential_loads_serialization_with_pending_queue() {
         let response = RouterResponse::PotentialLoads {
             loads: Vec::new(),

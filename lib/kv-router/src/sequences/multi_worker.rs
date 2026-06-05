@@ -612,6 +612,11 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         self.prompt_registry.active_tokens(decay_now)
     }
 
+    /// Query all workers for their current number of active requests.
+    pub fn active_request_counts(&self) -> HashMap<WorkerWithDpRank, usize> {
+        self.request_index.active_request_counts()
+    }
+
     /// Return true if any worker satisfies the provided predicate on active token count.
     pub fn any_worker_matches_active_tokens(
         &self,
