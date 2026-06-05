@@ -464,6 +464,12 @@ worker-query KV recovery to complete before registering the serving `generate`
 endpoint. This is intentionally scoped to the local-indexer/event-plane path;
 the deprecated JetStream recovery path is left unchanged.
 
+The router bookkeeping protocol now accepts a `request_id` payload override for
+`MarkPrefill`, matching the existing `MarkFree` behavior when the transport
+context id cannot be used. `PotentialLoads` responses also report the current
+router queue backlog through `pending_count` and `pending_isl_tokens`, so callers
+can inspect both worker load projections and queued-work pressure in one request.
+
 Replay notes:
 
 Treat this as one coherent router subsystem port. Do not cherry-pick the commits

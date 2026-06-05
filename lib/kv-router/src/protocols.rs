@@ -426,7 +426,12 @@ pub enum RouterRequest {
         #[serde(default, skip_serializing_if = "RoutingConstraints::is_empty")]
         routing_constraints: RoutingConstraints,
     },
-    MarkPrefill,
+    MarkPrefill {
+        // Once request is cancelled, the frontend might not be allowed to send a
+        // request with linking the id. In this case, the request_id is provided in the payload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
     MarkFree {
         // once request is cancelled, the frontend might not be allowed to send a
         // request with linking the id. In this case, the request_id is provided in the payload.
@@ -480,6 +485,10 @@ pub enum RouterResponse {
     },
     PotentialLoads {
         loads: Vec<PotentialLoad>,
+        #[serde(default)]
+        pending_count: usize,
+        #[serde(default)]
+        pending_isl_tokens: usize,
     },
 }
 
@@ -1416,6 +1425,16 @@ mod tests {
     }
 
     #[test]
+    fn test_router_request_mark_prefill_backwards_compatible_deserialization() {
+        let request: RouterRequest = serde_json::from_str(r#"{"method":"mark_prefill"}"#).unwrap();
+
+        assert!(matches!(
+            request,
+            RouterRequest::MarkPrefill { request_id: None }
+        ));
+    }
+
+    #[test]
     fn test_shared_cache_hits_from_hits() {
         // All hits contiguous
         let hits = SharedCacheHits::from_hits(&[true, true, true, true]);
@@ -1544,6 +1563,67 @@ mod tests {
             RouterRequest::MarkFree {
                 request_id: Some(ref request_id)
             } if request_id == "req-123"
+        ));
+    }
+
+    #[test]
+    fn test_router_request_mark_prefill_serialization_with_request_id() {
+        let request = RouterRequest::MarkPrefill {
+            request_id: Some("req-123".to_string()),
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"mark_prefill","request_id":"req-123"}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::MarkPrefill {
+                request_id: Some(ref request_id)
+            } if request_id == "req-123"
+        ));
+    }
+
+    #[test]
+    fn test_router_response_potential_loads_backwards_compatible_deserialization() {
+        let response: RouterResponse =
+            serde_json::from_str(r#"{"method":"potential_loads","loads":[]}"#).unwrap();
+
+        assert!(matches!(
+            response,
+            RouterResponse::PotentialLoads {
+                loads,
+                pending_count: 0,
+                pending_isl_tokens: 0,
+            } if loads.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_router_response_potential_loads_serialization_with_pending_queue() {
+        let response = RouterResponse::PotentialLoads {
+            loads: Vec::new(),
+            pending_count: 3,
+            pending_isl_tokens: 128,
+        };
+
+        let serialized = serde_json::to_string(&response).unwrap();
+        let deserialized: RouterResponse = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"potential_loads","loads":[],"pending_count":3,"pending_isl_tokens":128}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterResponse::PotentialLoads {
+                loads,
+                pending_count: 3,
+                pending_isl_tokens: 128,
+            } if loads.is_empty()
         ));
     }
 }

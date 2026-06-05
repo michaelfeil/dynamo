@@ -741,6 +741,11 @@ where
         self.scheduler.pending_count()
     }
 
+    /// Total input tokens currently parked in the scheduler queue.
+    pub fn pending_isl_tokens(&self) -> usize {
+        self.scheduler.pending_isl_tokens()
+    }
+
     fn prefill_load_hint_for(
         &self,
         isl_tokens: usize,
@@ -1098,9 +1103,15 @@ where
                     Err(error) => return Err(error),
                 }
             }
-            RouterRequest::MarkPrefill => RouterResponse::PrefillMarked {
-                success: self.mark_prefill_completed(&context_id).await.is_ok(),
-            },
+            RouterRequest::MarkPrefill { request_id } => {
+                let request_id = match request_id.as_deref() {
+                    Some(request_id) if !request_id.trim().is_empty() => request_id,
+                    _ => &context_id,
+                };
+                RouterResponse::PrefillMarked {
+                    success: self.mark_prefill_completed(request_id).await.is_ok(),
+                }
+            }
             RouterRequest::MarkFree { request_id } => {
                 let request_id = match request_id.as_deref() {
                     Some(request_id) if !request_id.trim().is_empty() => request_id,
@@ -1113,7 +1124,11 @@ where
             RouterRequest::PotentialLoads { tokens: _ } => {
                 // Potential-load probing is not implemented for the in-process
                 // KvRouter; remote/serve-indexer paths handle this elsewhere.
-                RouterResponse::PotentialLoads { loads: Vec::new() }
+                RouterResponse::PotentialLoads {
+                    loads: Vec::new(),
+                    pending_count: self.pending_count(),
+                    pending_isl_tokens: self.pending_isl_tokens(),
+                }
             }
         };
 
