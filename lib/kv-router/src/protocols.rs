@@ -16,6 +16,10 @@ const fn default_track_prefill_tokens() -> bool {
     true
 }
 
+fn is_default_priority_jump(priority_jump: &f64) -> bool {
+    *priority_jump == 0.0
+}
+
 /// The event subject that workers publish KV cache events on.
 pub const KV_EVENT_SUBJECT: &str = "kv-events";
 
@@ -425,6 +429,8 @@ pub enum RouterRequest {
         block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
         #[serde(default, skip_serializing_if = "RoutingConstraints::is_empty")]
         routing_constraints: RoutingConstraints,
+        #[serde(default, skip_serializing_if = "is_default_priority_jump")]
+        priority_jump: f64,
     },
     MarkPrefill {
         // Once request is cancelled, the frontend might not be allowed to send a
@@ -449,6 +455,7 @@ impl Default for RouterRequest {
             tokens: vec![],
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
+            priority_jump: 0.0,
         }
     }
 }
@@ -1431,6 +1438,32 @@ mod tests {
         assert!(matches!(
             request,
             RouterRequest::MarkPrefill { request_id: None }
+        ));
+    }
+
+    #[test]
+    fn test_router_request_new_serialization_with_priority_jump() {
+        let request = RouterRequest::New {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            routing_constraints: RoutingConstraints::default(),
+            priority_jump: 5.0,
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"new","tokens":[1,2,3],"priority_jump":5.0}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::New {
+                tokens,
+                priority_jump,
+                ..
+            } if tokens == vec![1, 2, 3] && priority_jump == 5.0
         ));
     }
 

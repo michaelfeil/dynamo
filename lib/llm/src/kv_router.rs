@@ -1062,6 +1062,7 @@ where
                 tokens,
                 block_mm_infos,
                 routing_constraints,
+                priority_jump,
             } => {
                 match self
                     .find_best_match_details(
@@ -1072,7 +1073,7 @@ where
                         true,
                         false,
                         None,
-                        0.0,
+                        priority_jump,
                         None,
                         None,
                         None,
