@@ -36,9 +36,7 @@ def b10_register_shutdown_signals(runtime: DistributedRuntime):
         loop.add_signal_handler(sig, lambda: _b10_shutdown_handler(runtime))
 
 
-def dynamo_worker(
-    enable_nats: Optional[bool] = None, register_shutdown: bool = False
-):
+def dynamo_worker(enable_nats: Optional[bool] = None, register_shutdown: bool = False):
     """
     Decorator that creates a DistributedRuntime and passes it to the worker function.
 
