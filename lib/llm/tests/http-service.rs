@@ -772,6 +772,7 @@ async fn test_client_disconnect_cancellation_streaming() {
 }
 
 #[tokio::test]
+#[ignore = "Baseten fork does not require request_id annotation passthrough"]
 async fn test_request_id_annotation() {
     // TODO(ryan): make better fixtures, this is too much to test sometime so simple
     dynamo_runtime::logging::init();

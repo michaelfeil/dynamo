@@ -81,6 +81,7 @@ pub(crate) fn tool_call_response_chunk_to_protocol(
 /// # Fields
 /// - `inner`: The base OpenAI chat completion request, embedded using `serde(flatten)`.
 /// - `common`: Common extension fields (ignore_eos, min_tokens) at root level, embedded using `serde(flatten)`.
+/// - `baseten_ext`: Baseten-specific extensions (cache_control, decode_cache_control, priority, baseten, dynamic_temperature, thinking, reasoning) at root level, embedded using `serde(flatten)`.
 /// - `nvext`: The optional NVIDIA extension field. See [`NvExt`] for more details.
 ///   Note: If ignore_eos is specified in both common and nvext, the common (root-level) value takes precedence.
 #[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
