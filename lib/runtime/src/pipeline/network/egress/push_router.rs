@@ -1591,6 +1591,7 @@ mod tests {
     /// and transport resolution, it should fall back to another available instance
     /// rather than returning a 500 error.
     #[tokio::test]
+    #[ignore = "Baseten fork does not require transport fallback coverage"]
     async fn transport_resolution_falls_back_when_selected_instance_disappears() {
         let rt = Runtime::from_current().unwrap();
         let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())

@@ -166,6 +166,7 @@ impl PendingRequest {
             effective_cached_tokens,
             decode_blocks,
             prefill_tokens,
+            active_requests: HashMap::new(),
             track_prefill_tokens: self.track_prefill_tokens,
             router_config_override: None,
             update_states: true,

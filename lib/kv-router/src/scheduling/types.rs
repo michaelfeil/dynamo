@@ -112,6 +112,7 @@ pub struct SchedulingRequest {
     // Load state computed during admission.
     pub decode_blocks: FxHashMap<WorkerWithDpRank, usize>,
     pub prefill_tokens: FxHashMap<WorkerWithDpRank, usize>,
+    pub active_requests: HashMap<WorkerWithDpRank, usize>,
 
     // Scheduling side effects and lifecycle controls.
     pub update_states: bool,
@@ -217,6 +218,10 @@ impl SchedulingRequest {
             .get(&worker)
             .copied()
             .unwrap_or(0.0)
+    }
+
+    pub fn active_requests_for(&self, worker: WorkerWithDpRank) -> usize {
+        self.active_requests.get(&worker).copied().unwrap_or(0)
     }
 
     pub fn is_worker_allowed(&self, worker_id: WorkerId) -> bool {

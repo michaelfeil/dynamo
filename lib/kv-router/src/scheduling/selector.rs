@@ -26,30 +26,32 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
 
 /// Helper function for softmax sampling.
 /// Returns the selected worker and its logit.
-fn softmax_sample(
-    logits: &FxHashMap<WorkerWithDpRank, f64>,
-    temperature: f64,
-) -> (WorkerWithDpRank, f64) {
+pub fn softmax_sample<M>(logits: &M, temperature: f64) -> (WorkerWithDpRank, f64)
+where
+    for<'a> &'a M: IntoIterator<Item = (&'a WorkerWithDpRank, &'a f64)>,
+{
     let mut rng = rand::rng();
     softmax_sample_with_sample(logits, temperature, rng.random())
 }
 
-fn softmax_sample_with_sample(
-    logits: &FxHashMap<WorkerWithDpRank, f64>,
+fn softmax_sample_with_sample<M>(
+    logits: &M,
     temperature: f64,
     sample: f64,
-) -> (WorkerWithDpRank, f64) {
-    assert!(!logits.is_empty(), "Empty logits for softmax sampling");
-
+) -> (WorkerWithDpRank, f64)
+where
+    for<'a> &'a M: IntoIterator<Item = (&'a WorkerWithDpRank, &'a f64)>,
+{
     if temperature == 0.0 {
         let (worker, logit) = logits
-            .iter()
+            .into_iter()
             .min_by(|a, b| a.1.total_cmp(b.1))
             .expect("logits non-empty");
         return (*worker, *logit);
     }
 
-    let entries: Vec<(WorkerWithDpRank, f64)> = logits.iter().map(|(w, l)| (*w, *l)).collect();
+    let entries: Vec<(WorkerWithDpRank, f64)> = logits.into_iter().map(|(w, l)| (*w, *l)).collect();
+    assert!(!entries.is_empty(), "Empty logits for softmax sampling");
 
     let (min_val, max_val) = entries
         .iter()
@@ -447,6 +449,7 @@ mod tests {
             effective_cached_tokens: HashMap::default(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -593,6 +596,7 @@ mod tests {
             effective_cached_tokens: HashMap::default(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -729,6 +733,7 @@ mod tests {
             effective_cached_tokens: HashMap::default(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -775,6 +780,7 @@ mod tests {
             effective_cached_tokens: HashMap::default(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -839,6 +845,7 @@ mod tests {
                 effective_cached_tokens: HashMap::default(),
                 decode_blocks,
                 prefill_tokens: FxHashMap::default(),
+                active_requests: HashMap::new(),
                 track_prefill_tokens: true,
                 router_config_override: None,
                 update_states: false,
@@ -901,6 +908,7 @@ mod tests {
             effective_cached_tokens: HashMap::default(),
             decode_blocks,
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -959,6 +967,7 @@ mod tests {
             effective_cached_tokens: HashMap::default(),
             decode_blocks,
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -1033,6 +1042,7 @@ mod tests {
             effective_cached_tokens,
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -1098,6 +1108,7 @@ mod tests {
             effective_cached_tokens,
             decode_blocks,
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -1158,6 +1169,7 @@ mod tests {
             effective_cached_tokens: HashMap::new(),
             decode_blocks,
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -1208,6 +1220,7 @@ mod tests {
             effective_cached_tokens: HashMap::new(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,

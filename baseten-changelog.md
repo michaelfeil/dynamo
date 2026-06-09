@@ -472,6 +472,28 @@ can inspect both worker load projections and queued-work pressure in one request
 Each `PotentialLoad` row also carries the worker's `active_requests` count,
 matching the v1.0 bookkeeping surface used by autoscaling consumers.
 
+The B10 selector heuristic must stay compatible with v1.0 for a seamless router
+upgrade. The v1.2 port therefore restores the v1.0 active-request term, DP
+strict-rank decision, softmax temperature sampling, and throttled score
+breakdown logs while adapting the cache-hit input to the target scheduler's
+`effective_cached_tokens` model. v1.0 did not distinguish cache tiers for this
+heuristic: every cache hit received full routing credit. With host/disk
+cache-hit weights set to `1.0` and no active queue/load, the selector preserves
+that behavior: prefill load is based on all cache hits at full credit, decode
+load is unchanged, and cache-miss tokens are computed from the same effective
+cached-token signal. This is needed so deployments can turn on the v1.2 router
+without changing worker placement behavior except where the new tiered-cache
+weights or eligibility constraints are intentionally configured.
+
+Heuristic and selector parity note:
+
+- `softmax_sample` accepts any worker-logit map that can be iterated as
+  `(&WorkerWithDpRank, &f64)`, instead of requiring `FxHashMap`.
+- The B10 worker selector can use the standard `HashMap` for its local logits
+  map, so `dynamo-llm` does not need to depend on `rustc-hash` for this path.
+- The zero-temperature selection path stays allocation-free; only the softmax
+  sampling path collects entries.
+
 Replay notes:
 
 Treat this as one coherent router subsystem port. Do not cherry-pick the commits

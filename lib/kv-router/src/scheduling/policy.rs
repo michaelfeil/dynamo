@@ -199,6 +199,7 @@ mod tests {
             effective_cached_tokens,
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,

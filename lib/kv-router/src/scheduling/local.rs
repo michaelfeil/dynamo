@@ -263,6 +263,7 @@ where
             effective_cached_tokens,
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens,
             routing_constraints,
             router_config_override: router_config_override.cloned(),

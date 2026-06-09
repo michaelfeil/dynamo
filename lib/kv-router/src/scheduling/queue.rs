@@ -636,6 +636,7 @@ impl<
         );
         request.decode_blocks = decode_blocks;
         request.prefill_tokens = prefill_tokens;
+        request.active_requests = self.slots.active_request_counts();
 
         let selection = {
             let workers = self.workers_with_configs.borrow();
@@ -1271,6 +1272,7 @@ mod tests {
             effective_cached_tokens: HashMap::new(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: true,
@@ -1825,6 +1827,7 @@ mod tests {
             effective_cached_tokens: HashMap::new(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_requests: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: true,
