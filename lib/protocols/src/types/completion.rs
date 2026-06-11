@@ -13,10 +13,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::OpenAIError;
 
-use super::{ChatCompletionStreamOptions, Prompt, Stop};
+use super::{ChatCompletionStreamOptions, Choice, CompletionUsage, Prompt, Stop};
 
-// Re-export response type from upstream (identical)
-pub use async_openai::types::completions::CreateCompletionResponse;
+/// Completion response.
+///
+/// Kept locally so optional response-only fields are omitted when absent.
+#[derive(Debug, Deserialize, Clone, PartialEq, Serialize)]
+pub struct CreateCompletionResponse {
+    /// A unique identifier for the completion.
+    pub id: String,
+    pub choices: Vec<Choice>,
+    /// The Unix timestamp (in seconds) of when the completion was created.
+    pub created: u32,
+
+    /// The model used for completion.
+    pub model: String,
+    /// This fingerprint represents the backend configuration that the model runs with.
+    ///
+    /// Can be used in conjunction with the `seed` request parameter to understand when backend changes have been
+    /// made that might impact determinism.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+
+    /// The object type, which is always "text_completion"
+    pub object: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<CompletionUsage>,
+}
 
 /// Custom deserializer for the echo parameter that only accepts booleans.
 /// Rejects integers and strings with clear error messages.
@@ -186,6 +209,34 @@ mod tests {
 
         assert_eq!(value["finish_reason"], "stop");
         assert_eq!(value["text"], "hello");
+    }
+
+    #[test]
+    fn completion_response_omits_null_fields() {
+        use crate::types::Choice;
+
+        let response = CreateCompletionResponse {
+            id: "cmpl-123".to_string(),
+            choices: vec![Choice {
+                text: "hello".to_string(),
+                index: 0,
+                logprobs: None,
+                finish_reason: None,
+            }],
+            created: 1,
+            model: "test-model".to_string(),
+            system_fingerprint: None,
+            object: "text_completion".to_string(),
+            usage: None,
+        };
+
+        let value = serde_json::to_value(response).expect("serialize response");
+
+        assert_eq!(value["choices"][0]["text"], "hello");
+        assert!(value.get("system_fingerprint").is_none());
+        assert!(value.get("usage").is_none());
+        assert!(value["choices"][0].get("logprobs").is_none());
+        assert!(value["choices"][0].get("finish_reason").is_none());
     }
 
     #[test]

@@ -217,8 +217,13 @@ pub struct FunctionCall {
 /// Streaming variant of [`FunctionCall`] where both fields are optional.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
 pub struct FunctionCallStream {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_arguments_opt")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_arguments_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub arguments: Option<String>,
 }
 
@@ -230,8 +235,11 @@ pub struct FunctionCallStream {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
 pub struct ChatCompletionMessageToolCallChunk {
     pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub r#type: Option<FunctionType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<FunctionCallStream>,
 }
 
@@ -759,7 +767,9 @@ pub struct CreateChatCompletionRequest {
 pub struct ChatChoice {
     pub index: u32,
     pub message: ChatCompletionResponseMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatChoiceLogprobs>,
 }
 
@@ -770,9 +780,12 @@ pub struct CreateChatCompletionResponse {
     pub choices: Vec<ChatChoice>,
     pub created: u32,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTierResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
     pub object: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<CompletionUsage>,
 }
 
@@ -803,8 +816,13 @@ pub struct ChatCompletionStreamResponseDelta {
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct ChatCompletionStreamResponseDeltaFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_arguments_opt")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_arguments_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub arguments: Option<String>,
 }
 
@@ -813,7 +831,9 @@ pub struct ChatCompletionStreamResponseDeltaFunctionCall {
 pub struct ChatChoiceStream {
     pub index: u32,
     pub delta: ChatCompletionStreamResponseDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<ChatChoiceLogprobs>,
 }
 
@@ -824,9 +844,12 @@ pub struct CreateChatCompletionStreamResponse {
     pub choices: Vec<ChatChoiceStream>,
     pub created: u32,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTierResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
     pub object: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<CompletionUsage>,
 }
 
@@ -1046,5 +1069,105 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(delta.arguments.as_deref(), Some("{\"location\":\"SF\"}"));
+    }
+
+    #[test]
+    fn chat_stream_response_omits_null_fields_recursively() {
+        let response = CreateChatCompletionStreamResponse {
+            id: "chatcmpl-123".to_string(),
+            choices: vec![ChatChoiceStream {
+                index: 0,
+                delta: ChatCompletionStreamResponseDelta {
+                    content: Some(ChatCompletionMessageContent::Text("<think>".to_string())),
+                    function_call: None,
+                    tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                        index: 0,
+                        id: None,
+                        r#type: None,
+                        function: Some(FunctionCallStream {
+                            name: None,
+                            arguments: Some("{\"query\":\"weather\"}".to_string()),
+                        }),
+                    }]),
+                    role: Some(Role::Assistant),
+                    refusal: None,
+                    reasoning_content: None,
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            created: 1,
+            model: "test-model".to_string(),
+            service_tier: None,
+            system_fingerprint: None,
+            object: "chat.completion.chunk".to_string(),
+            usage: None,
+        };
+
+        let value = serde_json::to_value(response).expect("serialize response");
+        let choice = &value["choices"][0];
+        let delta = &choice["delta"];
+        let tool_call = &delta["tool_calls"][0];
+        let function = &tool_call["function"];
+
+        assert_eq!(delta["content"], "<think>");
+        assert_eq!(delta["role"], "assistant");
+        assert_eq!(function["arguments"], "{\"query\":\"weather\"}");
+        assert!(value.get("service_tier").is_none());
+        assert!(value.get("system_fingerprint").is_none());
+        assert!(value.get("usage").is_none());
+        assert!(choice.get("finish_reason").is_none());
+        assert!(choice.get("logprobs").is_none());
+        assert!(delta.get("function_call").is_none());
+        assert!(delta.get("refusal").is_none());
+        assert!(delta.get("reasoning_content").is_none());
+        assert!(tool_call.get("id").is_none());
+        assert!(tool_call.get("type").is_none());
+        assert!(function.get("name").is_none());
+    }
+
+    #[test]
+    fn chat_stream_response_keeps_present_tool_call_fields() {
+        let response = CreateChatCompletionStreamResponse {
+            id: "chatcmpl-123".to_string(),
+            choices: vec![ChatChoiceStream {
+                index: 0,
+                delta: ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
+                        index: 0,
+                        id: Some("call_123".to_string()),
+                        r#type: Some(FunctionType::Function),
+                        function: Some(FunctionCallStream {
+                            name: Some("search".to_string()),
+                            arguments: Some("{\"query\":\"weather\"}".to_string()),
+                        }),
+                    }]),
+                    role: None,
+                    refusal: None,
+                    reasoning_content: None,
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            created: 1,
+            model: "test-model".to_string(),
+            service_tier: None,
+            system_fingerprint: None,
+            object: "chat.completion.chunk".to_string(),
+            usage: None,
+        };
+
+        let value = serde_json::to_value(response).expect("serialize response");
+        let tool_call = &value["choices"][0]["delta"]["tool_calls"][0];
+
+        assert_eq!(tool_call["id"], "call_123");
+        assert_eq!(tool_call["type"], "function");
+        assert_eq!(tool_call["function"]["name"], "search");
+        assert_eq!(
+            tool_call["function"]["arguments"],
+            "{\"query\":\"weather\"}"
+        );
     }
 }
