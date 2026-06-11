@@ -20,6 +20,14 @@ fn is_default_priority_jump(priority_jump: &f64) -> bool {
     *priority_jump == 0.0
 }
 
+fn is_default_priority_load_shed_percent(priority_load_shed_percent: &u8) -> bool {
+    *priority_load_shed_percent == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// The event subject that workers publish KV cache events on.
 pub const KV_EVENT_SUBJECT: &str = "kv-events";
 
@@ -431,6 +439,10 @@ pub enum RouterRequest {
         routing_constraints: RoutingConstraints,
         #[serde(default, skip_serializing_if = "is_default_priority_jump")]
         priority_jump: f64,
+        #[serde(default, skip_serializing_if = "is_default_priority_load_shed_percent")]
+        priority_load_shed_percent: u8,
+        #[serde(default, skip_serializing_if = "is_false")]
+        do_not_queue: bool,
     },
     MarkPrefill {
         // Once request is cancelled, the frontend might not be allowed to send a
@@ -456,6 +468,8 @@ impl Default for RouterRequest {
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
             priority_jump: 0.0,
+            priority_load_shed_percent: 0,
+            do_not_queue: false,
         }
     }
 }
@@ -465,6 +479,8 @@ impl Default for RouterRequest {
 pub enum RouterBackpressureReason {
     /// The configured cap on total queued ISL tokens has been reached.
     MaxQueuedIslTokensExceeded,
+    /// The request opted out of queueing while all eligible workers were busy.
+    DoNotQueue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1448,6 +1464,8 @@ mod tests {
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
             priority_jump: 5.0,
+            priority_load_shed_percent: 0,
+            do_not_queue: false,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -1464,6 +1482,52 @@ mod tests {
                 priority_jump,
                 ..
             } if tokens == vec![1, 2, 3] && priority_jump == 5.0
+        ));
+    }
+
+    #[test]
+    fn test_router_request_new_serialization_with_priority_load_shed_percent() {
+        let request = RouterRequest::New {
+            tokens: vec![1, 2, 3],
+            block_mm_infos: None,
+            routing_constraints: RoutingConstraints::default(),
+            priority_jump: 5.0,
+            priority_load_shed_percent: 10,
+            do_not_queue: false,
+        };
+
+        let serialized = serde_json::to_string(&request).unwrap();
+        let deserialized: RouterRequest = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            serialized,
+            r#"{"method":"new","tokens":[1,2,3],"priority_jump":5.0,"priority_load_shed_percent":10}"#
+        );
+        assert!(matches!(
+            deserialized,
+            RouterRequest::New {
+                tokens,
+                priority_jump,
+                priority_load_shed_percent,
+                ..
+            } if tokens == vec![1, 2, 3]
+                && priority_jump == 5.0
+                && priority_load_shed_percent == 10
+        ));
+    }
+
+    #[test]
+    fn test_router_request_new_do_not_queue_defaults_to_false() {
+        let request: RouterRequest =
+            serde_json::from_str(r#"{"method":"new","tokens":[1,2,3]}"#).unwrap();
+
+        assert!(matches!(
+            request,
+            RouterRequest::New {
+                tokens,
+                do_not_queue,
+                ..
+            } if tokens == vec![1, 2, 3] && !do_not_queue
         ));
     }
 

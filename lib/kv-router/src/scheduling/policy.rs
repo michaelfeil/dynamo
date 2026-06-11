@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cmp::Ordering;
 use std::time::Duration;
 
 use super::config::RouterQueuePolicy;
@@ -35,6 +36,11 @@ pub trait SchedulingPolicy: Send + Sync + 'static {
     /// When true, queue rebuilds heap via rekey() on each update() call.
     /// When false (default), rekey path is compiled out entirely.
     const DYNAMIC: bool = false;
+
+    /// Runtime equivalent of [`Self::DYNAMIC`] for enum-dispatched policies.
+    fn is_dynamic(&self) -> bool {
+        Self::DYNAMIC
+    }
 }
 
 /// FCFS with priority bumps: key = priority_jump - arrival_offset.
@@ -100,6 +106,79 @@ impl SchedulingPolicy for WsptPolicy {
     }
 }
 
+const B10_FAIR_WSPT_BLEND_SECS: f64 = 15.0;
+const B10_FAIR_WSPT_CREDIT_SCALE_SECS: f64 = 15.0;
+const B10_FAIR_WSPT_REFERENCE_TOKENS: f64 = 1024.0;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct B10FairWsptKey {
+    score: OrderedFloat<f64>,
+    arrival_offset: Duration,
+}
+
+impl Ord for B10FairWsptKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .cmp(&other.score)
+            // Stable FCFS tie-break: earlier arrival wins.
+            .then_with(|| other.arrival_offset.cmp(&self.arrival_offset))
+    }
+}
+
+impl PartialOrd for B10FairWsptKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// B10 fair WSPT hybrid:
+/// FCFS with a bounded WSPT credit that linearly fades to zero over 15s.
+pub struct B10FairWsptPolicy;
+
+impl B10FairWsptPolicy {
+    fn key<C: WorkerConfigLike>(
+        now: Duration,
+        arrival_offset: Duration,
+        ctx: SchedulingContext<'_, C>,
+    ) -> B10FairWsptKey {
+        let age_secs = now.saturating_sub(arrival_offset).as_secs_f64().max(0.0);
+        let wspt_weight = (1.0 - age_secs / B10_FAIR_WSPT_BLEND_SECS).clamp(0.0, 1.0);
+        let priority_jump = ctx.request().priority_jump.max(0.0);
+        let effective_new_tokens = ctx.best_effective_prefill_tokens().max(1) as f64;
+        let wspt_credit = B10_FAIR_WSPT_CREDIT_SCALE_SECS * B10_FAIR_WSPT_REFERENCE_TOKENS
+            / (B10_FAIR_WSPT_REFERENCE_TOKENS + effective_new_tokens);
+        let score = priority_jump - arrival_offset.as_secs_f64() + wspt_weight * wspt_credit;
+
+        B10FairWsptKey {
+            score: OrderedFloat(score),
+            arrival_offset,
+        }
+    }
+}
+
+impl SchedulingPolicy for B10FairWsptPolicy {
+    type Key = B10FairWsptKey;
+
+    const DYNAMIC: bool = true;
+
+    fn enqueue_key<C: WorkerConfigLike>(
+        &self,
+        arrival_offset: Duration,
+        ctx: SchedulingContext<'_, C>,
+    ) -> Self::Key {
+        Self::key(arrival_offset, arrival_offset, ctx)
+    }
+
+    fn rekey<C: WorkerConfigLike>(
+        &self,
+        now: Duration,
+        old_key: &Self::Key,
+        ctx: SchedulingContext<'_, C>,
+    ) -> Self::Key {
+        Self::key(now, old_key.arrival_offset, ctx)
+    }
+}
+
 /// Runtime-dispatched scheduling policy selected via configuration.
 /// Delegates to the concrete policy variant; the branch is fully predictable
 /// since the variant is fixed at queue construction time.
@@ -107,6 +186,7 @@ pub enum RouterSchedulingPolicy {
     Fcfs(FcfsPolicy),
     Lcfs(LcfsPolicy),
     Wspt(WsptPolicy),
+    B10FairWspt(B10FairWsptPolicy),
 }
 
 impl RouterSchedulingPolicy {
@@ -115,12 +195,19 @@ impl RouterSchedulingPolicy {
             RouterQueuePolicy::Fcfs => Self::Fcfs(FcfsPolicy),
             RouterQueuePolicy::Lcfs => Self::Lcfs(LcfsPolicy),
             RouterQueuePolicy::Wspt => Self::Wspt(WsptPolicy),
+            RouterQueuePolicy::B10FairWspt => Self::B10FairWspt(B10FairWsptPolicy),
         }
     }
 }
 
 impl SchedulingPolicy for RouterSchedulingPolicy {
-    type Key = OrderedFloat<f64>;
+    type Key = RouterSchedulingKey;
+
+    const DYNAMIC: bool = true;
+
+    fn is_dynamic(&self) -> bool {
+        matches!(self, Self::B10FairWspt(_))
+    }
 
     fn enqueue_key<C: WorkerConfigLike>(
         &self,
@@ -128,10 +215,50 @@ impl SchedulingPolicy for RouterSchedulingPolicy {
         ctx: SchedulingContext<'_, C>,
     ) -> Self::Key {
         match self {
-            Self::Fcfs(p) => p.enqueue_key(arrival_offset, ctx),
-            Self::Lcfs(p) => p.enqueue_key(arrival_offset, ctx),
-            Self::Wspt(p) => p.enqueue_key(arrival_offset, ctx),
+            Self::Fcfs(p) => RouterSchedulingKey::Scalar(p.enqueue_key(arrival_offset, ctx)),
+            Self::Lcfs(p) => RouterSchedulingKey::Scalar(p.enqueue_key(arrival_offset, ctx)),
+            Self::Wspt(p) => RouterSchedulingKey::Scalar(p.enqueue_key(arrival_offset, ctx)),
+            Self::B10FairWspt(p) => {
+                RouterSchedulingKey::B10FairWspt(p.enqueue_key(arrival_offset, ctx))
+            }
         }
+    }
+
+    fn rekey<C: WorkerConfigLike>(
+        &self,
+        now: Duration,
+        old_key: &Self::Key,
+        ctx: SchedulingContext<'_, C>,
+    ) -> Self::Key {
+        match (self, old_key) {
+            (Self::B10FairWspt(p), RouterSchedulingKey::B10FairWspt(key)) => {
+                RouterSchedulingKey::B10FairWspt(p.rekey(now, key, ctx))
+            }
+            _ => old_key.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouterSchedulingKey {
+    Scalar(OrderedFloat<f64>),
+    B10FairWspt(B10FairWsptKey),
+}
+
+impl Ord for RouterSchedulingKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Scalar(a), Self::Scalar(b)) => a.cmp(b),
+            (Self::B10FairWspt(a), Self::B10FairWspt(b)) => a.cmp(b),
+            (Self::Scalar(_), Self::B10FairWspt(_)) => Ordering::Less,
+            (Self::B10FairWspt(_), Self::Scalar(_)) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for RouterSchedulingKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -205,6 +332,8 @@ mod tests {
             update_states: false,
             lora_name: None,
             priority_jump,
+            priority_load_shed_percent: 0,
+            do_not_queue: false,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -298,6 +427,97 @@ mod tests {
 
         let lcfs = RouterSchedulingPolicy::new(RouterQueuePolicy::Lcfs);
         assert!(enqueue_key(&lcfs, late, &req) > enqueue_key(&lcfs, early, &req));
+    }
+
+    #[test]
+    fn router_scheduling_policy_dynamic_only_for_b10_fair_wspt() {
+        assert!(!RouterSchedulingPolicy::new(RouterQueuePolicy::Fcfs).is_dynamic());
+        assert!(!RouterSchedulingPolicy::new(RouterQueuePolicy::Lcfs).is_dynamic());
+        assert!(!RouterSchedulingPolicy::new(RouterQueuePolicy::Wspt).is_dynamic());
+        assert!(RouterSchedulingPolicy::new(RouterQueuePolicy::B10FairWspt).is_dynamic());
+    }
+
+    // ---- B10 fair WSPT policy tests ----
+
+    #[test]
+    fn b10_fair_wspt_shorter_request_gets_early_credit() {
+        let policy = B10FairWsptPolicy;
+        let short = request_with(100, 0.0, OverlapScores::default());
+        let long = request_with(10_000, 0.0, OverlapScores::default());
+
+        assert!(
+            enqueue_key(&policy, Duration::ZERO, &short)
+                > enqueue_key(&policy, Duration::ZERO, &long),
+            "fresh queued requests should be WSPT-like"
+        );
+    }
+
+    #[test]
+    fn b10_fair_wspt_short_newer_request_can_beat_early_longer_request() {
+        let policy = B10FairWsptPolicy;
+        let old_long = request_with(10_000, 0.0, OverlapScores::default());
+        let newer_short = request_with(100, 0.0, OverlapScores::default());
+
+        assert!(
+            enqueue_key(&policy, Duration::from_secs(5), &newer_short)
+                > enqueue_key(&policy, Duration::ZERO, &old_long),
+            "bounded WSPT credit should allow early short-request promotion"
+        );
+    }
+
+    #[test]
+    fn b10_fair_wspt_ages_into_fcfs_after_15_seconds() {
+        let policy = B10FairWsptPolicy;
+        let old_long = request_with(10_000, 0.0, OverlapScores::default());
+        let newer_short = request_with(100, 0.0, OverlapScores::default());
+
+        let old_key = enqueue_key(&policy, Duration::ZERO, &old_long);
+        let newer_key = enqueue_key(&policy, Duration::from_secs(5), &newer_short);
+        assert!(newer_key > old_key);
+
+        let old_workers = workers_for_request(&old_long);
+        let newer_workers = workers_for_request(&newer_short);
+        let aged_old_key = policy.rekey(
+            Duration::from_secs(15),
+            &old_key,
+            SchedulingContext::new(&old_long, &old_workers),
+        );
+        let aged_newer_key = policy.rekey(
+            Duration::from_secs(15),
+            &newer_key,
+            SchedulingContext::new(&newer_short, &newer_workers),
+        );
+
+        assert!(
+            aged_old_key > aged_newer_key,
+            "a 15s-old request should fall back to FCFS ahead of newer requests"
+        );
+    }
+
+    #[test]
+    fn b10_fair_wspt_priority_jump_promotes() {
+        let policy = B10FairWsptPolicy;
+        let normal = request_with(512, 0.0, OverlapScores::default());
+        let boosted = request_with(512, 5.0, OverlapScores::default());
+
+        assert!(
+            enqueue_key(&policy, Duration::from_secs(3), &boosted)
+                > enqueue_key(&policy, Duration::from_secs(3), &normal),
+            "priority_jump should remain additive"
+        );
+    }
+
+    #[test]
+    fn b10_fair_wspt_overlap_increases_early_credit() {
+        let policy = B10FairWsptPolicy;
+        let no_cache = request_with(1024, 0.0, OverlapScores::default());
+        let cached = request_with(1024, 0.0, overlaps_from(&[(0, 60)]));
+
+        assert!(
+            enqueue_key(&policy, Duration::ZERO, &cached)
+                > enqueue_key(&policy, Duration::ZERO, &no_cache),
+            "effective cache overlap should increase early WSPT credit"
+        );
     }
 
     // ---- WSPT policy tests ----

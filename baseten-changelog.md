@@ -520,12 +520,118 @@ configuration, or selection/response fields that are still absent. Do not carry
 the DP routing stats patch unless target deployments prove they cannot source
 the same values through MDC/configmap.
 
+Current replay delta for Baseten `main-v1.2.0`:
+
+When replaying this PR from Dynamo upstream onto Baseten `main-v1.2.0`, treat
+the selector and queue changes as one compatibility unit. The target branch
+already contains the v1.2 scheduler shape and Baseten selector parity work, so
+the replay should preserve that shape and add only the request fields and
+admission behavior described below.
+
+- `SchedulingRequest` carries an `active_requests` snapshot populated at
+  admission before invoking the selector. This intentionally matches the v1.0
+  cost model, where active requests were counted by scanning the active
+  request-to-worker map and materializing a per-worker map before selection.
+  The cost is still an O(active requests) scan plus a fresh map allocation, but
+  it is not a new regression relative to the Baseten v1.0 router behavior.
+- `B10WorkerSelector` restores the v1.0 active-request blend:
+  two-thirds selected DP-rank active requests plus one-third mean active
+  requests across the worker's DP ranks. The score also retains the absolute
+  cache-miss token term and the short-request full-miss bypass.
+- `softmax_sample` is public and generic over worker-logit maps that iterate as
+  `(&WorkerWithDpRank, &f64)`. That keeps the shared scheduler helper usable by
+  both the core router and the B10 selector without forcing `dynamo-llm` to
+  carry a `rustc-hash` dependency solely for this path.
+- The B10 selector uses `HashMap<WorkerWithDpRank, f64>` for its local logits
+  map. Zero-temperature selection remains deterministic by choosing the lowest
+  logit and breaking ties by `(worker_id, dp_rank)` without allocating an
+  additional entries vector. Non-zero temperature still delegates to softmax
+  sampling.
+- The selector keeps the v1.0 strict-DP decision: strict rank is returned when
+  the selected rank has more than a 5% score advantage over the worst
+  same-worker alternative.
+
+Queue admission fields to replay:
+
+- Add `priority_load_shed_percent: u8` to `RouterRequest::New`, with
+  `#[serde(default, skip_serializing_if = "is_default_priority_load_shed_percent")]`
+  and default `0`. Thread the value through `KvRouter::find_best_match_details`,
+  `KvRouter::find_best_match`, `KvRouterScheduler`, `LocalScheduler`, and into
+  `SchedulingRequest`.
+- `priority_load_shed_percent` is only meaningful together with
+  `priority_jump > 0.0`. The queue's `tier_cap_for_request` should leave the
+  cap unchanged unless both are set. When both are set, compute the boosted cap
+  as `cap + cap * priority_load_shed_percent / 100`, using saturating arithmetic.
+- The cap being boosted is the existing tiered pending-ISL rejection cap from
+  `router_queue_by_incoming_missing_isl`, selected from the request's effective
+  cache-miss tokens and the registered worker count. This is a load-shed grace
+  margin for priority requests: it allows a priority request to enter a slightly
+  fuller pending queue before returning `MaxQueuedIslTokensExceeded`.
+- `priority_load_shed_percent` does not change queue ordering. Queue ordering
+  still comes from `priority_jump` through the queue policy's enqueue key. The
+  percent only changes the rejection threshold used when the queue is already
+  active and pending-ISL caps are configured.
+- Backpressure responses for cap rejection should report the cap that was
+  actually applied to that request. For a priority request this means
+  `max_queued_isl_tokens` can be the boosted cap, not the base tier cap.
+- Add `do_not_queue: bool` to `RouterRequest::New`, with
+  `#[serde(default, skip_serializing_if = "is_false")]` and default `false`.
+  Thread the value through the same scheduler path into `SchedulingRequest`.
+- `do_not_queue` preserves queue-by-default behavior. If the field is omitted,
+  the router should behave exactly as before and may park the request in the
+  pending queue.
+- When `do_not_queue: true`, only reject at the point where the queue would
+  otherwise park the request because queueing is enabled and all eligible
+  workers are prefill-busy. Do not reject requests that can be scheduled
+  immediately. Do not change pinned-worker or allow-list eligibility checks.
+- The `do_not_queue` rejection is surfaced as
+  `RouterBackpressureReason::DoNotQueue` with the current
+  `queued_isl_tokens` and no max cap. This keeps it distinguishable from
+  `MaxQueuedIslTokensExceeded` for callers and metrics.
+- Existing OpenAI/preprocessed request paths can pass `do_not_queue: false`
+  unless the replay also adds a higher-level request hint. Mocker replay paths
+  should also pass `false` to preserve prior behavior.
+
+Compatibility and API notes:
+
+- `RouterRequest::New` remains backwards-compatible for older JSON clients:
+  omitted `priority_jump`, `priority_load_shed_percent`, and `do_not_queue`
+  deserialize to `0.0`, `0`, and `false` respectively.
+- Default serialization omits `priority_jump`, `priority_load_shed_percent`,
+  and `do_not_queue`, so request JSON remains compact and older wire payloads
+  are not churned.
+- `RouterBackpressureReason` is now part of the behavior contract for queue
+  opt-out. Downstream clients that match reasons should tolerate the new
+  `do_not_queue` snake-case value.
+
+Conflict/rebase notes:
+
+- If `b10_worker_selector.rs` conflicts during replay, keep the
+  `B10WorkerSelector` implementation with active-request scoring, softmax
+  temperature sampling, throttled score logs, and the `(worker_id, dp_rank)`
+  zero-temperature tie-break. Do not revert to the simpler upstream-style
+  selector that omits active-request scoring.
+- If duplicate `active_requests_for` methods appear in
+  `scheduling/types.rs`, keep a single method. Some target branches may already
+  have this helper from the selector parity replay.
+- If `SchedulingRequest` construction fails after adding fields, update all
+  request literals and helper constructors with `priority_load_shed_percent: 0`
+  and `do_not_queue: false` unless the test is specifically exercising those
+  fields.
+
 Validation:
 
 Run router unit tests plus manual or integration coverage for: hot config
 reload, queue threshold changes, cancellation, caller disconnect, queue-full
 behavior, `mark_free`/`add_request` races, DP routing, active replica changes,
 and best-overlap response fields.
+
+Focused validation from the current replay:
+
+- `cargo fmt -- --check`
+- `cargo test -p dynamo-kv-router test_router_request_new_do_not_queue_defaults_to_false --lib`
+- `cargo test -p dynamo-kv-router test_do_not_queue_backpressures_instead_of_queueing --lib`
+- `cargo test -p dynamo-llm b10_worker_selector --lib`
 
 ## PATCH-005: Router Metrics, Tracing, and Observability
 

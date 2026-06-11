@@ -453,6 +453,15 @@ impl<
         }
 
         if self.all_workers_prefill_busy(threshold, request.eligibility(), decay_now) {
+            if request.do_not_queue {
+                request.respond(Err(KvSchedulerError::Backpressure {
+                    reason: RouterBackpressureReason::DoNotQueue,
+                    queued_isl_tokens: self.pending_isl_tokens.load(AtomicOrdering::Relaxed),
+                    max_queued_isl_tokens: None,
+                }));
+                return;
+            }
+
             if !self.queue_depth_tiers.is_unbounded() {
                 let pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
                 // This is a rejection threshold on current queued ISL, not a hard
@@ -496,7 +505,7 @@ impl<
             return;
         };
 
-        if S::DYNAMIC {
+        if self.policy.is_dynamic() {
             let now = self.start_time.elapsed();
             let workers = self.workers_with_configs.borrow();
             let rekeyed: Vec<_> = std::mem::take(&mut self.pending)
@@ -749,6 +758,14 @@ impl<
         let worker_count = workers.len();
         self.queue_depth_tiers
             .cap_for(cache_miss_tokens, worker_count)
+            .map(|cap| {
+                if request.priority_jump <= 0.0 || request.priority_load_shed_percent == 0 {
+                    return cap;
+                }
+
+                let bonus = cap.saturating_mul(request.priority_load_shed_percent as usize) / 100;
+                cap.saturating_add(bonus)
+            })
     }
 
     /// Check if all eligible workers are prefill-busy based on threshold.
@@ -1278,6 +1295,8 @@ mod tests {
             update_states: true,
             lora_name: None,
             priority_jump: 0.0,
+            priority_load_shed_percent: 0,
+            do_not_queue: false,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -1558,6 +1577,98 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_priority_load_shed_percent_extends_missing_isl_tier_cap() {
+        let block_size = 16;
+        let isl = 512;
+
+        let tiers = RouterQueueDepthTiers::try_from(vec![RouterQueueDepthByMissingIslTier {
+            missing_cache_tokens_floor: 0,
+            max_queue_depth: isl,
+        }])
+        .unwrap();
+        let (queue, _slots, _cfg_tx) =
+            make_queue_with_sender_with_tiers(1, block_size, isl, Some(0.0), tiers, None);
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _resp1 = rx1.await.unwrap().unwrap();
+
+        let (req2, _rx2) = make_request("req-2", isl);
+        queue.enqueue(req2).await;
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.pending_isl_tokens(), isl);
+
+        let (req3, rx3) = make_request("req-3", isl);
+        queue.enqueue(req3).await;
+        let resp3 = rx3.await.expect("oneshot dropped");
+        assert!(
+            matches!(
+                resp3,
+                Err(KvSchedulerError::Backpressure {
+                    reason: RouterBackpressureReason::MaxQueuedIslTokensExceeded,
+                    queued_isl_tokens: 512,
+                    max_queued_isl_tokens: Some(512),
+                })
+            ),
+            "normal request should backpressure at base cap, got {resp3:?}"
+        );
+
+        let (mut priority_req, _priority_rx) = make_request("priority-1", isl);
+        priority_req.priority_jump = 1.0;
+        priority_req.priority_load_shed_percent = 10;
+        queue.enqueue(priority_req).await;
+        assert_eq!(queue.pending_count(), 2);
+        assert_eq!(queue.pending_isl_tokens(), 2 * isl);
+
+        let (mut priority_req2, priority_rx2) = make_request("priority-2", isl);
+        priority_req2.priority_jump = 1.0;
+        priority_req2.priority_load_shed_percent = 10;
+        queue.enqueue(priority_req2).await;
+        let priority_resp2 = priority_rx2.await.expect("oneshot dropped");
+        assert!(
+            matches!(
+                priority_resp2,
+                Err(KvSchedulerError::Backpressure {
+                    reason: RouterBackpressureReason::MaxQueuedIslTokensExceeded,
+                    queued_isl_tokens: 1024,
+                    max_queued_isl_tokens: Some(563),
+                })
+            ),
+            "priority request should backpressure past boosted cap, got {priority_resp2:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_do_not_queue_backpressures_instead_of_queueing() {
+        let block_size = 16;
+        let isl = 512;
+        let (queue, _slots, _cfg_tx) = make_queue_with_sender(1, block_size, isl, Some(0.0), None);
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _resp1 = rx1.await.unwrap().unwrap();
+
+        let (mut req2, rx2) = make_request("req-2", isl);
+        req2.do_not_queue = true;
+        queue.enqueue(req2).await;
+
+        let resp2 = rx2.await.expect("oneshot dropped");
+        assert!(
+            matches!(
+                resp2,
+                Err(KvSchedulerError::Backpressure {
+                    reason: RouterBackpressureReason::DoNotQueue,
+                    queued_isl_tokens: 0,
+                    max_queued_isl_tokens: None,
+                })
+            ),
+            "do_not_queue request should backpressure instead of queueing, got {resp2:?}"
+        );
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(queue.pending_isl_tokens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_missing_isl_tiers_shed_expensive_first() {
         let block_size = 16;
         let isl = 512;
@@ -1833,6 +1944,8 @@ mod tests {
             update_states: true,
             lora_name: None,
             priority_jump: 0.0,
+            priority_load_shed_percent: 0,
+            do_not_queue: false,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: Some(allowed),

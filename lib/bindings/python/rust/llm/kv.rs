@@ -1133,6 +1133,8 @@ impl KvRouter {
                     false,
                     lora_name.clone(),
                     0.0,
+                    0,
+                    false,
                     None,
                     None,
                     None, // allowed_worker_ids: pass via RoutingHints in PreprocessedRequest path

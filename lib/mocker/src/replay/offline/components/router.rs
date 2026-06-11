@@ -172,6 +172,8 @@ impl PendingRequest {
             update_states: true,
             lora_name: None,
             priority_jump: 0.0,
+            priority_load_shed_percent: 0,
+            do_not_queue: false,
             expected_output_tokens: self.expected_output_tokens,
             pinned_worker: None,
             allowed_worker_ids: None,

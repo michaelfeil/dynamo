@@ -475,6 +475,8 @@ impl RouterHandles {
                 update_states,
                 lora_name,
                 priority_jump,
+                0,
+                false,
                 allowed_worker_ids,
                 routing_constraints,
             )
@@ -552,6 +554,8 @@ impl RouterHandles {
                 false,
                 None,
                 priority_jump,
+                0,
+                false,
                 None,
                 None,
                 allowed_worker_ids,

@@ -81,6 +81,8 @@ impl PrefillRouter {
                 .as_ref()
                 .and_then(|r| r.priority_jump)
                 .unwrap_or(0.0);
+            let priority_load_shed_percent = 0;
+            let do_not_queue = false;
             let allowed_worker_ids = req
                 .routing
                 .as_ref()
@@ -98,6 +100,8 @@ impl PrefillRouter {
                     false,
                     lora_name,
                     priority_jump,
+                    priority_load_shed_percent,
+                    do_not_queue,
                     allowed_worker_ids,
                     routing_constraints,
                 )
@@ -350,6 +354,8 @@ impl PrefillRouter {
         update_states: bool,
         lora_name: Option<String>,
         priority_jump: f64,
+        priority_load_shed_percent: u8,
+        do_not_queue: bool,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
     ) -> Result<PrefillQueryOutcome> {
@@ -371,6 +377,8 @@ impl PrefillRouter {
                         false,
                         lora_name,
                         priority_jump,
+                        priority_load_shed_percent,
+                        do_not_queue,
                         None,
                         None,
                         allowed_worker_ids,

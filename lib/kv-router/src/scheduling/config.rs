@@ -278,6 +278,8 @@ pub enum RouterQueuePolicy {
     Fcfs,
     Lcfs,
     Wspt,
+    #[serde(rename = "b10-fair-wspt")]
+    B10FairWspt,
 }
 
 impl fmt::Display for RouterQueuePolicy {
@@ -286,6 +288,7 @@ impl fmt::Display for RouterQueuePolicy {
             Self::Fcfs => f.write_str("fcfs"),
             Self::Lcfs => f.write_str("lcfs"),
             Self::Wspt => f.write_str("wspt"),
+            Self::B10FairWspt => f.write_str("b10-fair-wspt"),
         }
     }
 }
@@ -335,8 +338,9 @@ impl FromStr for RouterQueuePolicy {
             "fcfs" => Ok(Self::Fcfs),
             "lcfs" => Ok(Self::Lcfs),
             "wspt" => Ok(Self::Wspt),
+            "b10-fair-wspt" => Ok(Self::B10FairWspt),
             _ => Err(format!(
-                "unknown queue policy: {s:?}, expected 'fcfs', 'lcfs', or 'wspt'"
+                "unknown queue policy: {s:?}, expected 'fcfs', 'lcfs', 'wspt', or 'b10-fair-wspt'"
             )),
         }
     }
@@ -598,6 +602,7 @@ pub struct KvRouterConfig {
     /// Scheduling policy for the router queue.
     /// "fcfs" (default): first-come first-served with priority bumps — optimizes tail TTFT.
     /// "wspt": weighted shortest processing time (Smith's rule) — optimizes average TTFT.
+    /// "b10-fair-wspt": WSPT-heavy for fresh requests, then ages into FCFS by 15s.
     pub router_queue_policy: RouterQueuePolicy,
 
     /// Whether to query a remote KV indexer served from the worker component
@@ -1002,6 +1007,18 @@ mod tests {
             serde_json::from_str(r#"{"router_queue_by_incoming_missing_isl":[]}"#).unwrap();
 
         assert!(config.router_queue_by_incoming_missing_isl.is_unbounded());
+    }
+
+    #[test]
+    fn test_router_queue_policy_b10_fair_wspt_wire_name() {
+        let policy: RouterQueuePolicy = serde_json::from_str(r#""b10-fair-wspt""#).unwrap();
+
+        assert_eq!(policy, RouterQueuePolicy::B10FairWspt);
+        assert_eq!(policy.to_string(), "b10-fair-wspt");
+        assert_eq!(
+            serde_json::to_string(&RouterQueuePolicy::B10FairWspt).unwrap(),
+            r#""b10-fair-wspt""#
+        );
     }
 
     #[test]

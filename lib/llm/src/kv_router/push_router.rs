@@ -106,6 +106,8 @@ struct BestMatchArgs<'a> {
     return_routing_hashes: bool,
     lora_name: Option<String>,
     priority_jump: f64,
+    priority_load_shed_percent: u8,
+    do_not_queue: bool,
     expected_output_tokens: Option<u32>,
     pinned_worker: Option<WorkerWithDpRank>,
     allowed_worker_ids: Option<HashSet<WorkerId>>,
@@ -340,6 +342,8 @@ impl KvPushRouter {
                 args.return_routing_hashes,
                 args.lora_name,
                 args.priority_jump,
+                args.priority_load_shed_percent,
+                args.do_not_queue,
                 args.expected_output_tokens,
                 args.pinned_worker,
                 args.allowed_worker_ids,
@@ -393,6 +397,8 @@ impl KvPushRouter {
         let routing = request.routing.as_ref();
         let lora_name = routing.and_then(|r| r.lora_name.clone());
         let priority_jump = routing.and_then(|r| r.priority_jump).unwrap_or(0.0);
+        let priority_load_shed_percent = 0;
+        let do_not_queue = false;
         let expected_output_tokens = routing.and_then(|r| r.expected_output_tokens);
         let allowed_worker_ids = routing.and_then(|r| r.allowed_worker_ids.clone());
         let return_routing_hashes =
@@ -414,6 +420,8 @@ impl KvPushRouter {
                     return_routing_hashes,
                     lora_name,
                     priority_jump,
+                    priority_load_shed_percent,
+                    do_not_queue,
                     expected_output_tokens,
                     pinned_worker: None,
                     allowed_worker_ids,
@@ -482,6 +490,8 @@ impl KvPushRouter {
             return_routing_hashes,
             lora_name,
             priority_jump,
+            priority_load_shed_percent,
+            do_not_queue,
             expected_output_tokens,
             pinned_worker: Some(pinned_worker),
             allowed_worker_ids,

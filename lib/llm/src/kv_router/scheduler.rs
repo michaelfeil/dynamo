@@ -178,6 +178,8 @@ where
         update_states: bool,
         lora_name: Option<String>,
         priority_jump: f64,
+        priority_load_shed_percent: u8,
+        do_not_queue: bool,
         expected_output_tokens: Option<u32>,
         pinned_worker: Option<WorkerWithDpRank>,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
@@ -196,6 +198,8 @@ where
             update_states,
             lora_name,
             priority_jump,
+            priority_load_shed_percent,
+            do_not_queue,
             expected_output_tokens,
             pinned_worker,
             allowed_worker_ids,
@@ -222,6 +226,8 @@ where
         update_states: bool,
         lora_name: Option<String>,
         priority_jump: f64,
+        priority_load_shed_percent: u8,
+        do_not_queue: bool,
         expected_output_tokens: Option<u32>,
         pinned_worker: Option<WorkerWithDpRank>,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
@@ -242,6 +248,8 @@ where
                 update_states,
                 lora_name,
                 priority_jump,
+                priority_load_shed_percent,
+                do_not_queue,
                 expected_output_tokens,
                 pinned_worker,
                 allowed_worker_ids,
@@ -327,5 +335,6 @@ where
 fn router_backpressure_reason_label(reason: &RouterBackpressureReason) -> &'static str {
     match reason {
         RouterBackpressureReason::MaxQueuedIslTokensExceeded => "max_queued_isl_tokens_exceeded",
+        RouterBackpressureReason::DoNotQueue => "do_not_queue",
     }
 }
