@@ -35,6 +35,7 @@ struct B10RoutingConfigOverride {
     router_prefill_token_discount: Option<f64>,
     router_decode_token_discount: Option<f64>,
     router_active_request_weight: Option<f64>,
+    router_active_replicas: Option<usize>,
     router_cache_miss_weight: Option<f64>,
     router_cache_miss_min_isl: Option<usize>,
     router_queue_threshold: Option<Option<f64>>,
@@ -58,6 +59,9 @@ pub struct B10RoutingConfig {
 
     #[serde(default = "default_router_active_request_weight")]
     pub router_active_request_weight: f64,
+
+    #[serde(default = "default_router_active_replicas")]
+    pub router_active_replicas: usize,
 
     #[serde(default = "default_router_cache_miss_weight")]
     pub router_cache_miss_weight: f64,
@@ -88,6 +92,9 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_active_request_weight {
             self.router_active_request_weight = value;
         }
+        if let Some(value) = overrides.router_active_replicas {
+            self.router_active_replicas = value;
+        }
         if let Some(value) = overrides.router_cache_miss_weight {
             self.router_cache_miss_weight = value;
         }
@@ -108,6 +115,7 @@ impl Default for B10RoutingConfig {
             router_prefill_token_discount: default_router_prefill_token_discount(),
             router_decode_token_discount: default_router_decode_token_discount(),
             router_active_request_weight: default_router_active_request_weight(),
+            router_active_replicas: default_router_active_replicas(),
             router_cache_miss_weight: default_router_cache_miss_weight(),
             router_cache_miss_min_isl: default_router_cache_miss_min_isl(),
             router_queue_threshold: None,
@@ -172,9 +180,6 @@ struct OverrideConfig {
     b10_routing_config: Option<B10RoutingConfigOverride>,
 
     #[serde(default)]
-    router_active_replicas: Option<usize>,
-
-    #[serde(default)]
     tensor_parallel_size: Option<usize>,
 
     #[serde(default)]
@@ -186,9 +191,6 @@ struct OverrideConfig {
 struct LLMConfig {
     #[serde(default)]
     b10_routing_config: B10RoutingConfig,
-
-    #[serde(default = "default_router_active_replicas")]
-    router_active_replicas: usize,
 
     #[serde(default)]
     override_args: Option<HashMap<String, OverrideConfig>>,
@@ -350,9 +352,6 @@ impl HotReloadableConfig {
                     .b10_routing_config
                     .apply_override(routing_override);
             }
-            if let Some(router_active_replicas) = group_config.router_active_replicas {
-                root_config.router_active_replicas = router_active_replicas;
-            }
             if let Some(tp) = group_config.tensor_parallel_size {
                 root_config.tensor_parallel_size = Some(tp);
             }
@@ -368,8 +367,8 @@ impl HotReloadableConfig {
         };
 
         let unified_config = UnifiedConfig {
+            router_active_replicas: root_config.b10_routing_config.router_active_replicas,
             routing: root_config.b10_routing_config,
-            router_active_replicas: root_config.router_active_replicas,
             runtime: runtime_config,
         };
 
@@ -543,9 +542,9 @@ b10_routing_config:
   router_temperature: 0.15
   router_overlap_score_weight: 3.5
   router_queue_threshold: 0.25
+  router_active_replicas: 2
 tensor_parallel_size: 8
 enable_attention_dp: true
-router_active_replicas: 2
 
 override_args:
   test_group:
@@ -553,7 +552,7 @@ override_args:
       router_temperature: 0.99
       router_overlap_score_weight: 1.0
       router_queue_threshold: 0
-    router_active_replicas: 3
+      router_active_replicas: 3
 "#;
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
@@ -584,14 +583,14 @@ override_args:
 
     #[test]
     #[serial]
-    fn test_override_args_preserve_root_router_active_replicas_when_missing() {
+    fn test_override_args_preserve_router_active_replicas_when_missing() {
         use std::io::Write;
 
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
         let config_content = r#"
 b10_routing_config:
   router_temperature: 0.15
-router_active_replicas: 4
+  router_active_replicas: 4
 
 override_args:
   test_group:
@@ -627,7 +626,7 @@ b10_routing_config:
   router_temperature: 0.15
   router_overlap_score_weight: 3.5
   router_queue_threshold: 0.25
-router_active_replicas: 2
+  router_active_replicas: 2
 
 override_args:
   test_group:
@@ -653,6 +652,61 @@ override_args:
         assert_eq!(config.routing.router_overlap_score_weight, 3.5);
         assert_eq!(config.routing.router_queue_threshold, Some(0.25));
         assert_eq!(config.router_active_replicas, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_nested_router_active_replicas() {
+        use std::io::Write;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_temperature: 0.15
+  router_active_replicas: 2
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        unsafe {
+            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
+        }
+
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        assert_eq!(config.routing.router_temperature, 0.15);
+        assert_eq!(config.router_active_replicas, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_override_args_nested_router_active_replicas_applied() {
+        use std::io::Write;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_active_replicas: 2
+
+override_args:
+  test_group:
+    b10_routing_config:
+      router_active_replicas: 3
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        unsafe {
+            std::env::set_var("ENGINE_ARGS_OVERRIDE_GROUP", "test_group");
+        }
+
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        assert_eq!(config.router_active_replicas, 3);
+
+        unsafe {
+            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
+        }
     }
 
     #[test]
