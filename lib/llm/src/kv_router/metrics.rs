@@ -60,6 +60,7 @@ use dynamo_runtime::traits::DistributedRuntimeProvider;
 use prometheus::{HistogramOpts, IntCounter, IntCounterVec, IntGaugeVec, Opts};
 
 use crate::http::service::metrics::generate_log_buckets;
+use crate::kv_router::b10_metrics_helper::bis_const_labels;
 
 /// Buckets for CPU-bound compute phases (block hashing, sequence hashing).
 fn compute_overhead_buckets() -> Vec<f64> {
@@ -280,7 +281,8 @@ pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> =
                     frontend_service::ROUTER_QUEUE_PENDING_REQUESTS
                 ),
                 "Number of requests pending in the router scheduler queue",
-            ),
+            )
+            .const_labels(bis_const_labels()),
             &[labels::WORKER_TYPE],
         )
         .expect("Failed to create router_queue_pending_requests gauge"),
@@ -288,7 +290,8 @@ pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> =
             Opts::new(
                 format!("{}_router_queue_pending_isl_tokens", name_prefix::FRONTEND),
                 "Sum of isl_tokens for requests pending in the router scheduler queue",
-            ),
+            )
+            .const_labels(bis_const_labels()),
             &[labels::WORKER_TYPE],
         )
         .expect("Failed to create router_queue_pending_isl_tokens gauge"),
@@ -296,7 +299,8 @@ pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> =
             Opts::new(
                 format!("{}_router_queue_backpressure_total", name_prefix::FRONTEND),
                 "Total number of router scheduler queue backpressure rejections",
-            ),
+            )
+            .const_labels(bis_const_labels()),
             &[labels::WORKER_TYPE, "reason"],
         )
         .expect("Failed to create router_queue_backpressure_total counter"),

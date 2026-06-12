@@ -45,6 +45,7 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+pub mod b10_metrics_helper;
 pub mod b10_worker_selector;
 pub mod b10hotreloadablecm;
 pub mod indexer;
