@@ -685,6 +685,13 @@ metrics against its component metrics registry so the explicit router metrics
 port exposes the same production counters and gauges expected by v1.1-era
 dashboards.
 
+The standalone B10 router path also initializes deferred Rust logging when
+`OTEL_EXPORT_ENABLED=1`. `_core` defers `dynamo_runtime::logging::init()` under
+OTel until a Tokio runtime exists, and the B10 router creates a Rust `Worker`
+directly instead of constructing a Python `DistributedRuntime`. Initializing
+logging after `Worker::from_settings()` preserves Rust `tracing` startup logs
+and OTLP trace export for router/distributed startup.
+
 Worker-based KV recovery now has a lightweight `RecoveryProcessLogger` that
 reports aggregate restore progress, recovered event counts, and the final
 initial-recovery completion summary used by router startup gating.

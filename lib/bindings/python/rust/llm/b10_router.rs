@@ -39,7 +39,10 @@ use dynamo_llm::kv_router::{
 };
 use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
 use dynamo_runtime::{
-    DistributedRuntime, Runtime, Worker, component::Component, metrics::MetricsHierarchy,
+    DistributedRuntime, Runtime, Worker,
+    component::Component,
+    config::{self, environment_names::logging::otlp as env_otlp},
+    metrics::MetricsHierarchy,
     pipeline::network::Ingress,
 };
 
@@ -443,6 +446,24 @@ pub fn start_router(
 
         let worker = Worker::from_settings()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        // `_core` defers Rust logging initialization when OTEL export is
+        // enabled because the OTLP batch exporter needs a Tokio runtime.  This
+        // router path creates a Rust Worker directly, so initialize logging now
+        // that the Worker runtime exists and before router startup emits Rust
+        // tracing events.
+        if config::env_is_truthy(env_otlp::OTEL_EXPORT_ENABLED) {
+            worker.runtime().secondary().block_on(async {
+                dynamo_runtime::logging::init();
+            });
+            if !tracing::dispatcher::has_been_set() {
+                eprintln!(
+                    "ERROR: OTEL_EXPORT_ENABLED=1 but no tracing subscriber \
+                     installed before `start_router` startup. Router telemetry \
+                     (spans, logs) will be SILENT."
+                );
+            }
+        }
 
         worker
             .execute(move |rt| async move { app(rt, args).await })
