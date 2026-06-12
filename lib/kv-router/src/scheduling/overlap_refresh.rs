@@ -53,7 +53,8 @@ pub trait OverlapScoresRefresh: Send + Sync {
 
 /// Default wait threshold after which a dequeued request gets a fresh overlap-score lookup.
 /// Override with `DYN_ROUTER_OVERLAP_REFRESH_AFTER_SECS`. A value of `0` disables refresh.
-pub const DEFAULT_OVERLAP_REFRESH_AFTER_SECS: u64 = 10;
+/// B10: change default to 2s
+pub const DEFAULT_OVERLAP_REFRESH_AFTER_SECS: u64 = 2;
 
 pub fn read_overlap_refresh_after() -> Option<Duration> {
     let raw = match std::env::var("DYN_ROUTER_OVERLAP_REFRESH_AFTER_SECS") {
