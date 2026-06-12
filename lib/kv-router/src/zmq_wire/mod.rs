@@ -176,10 +176,38 @@ impl ZmqEventNormalizer {
             return Some(ZmqEventFilterReason::NonMainAttentionGroup);
         }
 
-        if group_idx == 0 {
+        if group_idx == fallback_main_group_idx() {
             None
         } else {
             Some(ZmqEventFilterReason::UnlearnedGroupIdx)
         }
     }
+}
+
+/// Env var: main KV-cache group index used by the unlearned-group fallback
+/// (default 0). Engines that don't emit `kv_cache_spec_kind` (vLLM < 0.22)
+/// never populate `group_metadata`, so every event takes this fallback —
+/// and the group ordering is model-dependent: Qwen3.5/3.6 hybrid GDN places
+/// full attention at group 3, with groups 0-2 emitting aggregate mamba
+/// pseudo-events that must not reach the radix indexer.
+pub const KV_EVENT_MAIN_GROUP_IDX_ENV: &str = "DYN_KV_EVENT_MAIN_GROUP_IDX";
+
+fn fallback_main_group_idx() -> u32 {
+    static MAIN_GROUP_IDX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAIN_GROUP_IDX.get_or_init(|| {
+        let idx = std::env::var(KV_EVENT_MAIN_GROUP_IDX_ENV)
+            .ok()
+            .map(|v| {
+                v.trim().parse().unwrap_or_else(|_| {
+                    panic!("{KV_EVENT_MAIN_GROUP_IDX_ENV} must be a u32, got '{v}'")
+                })
+            })
+            .unwrap_or(0);
+        if idx != 0 {
+            tracing::info!(
+                "KV event fallback main group index set to {idx} via {KV_EVENT_MAIN_GROUP_IDX_ENV}"
+            );
+        }
+        idx
+    })
 }

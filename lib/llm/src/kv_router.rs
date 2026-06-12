@@ -1134,11 +1134,13 @@ where
                     success: self.free(request_id).await.is_ok(),
                 }
             }
-            RouterRequest::PotentialLoads { tokens: _ } => {
-                // Potential-load probing is not implemented for the in-process
-                // KvRouter; remote/serve-indexer paths handle this elsewhere.
+            RouterRequest::PotentialLoads { tokens } => {
+                // Same overlap-aware pipeline as main-v1.0.0; the v1.2.0 port
+                // stubbed this arm to an empty response, pinning the frontend
+                // rate limiter at level=1.0 and blinding autoscaler/planner.
+                let loads = self.get_potential_loads(&tokens, None, None, None).await?;
                 RouterResponse::PotentialLoads {
-                    loads: Vec::new(),
+                    loads,
                     pending_count: self.pending_count(),
                     pending_isl_tokens: self.pending_isl_tokens(),
                 }
