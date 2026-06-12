@@ -842,6 +842,9 @@ DeepSeek, Kimi, Qwen, and Nemotron captures. The GPT-OSS tests require the
 `openai_harmony` tokenizer vocab to be cached or downloadable; without network
 access they fail before exercising Dynamo behavior.
 
+Also: carry `ErrorMessage::from_http_error` 5xx pass-through (BIS-165/#272) to each future fork — it allows 529 (site overloaded) to reach clients instead of being squashed to 500.
+Also should include error classsification for metrics, so that we can observe it as site-overloaded etc in metrics.
+
 The response-only null-omission patch should be preserved on v1.2. The target
 already omits absent `Choice.logprobs` and `Choice.finish_reason` through
 upstream `async-openai`, but Dynamo's local chat response types and completion
@@ -849,7 +852,7 @@ response wrapper still need explicit `skip_serializing_if = "Option::is_none"`
 on optional response fields. This avoids streaming chunks like
 `function_call: null`, `tool_calls: null`, `refusal: null`, `usage: null`,
 `service_tier: null`, and `system_fingerprint: null` while leaving request-side
-serialization behavior unchanged.
+serialization behaviour unchanged.
 
 Validation:
 

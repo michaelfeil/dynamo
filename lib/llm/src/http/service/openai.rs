@@ -110,6 +110,9 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
         // 499 is not IANA-registered (nginx convention for client-closed-request),
         // so canonical_reason() returns None. Use the de facto standard name.
         None if code.as_u16() == 499 => "Client Closed Request".to_string(),
+        // 529 ("site overloaded") is also non-standard; Baseten-wide
+        // capacity-rejection convention (beefeater's hard load-shed tier uses it).
+        None if code.as_u16() == 529 => "Service Overloaded".to_string(),
         None => "UnknownError".to_string(),
     }
 }
@@ -130,6 +133,7 @@ fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
         StatusCode::TOO_MANY_REQUESTS => ErrorType::Overload, // 429
         StatusCode::SERVICE_UNAVAILABLE => ErrorType::Overload, // 503
         StatusCode::INTERNAL_SERVER_ERROR => ErrorType::Internal, // 500
+        _ if code.as_u16() == 529 => ErrorType::Overload, // 529 site overloaded
         _ if code.as_u16() == 499 => ErrorType::Cancelled, // 499 Client Closed Request
         _ if code.is_client_error() => ErrorType::Validation, // other 4xx
         _ => ErrorType::Internal,                     // everything else
@@ -326,9 +330,9 @@ impl ErrorMessage {
         }
     }
 
-    /// Implementers should only be able to throw 400-499 errors.
+    /// Implementers should only be able to throw 400-599 errors.
     pub fn from_http_error(err: HttpError) -> ErrorResponse {
-        if err.code < 400 || err.code >= 500 {
+        if err.code < 400 || err.code >= 600 {
             return ErrorMessage::internal_server_error(&err.message);
         }
         match StatusCode::from_u16(err.code) {
@@ -3037,6 +3041,14 @@ mod tests {
         assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(response.1.message, "custom error message");
 
+        let err = http_error_from_engine(600).unwrap_err();
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.1.message, "custom error message");
+    }
+
+    #[test]
+    fn test_5xx_http_error_response_from_anyhow_passes_through() {
         let err = http_error_from_engine(500).unwrap_err();
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
         assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3044,8 +3056,36 @@ mod tests {
 
         let err = http_error_from_engine(501).unwrap_err();
         let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
-        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.0, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(response.1.message, "custom error message");
+    }
+
+    #[test]
+    fn test_from_http_error_529_passes_through_as_overload() {
+        let response = ErrorMessage::from_http_error(HttpError {
+            code: 529,
+            message: "KV router queue is full".to_string(),
+        });
+        assert_eq!(response.0.as_u16(), 529);
+        assert_eq!(response.1.code, 529);
+        // Engine-provided message must survive verbatim, not be replaced by error_type.
+        assert_eq!(response.1.message, "KV router queue is full");
+        assert_eq!(response.1.error_type, "Service Overloaded");
+        assert_eq!(
+            extract_error_type_from_response(&response),
+            ErrorType::Overload
+        );
+    }
+
+    #[test]
+    fn test_from_http_error_rejects_out_of_range_codes() {
+        for code in [200, 302, 600] {
+            let response = ErrorMessage::from_http_error(HttpError {
+                code,
+                message: "whatever".to_string(),
+            });
+            assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 
     #[test]
