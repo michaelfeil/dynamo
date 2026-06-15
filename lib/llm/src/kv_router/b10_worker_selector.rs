@@ -76,6 +76,7 @@ struct B10Score {
     potential_prefill_block: f64,
     decode_block: f64,
     active_requests: f64,
+    active_request_dp_blend: f64,
     cache_miss_absolute_tokens: usize,
 }
 
@@ -142,6 +143,7 @@ fn score_worker<C: WorkerConfigLike>(
     cache_miss_weight: f64,
     cache_miss_min_isl: usize,
     active_request_weight: f64,
+    active_request_dp_blend: f64,
 ) -> B10Score {
     let prefill_token = request.prefill_tokens_for(worker);
     let potential_prefill_block = (prefill_token as f64) / (block_size as f64);
@@ -164,8 +166,8 @@ fn score_worker<C: WorkerConfigLike>(
     };
 
     let active_requests_worker = request.active_requests_for(worker) as f64;
-    let active_requests = active_requests_worker * 0.666
-        + mean_active_requests_for_worker(workers, request, worker) * 0.333;
+    let active_requests = active_requests_worker * (1.0 - active_request_dp_blend)
+        + mean_active_requests_for_worker(workers, request, worker) * active_request_dp_blend;
 
     let logit = overlap_weight * potential_prefill_block
         + decode_block
@@ -177,6 +179,7 @@ fn score_worker<C: WorkerConfigLike>(
         potential_prefill_block,
         decode_block,
         active_requests,
+        active_request_dp_blend,
         cache_miss_absolute_tokens,
     }
 }
@@ -224,6 +227,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         let cache_miss_weight = hot_reloadable_config.routing.router_cache_miss_weight;
         let cache_miss_min_isl = hot_reloadable_config.routing.router_cache_miss_min_isl;
         let active_request_weight = hot_reloadable_config.routing.router_active_request_weight;
+        let active_request_dp_blend = hot_reloadable_config.routing.router_active_request_dp_blend;
         let temperature = request
             .router_config_override
             .as_ref()
@@ -240,6 +244,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                 cache_miss_weight,
                 cache_miss_min_isl,
                 active_request_weight,
+                active_request_dp_blend,
             )
         };
 
@@ -264,7 +269,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             let cached_tokens = request.effective_cached_tokens_for(worker);
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2} + cmw={:.2}*cm={}",
+                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={}",
                     worker.worker_id,
                     worker.dp_rank,
                     score.logit,
@@ -273,6 +278,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                     score.decode_block,
                     active_request_weight,
                     score.active_requests,
+                    score.active_request_dp_blend,
                     cache_miss_weight,
                     score.cache_miss_absolute_tokens
                 );
@@ -300,7 +306,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             let score = score_worker(worker);
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2} + cmw={:.2}*cm={}",
+                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={}",
                     worker.worker_id,
                     worker.dp_rank,
                     score.logit,
@@ -309,6 +315,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                     score.decode_block,
                     active_request_weight,
                     score.active_requests,
+                    score.active_request_dp_blend,
                     cache_miss_weight,
                     score.cache_miss_absolute_tokens
                 );
@@ -413,7 +420,7 @@ mod tests {
         request.effective_cached_tokens.insert(worker, 63);
         request.prefill_tokens.insert(worker, 0);
 
-        let score = score_worker(&workers, &request, worker, 64, 0.0, 1.0, 0, 0.0);
+        let score = score_worker(&workers, &request, worker, 64, 0.0, 1.0, 0, 0.0, 2.0 / 3.0);
 
         assert_eq!(score.cache_miss_absolute_tokens, 2);
         assert_eq!(score.logit, 2.0);
@@ -429,9 +436,9 @@ mod tests {
         request.active_requests.insert(worker1, 3);
         request.prefill_tokens.insert(worker0, 0);
 
-        let score = score_worker(&workers, &request, worker0, 64, 0.0, 0.0, 0, 1.0);
+        let score = score_worker(&workers, &request, worker0, 64, 0.0, 0.0, 0, 1.0, 2.0 / 3.0);
 
-        assert!((score.active_requests - (9.0 * 0.666 + 6.0 * 0.333)).abs() < 1e-9);
+        assert!((score.active_requests - (9.0 / 3.0 + 6.0 * 2.0 / 3.0)).abs() < 1e-9);
         assert!((score.logit - score.active_requests).abs() < 1e-9);
     }
 

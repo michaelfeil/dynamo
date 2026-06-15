@@ -562,9 +562,11 @@ admission behavior described below.
   request-to-worker map and materializing a per-worker map before selection.
   The cost is still an O(active requests) scan plus a fresh map allocation, but
   it is not a new regression relative to the Baseten v1.0 router behavior.
-- `B10WorkerSelector` restores the v1.0 active-request blend:
-  two-thirds selected DP-rank active requests plus one-third mean active
-  requests across the worker's DP ranks. The score also retains the absolute
+- `B10WorkerSelector` keeps the active-request blend hot-reloadable through
+  `router_active_request_dp_blend`. The default is `2/3` DP-wide mean active
+  requests across the worker's DP ranks and `1/3` selected DP-rank active
+  requests. Non-finite values fall back to the default and out-of-range values
+  are clamped with error-level logs. The score also retains the absolute
   cache-miss token term and the short-request full-miss bypass.
 - `softmax_sample` is public and generic over worker-logit maps that iterate as
   `(&WorkerWithDpRank, &f64)`. That keeps the shared scheduler helper usable by

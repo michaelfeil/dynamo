@@ -17,6 +17,9 @@ use std::collections::HashMap;
 
 const DEFAULT_CONFIG_PATH: &str = "/configs/llm_api_config_router.yaml";
 const RELOAD_INTERVAL_SECS: u64 = 15; // Reload every 15 seconds
+const DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND: f64 = 2.0 / 3.0;
+const ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN: f64 = 0.0001;
+const ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX: f64 = 0.9999;
 
 fn is_warning_disabled() -> bool {
     static DISABLE_WARNING: OnceLock<bool> = OnceLock::new();
@@ -35,6 +38,7 @@ struct B10RoutingConfigOverride {
     router_prefill_token_discount: Option<f64>,
     router_decode_token_discount: Option<f64>,
     router_active_request_weight: Option<f64>,
+    router_active_request_dp_blend: Option<f64>,
     router_active_replicas: Option<usize>,
     router_cache_miss_weight: Option<f64>,
     router_cache_miss_min_isl: Option<usize>,
@@ -59,6 +63,9 @@ pub struct B10RoutingConfig {
 
     #[serde(default = "default_router_active_request_weight")]
     pub router_active_request_weight: f64,
+
+    #[serde(default = "default_router_active_request_dp_blend")]
+    pub router_active_request_dp_blend: f64,
 
     #[serde(default = "default_router_active_replicas")]
     pub router_active_replicas: usize,
@@ -92,6 +99,9 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_active_request_weight {
             self.router_active_request_weight = value;
         }
+        if let Some(value) = overrides.router_active_request_dp_blend {
+            self.router_active_request_dp_blend = value;
+        }
         if let Some(value) = overrides.router_active_replicas {
             self.router_active_replicas = value;
         }
@@ -115,6 +125,7 @@ impl Default for B10RoutingConfig {
             router_prefill_token_discount: default_router_prefill_token_discount(),
             router_decode_token_discount: default_router_decode_token_discount(),
             router_active_request_weight: default_router_active_request_weight(),
+            router_active_request_dp_blend: default_router_active_request_dp_blend(),
             router_active_replicas: default_router_active_replicas(),
             router_cache_miss_weight: default_router_cache_miss_weight(),
             router_cache_miss_min_isl: default_router_cache_miss_min_isl(),
@@ -156,6 +167,41 @@ fn default_router_active_request_weight() -> f64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0)
+}
+
+fn default_router_active_request_dp_blend() -> f64 {
+    std::env::var("B10_KV_ROUTER_ACTIVE_REQUEST_DP_BLEND")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(sanitize_router_active_request_dp_blend)
+        .unwrap_or(DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND)
+}
+
+fn sanitize_router_active_request_dp_blend(blend: f64) -> f64 {
+    if !blend.is_finite() {
+        tracing::error!(
+            configured_blend = ?blend,
+            sanitized_blend = DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND,
+            "router_active_request_dp_blend must be finite, using default"
+        );
+        return DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND;
+    }
+
+    let sanitized = blend.clamp(
+        ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN,
+        ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX,
+    );
+    if sanitized != blend {
+        tracing::error!(
+            configured_blend = blend,
+            sanitized_blend = sanitized,
+            min_blend = ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN,
+            max_blend = ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX,
+            "router_active_request_dp_blend outside bounds, clamping"
+        );
+    }
+
+    sanitized
 }
 
 fn default_router_cache_miss_weight() -> f64 {
@@ -360,6 +406,14 @@ impl HotReloadableConfig {
             }
         }
 
+        root_config
+            .b10_routing_config
+            .router_active_request_dp_blend = sanitize_router_active_request_dp_blend(
+            root_config
+                .b10_routing_config
+                .router_active_request_dp_blend,
+        );
+
         // Build UnifiedConfig with separate routing and runtime configs
         let runtime_config = LLMRuntimeConfig {
             tensor_parallel_size: root_config.tensor_parallel_size,
@@ -381,11 +435,12 @@ impl HotReloadableConfig {
         );
 
         tracing::info!(
-            "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
+            "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
             path,
             unified_config.routing.router_prefill_token_discount,
             unified_config.routing.router_decode_token_discount,
             unified_config.routing.router_temperature,
+            unified_config.routing.router_active_request_dp_blend,
             unified_config.router_active_replicas,
             unified_config.runtime.tensor_parallel_size,
             unified_config.runtime.enable_attention_dp,
@@ -475,6 +530,11 @@ pub fn get_active_request_weight() -> f64 {
     get_config().get().routing.router_active_request_weight
 }
 
+/// Convenience function to get router active request DP blend
+pub fn get_active_request_dp_blend() -> f64 {
+    get_config().get().routing.router_active_request_dp_blend
+}
+
 /// Convenience function to get router cache miss weight
 pub fn get_router_cache_miss_weight() -> f64 {
     get_config().get().routing.router_cache_miss_weight
@@ -524,6 +584,10 @@ mod tests {
         assert_eq!(unified_config.routing.router_overlap_score_weight, 3.5);
         assert_eq!(unified_config.routing.router_prefill_token_discount, 0.5);
         assert_eq!(unified_config.routing.router_decode_token_discount, 0.8);
+        assert_eq!(
+            unified_config.routing.router_active_request_dp_blend,
+            2.0 / 3.0
+        );
         assert_eq!(unified_config.router_active_replicas, 1);
     }
 
@@ -531,8 +595,10 @@ mod tests {
     fn test_config_access() {
         let prefill_discount = get_prefill_token_discount();
         let decode_discount = get_decode_token_discount();
+        let active_request_dp_blend = get_active_request_dp_blend();
         assert!(prefill_discount >= 0.0);
         assert!(decode_discount >= 0.0);
+        assert!(active_request_dp_blend >= 0.0);
     }
 
     #[test]
@@ -546,6 +612,7 @@ mod tests {
 b10_routing_config:
   router_temperature: 0.15
   router_overlap_score_weight: 3.5
+  router_active_request_dp_blend: 0.2
   router_queue_threshold: 0.25
   router_active_replicas: 2
 tensor_parallel_size: 8
@@ -556,6 +623,7 @@ override_args:
     b10_routing_config:
       router_temperature: 0.99
       router_overlap_score_weight: 1.0
+      router_active_request_dp_blend: 0.75
       router_queue_threshold: 0
       router_active_replicas: 3
 "#;
@@ -573,6 +641,7 @@ override_args:
         // Check overrides applied
         assert_eq!(config.routing.router_temperature, 0.99);
         assert_eq!(config.routing.router_overlap_score_weight, 1.0);
+        assert_eq!(config.routing.router_active_request_dp_blend, 0.75);
         assert_eq!(config.routing.router_queue_threshold, Some(0.0));
         assert_eq!(config.router_active_replicas, 3);
         // Check runtime config and computed data_parallel_size
@@ -630,6 +699,7 @@ override_args:
 b10_routing_config:
   router_temperature: 0.15
   router_overlap_score_weight: 3.5
+  router_active_request_dp_blend: 0.4
   router_queue_threshold: 0.25
   router_active_replicas: 2
 
@@ -655,8 +725,40 @@ override_args:
         // Check overrides NOT applied
         assert_eq!(config.routing.router_temperature, 0.15);
         assert_eq!(config.routing.router_overlap_score_weight, 3.5);
+        assert_eq!(config.routing.router_active_request_dp_blend, 0.4);
         assert_eq!(config.routing.router_queue_threshold, Some(0.25));
         assert_eq!(config.router_active_replicas, 2);
+    }
+
+    #[test]
+    fn test_active_request_dp_blend_sanitization() {
+        use std::io::Write;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_active_request_dp_blend: 2.0
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+        assert_eq!(
+            config.routing.router_active_request_dp_blend,
+            ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX
+        );
+        assert_eq!(
+            sanitize_router_active_request_dp_blend(f64::NAN),
+            DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND
+        );
+        assert_eq!(
+            sanitize_router_active_request_dp_blend(f64::INFINITY),
+            DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND
+        );
+        assert_eq!(
+            sanitize_router_active_request_dp_blend(-1.0),
+            ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN
+        );
     }
 
     #[test]
