@@ -54,17 +54,14 @@ RUN --mount=type=bind,from=wheel_builder,source=/usr/local/,target=/tmp/usr/loca
     cp -r /tmp/usr/local/src/ffmpeg /usr/local/src/ && \
     ldconfig
 
-{% if target not in ("dev", "local-dev") %}
-# Copy built artifacts (not needed for dev/local-dev; users build from source)
-COPY --chown=dynamo: --from=wheel_builder $CARGO_TARGET_DIR $CARGO_TARGET_DIR
-{% endif %}
-COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
-
-# Baseten version stamp — produced by tools/version-stamp.sh and passed in by
-# container/build.sh. Downstream images (e.g. mp/baseten_dynamo harness) copy
-# this file forward via `COPY --from=<dynamo image> /etc/baseten/version/dynamo`.
-ARG BASETEN_VERSION_FILE
-COPY --chown=dynamo: ${BASETEN_VERSION_FILE} /etc/baseten/version/dynamo
+# ===========================================================================
+# Source-INDEPENDENT runtime layers
+# ===========================================================================
+# Everything below up to the "Source-DEPENDENT layers" banner depends only on
+# the base image + requirements files, NOT on the dynamo source tree (lib/,
+# components/) or the freshly-built wheels. Keeping these layers ABOVE the wheel
+# and workspace COPYs means a one-file Rust/Python edit no longer invalidates
+# the expensive apt + pip layers, so cold (source-changed) rebuilds reuse them.
 
 # Install Python for framework=none runtime (cuda-dl-base doesn't include Python)
 # This is needed to create venv and install dynamo packages
@@ -104,6 +101,46 @@ RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sh
 ENV VIRTUAL_ENV=/opt/dynamo/venv \
     PATH="/opt/dynamo/venv/bin:${PATH}"
 
+# Initialize Git LFS (required for git+https dependencies with LFS artifacts)
+RUN git lfs install
+
+{% if target in ("dev", "local-dev") %}
+# Dev/local-dev: skip dynamo wheel install (users build from source via cargo build + maturin develop).
+# Install NIXL wheel only (pre-built C++ binary, not buildable from source). The nixl
+# wheelhouse was copied above from wheel_builder and is independent of dynamo source,
+# so this layer stays cached when only Rust/Python source changes.
+RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
+    uv pip install /opt/dynamo/wheelhouse/nixl/nixl*.whl
+
+# Install runtime dependencies (common + planner + frontend).
+# These are driven entirely by the requirements files (not the dynamo wheels), so for
+# dev/local-dev we install them here — above the wheel/source COPYs — to keep this
+# expensive network layer cached across source-only changes. (For runtime targets this
+# install stays below the wheel install so the resolver sees the dynamo wheels' pins in
+# one pass; see the source-dependent section.)
+RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
+    --mount=type=bind,source=./container/deps/requirements.planner.txt,target=/tmp/requirements.planner.txt \
+    --mount=type=bind,source=./container/deps/requirements.frontend.txt,target=/tmp/requirements.frontend.txt \
+    --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv pip install \
+        --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        --requirement /tmp/requirements.common.txt \
+        --requirement /tmp/requirements.planner.txt \
+        --requirement /tmp/requirements.frontend.txt
+{% endif %}
+
+# ===========================================================================
+# Source-DEPENDENT layers (rebuilt when dynamo source / wheels change)
+# ===========================================================================
+{% if target not in ("dev", "local-dev") %}
+# Copy built artifacts (not needed for dev/local-dev; users build from source)
+COPY --chown=dynamo: --from=wheel_builder $CARGO_TARGET_DIR $CARGO_TARGET_DIR
+{% endif %}
+COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
+
 {% if target not in ("dev", "local-dev") %}
 # Install dynamo wheels (runtime packages only, no test dependencies)
 # uv handles its own locking for the cache, no need to add sharing=locked
@@ -122,25 +159,6 @@ RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sh
         fi; \
         uv pip install "$KVBM_WHEEL"; \
     fi
-{% else %}
-# Dev/local-dev: skip dynamo wheel install (users build from source via cargo build + maturin develop).
-# Install NIXL wheel only (pre-built C++ binary, not buildable from source).
-RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
-    export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
-    uv pip install /opt/dynamo/wheelhouse/nixl/nixl*.whl
-{% endif %}
-
-# Install gpu_memory_service wheel if enabled (all targets)
-ARG ENABLE_GPU_MEMORY_SERVICE
-RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
-    if [ "${ENABLE_GPU_MEMORY_SERVICE}" = "true" ]; then \
-        export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
-        GMS_WHEEL=$(ls /opt/dynamo/wheelhouse/gpu_memory_service*.whl 2>/dev/null | head -1); \
-        if [ -n "$GMS_WHEEL" ]; then uv pip install "$GMS_WHEEL"; fi; \
-    fi
-
-# Initialize Git LFS (required for git+https dependencies with LFS artifacts)
-RUN git lfs install
 
 # Install runtime dependencies (common + planner + frontend).
 # Frontend deps (tritonclient + grpcio/protobuf pins) are installed here so the resolver
@@ -157,12 +175,34 @@ RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tm
         --requirement /tmp/requirements.common.txt \
         --requirement /tmp/requirements.planner.txt \
         --requirement /tmp/requirements.frontend.txt
+{% endif %}
+
+# Install gpu_memory_service wheel if enabled (all targets). Guarded so it is a
+# no-op when the wheel is absent (e.g. dev/local-dev, which keep the wheel in the
+# wheelhouse for downstream COPY --from consumers but do not install it).
+ARG ENABLE_GPU_MEMORY_SERVICE
+RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    if [ "${ENABLE_GPU_MEMORY_SERVICE}" = "true" ]; then \
+        export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
+        GMS_WHEEL=$(ls /opt/dynamo/wheelhouse/gpu_memory_service*.whl 2>/dev/null | head -1); \
+        if [ -n "$GMS_WHEEL" ]; then uv pip install "$GMS_WHEEL"; fi; \
+    fi
 
 # TODO: skip /workspace COPY for dev/local-dev (bind-mounted from host, gets shadowed)
 # Copy workspace source code
 ARG WORKSPACE_DIR=/workspace
 WORKDIR ${WORKSPACE_DIR}
 COPY --chmod=775 --chown=dynamo:0 ./ ${WORKSPACE_DIR}/
+
+# Baseten version stamp — produced by tools/version-stamp.sh and passed in by
+# container/build.sh. Downstream images (e.g. mp/baseten_dynamo harness) copy
+# this file forward via `COPY --from=<dynamo image> /etc/baseten/version/dynamo`.
+# Placed LAST on purpose: version-stamp.sh records a fresh `built_at` timestamp on
+# every build, so this file's content changes every run. Keeping the COPY at the end
+# means that churn only invalidates this final tiny layer instead of busting the
+# expensive apt/pip/wheel layers above it (which is what kills warm rebuilds).
+ARG BASETEN_VERSION_FILE
+COPY --chown=dynamo: ${BASETEN_VERSION_FILE} /etc/baseten/version/dynamo
 
 ARG DYNAMO_COMMIT_SHA
 ENV DYNAMO_COMMIT_SHA=$DYNAMO_COMMIT_SHA
