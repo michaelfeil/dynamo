@@ -24,10 +24,13 @@ use once_cell::sync::OnceCell;
 use std::{
     mem::ManuallyDrop,
     sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
 use tokio::{signal, sync::Mutex, task::JoinHandle};
 
 pub use tokio_util::sync::CancellationToken;
+
+const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 4 * 60;
 
 /// Types of Tokio runtimes that can be used to construct a Dynamo [Runtime].
 #[derive(Clone, Debug)]
@@ -330,7 +333,19 @@ impl Runtime {
             tracing::info!("Active graceful endpoints: {count}");
 
             if count != 0 {
-                tracker.wait_for_completion().await;
+                let timeout = graceful_shutdown_timeout();
+                if tokio::time::timeout(timeout, tracker.wait_for_completion())
+                    .await
+                    .is_err()
+                {
+                    let remaining = tracker.get_count();
+                    tracing::warn!(
+                        unified_model_logs = true,
+                        timeout_secs = timeout.as_secs(),
+                        remaining_endpoints = remaining,
+                        "Graceful endpoint shutdown timed out; proceeding with runtime teardown"
+                    );
+                }
             }
 
             // Phase 3: Now connections will be disconnected to backend services (e.g. NATS/ETCD) by cancelling the main token
@@ -341,6 +356,17 @@ impl Runtime {
             main_token.cancel();
         });
     }
+}
+
+fn graceful_shutdown_timeout() -> Duration {
+    let timeout_secs = std::env::var(
+        crate::config::environment_names::runtime::DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok())
+    .unwrap_or(DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS);
+
+    Duration::from_secs(timeout_secs)
 }
 
 impl RuntimeType {

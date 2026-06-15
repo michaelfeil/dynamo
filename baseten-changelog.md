@@ -266,6 +266,13 @@ The Python `dynamo_worker` decorator also accepts the Baseten
 runtime shutdown hooks. This is a narrow binding compatibility restore rather
 than a broader NATS lifecycle replay.
 
+Runtime shutdown Phase 2 now has a Baseten-owned safety cap around the
+graceful endpoint drain wait. If `tracker.wait_for_completion()` does not
+finish, the runtime logs the remaining graceful endpoint count and proceeds to
+Phase 3 teardown instead of hanging forever behind a deadlocked in-flight
+request. The cap is controlled by `DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS`;
+Baseten uses a 4 minute default (`240` seconds), not the 15 minute value discussed for the upstream proposal in dyn1.3+.
+
 Replay notes:
 
 Port behavior, not necessarily implementation. Upstream may have refactored
