@@ -375,6 +375,11 @@ impl HotReloadableConfig {
         // Compute data_parallel_size for logging
         let data_parallel_size = unified_config.runtime.compute_data_parallel_size();
 
+        dynamo_kv_router::sequences::set_token_load_discounts(
+            unified_config.routing.router_prefill_token_discount,
+            unified_config.routing.router_decode_token_discount,
+        );
+
         tracing::info!(
             "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
             path,

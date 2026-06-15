@@ -112,6 +112,7 @@ impl PromptRegistry {
         let mut potential_tokens =
             FxHashMap::with_capacity_and_hasher(self.loads.len(), FxBuildHasher);
 
+        let (prefill_discount, decode_discount) = super::token_load_discounts();
         for entry in &self.loads {
             let worker = *entry.key();
             let load = *entry.value();
@@ -120,8 +121,14 @@ impl PromptRegistry {
             let active_tokens = load.active_tokens(decay_now);
             let added_tokens = prefill_token_deltas.tokens_for(worker);
 
-            potential_blocks.insert(worker, load.active_blocks + new_blocks);
-            potential_tokens.insert(worker, active_tokens + added_tokens);
+            potential_blocks.insert(
+                worker,
+                ((load.active_blocks as f64) * decode_discount) as usize + new_blocks,
+            );
+            potential_tokens.insert(
+                worker,
+                ((active_tokens as f64) * prefill_discount) as usize + added_tokens,
+            );
         }
 
         (potential_blocks, potential_tokens)

@@ -503,6 +503,16 @@ set[taint]]` by reading `DiscoveryQuery::EndpointModels`, deserializing each
 Startup code can use this primitive before `register_model` to choose and
 advertise a pool taint such as `fast` or `slow`.
 
+The active token-load discounting from the Baseten router is also required for
+v1.2. Upstream Dynamo does not currently carry this behavior, but without it the
+router over-penalizes workers that already have active decode/prefill load and
+under-emphasizes the incremental load from the next request. This is a major
+routing flaw for agentic workloads, where repeated short requests need the new
+request's potential load to dominate the placement decision while existing
+worker load is discounted by the hot-reloadable B10 prefill/decode factors.
+The discount acts only on the current load, not potential load. Potential load
+is more important because it is about to be added.
+
 Heuristic and selector parity note:
 
 - `softmax_sample` accepts any worker-logit map that can be iterated as
