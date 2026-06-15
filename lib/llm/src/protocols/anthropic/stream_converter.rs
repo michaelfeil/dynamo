@@ -342,13 +342,32 @@ impl AnthropicStreamConverter {
                             };
                             events.push(make_sse_event("content_block_delta", &block_delta));
 
-                            // Emit content_block_stop immediately if the tool call arrived
-                            // complete in a single chunk (id + name + args all present).
-                            // Dynamo backends emit complete tool calls, so this fires on the
-                            // same chunk — no need to wait for finish_reason.
-                            if tc.id.is_some()
-                                && func.name.is_some()
+                            // Emit content_block_stop immediately if the tool call's
+                            // arguments have been fully accumulated and parse as valid
+                            // JSON. Backends that emit a complete tool call in one
+                            // chunk (e.g. trtllm with `id+name+args` packed) close the
+                            // block here on the same chunk. Backends that stream args
+                            // incrementally (e.g. `minimax_m2` parser, which dribbles
+                            // `""`, `{"file_path":...`, `, "content":...`, `}` across
+                            // multiple chunks) do not close until `accumulated_args`
+                            // parses, then `emit_end_events` finalizes on stream end.
+                            //
+                            // Without the JSON-parse guard, the very first chunk —
+                            // which carries `id` and `name` but only an empty/prefix
+                            // `arguments` — would emit `content_block_stop` before any
+                            // `input_json_delta` carrying real arguments arrived.
+                            // Anthropic SSE consumers (Claude Code, Anthropic SDK)
+                            // close the block on `content_block_stop` and discard
+                            // subsequent deltas as orphans, leaving callers with
+                            // `tool_use.input == {}` and a deterministic
+                            // `InputValidationError` retry loop.
+                            if !self.tool_call_states[tc_index].id.is_empty()
+                                && !self.tool_call_states[tc_index].name.is_empty()
                                 && !self.tool_call_states[tc_index].stopped
+                                && serde_json::from_str::<serde_json::Value>(
+                                    &self.tool_call_states[tc_index].accumulated_args,
+                                )
+                                .is_ok()
                             {
                                 self.tool_call_states[tc_index].stopped = true;
                                 let block_stop =
@@ -652,13 +671,32 @@ impl AnthropicStreamConverter {
                             };
                             events.push(make_tagged_event("content_block_delta", &ev));
 
-                            // Emit content_block_stop immediately if the tool call arrived
-                            // complete in a single chunk (id + name + args all present).
-                            // Dynamo backends emit complete tool calls, so this fires on the
-                            // same chunk — no need to wait for finish_reason.
-                            if tc.id.is_some()
-                                && func.name.is_some()
+                            // Emit content_block_stop immediately if the tool call's
+                            // arguments have been fully accumulated and parse as valid
+                            // JSON. Backends that emit a complete tool call in one
+                            // chunk (e.g. trtllm with `id+name+args` packed) close the
+                            // block here on the same chunk. Backends that stream args
+                            // incrementally (e.g. `minimax_m2` parser, which dribbles
+                            // `""`, `{"file_path":...`, `, "content":...`, `}` across
+                            // multiple chunks) do not close until `accumulated_args`
+                            // parses, then `emit_end_events` finalizes on stream end.
+                            //
+                            // Without the JSON-parse guard, the very first chunk —
+                            // which carries `id` and `name` but only an empty/prefix
+                            // `arguments` — would emit `content_block_stop` before any
+                            // `input_json_delta` carrying real arguments arrived.
+                            // Anthropic SSE consumers (Claude Code, Anthropic SDK)
+                            // close the block on `content_block_stop` and discard
+                            // subsequent deltas as orphans, leaving callers with
+                            // `tool_use.input == {}` and a deterministic
+                            // `InputValidationError` retry loop.
+                            if !self.tool_call_states[tc_index].id.is_empty()
+                                && !self.tool_call_states[tc_index].name.is_empty()
                                 && !self.tool_call_states[tc_index].stopped
+                                && serde_json::from_str::<serde_json::Value>(
+                                    &self.tool_call_states[tc_index].accumulated_args,
+                                )
+                                .is_ok()
                             {
                                 self.tool_call_states[tc_index].stopped = true;
                                 let ev =
@@ -1151,5 +1189,268 @@ mod tests {
             event_types(&end),
             vec!["content_block_stop", "message_delta", "message_stop"]
         );
+    }
+
+    /// Regression: tool_use args streamed across multiple chunks must NOT close
+    /// the content block until the accumulated arguments parse as valid JSON.
+    ///
+    /// Reproduces the on-the-wire SSE order observed against MiniMax-M2.5 with
+    /// the `minimax_m2` tool-call parser (Claude Code session
+    /// `~/.claude/projects/-workspaces-demo-failure/23742d15-…`):
+    ///
+    ///   chunk 1: id=call-1, name=Write, args=""             → start + delta(empty)
+    ///   chunk 2: args=`{"file_path":"whoami.txt"`           → delta
+    ///   chunk 3: args=`, "content":"MiniMaxAI/MiniMax-M2.5"`→ delta
+    ///   chunk 4: args=`}`                                   → delta + stop (JSON now parses)
+    ///
+    /// Without the JSON-parse guard the inline stop fired on chunk 1, and
+    /// chunks 2-4 emitted orphan deltas that Anthropic SSE consumers
+    /// (Claude Code, Anthropic SDK) discard, surfacing as `tool_use.input == {}`
+    /// and a deterministic `InputValidationError: required parameter X is missing`
+    /// loop on every Claude Code Write/Bash/Edit invocation.
+    #[test]
+    fn test_streamed_tool_args_close_only_when_json_complete() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+
+        // Chunk 1: id + name + empty args prefix. Block opens, empty delta
+        // emitted, but block must NOT close (args don't parse yet).
+        let ev1 =
+            conv.process_chunk_tagged(&tool_call_chunk(0, Some("call-1"), Some("Write"), Some("")));
+        assert_eq!(
+            event_types(&ev1),
+            vec!["content_block_start", "content_block_delta"],
+            "first chunk: open block + empty delta, no premature stop"
+        );
+
+        // Chunk 2: partial args, still not parseable.
+        let ev2 = conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            None,
+            None,
+            Some("{\"file_path\":\"whoami.txt\""),
+        ));
+        assert_eq!(
+            event_types(&ev2),
+            vec!["content_block_delta"],
+            "partial-args chunk: delta only, no stop"
+        );
+
+        // Chunk 3: more partial args, still not parseable.
+        let ev3 = conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            None,
+            None,
+            Some(", \"content\":\"MiniMaxAI/MiniMax-M2.5\""),
+        ));
+        assert_eq!(
+            event_types(&ev3),
+            vec!["content_block_delta"],
+            "still-partial-args chunk: delta only, no stop"
+        );
+
+        // Chunk 4: closing brace. Accumulated args now parse as valid JSON,
+        // so the inline-stop fires on this chunk.
+        let ev4 = conv.process_chunk_tagged(&tool_call_chunk(0, None, None, Some("}")));
+        assert_eq!(
+            event_types(&ev4),
+            vec!["content_block_delta", "content_block_stop"],
+            "completing-args chunk: delta + inline stop (JSON now parses)"
+        );
+
+        // End events: no leftover block stop (already closed inline on chunk 4).
+        let end_events = conv.emit_end_events_tagged();
+        assert_eq!(
+            event_types(&end_events),
+            vec!["message_delta", "message_stop"],
+            "no leftover block stop in end events"
+        );
+    }
+
+    /// Regression: streamed tool_use whose args never parse (e.g. truncated by
+    /// `max_tokens`) must close in `emit_end_events`, not be left dangling.
+    #[test]
+    fn test_streamed_tool_args_unclosed_finalized_in_end_events() {
+        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+
+        let ev1 =
+            conv.process_chunk_tagged(&tool_call_chunk(0, Some("call-1"), Some("Write"), Some("")));
+        assert_eq!(
+            event_types(&ev1),
+            vec!["content_block_start", "content_block_delta"],
+            "open block + empty delta, no inline stop"
+        );
+
+        let ev2 = conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            None,
+            None,
+            Some("{\"file_path\":\"truncated"),
+        ));
+        assert_eq!(
+            event_types(&ev2),
+            vec!["content_block_delta"],
+            "partial-args chunk: delta only"
+        );
+
+        // Stream ends with args still incomplete. emit_end_events must close
+        // the block so consumers see a well-formed (if argument-empty) tool_use
+        // rather than a dangling content block.
+        let end_events = conv.emit_end_events_tagged();
+        assert_eq!(
+            event_types(&end_events),
+            vec!["content_block_stop", "message_delta", "message_stop"],
+            "end events close the dangling tool block"
+        );
+    }
+
+    /// Regression: full minimax-m2 Claude Code session captured on the wire.
+    ///
+    /// The OpenAI-format chunks below mirror what came back from the engine
+    /// when Claude Code asked
+    ///     user:      "What model are you?"
+    ///     assistant: "I am MiniMaxAI/MiniMax-M2.5."
+    ///     user:      "write that to whoami.txt"
+    /// against the production deployment on 2026-05-08. The pre-fix Anthropic
+    /// SSE re-emission closed the tool_use block on the first (empty-args)
+    /// delta and orphaned the four following `input_json_delta` events,
+    /// surfacing as `tool_use.input == {}` and a deterministic
+    /// `InputValidationError: required parameter file_path/content is missing`
+    /// retry loop in Claude Code (see Slack thread `1777841579.980589` and
+    /// session `~/.claude/projects/-workspaces-demo-failure/23742d15-…`).
+    ///
+    /// Asserts the full event sequence emitted by the converter:
+    ///
+    ///     content_block_start (thinking, idx=0)
+    ///     content_block_delta * N (thinking_delta)
+    ///     content_block_delta (signature_delta) + content_block_stop (idx=0)
+    ///     content_block_start (text, idx=1) + content_block_delta + content_block_stop
+    ///     content_block_start (tool_use, idx=2)
+    ///     content_block_delta (input_json_delta, partial_json="")
+    ///     content_block_delta (input_json_delta, partial_json="{\"file_path\":\"whoami.txt\"")
+    ///     content_block_delta (input_json_delta, partial_json=", \"content\":\"MiniMaxAI/MiniMax-M2.5\"")
+    ///     content_block_delta (input_json_delta, partial_json="}") + content_block_stop (idx=2)
+    ///     message_delta (stop_reason=tool_use) + message_stop
+    ///
+    /// Critically: every `input_json_delta` for index 2 must arrive *before*
+    /// `content_block_stop` for index 2.
+    #[test]
+    fn test_minimax_m2_claude_code_session_replay() {
+        let mut conv = AnthropicStreamConverter::new("MiniMaxAI/MiniMax-M2.5".into(), 0);
+
+        // 1. Thinking block: a few reasoning tokens, then text starts which
+        //    forces the thinking block closed (signature_delta + stop).
+        let mut events: Vec<TaggedEvent> = Vec::new();
+        events.extend(conv.process_chunk_tagged(&reasoning_chunk("The user wants me ")));
+        events.extend(conv.process_chunk_tagged(&reasoning_chunk("to write to whoami.txt.")));
+
+        // 2. Text content (Claude Code session captured "\n\n\n" between
+        //    thinking and the tool call — mirror that here).
+        events.extend(conv.process_chunk_tagged(&text_chunk("\n\n\n")));
+
+        // 3. Tool call: minimax_m2 parser streams arguments incrementally.
+        //    chunk a: id + name + empty args prefix.
+        //    chunk b..d: args dribble in across three more chunks.
+        events.extend(conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            Some("chatcmpl-tool-x"),
+            Some("Write"),
+            Some(""),
+        )));
+        events.extend(conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            None,
+            None,
+            Some("{\"file_path\":\"whoami.txt\""),
+        )));
+        events.extend(conv.process_chunk_tagged(&tool_call_chunk(
+            0,
+            None,
+            None,
+            Some(", \"content\":\"MiniMaxAI/MiniMax-M2.5\""),
+        )));
+        events.extend(conv.process_chunk_tagged(&tool_call_chunk(0, None, None, Some("}"))));
+
+        // 4. End-of-stream finalization.
+        events.extend(conv.emit_end_events_tagged());
+
+        // Locate every event for the tool_use block (index 2) and assert the
+        // input_json_delta events all precede content_block_stop. This is the
+        // exact ordering invariant the pre-fix code violated.
+        let tool_block_events: Vec<&TaggedEvent> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.data,
+                    AnthropicStreamEvent::ContentBlockStart { index: 2, .. }
+                        | AnthropicStreamEvent::ContentBlockDelta { index: 2, .. }
+                        | AnthropicStreamEvent::ContentBlockStop { index: 2, .. }
+                )
+            })
+            .collect();
+
+        let stop_pos = tool_block_events
+            .iter()
+            .position(|e| matches!(e.data, AnthropicStreamEvent::ContentBlockStop { .. }))
+            .expect("tool_use block must be closed");
+
+        // No event for index 2 may follow the content_block_stop.
+        assert_eq!(
+            stop_pos,
+            tool_block_events.len() - 1,
+            "content_block_stop for tool_use (idx=2) must be the last event for that block; \
+             pre-fix code emitted input_json_delta events after stop, which Anthropic SSE \
+             consumers (Claude Code, Anthropic SDK) discard as orphans → tool_use.input == {{}}"
+        );
+
+        // Concrete assertion on the tool block's event types:
+        //   start, delta(""), delta("{...}"), delta(", ..."), delta("}"), stop
+        let kinds: Vec<&str> = tool_block_events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+            ],
+            "tool_use block must receive 4 input_json_delta events (\"\", \
+             \"{{\\\"file_path\\\":...\", \", \\\"content\\\":...\", \"}}\") \
+             before close"
+        );
+
+        // The reconstructed JSON should match what Claude Code expects.
+        let mut accumulated = String::new();
+        for e in &tool_block_events {
+            if let AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicDelta::InputJsonDelta { partial_json },
+                ..
+            } = &e.data
+            {
+                accumulated.push_str(partial_json);
+            }
+        }
+        assert_eq!(
+            accumulated, r#"{"file_path":"whoami.txt", "content":"MiniMaxAI/MiniMax-M2.5"}"#,
+            "concatenated input_json_delta payloads must reconstruct the full tool args"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&accumulated).expect("accumulated args must be valid JSON");
+        assert_eq!(parsed["file_path"], "whoami.txt");
+        assert_eq!(parsed["content"], "MiniMaxAI/MiniMax-M2.5");
+
+        // Sanity: the stream as a whole ends cleanly with message_delta +
+        // message_stop and no leftover open blocks.
+        let last_two: Vec<&str> = events
+            .iter()
+            .rev()
+            .take(2)
+            .map(|e| e.event_type.as_str())
+            .collect();
+        assert_eq!(last_two, vec!["message_stop", "message_delta"]);
     }
 }
