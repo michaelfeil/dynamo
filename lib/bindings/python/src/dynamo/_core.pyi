@@ -278,6 +278,20 @@ class Endpoint:
         """
         ...
 
+    async def list_endpoint_taints(self, only_live: bool = True) -> Dict[int, Set[str]]:
+        """
+        Return a mapping of worker instance ID to the set of taints for that worker.
+
+        Args:
+            only_live: If True (default), only include workers that are currently
+                       registered as live instances.
+
+        Returns:
+            A dict mapping each worker's instance ID (int) to its set of taint
+            strings.
+        """
+        ...
+
 class Client:
     """
     A client capable of calling served instances of an endpoint

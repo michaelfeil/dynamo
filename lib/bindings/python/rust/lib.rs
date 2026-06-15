@@ -17,6 +17,7 @@ use std::ffi::CString;
 use std::fs;
 use std::path::PathBuf;
 use std::{
+    collections::{HashMap, HashSet},
     fmt::Display,
     sync::{Arc, Weak},
 };
@@ -1069,6 +1070,76 @@ impl Endpoint {
     // Opaque unique ID for this worker. May change over worker lifetime.
     fn connection_id(&self) -> u64 {
         self.inner.drt().connection_id()
+    }
+
+    /// List runtime config taints advertised by model cards on this endpoint.
+    #[pyo3(signature = (only_live = true))]
+    fn list_endpoint_taints<'p>(
+        &self,
+        py: Python<'p>,
+        only_live: bool,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let endpoint_id = inner.id();
+            let discovery = inner.component().drt().discovery();
+            let instances = discovery
+                .list(rs::discovery::DiscoveryQuery::EndpointModels {
+                    namespace: endpoint_id.namespace.clone(),
+                    component: endpoint_id.component.clone(),
+                    endpoint: endpoint_id.name.clone(),
+                })
+                .await
+                .map_err(to_pyerr)?;
+
+            let live_ids: Option<HashSet<u64>> = if only_live {
+                let endpoint_instances = discovery
+                    .list(rs::discovery::DiscoveryQuery::Endpoint {
+                        namespace: endpoint_id.namespace.clone(),
+                        component: endpoint_id.component.clone(),
+                        endpoint: endpoint_id.name.clone(),
+                    })
+                    .await
+                    .map_err(to_pyerr)?;
+                Some(
+                    endpoint_instances
+                        .into_iter()
+                        .map(|instance| instance.instance_id())
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
+            let mut taints_by_worker: HashMap<u64, HashSet<String>> = HashMap::new();
+            for instance in instances {
+                let worker_id = instance.instance_id();
+                if live_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.contains(&worker_id))
+                {
+                    continue;
+                }
+
+                match instance.deserialize_model::<llm_rs::model_card::ModelDeploymentCard>() {
+                    Ok(card) => {
+                        taints_by_worker
+                            .entry(worker_id)
+                            .or_default()
+                            .extend(card.runtime_config.taints);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            worker_id,
+                            error = %error,
+                            "Failed to deserialize model card while listing endpoint taints"
+                        );
+                    }
+                }
+            }
+
+            Ok(taints_by_worker)
+        })
     }
 
     /// Get a RuntimeMetrics helper for creating Prometheus metrics

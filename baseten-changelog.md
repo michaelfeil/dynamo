@@ -492,6 +492,17 @@ cached-token signal. This is needed so deployments can turn on the v1.2 router
 without changing worker placement behavior except where the new tiered-cache
 weights or eligibility constraints are intentionally configured.
 
+Taint-pool routing note:
+
+Add `Endpoint.list_endpoint_taints(only_live=True)` to the Python binding. It
+should return a same-endpoint MDC taint snapshot as `dict[worker_id,
+set[taint]]` by reading `DiscoveryQuery::EndpointModels`, deserializing each
+`ModelDeploymentCard`, and extracting `runtime_config.taints`. With
+`only_live=True`, filter the snapshot through a direct
+`DiscoveryQuery::Endpoint` instance list, not a newly created endpoint client.
+Startup code can use this primitive before `register_model` to choose and
+advertise a pool taint such as `fast` or `slow`.
+
 Heuristic and selector parity note:
 
 - `softmax_sample` accepts any worker-logit map that can be iterated as
