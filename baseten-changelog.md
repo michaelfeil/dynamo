@@ -861,6 +861,15 @@ backend/OpenAI tool-call IDs, and Anthropic backend errors preserve the backend
 HTTP status while rewriting `max_completion_tokens` wording to `max_tokens`.
 This intentionally does not reopen unrelated v1.0 protocol tolerance patches.
 
+Cherry-picked `d104200bf` (#232) onto v1.2.0 as #296: gate the inline Anthropic
+`content_block_stop` for `tool_use` on the accumulated `input_json_delta` args
+parsing as a complete JSON value. Without this, incremental-parser backends
+(`glm47`, `minimax_m2`, `kimi25`, `qwen3_coder`) emit `content_block_stop` after
+the first delta, so Anthropic SDK consumers (Claude Code) discard the trailing
+deltas and see `tool_use.input == {}`, looping on `InputValidationError`. Drop
+this patch once the equivalent guard lands upstream in `ai-dynamo/dynamo`'s
+`stream_converter.rs` (track via upstream port of #232).
+
 Validated the remaining PATCH-006 tolerance/parser decisions on v1.2. Keep the
 old warn-and-ignore unknown-field patch dropped: target tests still reject
 unsupported chat/completion fields, and that is the intended stricter behavior
