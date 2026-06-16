@@ -25,6 +25,10 @@ on:
         description: "Post to #mp-ci-alerts on failure (needs MP_CI_SLACK_WEBHOOK_URL)."
         type: boolean
         default: false
+      image-repo:
+        description: "Docker Hub repo to push to and store the registry layer cache under (matches container/build.sh's tag prefix)."
+        type: string
+        default: "baseten/dynamo-test"
 
 permissions:
   contents: read
