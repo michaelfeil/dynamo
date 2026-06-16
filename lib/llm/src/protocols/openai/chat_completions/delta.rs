@@ -129,6 +129,7 @@ impl DeltaGenerator {
                     dynamo_protocols::types::ChatCompletionTokenLogprob {
                         token: token_str.clone(),
                         logprob: lp,
+                        token_id: Some(*tid),
                         bytes: token_to_utf8_bytes(&token_str),
                         top_logprobs: converted,
                     }
@@ -744,5 +745,36 @@ mod tests {
                 "engine_data should not appear when backend provides None"
             );
         }
+    }
+
+    #[test]
+    fn test_create_logprobs_serializes_token_id() {
+        let mut request = create_test_request();
+        request.inner.logprobs = Some(true);
+        request.inner.top_logprobs = Some(1);
+        let generator = request.response_generator("req-logprobs-token-id".to_string());
+
+        let token = " streaming".to_string();
+        let token_id = 27098;
+        let token_bytes = token.as_bytes().to_vec();
+        let logprobs = generator
+            .create_logprobs(
+                vec![Some(token.clone())],
+                &[token_id],
+                Some(vec![-1.2885475]),
+                Some(vec![vec![common::llm_backend::TopLogprob {
+                    rank: 0,
+                    token_id,
+                    token: Some(token),
+                    logprob: -1.2885475,
+                    bytes: Some(token_bytes.clone()),
+                }]]),
+            )
+            .expect("logprobs should be created");
+
+        let payload = serde_json::to_value(logprobs).expect("serialize logprobs");
+        let entry = &payload["content"][0];
+        assert_eq!(entry["token_id"], token_id);
+        assert_eq!(entry["bytes"], serde_json::json!(token_bytes));
     }
 }

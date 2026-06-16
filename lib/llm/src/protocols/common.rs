@@ -573,6 +573,10 @@ pub struct ChatCompletionTokenLogprob {
     /// Otherwise, the value `-9999.0` signifies that the token is very unlikely.
     pub logprob: f64,
 
+    /// The token id corresponding to this token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<TokenIdType>,
+
     /// A list of integers representing the UTF-8 bytes representation of the token.
     /// Useful in instances where characters are represented by multiple tokens and their
     /// byte representations must be combined to generate the correct text representation.

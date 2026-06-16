@@ -22,7 +22,6 @@ use crate::error::OpenAIError;
 // Consumers should use them via `dynamo_protocols::types::*` as before.
 
 pub use async_openai::types::chat::{
-    ChatChoiceLogprobs,
     ChatCompletionAudio,
     ChatCompletionAudioFormat,
     ChatCompletionAudioVoice,
@@ -50,7 +49,6 @@ pub use async_openai::types::chat::{
     ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestToolMessageContentPart,
     ChatCompletionResponseMessageAudio,
-    ChatCompletionTokenLogprob,
     Choice,
     CompletionFinishReason,
     CompletionTokensDetails,
@@ -76,6 +74,25 @@ pub use async_openai::types::chat::{
     WebSearchUserLocation,
     WebSearchUserLocationType,
 };
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ChatChoiceLogprobs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ChatCompletionTokenLogprob>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Vec<ChatCompletionTokenLogprob>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ChatCompletionTokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    pub top_logprobs: Vec<TopLogprobs>,
+}
 
 /// OpenAI stop configuration, with Dynamo's token-id stop extension.
 ///
@@ -1124,6 +1141,23 @@ mod tests {
         assert!(tool_call.get("id").is_none());
         assert!(tool_call.get("type").is_none());
         assert!(function.get("name").is_none());
+    }
+
+    #[test]
+    fn chat_logprobs_include_token_id_when_present() {
+        let logprobs = ChatChoiceLogprobs {
+            content: Some(vec![ChatCompletionTokenLogprob {
+                token: " streaming".to_string(),
+                logprob: -1.2885475,
+                token_id: Some(27098),
+                bytes: Some(vec![32, 115, 116, 114, 101, 97, 109, 105, 110, 103]),
+                top_logprobs: vec![],
+            }]),
+            refusal: None,
+        };
+
+        let value = serde_json::to_value(logprobs).expect("serialize logprobs");
+        assert_eq!(value["content"][0]["token_id"], 27098);
     }
 
     #[test]
