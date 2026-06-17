@@ -18,7 +18,7 @@ struct CustomerRequestContext {
 
 /// Build the context ID: `{org_namespace}--{b10_request_id}--{model_version_id}[--{extras}]`.
 ///
-/// - `org_namespace`: `X-Baseten-Org-Namespace` (else "none").
+/// - `org_namespace`: `X-Baseten-Org-Namespace`, fallback `X-Baseten-Billing-Org-Id` (else "none").
 /// - `b10_request_id`: `X-Baseten-Request-Id`, truncated at the first `:` (SEG may
 ///   append a `:cf-ray:user-id` suffix); a UUID if absent.
 /// - `model_version_id`: `X-Baseten-Model-APIs-Version-Id`, fallback
@@ -30,21 +30,18 @@ struct CustomerRequestContext {
 /// Consumers split on `--` into 3 or 4 parts (the 4th, `extras`, is optional).
 /// org/request/model_version are assumed `--`-free.
 pub(super) fn get_or_create_context_id(headers: &HeaderMap) -> String {
-    let org_namespace = headers
-        .get("X-Baseten-Org-Namespace")
-        .and_then(|h| h.to_str().ok())
+    // Prefer the org-namespace header; fall back to the legacy billing-org header
+    // (beefeater sets that on the direct BIS route).
+    let org_namespace = nonempty_header(headers, "X-Baseten-Org-Namespace")
+        .or_else(|| nonempty_header(headers, "X-Baseten-Billing-Org-Id"))
         .unwrap_or("none");
 
     // Prefer the model-apis header; fall back to the legacy model-version header.
-    let model_version_id = headers
-        .get("X-Baseten-Model-APIs-Version-Id")
-        .or_else(|| headers.get("X-Baseten-Model-Version-ID"))
-        .and_then(|h| h.to_str().ok())
+    let model_version_id = nonempty_header(headers, "X-Baseten-Model-APIs-Version-Id")
+        .or_else(|| nonempty_header(headers, "X-Baseten-Model-Version-ID"))
         .unwrap_or("none");
 
-    let raw_request_id = headers
-        .get("X-Baseten-Request-Id")
-        .and_then(|h| h.to_str().ok())
+    let raw_request_id = nonempty_header(headers, "X-Baseten-Request-Id")
         .map(|s| s.to_owned())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
@@ -71,6 +68,15 @@ pub(super) fn get_or_create_context_id(headers: &HeaderMap) -> String {
     context_id
 }
 
+/// Header value as `&str`, treating a present-but-empty value as absent so the
+/// fallback chains (and the UUID default) fire on empty headers too.
+fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+}
+
 /// Collapse any run of 2+ `-` into a single `-` so an untrusted value can't forge
 /// the `--` segment separator. Other characters (including `:`) pass through.
 fn collapse_double_dash(s: &str) -> String {
@@ -87,10 +93,7 @@ fn collapse_double_dash(s: &str) -> String {
 }
 
 fn parse_customer_request_context(headers: &HeaderMap) -> CustomerRequestContext {
-    let Some(raw) = headers
-        .get("X-Baseten-Customer-Request-Context")
-        .and_then(|h| h.to_str().ok())
-    else {
+    let Some(raw) = nonempty_header(headers, "X-Baseten-Customer-Request-Context") else {
         return CustomerRequestContext::default();
     };
     serde_json::from_str(raw).unwrap_or_else(|err| {
@@ -151,6 +154,21 @@ mod tests {
         // SEG may append a `:cf-ray:user-id` suffix; only the head is kept.
         let headers = headers_with(&[("X-Baseten-Request-Id", "abc123:legacy-ray:legacy-user")]);
         assert_eq!(get_or_create_context_id(&headers), "none--abc123--none");
+    }
+
+    #[test]
+    fn empty_or_absent_org_falls_back_to_billing_org() {
+        // A present-but-empty X-Baseten-Org-Namespace is treated as absent and
+        // falls back to the billing-org header (beefeater's direct BIS route).
+        let headers = headers_with(&[
+            ("X-Baseten-Org-Namespace", ""),
+            ("X-Baseten-Request-Id", "abc123"),
+            ("X-Baseten-Billing-Org-Id", "billing-org"),
+        ]);
+        assert_eq!(
+            get_or_create_context_id(&headers),
+            "billing-org--abc123--none"
+        );
     }
 
     #[test]
