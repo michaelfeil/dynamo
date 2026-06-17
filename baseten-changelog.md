@@ -911,6 +911,17 @@ access they fail before exercising Dynamo behavior.
 Also: carry `ErrorMessage::from_http_error` 5xx pass-through (BIS-165/#272) to each future fork — it allows 529 (site overloaded) to reach clients instead of being squashed to 500.
 Also should include error classsification for metrics, so that we can observe it as site-overloaded etc in metrics.
 
+Restored the v1.0 logprobs `token_id` response field on v1.2.0 via #302:
+`ChatCompletionTokenLogprob` and `ChatChoiceLogprobs` are now defined locally in
+`lib/protocols/src/types/chat.rs` (shadowing the `async-openai` re-exports) with
+an added `token_id: Option<u32>` that serializes only when present, and
+`DeltaGenerator::create_logprobs` populates it from the backend `token_ids`
+already threaded through `lib/llm/src/protocols/common.rs` and the chat
+aggregator/jail/HTTP paths. This re-adds the Baseten logprobs `token_id` surface
+from commit `fce8920c3` that was dropped on the v1.1 follow-default in this section.
+Drop once upstream `async-openai` exposes an equivalent `token_id` field on
+`ChatCompletionTokenLogprob`.
+
 The response-only null-omission patch should be preserved on v1.2. The target
 already omits absent `Choice.logprobs` and `Choice.finish_reason` through
 upstream `async-openai`, but Dynamo's local chat response types and completion
