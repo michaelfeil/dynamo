@@ -66,15 +66,12 @@ use crate::types::Annotated;
 use dynamo_protocols::types::ChatCompletionMessageContent;
 use dynamo_protocols::types::ChatCompletionStreamResponseDelta;
 use dynamo_protocols::types::Choice;
-use dynamo_runtime::logging::get_distributed_tracing_context;
 use tracing::Instrument;
 
-pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 const X_REQUEST_ID_HEADER: &str = "x-request-id";
-const BASETEN_BILLING_ORG_ID_HEADER: &str = "x-baseten-billing-org-id";
-const BASETEN_REQUEST_ID_HEADER: &str = "x-baseten-request-id";
-const BASETEN_MODEL_VERSION_ID_HEADER: &str = "x-baseten-model-version-id";
-const BASETEN_CONTEXT_ID_EMPTY_PART: &str = "none";
+
+// Baseten: context-id construction has moved to `super::b10_context_id`.
+pub(super) use super::b10_context_id::get_or_create_context_id;
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
@@ -388,78 +385,6 @@ pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> 
     }
 }
 
-fn get_or_create_request_suffix(headers: &HeaderMap) -> String {
-    // Validate x-dynamo-request-id header if present, warn on invalid values.
-    // DEP #7812: x-dynamo-request-id is deprecated — clients should rely on
-    // server-generated request IDs instead of supplying their own.
-    let validated_header = if let Some(raw) = headers.get(DYNAMO_REQUEST_ID_HEADER) {
-        tracing::warn!(
-            "{} header is deprecated (DEP #7812); server-generated request IDs should be used instead",
-            DYNAMO_REQUEST_ID_HEADER
-        );
-        match raw.to_str() {
-            Err(_) => {
-                tracing::warn!(
-                    "{} header must be a valid UTF-8 string",
-                    DYNAMO_REQUEST_ID_HEADER
-                );
-                None
-            }
-            Ok(s) if uuid::Uuid::parse_str(s).is_err() => {
-                tracing::warn!(
-                    "{} header must be a valid UUID, got: {}",
-                    DYNAMO_REQUEST_ID_HEADER,
-                    s
-                );
-                None
-            }
-            Ok(s) => Some(s.to_string()),
-        }
-    } else {
-        None
-    };
-
-    // Prefer trace context (set by make_inference_request_span via DistributedTraceIdLayer)
-    if let Some(trace_context) = get_distributed_tracing_context()
-        && let Some(request_id) = trace_context.request_id
-    {
-        return request_id;
-    }
-
-    // Fallback: use validated header for backwards compat, or generate new UUID
-    validated_header.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-}
-
-/// Return the request ID for the current request.
-///
-/// Baseten workers parse context IDs as:
-/// `billing_org_id--request_id--billing_model_version`.
-/// Keep that 1.0-compatible shape at HTTP ingress so it propagates through
-/// `Context::id()` to Python workers. Missing Baseten values are represented as
-/// `none`, which the Python parser maps back to empty strings.
-///
-/// **Deprecation (DEP #7812):** The `x-dynamo-request-id` header is deprecated.
-/// Clients should rely on server-generated request IDs instead of supplying their own.
-pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
-    let billing_org_id = headers
-        .get(BASETEN_BILLING_ORG_ID_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or(BASETEN_CONTEXT_ID_EMPTY_PART);
-
-    let request_suffix = headers
-        .get(BASETEN_REQUEST_ID_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_owned)
-        .unwrap_or_else(|| get_or_create_request_suffix(headers));
-
-    let billing_model_version = headers
-        .get(BASETEN_MODEL_VERSION_ID_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or(BASETEN_CONTEXT_ID_EMPTY_PART);
-
-    format!("{billing_org_id}--{request_suffix}--{billing_model_version}")
-}
-
 fn attach_x_request_id<T: Send + Sync + 'static>(request: &mut Context<T>, headers: &HeaderMap) {
     if !crate::agents::trace::is_enabled() {
         return;
@@ -478,12 +403,12 @@ fn attach_x_request_id<T: Send + Sync + 'static>(request: &mut Context<T>, heade
 
 fn context_from_headers<T: Send + Sync + 'static>(
     request: T,
-    request_id: String,
+    context_id: String,
     headers: &HeaderMap,
 ) -> Result<Context<T>, ErrorResponse> {
     let metadata = extract_metadata_from_http(headers)
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
-    let mut request = Context::with_id_and_metadata(request, request_id, metadata);
+    let mut request = Context::with_id_and_metadata(request, context_id, metadata);
     attach_x_request_id(&mut request, headers);
     Ok(request)
 }
@@ -506,10 +431,10 @@ fn copy_x_request_id<T: Send + Sync + 'static, U: Send + Sync + 'static>(
 
 fn b10_rate_limit_request(
     headers: &HeaderMap,
-    request_id: &str,
+    context_id: &str,
 ) -> Option<axum::response::Response> {
     if let Some((rate_limit_msg, _)) = check_rate_limit(headers) {
-        tracing::info!("Request {} is rate limited: {}", request_id, rate_limit_msg);
+        tracing::info!(context_id = %context_id, "Request is rate limited: {rate_limit_msg}");
         let response = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorMessage {
@@ -544,8 +469,8 @@ async fn handler_completions(
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
-    if let Some(response) = b10_rate_limit_request(&headers, &request_id) {
+    let context_id = get_or_create_context_id(&headers);
+    if let Some(response) = b10_rate_limit_request(&headers, &context_id) {
         return Ok(response);
     }
     let streaming = request.inner.stream.unwrap_or(false);
@@ -557,7 +482,7 @@ async fn handler_completions(
         endpoint: Endpoint::Completions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, request_id, &headers)?;
+    let request = context_from_headers(request, context_id, &headers)?;
     let context = request.context();
 
     // create the connection handles
@@ -744,11 +669,7 @@ async fn completions_single(
         let response = NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
             .await
             .map_err(|e| {
-                tracing::error!(
-                    "Failed to fold completions stream for {}: {:?}",
-                    request_id,
-                    e
-                );
+                tracing::error!(request_id, "Failed to fold completions stream: {e}");
                 let err_response = ErrorMessage::internal_server_error(&format!(
                     "Failed to fold completions stream for {}: {:?}",
                     request_id, e
@@ -939,11 +860,7 @@ async fn completions_batch(
         let response = NvCreateCompletionResponse::from_annotated_stream(stream, parsing_options)
             .await
             .map_err(|e| {
-                tracing::error!(
-                    "Failed to fold completions stream for {}: {:?}",
-                    request_id,
-                    e
-                );
+                tracing::error!(request_id, "Failed to fold completions stream: {e}");
                 let err_response = ErrorMessage::internal_server_error(&format!(
                     "Failed to fold completions stream for {}: {:?}",
                     request_id, e
@@ -971,11 +888,11 @@ async fn embeddings(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
-    if let Some(response) = b10_rate_limit_request(&headers, &request_id) {
+    let context_id = get_or_create_context_id(&headers);
+    if let Some(response) = b10_rate_limit_request(&headers, &context_id) {
         return Ok(response);
     }
-    let request = context_from_headers(request, request_id, &headers)?;
+    let request = context_from_headers(request, context_id, &headers)?;
     let request_id = request.id().to_string();
 
     // The worker always emits base64-encoded vectors over NATS so we
@@ -1058,11 +975,7 @@ async fn embeddings(
     let mut response = NvCreateEmbeddingResponse::from_annotated_stream(stream)
         .await
         .map_err(|e| {
-            tracing::error!(
-                "Failed to fold embeddings stream for {}: {:?}",
-                request_id,
-                e
-            );
+            tracing::error!(request_id, "Failed to fold embeddings stream: {e}");
             let err_response =
                 ErrorMessage::internal_server_error("Failed to fold embeddings stream");
             inflight.mark_error(extract_error_type_from_response(&err_response));
@@ -1135,8 +1048,8 @@ async fn handler_chat_completions(
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
-    if let Some(response) = b10_rate_limit_request(&headers, &request_id) {
+    let context_id = get_or_create_context_id(&headers);
+    if let Some(response) = b10_rate_limit_request(&headers, &context_id) {
         return Ok(response);
     }
     let streaming = request.inner.stream.unwrap_or(false);
@@ -1146,7 +1059,7 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, request_id, &headers)?;
+    let request = context_from_headers(request, context_id, &headers)?;
     let context = request.context();
 
     // create the connection handles
@@ -1812,7 +1725,7 @@ async fn handler_responses(
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
-    let request_id = get_or_create_request_id(&headers);
+    let context_id = get_or_create_context_id(&headers);
     let streaming = request.inner.stream.unwrap_or(false);
     let raw_model = request.inner.model.as_deref().unwrap_or("");
     let resolved_model = resolve_request_model(raw_model, template.as_ref());
@@ -1821,7 +1734,7 @@ async fn handler_responses(
         endpoint: Endpoint::Responses.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, request_id, &headers)?;
+    let request = context_from_headers(request, context_id, &headers)?;
     let context = request.context();
 
     // create the connection handles
@@ -2413,8 +2326,8 @@ async fn images(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
-    let request = context_from_headers(request, request_id, &headers)?;
+    let context_id = get_or_create_context_id(&headers);
+    let request = context_from_headers(request, context_id, &headers)?;
     let request_id = request.id().to_string();
 
     // Images are typically not streamed, so we default to non-streaming
@@ -2487,7 +2400,7 @@ async fn images(
     let response = NvImagesResponse::from_annotated_stream(stream)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to fold images stream for {}: {:?}", request_id, e);
+            tracing::error!(request_id, "Failed to fold images stream: {e}");
             let err_response = ErrorMessage::internal_server_error("Failed to fold images stream");
             inflight.mark_error(extract_error_type_from_response(&err_response));
             err_response
@@ -2545,8 +2458,8 @@ async fn videos(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
-    let request = context_from_headers(request, request_id, &headers)?;
+    let context_id = get_or_create_context_id(&headers);
+    let request = context_from_headers(request, context_id, &headers)?;
     let request_id = request.id().to_string();
 
     let streaming = request.stream.unwrap_or(false);
@@ -2639,7 +2552,7 @@ async fn videos(
         let response = NvVideosResponse::from_annotated_stream(stream)
             .await
             .map_err(|e| {
-                tracing::error!("Failed to fold videos stream for {}: {:?}", request_id, e);
+                tracing::error!(request_id, "Failed to fold videos stream: {e}");
                 let err_response =
                     ErrorMessage::internal_server_error("Failed to fold videos stream");
                 inflight.mark_error(extract_error_type_from_response(&err_response));
@@ -2665,8 +2578,8 @@ async fn video_stream(
 ) -> Result<Response, ErrorResponse> {
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
-    let request = context_from_headers(request, request_id, &headers)?;
+    let context_id = get_or_create_context_id(&headers);
+    let request = context_from_headers(request, context_id, &headers)?;
     let model = request.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
 
@@ -2829,8 +2742,8 @@ async fn audio_speech(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    let request_id = get_or_create_request_id(&headers);
-    let request = context_from_headers(request, request_id, &headers)?;
+    let context_id = get_or_create_context_id(&headers);
+    let request = context_from_headers(request, context_id, &headers)?;
     let request_id = request.id().to_string();
 
     let streaming = false;
@@ -2879,7 +2792,7 @@ async fn audio_speech(
     let response = NvAudioSpeechResponse::from_annotated_stream(stream)
         .await
         .map_err(|e| {
-            tracing::error!("Failed to fold audio stream for {}: {:?}", request_id, e);
+            tracing::error!(request_id, "Failed to fold audio stream: {e}");
             ErrorMessage::internal_server_error("Failed to fold audio stream")
         })?;
 
@@ -2969,61 +2882,6 @@ mod tests {
             },
             nvext: None,
         }
-    }
-
-    #[test]
-    fn test_get_or_create_request_id_uses_baseten_context_shape() {
-        let mut headers = HeaderMap::new();
-        headers.insert(BASETEN_BILLING_ORG_ID_HEADER, "org-123".parse().unwrap());
-        headers.insert(BASETEN_REQUEST_ID_HEADER, "req-456".parse().unwrap());
-        headers.insert(
-            BASETEN_MODEL_VERSION_ID_HEADER,
-            "model-version-789".parse().unwrap(),
-        );
-
-        assert_eq!(
-            get_or_create_request_id(&headers),
-            "org-123--req-456--model-version-789"
-        );
-    }
-
-    #[test]
-    fn test_get_or_create_request_id_defaults_baseten_context_parts_to_none() {
-        let mut headers = HeaderMap::new();
-        headers.insert(BASETEN_REQUEST_ID_HEADER, "req-456".parse().unwrap());
-
-        assert_eq!(get_or_create_request_id(&headers), "none--req-456--none");
-    }
-
-    #[test]
-    fn test_get_or_create_request_id_wraps_generated_uuid_in_baseten_context() {
-        let headers = HeaderMap::new();
-        let request_id = get_or_create_request_id(&headers);
-        let parts: Vec<&str> = request_id.split("--").collect();
-
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0], "none");
-        uuid::Uuid::parse_str(parts[1]).expect("middle context part should be a UUID");
-        assert_eq!(parts[2], "none");
-    }
-
-    #[test]
-    fn test_get_or_create_request_id_prefers_baseten_request_id_suffix() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            BASETEN_REQUEST_ID_HEADER,
-            "baseten-request".parse().unwrap(),
-        );
-        headers.insert(X_REQUEST_ID_HEADER, "external-request".parse().unwrap());
-        headers.insert(
-            DYNAMO_REQUEST_ID_HEADER,
-            "67e55044-10b1-426f-9247-bb680e5fe0c8".parse().unwrap(),
-        );
-
-        assert_eq!(
-            get_or_create_request_id(&headers),
-            "none--baseten-request--none"
-        );
     }
 
     #[test]

@@ -205,7 +205,7 @@ impl Server {
                 let action = match tx.try_send(message.into()) {
                     Ok(_) => {
                         tracing::trace!(
-                            request_id,
+                            zmq_request_id = %request_id,
                             "response data sent eagerly to stream: {} bytes",
                             message_size
                         );
@@ -213,12 +213,15 @@ impl Server {
                     }
                     Err(e) => match e {
                         mpsc::error::TrySendError::Closed(_) => {
-                            tracing::info!(request_id, "response stream was closed");
+                            tracing::info!(
+                                zmq_request_id = %request_id,
+                                "response stream was closed"
+                            );
                             StreamAction::Close
                         }
                         mpsc::error::TrySendError::Full(data) => {
                             tracing::warn!(
-                                request_id,
+                                zmq_request_id = %request_id,
                                 "response stream is full; backpressure alert"
                             );
                             // todo - add timeout - we are blocking all other streams
@@ -249,7 +252,10 @@ impl Server {
             } else {
                 // increment bytes_dropped
                 // increment messages_dropped
-                tracing::trace!(request_id, "no active stream for request_id");
+                tracing::trace!(
+                    zmq_request_id = %request_id,
+                    "no active stream for request_id"
+                );
             }
         }
 

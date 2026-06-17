@@ -49,9 +49,10 @@ use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::{RequestTemplate, resolve_request_model};
 use crate::types::Annotated;
 
-// Re-use helpers from the openai module (sibling under service/)
+// Re-use helpers from sibling modules under service/.
+use super::b10_context_id::get_or_create_context_id;
 use super::metadata::extract_metadata_from_http;
-use super::openai::{get_body_limit, get_or_create_request_id};
+use super::openai::get_body_limit;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -148,7 +149,7 @@ async fn handler_anthropic_messages(
     }
 
     // Create request context
-    let request_id = get_or_create_request_id(&headers);
+    let context_id = get_or_create_context_id(&headers);
     let streaming = request.stream;
     let resolved_model = resolve_request_model(&request.model, template.as_ref());
     let cancellation_labels = CancellationLabels {
@@ -163,7 +164,7 @@ async fn handler_anthropic_messages(
             &err.to_string(),
         )
     })?;
-    let request = Context::with_id_and_metadata(request, request_id, metadata);
+    let request = Context::with_id_and_metadata(request, context_id, metadata);
     let context = request.context();
 
     // Create connection handles

@@ -180,8 +180,8 @@ where
         let (request, context) = request.transfer(());
         let ctx = context.context();
 
-        let id = context.id().to_string();
-        tracing::trace!("processing request: {}", id);
+        let context_id = context.id().to_string();
+        tracing::trace!("processing request: {}", context_id);
 
         // Capture current trace context
         let current_trace_context = get_distributed_tracing_context();
@@ -211,7 +211,7 @@ where
         let stream = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| {
                 let py_request = pythonize(py, &request)?;
-                let id = ctx_python.id().to_string();
+                let context_id = ctx_python.id().to_string();
 
                 // Create context with trace information
                 let py_ctx = Py::new(
@@ -230,7 +230,8 @@ where
                 }?;
                 tracing::info!(
                     unified_model_logs = true,
-                    "{}: Processing request {id}",
+                    context_id = %context_id,
+                    "{}: Processing request {context_id}",
                     logging_label
                 );
 
@@ -247,7 +248,7 @@ where
         // any error thrown in the stream will be caught and complete the processing task
         // errors are captured by a task that is watching the processing task
         // the error will be emitted as an annotated error
-        let request_id = id.clone();
+        let request_id = context_id.clone();
         let mut stream = Box::pin(stream);
 
         let stream = if self.block_until_stream_item {
