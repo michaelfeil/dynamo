@@ -211,6 +211,11 @@ PRs that legitimately do not need a changelog entry can bypass the check by
 applying the `skip-changelog` label. This makes the patch ledger an enforced
 artifact of the fork rather than a documentation convention.
 
+The post-merge `framework=none` image workflow now builds native `amd64` and
+`arm64` images on Depot runners, pushes arch-specific tags, and publishes the
+unsuffixed tag as a multi-arch manifest. The workflow does not publish a mutable
+`latest` tag.
+
 Replay notes:
 
 Port this first so the new branch has a working CI and image path. Retarget all
