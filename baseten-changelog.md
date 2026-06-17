@@ -205,6 +205,12 @@ the checkout has no merged semver tag or release branch. This keeps v1.2 branch
 builds on `v1.2.x.dev.<sha>-<suffix>` instead of falling back to
 `v0.0.1.dev.<sha>-<suffix>`.
 
+A required `Baseten Changelog Check` GitHub Actions workflow now runs on every
+PR targeting `main-v1.2.0` and fails if `baseten-changelog.md` is not modified.
+PRs that legitimately do not need a changelog entry can bypass the check by
+applying the `skip-changelog` label. This makes the patch ledger an enforced
+artifact of the fork rather than a documentation convention.
+
 Replay notes:
 
 Port this first so the new branch has a working CI and image path. Retarget all
