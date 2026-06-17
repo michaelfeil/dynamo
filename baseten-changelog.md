@@ -846,14 +846,30 @@ new endpoint-specific tests fail. Broader protocol work remains open only for
 response-shape or tolerance decisions not already covered by `baseten_ext` and
 Anthropic conformance slices.
 
-The v1.0 Baseten context-id contract was restored at HTTP ingress because
-Python workers still parse `Context::id()` as
-`billing_org_id--request_id--billing_model_version`. The request ID helper now
-uses `X-Baseten-Billing-Org-Id`, `X-Baseten-Request-Id`, and
-`X-Baseten-Model-Version-ID`, defaulting missing Baseten parts to `none` so
-worker-side parsers map them back to empty strings. When
-`X-Baseten-Request-Id` is absent, the middle component still falls back through
-the target branch's distributed-tracing/deprecated-UUID path.
+Baseten owns its own `context_id` format, built at HTTP ingress in the fork-only
+file `lib/llm/src/http/service/b10_context_id.rs`. The format is
+`{org_namespace}--{b10_request_id}--{model_version_id}[--{extras}]`:
+
+- `org_namespace`: `X-Baseten-Org-Namespace`, falling back to
+  `X-Baseten-Billing-Org-Id` (beefeater sets the billing-org header on the
+  direct BIS route), else `none`.
+- `b10_request_id`: `X-Baseten-Request-Id`, truncated at the first `:` (SEG may
+  append a `:cf-ray:user-id` suffix); a UUID when absent.
+- `model_version_id`: `X-Baseten-Model-APIs-Version-Id`, falling back to
+  `X-Baseten-Model-Version-ID`, else `none`.
+- `extras` (optional 4th segment): non-empty `cf_ray`/`user_id` from
+  `X-Baseten-Customer-Request-Context`, joined with `:` and sanitized so it
+  carries no `--`. Opaque pass-through; present-but-empty headers are treated as
+  absent so fallbacks fire.
+
+Workers parse `Context::id()` by splitting on `--` into 3 or 4 parts (the 4th,
+`extras`, is ignored); `none` maps back to an empty string. The format is
+backward-compatible with the older 3-part `org--request--model_version` build
+the gemma image still pins, since that image cannot be rebuilt.
+
+The goal of this format is log correlation: emit the full id as the `context_id`
+log field wherever a request is logged, and the narrow `b10_request_id` segment
+alongside it, so frontend and worker logs can be joined on a request.
 
 The next v1.2 slice restored the typed root-level `baseten_ext` fields for chat
 and completion requests: `b10_cache_control`, `baseten`, `dynamic_temperature`,
