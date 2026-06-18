@@ -1006,6 +1006,12 @@ abstraction. B10 routing remains exposed through `RouterConfig(...,
 algo_selector="B10")`, and JSON publisher/subscriber bindings were already
 restored in the earlier PATCH-003/PATCH-007 overlap slice.
 
+Also add Python `Context.detached(id)` for trace-preserving disaggregated handoff.
+It creates a fresh cancellation controller while carrying metadata, trace context,
+and the captured `engine.generate` span. This is needed because decode requests
+detach cancellation ownership after prefill without splitting TRT-LLM/Honeycomb
+backend spans from the original Dynamo request. Drop after upstream has this API.
+
 Validation:
 
 Compile Python bindings, import `dynamo.runtime`, validate type stubs, and run
