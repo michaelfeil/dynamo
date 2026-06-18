@@ -880,6 +880,8 @@ this slice intentionally kept the target branch's stricter unknown-field
 validation instead of changing all unknown parameters to warn-and-ignore; later
 validation kept that stricter target behavior.
 
+A later v1.2 slice (#308, port of #307) added the per-request `thinking_token_budget` field to `BasetenExt`, flattened at the request root like `reasoning` and `dynamic_temperature`. Without it the frontend's `warn_unsupported_fields` validator stripped the field before it reached the worker, so clients could not dynamically bound runaway reasoning (e.g. Qwen3.5/3.6, GLM-5.2). The worker maps it onto `vllm.SamplingParams.thinking_token_budget`, which forces the reasoning-end token (`</think>`) once the `<think>` block reaches the cap. Omitted -> `None`, so a worker/BIS-config default still applies.
+
 The Anthropic conformance slice follows v1.1 commit `d493fef1d` closely because
 all three behaviors are externally visible API compatibility requirements:
 Anthropic streams no longer receive the OpenAI-only `[DONE]` sentinel,

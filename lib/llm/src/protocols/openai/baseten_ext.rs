@@ -247,6 +247,18 @@ pub struct BasetenExt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub reasoning: Option<serde_json::Value>,
+
+    /// Per-request reasoning-token budget — forwarded to the worker, which maps
+    /// it onto ``vllm.SamplingParams.thinking_token_budget`` so vLLM forces the
+    /// reasoning-end token (``</think>``) once the ``<think>`` block hits the
+    /// cap. Bounds the documented Qwen3.5/3.6 runaway-reasoning behavior.
+    /// Without this passthrough the dynamo frontend strips it as an unsupported
+    /// parameter before it reaches the worker. A worker-side / BIS-config
+    /// default may still apply when this is omitted.
+    /// Example: `{"thinking_token_budget": 2048}`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub thinking_token_budget: Option<u32>,
 }
 
 impl BasetenExt {
@@ -262,6 +274,7 @@ impl BasetenExt {
             && self.priority.is_none()
             && self.thinking.is_none()
             && self.reasoning.is_none()
+            && self.thinking_token_budget.is_none()
     }
 
     pub fn validate_request(&self) -> anyhow::Result<()> {
@@ -363,6 +376,22 @@ mod tests {
         let reserialized = serde_json::to_string(&parsed).unwrap();
         let reparsed: BasetenExt = serde_json::from_str(&reserialized).unwrap();
         assert_eq!(reparsed.reasoning, parsed.reasoning);
+    }
+
+    #[test]
+    fn test_thinking_token_budget_passthrough() {
+        // Must survive deserialize -> reserialize so the per-request reasoning
+        // budget reaches the worker instead of being stripped as an unsupported
+        // parameter (bounds Qwen3.5/3.6 runaway reasoning).
+        let json = r#"{"thinking_token_budget":2048}"#;
+        let parsed: BasetenExt = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.thinking_token_budget, Some(2048));
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        let reparsed: BasetenExt = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(reparsed.thinking_token_budget, Some(2048));
+        // Omitted -> None (worker/BIS-config default may still apply).
+        let empty: BasetenExt = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.thinking_token_budget, None);
     }
 
     #[test]
