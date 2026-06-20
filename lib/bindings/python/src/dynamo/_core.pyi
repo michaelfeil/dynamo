@@ -12,6 +12,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
@@ -372,6 +373,306 @@ class Client:
         Generate a response from the endpoint
         """
         ...
+
+
+class CancellationPolicy:
+    """
+    Cancellation policy for
+    :meth:`RouterWorkerCoordinator.route_and_worker`. Selects which of three
+    phases — routing (the ``route_and_connect`` loop), the per-attempt worker
+    stream setup (the ``direct()`` open), and the worker generation stream
+    hand-back — may be aborted by a Python cancellation of the awaiting
+    awaitable in-band via the linked request context (NOT a tokio task-drop).
+    A detached phase runs to completion regardless; an armed guard produced by
+    an abandoned phase is still dropped (which fires the always-detached
+    ``mark_free`` cleanup task) when the phase finishes, so the router is never
+    orphaned. Routing and setup are INDEPENDENT axes — the variants below fix
+    the (routing, setup, stream) cancellability triple explicitly, not via a
+    single global toggle.
+    """
+
+    Cancellable: "CancellationPolicy"
+    DetachToWorkerStreamConnected: "CancellationPolicy"
+    FullyDetached: "CancellationPolicy"
+    CancellableUntilWorkerThenDetach: "CancellationPolicy"
+    DetachSetupOnly: "CancellationPolicy"
+    ...
+
+
+class PyRouterRequestNew:
+    """
+    Typed carrier of the six ``RouterRequest::New`` wire-body fields (minus the
+    ``method`` tag, supplied by the coordinator), sent as the REQUIRED
+    ``routing_kwargs`` argument to
+    :meth:`RouterWorkerCoordinator.route_and_worker`. This is the single source
+    of truth for routing inputs (the first-class ``tokens`` and
+    ``block_mm_infos`` arguments are GONE — both live on this pyclass now).
+
+    ``block_mm_infos`` is held loosely as ``Optional[Any]`` and converted to the
+    typed wire ``List[Optional[BlockExtraInfo]]`` at the Rust boundary under the
+    GIL. ``routing_constraints`` is the local-model pyclass
+    :class:`RoutingConstraints`; ``None`` means the default (empty) constraints.
+    ``tokens`` is REQUIRED (no default); pass ``[]`` (or any ``Sequence[int]``)
+    for decode-only requests.
+    """
+
+    tokens: List[int]
+    block_mm_infos: Optional[Any]
+    routing_constraints: Optional[RoutingConstraints]
+    priority_jump: float
+    priority_load_shed_percent: int
+    do_not_queue: bool
+
+    def __init__(
+        self,
+        tokens: Sequence[int],
+        block_mm_infos: Optional[Any] = None,
+        routing_constraints: Optional[RoutingConstraints] = None,
+        priority_jump: float = 0.0,
+        priority_load_shed_percent: int = 0,
+        do_not_queue: bool = False,
+    ) -> None: ...
+
+
+class RouterWorkerCoordinator:
+    """
+    Coordinates KV-aware routing and worker generation for a (pre)fill/aggregate
+    topology.
+
+    ``router_client`` decides which worker a request goes to (via its KV
+    router); ``worker_client`` runs generation on the routed worker.
+    """
+
+    def __init__(self, router_client: Client, worker_client: Client) -> None: ...
+
+    async def route_and_worker(
+            self,
+            context: Context,
+            routing_kwargs: PyRouterRequestNew,
+            worker_args: JsonLike | None = None,
+            require_available: List[Client] | None = None,
+            potential_loads_next_check: RouterCoordinatorPotentialLoadsCheck | None = None,
+            annotated: bool | None = False,
+            cancellation: CancellationPolicy = CancellationPolicy.Cancellable,
+            max_reroutes: int = 1,
+        ) -> AdmittedRequest | DeniedRequest:
+        """
+        Route a KV-router ``new`` request, then generate on the routed worker.
+
+        ``routing_kwargs`` is a :class:`PyRouterRequestNew` — the REQUIRED,
+        single source of truth for the six ``RouterRequest::New`` wire-body
+        fields (``tokens``, ``block_mm_infos``, ``routing_constraints``,
+        ``priority_jump``, ``priority_load_shed_percent``, ``do_not_queue``).
+        The first-class ``tokens`` and ``block_mm_infos`` arguments are GONE;
+        both live on the pyclass now. ``worker_args`` is the body sent to the
+        worker for generation; on a successful route the decoded
+        ``RouterResponse::New`` is added to it under the ``router_response``
+        field -- carrying ``worker_id``, ``overlap_blocks`` (potential cache
+        hit) and ``dp_rank`` / ``dp_strict_rank`` (the dp-rank instruction for
+        the worker) -- so the worker (or a further forwarder) receives the
+        routing decision.
+
+        When ``potential_loads_next_check`` is given, a *potential loads*
+        preflight queries the *downstream* ``client`` it carries (another router,
+        e.g. the next router in a disagg-prefill topology -- distinct from the
+        routing router) for the aggregated worker loads *in parallel* with the
+        route (on the first attempt only -- a stale-route reroute does not
+        change the downstream router's loads) and denies the request when they
+        exceed the configured thresholds. The preflight is part of the
+        ``routing`` phase, so it is shielded when the policy detaches routing
+        (e.g. ``CancellationPolicy.FullyDetached``).
+
+        The route, the ``require_available`` check, and (on the first attempt
+        only) the ``potential_loads_next_check`` preflight run in *parallel*; a
+        short post-route re-check repeats the ``require_available`` lookup. A
+        routed worker that turns out to be stale (its etcd entry was removed
+        after the router chose it) is re-routed, bounded by ``max_reroutes``
+        (the initial attempt plus up to ``max_reroutes`` reroutes); exhausting
+        the bound returns ``DeniedRequest::NextRouterUnreachable``.
+
+        ``cancellation`` (a :class:`CancellationPolicy`, default
+        ``CancellationPolicy.Cancellable``) selects which of three phases — the
+        ``route_and_connect`` loop (``routing``), each per-attempt ``direct()``
+        worker-stream open (``setup``), and the worker generation stream
+        hand-back (``stream``) — may be aborted by a Python cancellation of this
+        awaitable in-band via the linked request context. A detached phase runs
+        to completion regardless; an armed guard produced by an abandoned phase
+        is dropped (which fires the always-detached ``mark_free`` cleanup task)
+        when the phase finishes, so the router is never orphaned. Cancellation
+        is NEVER a tokio task-drop — it propagates through ``context.is_stopped()
+        || is_killed()`` to the underlying ``direct()`` open and the worker
+        stream. Routing and setup are INDEPENDENT axes; see
+        :class:`CancellationPolicy` for the full matrix.
+        ``DetachToWorkerStreamConnected`` detaches routing/setup until the worker
+        stream is connected and handed back, then stream consumption follows the
+        returned ``AsyncResponseStream``. ``DetachSetupOnly`` is the classic
+        «cancellable routing & stream, detached setup» triple.
+
+        Returns :class:`AdmittedRequest` on a successful route or
+        :class:`DeniedRequest` when the router is backpressured, a
+        ``require_available`` component is down, the preflight overflows, the
+        preflight cannot reach the router, or the stale-route reroute loop is
+        exhausted -- never raising in those cases. A non-stale worker-open
+        failure (or non-object ``worker_args``) is raised, not returned as a
+        ``DeniedRequest``. Discriminate with
+        ``isinstance(result, AdmittedRequest)`` /
+        ``isinstance(result, DeniedRequest)`` (and
+        ``isinstance(result, DeniedRequest.<Variant>)`` for the denial reason).
+        On a successful route, ``response_stream()`` yields the worker
+        generation tokens, ``overlap_blocks()`` reports the router's effective
+        cached blocks for the chosen worker, and ``mark_prefill()`` /
+        ``mark_free()`` drive the KV-lifecycle callbacks.
+        """
+        ...
+
+
+class AdmittedRequest:
+    """
+    Outcome of :meth:`RouterWorkerCoordinator.route_and_worker` on a successful
+    route. Carries the lifecycle guard (``mark_prefill`` / ``mark_free``), the
+    worker generation stream, and the router's reported ``overlap_blocks``. A
+    denial is a :class:`DeniedRequest` instead. The chosen ``worker_id`` is not
+    surfaced to Python.
+    """
+
+    def overlap_blocks(self) -> int:
+        """
+        The router's rounded effective cached blocks (approximate KV-cache hit,
+        in BLOCKS) the router reported for the chosen worker on this request.
+        ``0`` when the route did not arm the guard.
+        """
+        ...
+
+    def response_stream(self) -> AsyncIterator[JsonLike]:
+        """
+        The worker generation stream. May be called only once; raises
+        ``ValueError`` if already consumed.
+        """
+        ...
+
+    def mark_prefill(self) -> None:
+        """Mark the routed request's KV blocks as prefilled on the worker."""
+        ...
+
+    def mark_free(self) -> None:
+        """Free the routed request's KV blocks on the worker (also done on drop)."""
+        ...
+
+
+class DeniedRequest:
+    """
+    Why a :meth:`RouterWorkerCoordinator.route_and_worker` call was denied, of
+    any reason. Returned instead of a :class:`AdmittedRequest`; :meth:`route_and_worker`
+    never raises in these cases. Discriminate in Python with
+    ``isinstance(result, DeniedRequest.<Variant>)`` and read the variant fields
+    as attributes.
+    """
+
+    class RouterBackpressure:
+        """The KV router itself returned backpressure (or no router instances were up)."""
+        reason: str
+        """The router's backpressure reason name (snake_case), e.g. ``do_not_queue``."""
+        queued_isl_tokens: int
+        """ISL tokens the router reports as currently queued."""
+        max_queued_isl_tokens: int | None
+        """The configured cap on queued ISL tokens, when known."""
+        ...
+
+    class RequiredComponentsDown:
+        """A ``require_available`` component had zero replicas available."""
+        name: str
+        """The name of the down component (its endpoint id)."""
+        ...
+
+    class NextRouterBackpressure:
+        """
+        The ``potential_loads_next_check`` preflight found the aggregated router
+        loads would exceed the configured thresholds.
+        """
+        queue_depth: int
+        """Router-level pending queue depth (``pending_count``)."""
+        pending_isl_tokens: int
+        """ISL tokens the router reports as currently queued."""
+        total_prefill_tokens: int
+        """Sum of ``potential_prefill_tokens`` across workers."""
+        total_decode_blocks: int
+        """Sum of ``potential_decode_blocks`` across workers."""
+        ...
+
+    class NextRouterUnreachable:
+        """The ``potential_loads_next_check`` preflight could not reach the router."""
+        error: str
+        """The error encountered while querying the router."""
+        ...
+
+    class ProtocolError:
+        """
+        The ``potential_loads_next_check`` preflight received an unexpected
+        router response (not ``RouterResponse::PotentialLoads``): a
+        wrong-protocol shape such as ``Backpressure`` or ``New``, or an
+        older/unknown variant. The preflight fails closed -- the request is
+        denied rather than passing the overload check unvalidated.
+        """
+        received: str
+        """Debug representation of the unexpected ``RouterResponse`` variant."""
+        ...
+
+    ...
+
+
+class RouterCoordinatorPotentialLoadsCheck:
+    """
+    Required preflight passed to
+    :meth:`RouterWorkerCoordinator.route_and_worker`: before routing, the
+    coordinator queries the *downstream* ``client`` (another router further
+    along the pipeline, e.g. the next router in a disagg-prefill topology --
+    distinct from the routing router) for the *potential loads* of all its
+    workers (the ``potential_loads`` method) and denies the request when the
+    aggregated loads would exceed the configured thresholds -- so a request is
+    not routed onward to an already-overloaded downstream router. A threshold of
+    ``0`` disables that dimension (no limit). Prefill is summed in tokens,
+    decode in BLOCKS, and ``queue_depth`` is the router-level
+    ``pending_count``.
+
+    The ``client`` is required: it is the downstream router whose loads are
+    checked. The overlap-aware ``block_mm_infos`` conditioning the reported loads
+    is passed as a first-class argument to ``route_and_worker`` (shared by the
+    route and the preflight), not on this check. Defaults:
+    ``queue_depth_threshold=0`` (disabled), ``prefill_tokens_threshold=1_000_000``,
+    ``decode_blocks_threshold=16_000_000``.
+    """
+
+    def __init__(
+        self,
+        client: Client,
+        queue_depth_threshold: int = 0,
+        prefill_tokens_threshold: int = 1_000_000,
+        decode_blocks_threshold: int = 16_000_000,
+    ) -> None: ...
+
+    @property
+    def client(self) -> Client: ...
+
+    @client.setter
+    def client(self, value: Client) -> None: ...
+
+    @property
+    def queue_depth_threshold(self) -> int: ...
+
+    @queue_depth_threshold.setter
+    def queue_depth_threshold(self, value: int) -> None: ...
+
+    @property
+    def prefill_tokens_threshold(self) -> int: ...
+
+    @prefill_tokens_threshold.setter
+    def prefill_tokens_threshold(self, value: int) -> None: ...
+
+    @property
+    def decode_blocks_threshold(self) -> int: ...
+
+    @decode_blocks_threshold.setter
+    def decode_blocks_threshold(self, value: int) -> None: ...
 
 
 class ModelCardInstanceId:

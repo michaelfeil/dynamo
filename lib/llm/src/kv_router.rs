@@ -1135,11 +1135,16 @@ where
                     success: self.free(request_id).await.is_ok(),
                 }
             }
-            RouterRequest::PotentialLoads { tokens } => {
-                // Same overlap-aware pipeline as main-v1.0.0; the v1.2.0 port
-                // stubbed this arm to an empty response, pinning the frontend
-                // rate limiter at level=1.0 and blinding autoscaler/planner.
-                let loads = self.get_potential_loads(&tokens, None, None, None).await?;
+            RouterRequest::PotentialLoads {
+                tokens,
+                block_mm_infos,
+            } => {
+                // Same overlap-aware pipeline as main-v1.0.0; block_mm_infos
+                // (when provided) is forwarded so MM-conditioned hashes drive
+                // the overlap-aware cache-hit estimates.
+                let loads = self
+                    .get_potential_loads(&tokens, None, block_mm_infos.as_deref(), None)
+                    .await?;
                 RouterResponse::PotentialLoads {
                     loads,
                     pending_count: self.pending_count(),

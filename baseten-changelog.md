@@ -1012,6 +1012,41 @@ and the captured `engine.generate` span. This is needed because decode requests
 detach cancellation ownership after prefill without splitting TRT-LLM/Honeycomb
 backend spans from the original Dynamo request. Drop after upstream has this API.
 
+v1.2 b10_client portability note:
+
+The fork-carried `lib/bindings/python/rust/b10_client/` module exposes the
+admission lifecycle used by `RouterConfig(..., algo_selector="B10")`. It is a
+self-contained unit added by the fork; the upstream at the target SHA does not
+ship an equivalent. The module deliberately keeps all router-facing policy,
+guard arming, and post-admission failure handling in a single crate-local
+surface so it can be lifted forward without touching the rest of the Python
+bindings.
+
+`route_request` (in `coordinator.rs`) is the function that owns the
+post-admission fail-closed invariant. It is split into three explicit stages:
+Stage 1 `router.direct()` failure dismisses the provisional guard before
+admission (no `mark_free`); Stage 2 post-admission stream error drops the
+provisional guard without dismissing, so the armed cleanup task fires
+`mark_free` asynchronously; Stage 3 unexpected response variant (neither
+`New` nor `Backpressure`) fails closed via the new
+`RouteSource::ProtocolError { received }` variant, which `route_once` maps to
+`DeniedRequest::ProtocolError { received }`. The added behavior corresponds to
+fork commit `e06cc1308` (Race Site 12 + unexpected-variant regression); tests
+`route_and_connect_post_admit_stream_eof_fires_mark_free_then_denies_unreachable`
+and
+`route_and_connect_unexpected_response_variant_fires_mark_free_then_denies_protocol_error`
+guard the invariant.
+
+Guidance for future versions: prefer copying this module forward 1:1 from
+the prior fork release (or from a future upstream equivalent, when one exists)
+and avoid introducing bespoke Baseten-only changes inside `b10_client/`. The
+goal is to keep the module maintainable 1:1 with future Dynamo releases so an
+upgrade can be a near-verbatim copy plus test refresh, not a hand-port. If a
+behavior change is unavoidable, prefer adding it at a trait boundary the
+upstream client already exposes (e.g. the `Router` trait, `GuardMark`, or the
+`route_once` -> `DeniedRequest` mapping) rather than inside the
+admission/cleanup state machine itself.
+
 Validation:
 
 Compile Python bindings, import `dynamo.runtime`, validate type stubs, and run

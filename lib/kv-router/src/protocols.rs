@@ -458,6 +458,8 @@ pub enum RouterRequest {
     },
     PotentialLoads {
         tokens: Vec<Token>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
     },
 }
 
@@ -1525,9 +1527,9 @@ mod tests {
             request,
             RouterRequest::New {
                 tokens,
-                do_not_queue,
+                do_not_queue: false,
                 ..
-            } if tokens == vec![1, 2, 3] && !do_not_queue
+            } if tokens == vec![1, 2, 3]
         ));
     }
 
