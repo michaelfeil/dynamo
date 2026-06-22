@@ -78,6 +78,7 @@ struct RouterGuardClientForTesting {
     auto_remove_on_error: AtomicBool,
     stream_items_polled: Arc<AtomicUsize>,
     open_delay: Mutex<Duration>,
+    prefill_callback_delay: Mutex<Duration>,
     calls: Mutex<Vec<(u64, serde_json::Value)>>,
     detailed_calls: Mutex<Vec<DetailedCall>>,
 }
@@ -102,6 +103,7 @@ impl RouterGuardClientForTesting {
             auto_remove_on_error: AtomicBool::new(false),
             stream_items_polled: Arc::new(AtomicUsize::new(0)),
             open_delay: Mutex::new(Duration::ZERO),
+            prefill_callback_delay: Mutex::new(Duration::ZERO),
             calls: Mutex::new(Vec::new()),
             detailed_calls: Mutex::new(Vec::new()),
         })
@@ -115,6 +117,9 @@ impl RouterGuardClientForTesting {
     }
     fn set_open_delay(&self, delay: Duration) {
         *self.open_delay.lock().unwrap() = delay;
+    }
+    fn set_prefill_callback_delay(&self, delay: Duration) {
+        *self.prefill_callback_delay.lock().unwrap() = delay;
     }
     fn set_stream_chunks(&self, chunks: Vec<Vec<serde_json::Value>>) {
         *self.stream_chunks_queue.lock().unwrap() = Some(chunks.into());
@@ -208,6 +213,14 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         // shared fake would starve). The wire form carries the
         // success tag the cleanup task checks for.
         if method == "mark_free" || method == "mark_prefill" {
+            let callback_delay = if method == "mark_prefill" {
+                *self.prefill_callback_delay.lock().unwrap()
+            } else {
+                Duration::ZERO
+            };
+            if callback_delay > Duration::ZERO {
+                tokio::time::sleep(callback_delay).await;
+            }
             let resp = if method == "mark_free" {
                 RsRouterResponse::FreeMarked { success: true }
             } else {
@@ -220,7 +233,7 @@ impl RouterGuardClient for RouterGuardClientForTesting {
             self.detailed_calls.lock().unwrap().push(DetailedCall {
                 instance_id,
                 method,
-                observed_pause: false,
+                observed_pause: callback_delay > Duration::ZERO,
                 completed: true,
             });
             return Ok(stream);
@@ -361,6 +374,7 @@ async fn route(
         None,
         require,
         notify_timeout,
+        false,
     )
     .await
     .unwrap()
@@ -687,6 +701,7 @@ async fn connect(
         max_reroutes,
         allow_cancel_setup,
         notify_timeout,
+        false,
     )
     .await
 }
@@ -1096,8 +1111,8 @@ async fn route_and_connect_require_available_goes_down_post_route_returns_denied
 async fn route_and_connect_preflight_overflow_returns_next_router_backpressure() {
     // Prefill tokens sum (10_000) exceed the prefill_tokens_threshold (1_000)
     // -> evaluate_potential_loads returns Some(NextRouterBackpressureInfo).
-    // The route succeeds in parallel (New{1}) -> the post-route
-    // preflight_res check (Ok(Some(info))) yields Denied::NextRouterBackpressure.
+    // The potential-loads preflight runs before the route, so the route request
+    // is never sent and there is no routed guard to free.
     // The other thresholds are set high so only prefill trips.
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
@@ -1150,12 +1165,12 @@ async fn route_and_connect_preflight_overflow_returns_next_router_backpressure()
         other => panic!("expected Denied(NextRouterBackpressure), got {:?}", other),
     }
 
-    // Preflight ran on next; never reached the worker; guard drop fires
-    // mark_free on the routing router.
+    // Preflight ran on next; route and worker were never reached, so no routed
+    // guard exists and no mark_free is sent.
     assert_eq!(next.method_call_count("potential_loads"), 1);
+    assert_eq!(router.method_call_count("new"), 0);
+    assert_eq!(router.method_call_count("mark_free"), 0);
     assert_eq!(worker.method_call_count("generate"), 0);
-    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
-    assert_eq!(router.method_call_count("mark_free"), 1);
 }
 
 #[tokio::test]
@@ -1220,11 +1235,8 @@ async fn route_and_connect_preflight_thresholds_zero_disables_preflight() {
 #[tokio::test]
 async fn route_and_connect_preflight_unreachable_returns_next_router_unreachable() {
     // Preflight router fake has NO available instances -> query_potential_loads
-    // bails with "no router instances available...". Route succeeds in
-    // parallel (New{1}); the post-route preflight_res check (Some(Err))
-    // fires Denied::NextRouterUnreachable -- the error is the preflight's
-    // own "no router instances..." bail, NOT the route_err (route
-    // succeeded).
+    // bails with "no router instances available...". Because preflight is
+    // sequential, the route request is never sent.
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
     let next = RouterGuardClientForTesting::new(vec![], vec![], vec![]);
@@ -1269,10 +1281,11 @@ async fn route_and_connect_preflight_unreachable_returns_next_router_unreachable
     }
 
     // Preflight was attempted but never made a direct() call (empty
-    // instance set bails before the loop); worker was never called.
+    // instance set bails before the loop); route and worker were never called.
     assert_eq!(next.method_call_count("potential_loads"), 0);
+    assert_eq!(router.method_call_count("new"), 0);
+    assert_eq!(router.method_call_count("mark_free"), 0);
     assert_eq!(worker.method_call_count("generate"), 0);
-    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
 }
 
 #[tokio::test]
@@ -1592,6 +1605,65 @@ async fn route_and_connect_lifecycle_mark_prefill_then_mark_free_order() {
 }
 
 #[tokio::test]
+async fn route_and_connect_mark_free_preempts_in_flight_mark_prefill() {
+    // A slow/stuck mark_prefill callback must not delay freeing the router slot.
+    // The cleanup task should abandon the prefill future as soon as mark_free is
+    // requested and send mark_free immediately.
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    router.set_prefill_callback_delay(Duration::from_secs(5));
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    let context = build_test_context("test-prefill-preempted-by-free");
+
+    let outcome = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-prefill-preempted-by-free",
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("ok");
+
+    let (guard, _worker_id, _stream) = match outcome {
+        RouteAndConnectOutcome::Connected {
+            guard,
+            worker_id,
+            stream,
+        } => (guard, worker_id, stream),
+        other => panic!("expected Connected, got {:?}", other),
+    };
+
+    guard.mark_prefill();
+    wait_for_call_count(&router, 2).await;
+    assert_eq!(router.calls()[1].1["method"], "mark_prefill");
+
+    guard.mark_free();
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_millis(250)).await;
+    drop(guard);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let completed_methods: Vec<String> = router
+        .detailed_calls()
+        .iter()
+        .map(|c| c.method.clone())
+        .collect();
+    assert_eq!(
+        completed_methods,
+        vec!["new".to_string(), "mark_free".to_string()],
+        "completed lifecycle methods, got {:?}",
+        completed_methods
+    );
+    assert_eq!(router.method_call_count("mark_prefill"), 0);
+    assert_eq!(router.method_call_count("mark_free"), 1);
+}
+
+#[tokio::test]
 async fn route_and_connect_detached_setup_completes_after_outer_abort() {
     // allow_cancel_setup=false -> connect_worker wraps the worker open
     // in shield_to_completion: a tokio::spawn runs the worker's direct()
@@ -1683,6 +1755,7 @@ async fn shield_route_and_connect_no_taker_drains_connected_worker_stream() {
         0,
         false,
         Duration::from_secs(60),
+        false,
     );
     let task = tokio::spawn(async move { shield_route_and_connect(route_fut).await });
 

@@ -455,6 +455,7 @@ class RouterWorkerCoordinator:
             annotated: bool | None = False,
             cancellation: CancellationPolicy = CancellationPolicy.Cancellable,
             max_reroutes: int = 1,
+            tracing_enabled: bool = False,
         ) -> AdmittedRequest | DeniedRequest:
         """
         Route a KV-router ``new`` request, then generate on the routed worker.
@@ -475,20 +476,26 @@ class RouterWorkerCoordinator:
         When ``potential_loads_next_check`` is given, a *potential loads*
         preflight queries the *downstream* ``client`` it carries (another router,
         e.g. the next router in a disagg-prefill topology -- distinct from the
-        routing router) for the aggregated worker loads *in parallel* with the
-        route (on the first attempt only -- a stale-route reroute does not
+        routing router) for the aggregated worker loads before sending the route
+        request (on the first attempt only -- a stale-route reroute does not
         change the downstream router's loads) and denies the request when they
-        exceed the configured thresholds. The preflight is part of the
-        ``routing`` phase, so it is shielded when the policy detaches routing
-        (e.g. ``CancellationPolicy.FullyDetached``).
+        exceed the configured thresholds. This is deliberately sequential so a
+        preflight denial does not leave a newly routed request to free. The
+        preflight is part of the ``routing`` phase, so it is shielded when the
+        policy detaches routing (e.g. ``CancellationPolicy.FullyDetached``).
 
-        The route, the ``require_available`` check, and (on the first attempt
-        only) the ``potential_loads_next_check`` preflight run in *parallel*; a
-        short post-route re-check repeats the ``require_available`` lookup. A
+        The ``require_available`` check runs before routing, the first-attempt
+        ``potential_loads_next_check`` preflight runs next, then the route is sent
+        only if both pass. A short post-route re-check repeats the
+        ``require_available`` lookup. A
         routed worker that turns out to be stale (its etcd entry was removed
         after the router chose it) is re-routed, bounded by ``max_reroutes``
         (the initial attempt plus up to ``max_reroutes`` reroutes); exhausting
         the bound returns ``DeniedRequest::NextRouterUnreachable``.
+
+        ``tracing_enabled`` emits route/preflight step breadcrumbs with whether a
+        trace context is available. Slow potential-load checks still warn
+        regardless of this flag.
 
         ``cancellation`` (a :class:`CancellationPolicy`, default
         ``CancellationPolicy.Cancellable``) selects which of three phases — the
@@ -636,8 +643,8 @@ class RouterCoordinatorPotentialLoadsCheck:
 
     The ``client`` is required: it is the downstream router whose loads are
     checked. The overlap-aware ``block_mm_infos`` conditioning the reported loads
-    is passed as a first-class argument to ``route_and_worker`` (shared by the
-    route and the preflight), not on this check. Defaults:
+    lives on ``PyRouterRequestNew`` (shared by the route and the preflight), not
+    on this check. Defaults:
     ``queue_depth_threshold=0`` (disabled), ``prefill_tokens_threshold=1_000_000``,
     ``decode_blocks_threshold=16_000_000``.
     """

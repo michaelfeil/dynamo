@@ -105,11 +105,16 @@ impl RouterWorkerCoordinator {
     /// When `potential_loads_next_check` is given, a *potential loads* preflight
     /// queries the *downstream* `client` it carries (another router, e.g. the
     /// next router in a disagg-prefill topology -- distinct from the routing
-    /// router) for the aggregated worker loads *in parallel* with the route
+    /// router) for the aggregated worker loads before the route request is sent
     /// (on the first attempt only -- a stale-route reroute does not change the
     /// downstream router's loads) and denies the request when they exceed the
-    /// configured thresholds. The preflight is part of the `routing` phase, so
-    /// it is shielded when `cancellation.allow_cancel_routing()` is false.
+    /// configured thresholds. This is deliberately sequential so a preflight
+    /// denial does not leave a newly routed request to free. The preflight is part
+    /// of the `routing` phase, so it is shielded when
+    /// `cancellation.allow_cancel_routing()` is false.
+    /// `tracing_enabled=true` emits route/preflight step breadcrumbs with whether
+    /// a trace context is available; slow potential-load checks still warn
+    /// regardless of this flag.
     ///
     /// Returns a [`AdmittedRequest`] on a successful route (with the worker
     /// generation stream, the lifecycle guard, and the chosen `worker_id`) or a
@@ -124,7 +129,7 @@ impl RouterWorkerCoordinator {
     /// callbacks to the router. A non-stale worker-open failure (or a
     /// non-object `worker_args`) IS raised, not returned as a `DeniedRequest`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1))]
+    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false))]
     fn route_and_worker<'p>(
         &self,
         py: Python<'p>,
@@ -136,6 +141,7 @@ impl RouterWorkerCoordinator {
         annotated: Option<bool>,
         cancellation: CancellationPolicy,
         max_reroutes: u64,
+        tracing_enabled: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
         let annotated = annotated.unwrap_or(false);
         let allow_cancel_routing = cancellation.allow_cancel_routing();
@@ -264,9 +270,9 @@ impl RouterWorkerCoordinator {
                 Arc::new(JsonRouterGuardClient::new(worker_router));
 
             // --- Route + connect phase (routing shield) ---
-            // The whole loop -- `route_once` running the `new` route, the
-            // `require_available` check, and (on the first attempt only) the
-            // `potential_loads_next_check` preflight in parallel, plus a
+            // The whole loop -- `route_once` running the `require_available`
+            // check, then (on the first attempt only) the sequential
+            // `potential_loads_next_check` preflight, then the `new` route and
             // post-route `require_available` re-check, then `connect_worker`
             // opening the worker stream and re-routing on a stale worker up to
             // `max_reroutes` -- is the `routing` phase. When the caller disallows
@@ -290,6 +296,7 @@ impl RouterWorkerCoordinator {
                 max_reroutes,
                 allow_cancel_setup,
                 ROUTER_GUARD_NOTIFY_TIMEOUT,
+                tracing_enabled,
             );
             let outcome = if allow_cancel_routing {
                 loop_fut.await.map_err(to_pyerr)?

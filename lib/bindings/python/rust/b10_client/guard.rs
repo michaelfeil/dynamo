@@ -7,8 +7,9 @@
 //! always-detached cleanup task on creation when armed (i.e. the route
 //! succeeded). The cleanup task sends `mark_free` (and at most one
 //! `mark_prefill`) to the router, freeing the request on drop or when
-//! `mark_free` is requested, and never emits `mark_prefill` after a free. Held
-//! internally by the Python [`super::types::AdmittedRequest`].
+//! `mark_free` is requested. A free request preempts in-flight prefill marking
+//! best-effort so router-slot cleanup is not stuck behind `mark_prefill`
+//! retries/timeouts. Held internally by the Python [`super::types::AdmittedRequest`].
 //!
 //! Also holds the [`ROUTER_GUARD_ATTEMPTS`] / [`ROUTER_GUARD_RETRY_DELAY`] /
 //! [`ROUTER_GUARD_NOTIFY_TIMEOUT`] timeouts used across the `b10_client`
@@ -42,6 +43,11 @@ pub(super) enum GuardMark {
     Free,
 }
 
+enum GuardMarkSendResult {
+    Sent,
+    PreemptedByFree,
+}
+
 impl GuardMark {
     fn request_method(self) -> &'static str {
         match self {
@@ -56,6 +62,32 @@ impl GuardMark {
             (Self::Free, RsRouterResponse::FreeMarked { success }) => Some(*success),
             _ => None,
         }
+    }
+}
+
+fn guard_free_requested(state: &RouterRequestGuardState) -> bool {
+    state.free_requested.load(Ordering::Acquire) || state.dropped.load(Ordering::Acquire)
+}
+
+async fn wait_for_free_request(state: &RouterRequestGuardState) {
+    loop {
+        if guard_free_requested(state) {
+            return;
+        }
+        state.notify.notified().await;
+    }
+}
+
+fn flatten_guard_callback_timeout(
+    method: &str,
+    result: std::result::Result<Result<()>, tokio::time::error::Elapsed>,
+) -> Result<()> {
+    match result {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "router callback {method} timed out after {}s",
+            ROUTER_GUARD_CALLBACK_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -353,10 +385,14 @@ impl Drop for RouterRequestGuard {
     }
 }
 
-async fn send_router_guard_mark(state: &RouterRequestGuardState, mark: GuardMark) -> Result<()> {
+async fn send_router_guard_mark(
+    state: &RouterRequestGuardState,
+    mark: GuardMark,
+) -> Result<GuardMarkSendResult> {
     let instance_ids =
         callback_router_instance_ids(state.router.as_ref(), state.preferred_instance_id);
     let method = mark.request_method();
+    let preemptible = matches!(mark, GuardMark::Prefill);
     let request = serde_json::json!({
         "method": method,
         "request_id": state.request_id.clone(),
@@ -364,11 +400,28 @@ async fn send_router_guard_mark(state: &RouterRequestGuardState, mark: GuardMark
     let mut last_error = None;
 
     for attempt in 0..ROUTER_GUARD_ATTEMPTS {
+        if preemptible && guard_free_requested(state) {
+            return Ok(GuardMarkSendResult::PreemptedByFree);
+        }
+
         if attempt > 0 {
-            tokio::time::sleep(ROUTER_GUARD_RETRY_DELAY).await;
+            if preemptible {
+                tokio::select! {
+                    _ = tokio::time::sleep(ROUTER_GUARD_RETRY_DELAY) => {}
+                    _ = wait_for_free_request(state) => {
+                        return Ok(GuardMarkSendResult::PreemptedByFree);
+                    }
+                }
+            } else {
+                tokio::time::sleep(ROUTER_GUARD_RETRY_DELAY).await;
+            }
         }
 
         for &instance_id in &instance_ids {
+            if preemptible && guard_free_requested(state) {
+                return Ok(GuardMarkSendResult::PreemptedByFree);
+            }
+
             let request_ctx = RsContext::with_id_and_metadata(
                 request.clone(),
                 state.request_id.clone(),
@@ -405,12 +458,20 @@ async fn send_router_guard_mark(state: &RouterRequestGuardState, mark: GuardMark
             // in-flight future is aborted, the attempt is recorded as an
             // error so the outer 2x attempt loop can re-try, and a warning
             // is logged via the existing per-attempt `warn!` below.
-            let result = match tokio::time::timeout(ROUTER_GUARD_CALLBACK_TIMEOUT, result).await {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!(
-                    "router callback {method} timed out after {}s",
-                    ROUTER_GUARD_CALLBACK_TIMEOUT.as_secs()
-                )),
+            let result = if preemptible {
+                tokio::select! {
+                    result = tokio::time::timeout(ROUTER_GUARD_CALLBACK_TIMEOUT, result) => {
+                        flatten_guard_callback_timeout(method, result)
+                    }
+                    _ = wait_for_free_request(state) => {
+                        return Ok(GuardMarkSendResult::PreemptedByFree);
+                    }
+                }
+            } else {
+                flatten_guard_callback_timeout(
+                    method,
+                    tokio::time::timeout(ROUTER_GUARD_CALLBACK_TIMEOUT, result).await,
+                )
             };
 
             match result {
@@ -424,7 +485,7 @@ async fn send_router_guard_mark(state: &RouterRequestGuardState, mark: GuardMark
                             "router request guard callback succeeded via fallback router"
                         );
                     }
-                    return Ok(());
+                    return Ok(GuardMarkSendResult::Sent);
                 }
                 Err(err) => {
                     last_error = Some(err.to_string());
@@ -461,10 +522,7 @@ async fn router_request_guard_cleanup(
             break;
         }
 
-        let free_requested =
-            state.free_requested.load(Ordering::Acquire) || state.dropped.load(Ordering::Acquire);
-
-        if free_requested {
+        if guard_free_requested(&state) {
             let free_result = send_router_guard_mark(&state, GuardMark::Free).await;
             if let Err(err) = free_result {
                 tracing::error!(
@@ -479,9 +537,10 @@ async fn router_request_guard_cleanup(
 
         if state.prefill_requested.load(Ordering::Acquire) && !prefill_sent && !prefill_attempted {
             prefill_attempted = true;
-            prefill_sent = send_router_guard_mark(&state, GuardMark::Prefill)
-                .await
-                .is_ok();
+            prefill_sent = matches!(
+                send_router_guard_mark(&state, GuardMark::Prefill).await,
+                Ok(GuardMarkSendResult::Sent)
+            );
             continue;
         }
 

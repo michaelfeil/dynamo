@@ -327,8 +327,8 @@ pub(crate) enum DeniedRequest {
 /// The `client` is REQUIRED: it is the downstream router whose loads are checked
 /// (this is distinct from the routing router the coordinator routes through).
 /// The overlap-aware `block_mm_infos` conditioning the reported loads is passed
-/// as a first-class argument to `route_and_worker` (and is shared by the route
-/// and the preflight), not on this check. Defaults:
+/// on `PyRouterRequestNew` (and is shared by the route and the preflight), not on
+/// this check. Defaults:
 /// `queue_depth_threshold=0` (disabled), `prefill_tokens_threshold=1_000_000`,
 /// `decode_blocks_threshold=16_000_000`.
 #[pyclass]
