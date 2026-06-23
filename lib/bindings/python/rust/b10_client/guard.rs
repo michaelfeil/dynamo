@@ -12,6 +12,7 @@
 //! retries/timeouts. Held internally by the Python [`super::types::AdmittedRequest`].
 //!
 //! Also holds the [`ROUTER_GUARD_ATTEMPTS`] / [`ROUTER_GUARD_RETRY_DELAY`] /
+//! [`ROUTER_GUARD_CLEANUP_GRACE_PERIOD`] /
 //! [`ROUTER_GUARD_NOTIFY_TIMEOUT`] timeouts used across the `b10_client`
 //! submodules.
 
@@ -28,6 +29,7 @@ use super::coordinator::{RouterGuardClient, callback_router_instance_ids, first_
 
 pub(super) const ROUTER_GUARD_ATTEMPTS: usize = 2;
 pub(super) const ROUTER_GUARD_RETRY_DELAY: Duration = Duration::from_millis(50);
+pub(super) const ROUTER_GUARD_CLEANUP_GRACE_PERIOD: Duration = Duration::from_millis(500);
 pub(super) const ROUTER_GUARD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Per-attempt cap on a single `mark_prefill` / `mark_free` callback to an
 /// instance of the KV router. When the cap fires the in-flight future is
@@ -367,7 +369,7 @@ impl RouterRequestGuard {
             Err(_) => {
                 tracing::warn!(
                     request_id = %self.state.request_id,
-                    timeout_secs = timeout.as_secs(),
+                    timeout_ms = timeout.as_millis(),
                     "router request guard cleanup did not complete within timeout; proceeding anyway"
                 );
             }
@@ -378,6 +380,27 @@ impl RouterRequestGuard {
 impl Drop for RouterRequestGuard {
     fn drop(&mut self) {
         if self.armed && !self.state.cleanup_done.load(Ordering::Acquire) {
+            let prefill_requested = self.state.prefill_requested.load(Ordering::Acquire);
+            let free_requested = self.state.free_requested.load(Ordering::Acquire);
+            if free_requested {
+                tracing::debug!(
+                    request_id = %self.state.request_id,
+                    endpoint = %self.state.router.endpoint_id(),
+                    preferred_router_instance_id = self.state.preferred_instance_id,
+                    prefill_requested,
+                    free_requested,
+                    "router request guard dropped after explicit free request; ensuring cleanup"
+                );
+            } else {
+                tracing::warn!(
+                    request_id = %self.state.request_id,
+                    endpoint = %self.state.router.endpoint_id(),
+                    preferred_router_instance_id = self.state.preferred_instance_id,
+                    prefill_requested,
+                    free_requested,
+                    "router request guard dropped while still armed; requesting mark_free"
+                );
+            }
             self.state.dropped.store(true, Ordering::Release);
             self.state.free_requested.store(true, Ordering::Release);
             self.state.notify.notify_one();
@@ -454,24 +477,61 @@ async fn send_router_guard_mark(
             }
             .instrument(span);
 
-            // Bound each per-instance callback attempt. On timeout the
-            // in-flight future is aborted, the attempt is recorded as an
-            // error so the outer 2x attempt loop can re-try, and a warning
-            // is logged via the existing per-attempt `warn!` below.
-            let result = if preemptible {
-                tokio::select! {
-                    result = tokio::time::timeout(ROUTER_GUARD_CALLBACK_TIMEOUT, result) => {
-                        flatten_guard_callback_timeout(method, result)
+            // Bound each per-instance callback attempt with the existing hard
+            // timeout, but warn earlier when cleanup callbacks exceed the
+            // grace period that route_request waits before reusing the same
+            // request_id.
+            let started = tokio::time::Instant::now();
+            let hard_timeout = tokio::time::timeout(ROUTER_GUARD_CALLBACK_TIMEOUT, result);
+            tokio::pin!(hard_timeout);
+            let slow_log = tokio::time::sleep(ROUTER_GUARD_CLEANUP_GRACE_PERIOD);
+            tokio::pin!(slow_log);
+            let mut slow_logged = false;
+            let result = loop {
+                if preemptible {
+                    tokio::select! {
+                        result = &mut hard_timeout => {
+                            break flatten_guard_callback_timeout(method, result);
+                        }
+                        _ = wait_for_free_request(state) => {
+                            return Ok(GuardMarkSendResult::PreemptedByFree);
+                        }
+                        _ = &mut slow_log, if !slow_logged => {
+                            slow_logged = true;
+                            tracing::warn!(
+                                request_id = %state.request_id,
+                                method,
+                                router_instance_id = instance_id,
+                                preferred_router_instance_id = state.preferred_instance_id,
+                                attempt = attempt + 1,
+                                attempts = ROUTER_GUARD_ATTEMPTS,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                threshold_ms = ROUTER_GUARD_CLEANUP_GRACE_PERIOD.as_millis(),
+                                "router request guard callback still pending after cleanup grace period"
+                            );
+                        }
                     }
-                    _ = wait_for_free_request(state) => {
-                        return Ok(GuardMarkSendResult::PreemptedByFree);
+                } else {
+                    tokio::select! {
+                        result = &mut hard_timeout => {
+                            break flatten_guard_callback_timeout(method, result);
+                        }
+                        _ = &mut slow_log, if !slow_logged => {
+                            slow_logged = true;
+                            tracing::warn!(
+                                request_id = %state.request_id,
+                                method,
+                                router_instance_id = instance_id,
+                                preferred_router_instance_id = state.preferred_instance_id,
+                                attempt = attempt + 1,
+                                attempts = ROUTER_GUARD_ATTEMPTS,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                threshold_ms = ROUTER_GUARD_CLEANUP_GRACE_PERIOD.as_millis(),
+                                "router request guard callback still pending after cleanup grace period"
+                            );
+                        }
                     }
                 }
-            } else {
-                flatten_guard_callback_timeout(
-                    method,
-                    tokio::time::timeout(ROUTER_GUARD_CALLBACK_TIMEOUT, result).await,
-                )
             };
 
             match result {

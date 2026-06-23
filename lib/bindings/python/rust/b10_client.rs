@@ -294,6 +294,7 @@ impl RouterWorkerCoordinator {
                 preflight_inputs,
                 worker_request,
                 max_reroutes,
+                allow_cancel_routing,
                 allow_cancel_setup,
                 ROUTER_GUARD_NOTIFY_TIMEOUT,
                 tracing_enabled,

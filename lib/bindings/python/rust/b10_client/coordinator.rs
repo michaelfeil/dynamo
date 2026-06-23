@@ -23,7 +23,8 @@ use dynamo_kv_router::protocols::{
     BlockExtraInfo, RouterBackpressureReason, RouterRequest, RouterResponse as RsRouterResponse,
 };
 use dynamo_runtime::pipeline::{
-    EngineStream, PushRouter, async_trait, context::Context as RsContext,
+    AsyncEngineContextProvider, EngineStream, PushRouter, async_trait,
+    context::Context as RsContext,
 };
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 use futures::StreamExt;
@@ -34,8 +35,8 @@ use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 use super::guard::{
-    ROUTER_GUARD_ATTEMPTS, ROUTER_GUARD_CALLBACK_TIMEOUT, ROUTER_GUARD_RETRY_DELAY,
-    RouterRequestGuard,
+    ROUTER_GUARD_ATTEMPTS, ROUTER_GUARD_CALLBACK_TIMEOUT, ROUTER_GUARD_CLEANUP_GRACE_PERIOD,
+    ROUTER_GUARD_RETRY_DELAY, RouterRequestGuard,
 };
 use super::types::{
     DeniedRequest, MinReplicaAvailable, NextRouterBackpressureInfo, PotentialLoadsCheckData,
@@ -50,6 +51,84 @@ use super::types::{
 type JsonPushRouter = PushRouter<serde_json::Value, RsAnnotated<serde_json::Value>>;
 
 const POTENTIAL_LOADS_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+const ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+const ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+const ROUTE_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(590);
+
+fn create_detached_router_request_context(
+    request: serde_json::Value,
+    parent_ctx: &Option<context::Context>,
+    request_id: &str,
+    follow_parent_cancellation: bool,
+) -> (
+    RsContext<serde_json::Value>,
+    Option<tokio::task::JoinHandle<()>>,
+) {
+    let request_ctx = RsContext::with_id_and_metadata(
+        request,
+        request_id.to_string(),
+        parent_ctx
+            .as_ref()
+            .map(|ctx| ctx.metadata_snapshot())
+            .unwrap_or_default(),
+    );
+
+    let cancellation_forwarder = if follow_parent_cancellation && let Some(parent_ctx) = parent_ctx
+    {
+        let parent = parent_ctx.inner();
+        let route_context = request_ctx.context();
+        if parent.is_killed() {
+            route_context.kill_with_reason(Some("parent_context_already_killed"));
+            None
+        } else if parent.is_stopped() {
+            route_context.stop_generating_with_reason(Some("parent_context_already_stopped"));
+            None
+        } else {
+            let parent_for_kill = parent.clone();
+            let parent_for_stop = parent.clone();
+            let route_for_parent = route_context.clone();
+            let route_for_kill = route_context.clone();
+            let route_for_stop = route_context.clone();
+            let route_for_timeout = route_context.clone();
+            let request_id = request_id.to_string();
+            Some(tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = parent_for_kill.killed() => {
+                        route_for_parent.kill_with_reason(Some("parent_context_killed"));
+                    }
+                    _ = parent_for_stop.stopped() => {
+                        if parent_for_stop.is_killed() {
+                            route_for_parent.kill_with_reason(Some("parent_context_killed"));
+                        } else {
+                            route_for_parent.stop_generating_with_reason(Some("parent_context_stopped"));
+                        }
+                    }
+                    _ = route_for_kill.killed() => {}
+                    _ = route_for_stop.stopped() => {}
+                    _ = tokio::time::sleep(ROUTE_FIRST_RESPONSE_TIMEOUT + Duration::from_secs(1)) => {
+                        tracing::debug!(
+                            request_id = %request_id,
+                            timeout_secs = ROUTE_FIRST_RESPONSE_TIMEOUT.as_secs(),
+                            "detached route context cancellation forwarder expired"
+                        );
+                        route_for_timeout.kill_with_reason(Some("route_context_forwarder_timeout"));
+                    }
+                }
+            }))
+        }
+    } else {
+        None
+    };
+
+    (request_ctx, cancellation_forwarder)
+}
+
+fn abort_cancellation_forwarder(forwarder: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(forwarder) = forwarder.take() {
+        forwarder.abort();
+    }
+}
 
 fn trace_context_available(context: &Option<context::Context>) -> bool {
     context
@@ -90,8 +169,8 @@ pub(super) enum RouteSource {
     /// The router replied with a variant that is not a clean admit (`New`) or
     /// clean denial (`Backpressure`) for a `new` request (e.g. `PrefillMarked`,
     /// `FreeMarked`, `PotentialLoads`). Admission state is ambiguous, so
-    /// `route_request` fails closed -- it drops the provisional guard (whose
-    /// cleanup task fires `mark_free` asynchronously) and surfaces a
+    /// `route_request` fails closed -- it requests `mark_free`, drops the
+    /// provisional guard, and surfaces a
     /// [`DeniedRequest::ProtocolError`] to the caller. Mirrors the stricter
     /// `potential_loads` handling (`PotentialLoadsError::ProtocolError`).
     ProtocolError { received: String },
@@ -158,6 +237,7 @@ impl RouterGuardClient for JsonRouterGuardClient {
 /// components that must have at least one available replica as a preflight;
 /// any of those with zero replicas short-circuits to
 /// [`RouteSource::RequiredDown`] without routing.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn route_request(
     router: Arc<dyn RouterGuardClient>,
     request: serde_json::Value,
@@ -166,6 +246,7 @@ pub(super) async fn route_request(
     require_min1_replica_available: Vec<MinReplicaAvailable>,
     notify_timeout: Duration,
     tracing_enabled: bool,
+    allow_cancel_routing: bool,
 ) -> Result<(RouterRequestGuard, RouteSource)> {
     if let Some((response, name)) =
         min_replica_available_backpressure(&require_min1_replica_available)?
@@ -211,12 +292,16 @@ pub(super) async fn route_request(
 
     let mut last_error = None;
     for attempt in 0..ROUTER_GUARD_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(ROUTER_GUARD_RETRY_DELAY).await;
-        }
-
-        for &instance_id in &instance_ids {
-            let request_ctx = create_request_context(request.clone(), &context);
+        for (instance_index, &instance_id) in instance_ids.iter().enumerate() {
+            let has_more_route_attempts =
+                attempt + 1 < ROUTER_GUARD_ATTEMPTS || instance_index + 1 < instance_ids.len();
+            let (request_ctx, mut cancellation_forwarder) = create_detached_router_request_context(
+                request.clone(),
+                &context,
+                &request_id,
+                allow_cancel_routing,
+            );
+            let route_context = request_ctx.context();
             let span = context
                 .as_ref()
                 .map(|context| {
@@ -234,8 +319,8 @@ pub(super) async fn route_request(
             // response and the cleanup task remains armed (for `New`) or
             // exits immediately (for `Backpressure`). For an unexpected
             // variant (not `New` / `Backpressure`) `route_request` fails
-            // closed -- it drops the provisional guard (firing `mark_free`
-            // via the cleanup task) and surfaces a `RouteSource::ProtocolError`.
+            // closed -- it requests `mark_free`, drops the provisional guard,
+            // and surfaces a `RouteSource::ProtocolError`.
             let provisional_guard = RouterRequestGuard::new_provisional(
                 router.clone(),
                 request_id.clone(),
@@ -246,28 +331,44 @@ pub(super) async fn route_request(
             // Stage 1: open the router stream. An `Err` HERE means the
             // router never admitted the request (clean denial or in-band
             // context cancel): `dismiss` the provisional guard so the
-            // cleanup task exits WITHOUT sending `mark_free`. Preserves the
-            // `route_and_connect_routing_cancelled_in_band_returns_denied_next_router_unreachable`
-            // regression at tests.rs:1251 (asserts `mark_free == 0` after a
-            // context-stop on `direct`).
+            // cleanup task exits WITHOUT sending `mark_free`. The detached
+            // route context is still killed and, when another route attempt
+            // remains, the retry backs off so any queued router coroutine can
+            // observe cancellation before the same request id is reused.
+            let stream_open_started = Instant::now();
             let stream = match router
                 .direct(request_ctx, instance_id)
                 .instrument(span)
                 .await
             {
                 Ok(stream) => {
-                    if tracing_enabled {
+                    let elapsed = stream_open_started.elapsed();
+                    if elapsed >= ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            router_instance_id = instance_id,
+                            attempt = attempt + 1,
+                            attempts = ROUTER_GUARD_ATTEMPTS,
+                            elapsed_ms = elapsed.as_millis(),
+                            threshold_ms = ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD.as_millis(),
+                            "route_request router stream open exceeded expected latency"
+                        );
+                    } else if tracing_enabled {
                         tracing::debug!(
                             request_id = %request_id,
                             router_instance_id = instance_id,
                             attempt = attempt + 1,
                             attempts = ROUTER_GUARD_ATTEMPTS,
+                            elapsed_ms = elapsed.as_millis(),
                             "route_request router stream opened"
                         );
                     }
                     stream
                 }
                 Err(err) => {
+                    let elapsed = stream_open_started.elapsed();
+                    route_context.kill_with_reason(Some("router_direct_failed"));
+                    abort_cancellation_forwarder(&mut cancellation_forwarder);
                     provisional_guard.dismiss();
                     last_error = Some(err.to_string());
                     tracing::warn!(
@@ -275,9 +376,13 @@ pub(super) async fn route_request(
                         router_instance_id = instance_id,
                         attempt = attempt + 1,
                         attempts = ROUTER_GUARD_ATTEMPTS,
+                        elapsed_ms = elapsed.as_millis(),
                         error = %err,
                         "route_request router.direct failed (no admission)"
                     );
+                    if has_more_route_attempts {
+                        tokio::time::sleep(ROUTER_GUARD_CLEANUP_GRACE_PERIOD).await;
+                    }
                     continue;
                 }
             };
@@ -286,30 +391,100 @@ pub(super) async fn route_request(
             // admitted the request internally, so an `Err` here (stream
             // ended before data, decode failure, malformed JSON) is a
             // POST-ADMISSION error: the slot may be reserved on the router.
-            // Drop the provisional guard WITHOUT dismissing it -- the
-            // cleanup task fires `mark_free` asynchronously. The router's
+            // Request `mark_free` before dropping the provisional guard. The
+            // cleanup task sends `mark_free` asynchronously. The router's
             // `ActiveSequencesMultiWorker::free` tolerates spurious
             // `mark_free` for unknown request_ids (idempotent
             // `RequestNotFound` arm at
             // lib/kv-router/src/sequences/multi_worker.rs:482 logs at
-            // debug and returns Ok).
-            let router_response = match first_stream_response(stream).await {
-                Ok(response) => response,
-                Err(err) => {
+            // debug and returns Ok). A first-response timeout additionally
+            // kills the detached route context so the router coroutine is
+            // cancelled instead of only freeing scheduler state.
+            let first_response_started = Instant::now();
+            let router_response = match tokio::time::timeout(
+                ROUTE_FIRST_RESPONSE_TIMEOUT,
+                first_stream_response(stream),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
+                    let elapsed = first_response_started.elapsed();
+                    if elapsed >= ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            router_instance_id = instance_id,
+                            attempt = attempt + 1,
+                            attempts = ROUTER_GUARD_ATTEMPTS,
+                            elapsed_ms = elapsed.as_millis(),
+                            threshold_ms = ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD.as_millis(),
+                            "route_request first router response exceeded expected latency"
+                        );
+                    } else if tracing_enabled {
+                        tracing::debug!(
+                            request_id = %request_id,
+                            router_instance_id = instance_id,
+                            attempt = attempt + 1,
+                            attempts = ROUTER_GUARD_ATTEMPTS,
+                            elapsed_ms = elapsed.as_millis(),
+                            "route_request first router response received"
+                        );
+                    }
+                    response
+                }
+                Ok(Err(err)) => {
                     last_error = Some(err.to_string());
                     tracing::warn!(
                         request_id = %request_id,
                         router_instance_id = instance_id,
                         attempt = attempt + 1,
                         attempts = ROUTER_GUARD_ATTEMPTS,
+                        elapsed_ms = first_response_started.elapsed().as_millis(),
                         error = %err,
                         "route_request post-admission first_stream_response failed; \
-                         dropping provisional guard (cleanup task fires mark_free)"
+                         freeing provisional guard and killing detached route context"
                     );
+                    provisional_guard.mark_free();
+                    route_context.kill_with_reason(Some("router_first_response_failed"));
+                    abort_cancellation_forwarder(&mut cancellation_forwarder);
+                    provisional_guard
+                        .wait_for_cleanup(ROUTER_GUARD_CLEANUP_GRACE_PERIOD)
+                        .await;
                     drop(provisional_guard);
                     continue;
                 }
+                Err(_) => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        router_instance_id = instance_id,
+                        attempt = attempt + 1,
+                        attempts = ROUTER_GUARD_ATTEMPTS,
+                        timeout_secs = ROUTE_FIRST_RESPONSE_TIMEOUT.as_secs(),
+                        elapsed_ms = first_response_started.elapsed().as_millis(),
+                        "route_request timed out waiting for first router response; \
+                         freeing provisional guard, killing detached route context, \
+                         and returning router backpressure"
+                    );
+                    provisional_guard.mark_free();
+                    route_context.kill_with_reason(Some("router_first_response_timeout"));
+                    abort_cancellation_forwarder(&mut cancellation_forwarder);
+                    provisional_guard
+                        .wait_for_cleanup(ROUTER_GUARD_CLEANUP_GRACE_PERIOD)
+                        .await;
+                    drop(provisional_guard);
+                    let response = router_backpressure_response()?;
+                    let guard = RouterRequestGuard::new(
+                        router,
+                        request_id,
+                        instance_id,
+                        response.data,
+                        response.response,
+                        false,
+                        notify_timeout,
+                    );
+                    return Ok((guard, RouteSource::RouterBackpressure));
+                }
             };
+            abort_cancellation_forwarder(&mut cancellation_forwarder);
 
             // Stage 3: dispatch on the decoded router response variant.
             //   `New` => router admitted; commit armed (cleanup stays armed
@@ -318,7 +493,7 @@ pub(super) async fn route_request(
             //   `Backpressure` => clean denial; commit unarmed (cleanup task
             //            exits without sending `mark_free`).
             //   other => protocol error: fail closed. Drop the provisional
-            //            guard (armed cleanup task fires `mark_free`), then
+            //            guard after requesting `mark_free`, then
             //            return an unarmed placeholder guard via the same
             //            `router_backpressure_response` helper used by the
             //            no-instances early-return. `route_once` drops the
@@ -335,9 +510,10 @@ pub(super) async fn route_request(
                     router_instance_id = instance_id,
                     response = ?router_response.response,
                     "route_request got unexpected router response variant \
-                     (expected New or Backpressure); failing closed -- dropping \
-                     provisional guard (cleanup task fires mark_free)"
+                     (expected New or Backpressure); failing closed -- freeing \
+                     provisional guard"
                 );
+                provisional_guard.mark_free();
                 drop(provisional_guard);
                 // `router` and `request_id` are moved (not cloned) because
                 // the immediately-following `return Ok(...)` is the final
@@ -630,6 +806,7 @@ async fn query_potential_loads(
     request_id: &str,
     check: &PotentialLoadsCheckData,
     tracing_enabled: bool,
+    allow_cancel_routing: bool,
 ) -> Result<Option<NextRouterBackpressureInfo>, PotentialLoadsError> {
     let started = Instant::now();
     if tracing_enabled {
@@ -667,7 +844,13 @@ async fn query_potential_loads(
             }
 
             for &instance_id in &instance_ids {
-                let request_ctx = create_request_context(request_value.clone(), &context);
+                let (request_ctx, mut cancellation_forwarder) =
+                    create_detached_router_request_context(
+                        request_value.clone(),
+                        &context,
+                        request_id,
+                        allow_cancel_routing,
+                    );
                 let span = context
                     .as_ref()
                     .map(|ctx| {
@@ -708,6 +891,7 @@ async fn query_potential_loads(
                         result.await
                     }
                 };
+                abort_cancellation_forwarder(&mut cancellation_forwarder);
 
                 match result {
                     Ok(router_stream_response) => {
@@ -847,6 +1031,7 @@ async fn route_once(
     preflight: Option<PreflightInputs>,
     notify_timeout: Duration,
     tracing_enabled: bool,
+    allow_cancel_routing: bool,
 ) -> RouteOnceOutcome {
     log_route_step(tracing_enabled, &context, &request_id, "route_once_start");
 
@@ -880,6 +1065,7 @@ async fn route_once(
             &request_id,
             &check,
             tracing_enabled,
+            allow_cancel_routing,
         )
         .await
         {
@@ -940,6 +1126,7 @@ async fn route_once(
         Vec::new(),
         notify_timeout,
         tracing_enabled,
+        allow_cancel_routing,
     )
     .await;
 
@@ -978,10 +1165,9 @@ async fn route_once(
         }
         // The router replied with a variant that is not a clean admit
         // (`New`) or clean denial (`Backpressure`) for a `new` request.
-        // `route_request` already failed closed (dropped the provisional
-        // guard so the cleanup task fires `mark_free` asynchronously) and
-        // returned an unarmed placeholder guard. Surface the protocol error
-        // to the caller.
+        // `route_request` already failed closed (requested mark_free, dropped
+        // the provisional guard) and returned an unarmed placeholder guard.
+        // Surface the protocol error to the caller.
         Ok((_guard, RouteSource::ProtocolError { received })) => {
             drop(_guard);
             RouteOnceOutcome::Denied(DeniedRequest::ProtocolError { received })
@@ -1206,6 +1392,7 @@ pub(super) async fn route_and_connect(
     mut preflight_inputs: Option<PreflightInputs>,
     worker_request: serde_json::Value,
     max_reroutes: u64,
+    allow_cancel_routing: bool,
     allow_cancel_setup: bool,
     notify_timeout: Duration,
     tracing_enabled: bool,
@@ -1226,6 +1413,7 @@ pub(super) async fn route_and_connect(
             preflight,
             notify_timeout,
             tracing_enabled,
+            allow_cancel_routing,
         )
         .await;
 

@@ -2,7 +2,7 @@ use super::coordinator::{
     RouteAndConnectOutcome, RouteSource, RouterGuardClient, route_and_connect, route_request,
     shield_route_and_connect,
 };
-use super::guard::RouterRequestGuard;
+use super::guard::{ROUTER_GUARD_CLEANUP_GRACE_PERIOD, RouterRequestGuard};
 use super::types::{
     DeniedRequest, MinReplicaAvailable, PotentialLoadsCheckData, PreflightInputs, RouterRequestNew,
 };
@@ -78,7 +78,10 @@ struct RouterGuardClientForTesting {
     auto_remove_on_error: AtomicBool,
     stream_items_polled: Arc<AtomicUsize>,
     open_delay: Mutex<Duration>,
+    first_response_delay: Mutex<Duration>,
     prefill_callback_delay: Mutex<Duration>,
+    mark_free_callback_delay: Mutex<Duration>,
+    route_contexts: Mutex<Vec<Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>>>,
     calls: Mutex<Vec<(u64, serde_json::Value)>>,
     detailed_calls: Mutex<Vec<DetailedCall>>,
 }
@@ -103,7 +106,10 @@ impl RouterGuardClientForTesting {
             auto_remove_on_error: AtomicBool::new(false),
             stream_items_polled: Arc::new(AtomicUsize::new(0)),
             open_delay: Mutex::new(Duration::ZERO),
+            first_response_delay: Mutex::new(Duration::ZERO),
             prefill_callback_delay: Mutex::new(Duration::ZERO),
+            mark_free_callback_delay: Mutex::new(Duration::ZERO),
+            route_contexts: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             detailed_calls: Mutex::new(Vec::new()),
         })
@@ -118,8 +124,14 @@ impl RouterGuardClientForTesting {
     fn set_open_delay(&self, delay: Duration) {
         *self.open_delay.lock().unwrap() = delay;
     }
+    fn set_first_response_delay(&self, delay: Duration) {
+        *self.first_response_delay.lock().unwrap() = delay;
+    }
     fn set_prefill_callback_delay(&self, delay: Duration) {
         *self.prefill_callback_delay.lock().unwrap() = delay;
+    }
+    fn set_mark_free_callback_delay(&self, delay: Duration) {
+        *self.mark_free_callback_delay.lock().unwrap() = delay;
     }
     fn set_stream_chunks(&self, chunks: Vec<Vec<serde_json::Value>>) {
         *self.stream_chunks_queue.lock().unwrap() = Some(chunks.into());
@@ -172,6 +184,9 @@ impl RouterGuardClientForTesting {
     fn stream_items_polled_count(&self) -> usize {
         self.stream_items_polled.load(Ordering::Acquire)
     }
+    fn route_contexts(&self) -> Vec<Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>> {
+        self.route_contexts.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -206,6 +221,9 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         // assert the ATTEMPT happened, even if direct() is subsequently
         // cancelled before pushing a `DetailedCall`.
         self.calls.lock().unwrap().push((instance_id, data.clone()));
+        if method != "mark_free" && method != "mark_prefill" {
+            self.route_contexts.lock().unwrap().push(context.clone());
+        }
 
         // Method-aware fixed acknowledgements for cleanup callbacks:
         // mark_free / mark_prefill MUST NOT consume the scripted
@@ -216,7 +234,7 @@ impl RouterGuardClient for RouterGuardClientForTesting {
             let callback_delay = if method == "mark_prefill" {
                 *self.prefill_callback_delay.lock().unwrap()
             } else {
-                Duration::ZERO
+                *self.mark_free_callback_delay.lock().unwrap()
             };
             if callback_delay > Duration::ZERO {
                 tokio::time::sleep(callback_delay).await;
@@ -312,8 +330,18 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         let stream_result: Result<EngineStream<RsAnnotated<serde_json::Value>>> = match response {
             Ok(resp) => {
                 let data = serde_json::to_value(&resp)?;
-                let stream = stream::iter(vec![RsAnnotated::from_data(data)]);
-                Ok(ResponseStream::new(Box::pin(stream), context))
+                let first_response_delay = *self.first_response_delay.lock().unwrap();
+                let stream: std::pin::Pin<
+                    Box<dyn futures::Stream<Item = RsAnnotated<serde_json::Value>> + Send>,
+                > = if first_response_delay > Duration::ZERO {
+                    Box::pin(stream::once(async move {
+                        tokio::time::sleep(first_response_delay).await;
+                        RsAnnotated::from_data(data)
+                    }))
+                } else {
+                    Box::pin(stream::iter(vec![RsAnnotated::from_data(data)]))
+                };
+                Ok(ResponseStream::new(stream, context))
             }
             Err(err) => {
                 if self.auto_remove_on_error.load(Ordering::Acquire) {
@@ -375,6 +403,7 @@ async fn route(
         require,
         notify_timeout,
         false,
+        true,
     )
     .await
     .unwrap()
@@ -686,6 +715,7 @@ async fn connect(
     preflight_inputs: Option<PreflightInputs>,
     worker_request: serde_json::Value,
     max_reroutes: u64,
+    allow_cancel_routing: bool,
     allow_cancel_setup: bool,
     notify_timeout: Duration,
 ) -> Result<RouteAndConnectOutcome> {
@@ -699,6 +729,7 @@ async fn connect(
         preflight_inputs,
         worker_request,
         max_reroutes,
+        allow_cancel_routing,
         allow_cancel_setup,
         notify_timeout,
         false,
@@ -792,6 +823,7 @@ async fn route_and_connect_happy_router_response_inject_and_mark_free_on_drop() 
         make_worker_request(),
         0,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -844,6 +876,7 @@ async fn route_and_connect_proactive_stale_reroutes_then_connects() {
         make_worker_request(),
         1,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -890,6 +923,7 @@ async fn route_and_connect_stale_loop_exhausted_returns_next_router_unreachable(
         None,
         make_worker_request(),
         1,
+        true,
         true,
         Duration::from_secs(60),
     )
@@ -943,6 +977,7 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
         make_worker_request(),
         1,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -988,6 +1023,7 @@ async fn route_and_connect_non_stale_open_error_raises_and_frees_guard() {
         make_worker_request(),
         0,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -1030,6 +1066,7 @@ async fn route_and_connect_router_backpressure_returns_denied() {
         make_worker_request(),
         0,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -1051,6 +1088,140 @@ async fn route_and_connect_router_backpressure_returns_denied() {
     // Unarmed guard -- cleanup task was NOT spawned, so no mark_free.
     assert_eq!(router.method_call_count("mark_free"), 0);
     assert_eq!(worker.method_call_count("generate"), 0);
+}
+
+#[tokio::test]
+async fn route_request_parent_kill_kills_detached_route_context_when_cancellable() {
+    async fn wait_for_context_killed(
+        context: Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>,
+        timeout: Duration,
+    ) {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if context.is_killed() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for context to be killed");
+    }
+
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    router.set_open_delay(Duration::from_millis(200));
+    let context = build_test_context("test-route-parent-kill");
+
+    let route_task = tokio::spawn(route_request(
+        router.clone(),
+        make_routing_request(),
+        "req-route-parent-kill".to_string(),
+        Some(context.clone()),
+        Vec::new(),
+        Duration::from_secs(60),
+        false,
+        true,
+    ));
+
+    wait_for_call_count(&router, 1).await;
+    let route_contexts = router.route_contexts();
+    assert_eq!(route_contexts.len(), 1);
+    assert!(!route_contexts[0].is_killed());
+
+    context
+        .inner()
+        .kill_with_reason(Some("test_parent_context_killed"));
+    wait_for_context_killed(route_contexts[0].clone(), Duration::from_secs(1)).await;
+
+    let (guard, source) = route_task
+        .await
+        .expect("route task should not panic")
+        .expect("fake route still returns its scripted response");
+    assert!(matches!(source, RouteSource::Routed { worker_id: 1 }));
+    drop(guard);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn route_request_success_aborts_parent_cancellation_forwarder() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let context = build_test_context("test-route-forwarder-abort");
+
+    let (guard, source) = route_request(
+        router.clone(),
+        make_routing_request(),
+        "req-route-forwarder-abort".to_string(),
+        Some(context),
+        Vec::new(),
+        Duration::from_secs(60),
+        false,
+        true,
+    )
+    .await
+    .expect("route should succeed");
+    assert!(matches!(source, RouteSource::Routed { worker_id: 1 }));
+
+    let route_contexts = router.route_contexts();
+    assert_eq!(route_contexts.len(), 1);
+    assert!(!route_contexts[0].is_killed());
+
+    tokio::time::sleep(Duration::from_secs(592)).await;
+    assert!(
+        !route_contexts[0].is_killed(),
+        "successful route should abort its cancellation forwarder"
+    );
+
+    drop(guard);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn route_and_connect_first_response_timeout_kills_route_context_and_backpressures() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    router.set_first_response_delay(Duration::from_secs(600));
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    let context = build_test_context("test-first-response-timeout");
+
+    let outcome = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-first-response-timeout",
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("timeout maps to router backpressure, not an error");
+
+    match outcome {
+        RouteAndConnectOutcome::Denied(DeniedRequest::RouterBackpressure {
+            reason,
+            queued_isl_tokens,
+            max_queued_isl_tokens,
+        }) => {
+            assert_eq!(reason, "do_not_queue");
+            assert_eq!(queued_isl_tokens, 0);
+            assert_eq!(max_queued_isl_tokens, None);
+        }
+        other => panic!("expected Denied(RouterBackpressure), got {:?}", other),
+    }
+
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(router.method_call_count("mark_free"), 1);
+    assert_eq!(worker.method_call_count("generate"), 0);
+
+    let route_contexts = router.route_contexts();
+    assert_eq!(route_contexts.len(), 1);
+    assert!(
+        route_contexts[0].is_killed(),
+        "timeout should kill the detached route context"
+    );
 }
 
 #[tokio::test]
@@ -1085,6 +1256,7 @@ async fn route_and_connect_require_available_goes_down_post_route_returns_denied
         None,
         make_worker_request(),
         0,
+        true,
         true,
         Duration::from_secs(60),
     )
@@ -1144,6 +1316,7 @@ async fn route_and_connect_preflight_overflow_returns_next_router_backpressure()
         Some(preflight_inputs),
         make_worker_request(),
         0,
+        true,
         true,
         Duration::from_secs(60),
     )
@@ -1214,6 +1387,7 @@ async fn route_and_connect_preflight_thresholds_zero_disables_preflight() {
         make_worker_request(),
         0,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -1228,6 +1402,135 @@ async fn route_and_connect_preflight_thresholds_zero_disables_preflight() {
     // the route succeeded; the worker's direct opened.
     assert_eq!(next.method_call_count("potential_loads"), 1);
     assert_eq!(worker.method_call_count("generate"), 1);
+    drop(outcome);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn route_and_connect_preflight_follows_cancellable_routing_policy() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    let next = RouterGuardClientForTesting::new(
+        vec![9],
+        vec![9],
+        vec![potential_loads_response(1, 1, 0, 0)],
+    );
+    next.set_respect_cancel(CancelRespect::Yes);
+    let context = build_test_context("test-preflight-cancellable-routing");
+    context.inner().stop_generating();
+
+    let preflight_inputs = PreflightInputs {
+        check: PotentialLoadsCheckData {
+            router: next.clone(),
+            queue_depth_threshold: 100,
+            prefill_tokens_threshold: 100,
+            decode_blocks_threshold: 100,
+        },
+        tokens: vec![1],
+        block_mm_infos: None,
+    };
+
+    let outcome = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-pf-cancellable-routing",
+        context,
+        Vec::new(),
+        Some(preflight_inputs),
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("denied, not raised");
+
+    match outcome {
+        RouteAndConnectOutcome::Denied(DeniedRequest::NextRouterUnreachable { error }) => {
+            assert!(
+                error.contains("failed to query potential loads through any KV router"),
+                "error: {}",
+                error
+            );
+            assert!(
+                error.contains("cancelled by context stop"),
+                "error: {}",
+                error
+            );
+        }
+        other => panic!("expected Denied(NextRouterUnreachable), got {:?}", other),
+    }
+
+    assert_eq!(next.calls().len(), 2);
+    assert_eq!(next.method_call_count("potential_loads"), 2);
+    assert_eq!(router.method_call_count("new"), 0);
+    assert_eq!(worker.method_call_count("generate"), 0);
+    let preflight_contexts = next.route_contexts();
+    assert_eq!(preflight_contexts.len(), 2);
+    assert!(preflight_contexts.iter().all(|ctx| ctx.is_stopped()));
+}
+
+#[tokio::test]
+async fn route_and_connect_preflight_detaches_when_routing_cancellation_disabled() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    router.set_respect_cancel(CancelRespect::Yes);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    let next = RouterGuardClientForTesting::new(
+        vec![9],
+        vec![9],
+        vec![potential_loads_response(1, 1, 0, 0)],
+    );
+    next.set_respect_cancel(CancelRespect::Yes);
+    let context = build_test_context("test-preflight-detached-routing");
+    context.inner().stop_generating();
+
+    let preflight_inputs = PreflightInputs {
+        check: PotentialLoadsCheckData {
+            router: next.clone(),
+            queue_depth_threshold: 100,
+            prefill_tokens_threshold: 100,
+            decode_blocks_threshold: 100,
+        },
+        tokens: vec![1],
+        block_mm_infos: None,
+    };
+
+    let outcome = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-pf-detached-routing",
+        context,
+        Vec::new(),
+        Some(preflight_inputs),
+        make_worker_request(),
+        0,
+        false,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("ok");
+
+    match &outcome {
+        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(*worker_id, 1),
+        other => panic!("expected Connected, got {:?}", other),
+    }
+
+    assert_eq!(next.method_call_count("potential_loads"), 1);
+    assert_eq!(router.method_call_count("new"), 1);
+    assert_eq!(worker.method_call_count("generate"), 1);
+    let preflight_contexts = next.route_contexts();
+    assert_eq!(preflight_contexts.len(), 1);
+    assert!(!preflight_contexts[0].is_stopped());
+    assert!(!preflight_contexts[0].is_killed());
+    let route_contexts = router.route_contexts();
+    assert_eq!(route_contexts.len(), 1);
+    assert!(!route_contexts[0].is_stopped());
+    assert!(!route_contexts[0].is_killed());
+
     drop(outcome);
     wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
 }
@@ -1264,6 +1567,7 @@ async fn route_and_connect_preflight_unreachable_returns_next_router_unreachable
         make_worker_request(),
         0,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -1288,24 +1592,21 @@ async fn route_and_connect_preflight_unreachable_returns_next_router_unreachable
     assert_eq!(worker.method_call_count("generate"), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn route_and_connect_routing_cancelled_in_band_returns_denied_next_router_unreachable() {
     // Stop the parent context BEFORE awaiting route_and_connect. Each
-    // route attempt create_request_context links the child and -- seeing
-    // the parent already stopped -- stops the child immediately; the
-    // router fake's respect_cancel=Yes short-circuits direct() to
-    // Err("cancelled by context stop"). Both ROUTER_GUARD_ATTEMPTS=2
-    // attempts fail -> route_request returns Err("failed to route
-    // request through any KV router: ...") -> route_once wraps as
-    // Denied::NextRouterUnreachable (NOT raised): no preflight, no
-    // require, so the final Err-arm falls through to the route_err.
+    // detached route attempt copies that already-stopped state onto its
+    // request context, so the router fake's respect_cancel=Yes short-circuits
+    // direct() to Err("cancelled by context stop"). Failed setup kills that
+    // detached route context and backs off before the retry.
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     router.set_respect_cancel(CancelRespect::Yes);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
     let context = build_test_context("test-routing-cancel");
-    // Stop BEFORE the await so the linked child is stopped at link time.
+    // Stop BEFORE the await so each detached route context starts stopped.
     context.inner().stop_generating();
 
+    let started = tokio::time::Instant::now();
     let outcome = connect(
         router.clone(),
         worker.clone(),
@@ -1316,6 +1617,7 @@ async fn route_and_connect_routing_cancelled_in_band_returns_denied_next_router_
         None,
         make_worker_request(),
         0,
+        true,
         true,
         Duration::from_secs(60),
     )
@@ -1341,20 +1643,24 @@ async fn route_and_connect_routing_cancelled_in_band_returns_denied_next_router_
     // Both attempts reached direct (recorded in calls() + detailed_calls),
     // both incomplete; no mark_free (cancelled routes produce no armed
     // guard); no worker direct.
+    assert!(started.elapsed() >= ROUTER_GUARD_CLEANUP_GRACE_PERIOD);
     assert_eq!(router.calls().len(), 2);
     assert_eq!(router.completed_direct_count(), 0);
     assert_eq!(router.method_call_count("mark_free"), 0);
     assert_eq!(worker.method_call_count("generate"), 0);
+    let route_contexts = router.route_contexts();
+    assert_eq!(route_contexts.len(), 2);
+    assert!(route_contexts.iter().all(|ctx| ctx.is_killed()));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn route_and_connect_post_admit_stream_eof_fires_mark_free_then_denies_unreachable() {
     // Race Site 12 regression: `router.direct()` returns Ok(stream) (the
     // router ADMITTED the request internally), but the stream ends before
     // yielding any data -- so `first_stream_response` returns
     // `Err("router response stream ended before data")`. The provisional
-    // guard is dropped WITHOUT dismissing it, so the armed cleanup task
-    // fires `mark_free` (the router's slot is reclaimed). Both
+    // guard requests `mark_free`, kills the detached route context, and waits
+    // for cleanup before the retry can reuse the same request id. Both
     // ROUTER_GUARD_ATTEMPTS=2 attempts hit this path; the loop exhausts and
     // `route_request` returns Err, which `route_once` (no preflight, no
     // require_during) maps to `Denied::NextRouterUnreachable`.
@@ -1364,6 +1670,7 @@ async fn route_and_connect_post_admit_stream_eof_fires_mark_free_then_denies_unr
     // (`router.direct()` returns Err) still `dismiss`es with `mark_free == 0`
     // -- see `route_and_connect_routing_cancelled_in_band_returns_denied_next_router_unreachable`.
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], Vec::new());
+    router.set_mark_free_callback_delay(Duration::from_millis(250));
     // Empty chunk-Vec per direct() -> stream::iter(vec![]) -> first
     // stream.next() is None -> first_stream_response errors. One entry
     // per direct() so the chunks_queue survives both attempts.
@@ -1382,6 +1689,7 @@ async fn route_and_connect_post_admit_stream_eof_fires_mark_free_then_denies_unr
         make_worker_request(),
         0,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -1399,15 +1707,29 @@ async fn route_and_connect_post_admit_stream_eof_fires_mark_free_then_denies_unr
     }
 
     // Both attempts: direct() returned Ok with an empty stream (completed),
-    // the provisional guard was dropped (not dismissed), so the cleanup task
-    // fired `mark_free` asynchronously. Two route direct() calls (method="new")
-    // plus two mark_free callbacks (method="mark_free") = 4 entries with
-    // `completed=true` (the fake logs a `DetailedCall` for both route and
-    // mark_free branches at direct()).
+    // the route context was killed, and mark_free completed before the next
+    // route attempt reused the same request id.
     wait_for_method_call_count(&router, "mark_free", 2, Duration::from_secs(2)).await;
     assert_eq!(router.completed_direct_count(), 4);
     assert_eq!(router.method_call_count("mark_free"), 2);
     assert_eq!(worker.method_call_count("generate"), 0);
+    let methods: Vec<String> = router
+        .detailed_calls()
+        .iter()
+        .map(|c| c.method.clone())
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "new".to_string(),
+            "mark_free".to_string(),
+            "new".to_string(),
+            "mark_free".to_string()
+        ]
+    );
+    let route_contexts = router.route_contexts();
+    assert_eq!(route_contexts.len(), 2);
+    assert!(route_contexts.iter().all(|ctx| ctx.is_killed()));
 }
 
 #[tokio::test]
@@ -1418,9 +1740,9 @@ async fn route_and_connect_unexpected_response_variant_fires_mark_free_then_deni
     // admit (`New`) or clean denial (`Backpressure`). Instead the router
     // returns `FreeMarked` (which is the reply shape for a `mark_free`
     // request, not a `new` request). Admission state is ambiguous -- the
-    // router's contract is broken. `route_request` fails closed: drops the
-    // provisional guard (the armed cleanup task fires `mark_free`
-    // asynchronously), returns an unarmed placeholder guard with
+    // router's contract is broken. `route_request` fails closed: requests
+    // mark_free, drops the provisional guard, returns an unarmed placeholder
+    // guard with
     // `RouteSource::ProtocolError { received }`. `route_once` maps that to
     // `Denied::ProtocolError { received }`. Mirrors the stricter
     // `potential_loads` handling (`PotentialLoadsError::ProtocolError`
@@ -1444,6 +1766,7 @@ async fn route_and_connect_unexpected_response_variant_fires_mark_free_then_deni
         make_worker_request(),
         0,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -1462,10 +1785,9 @@ async fn route_and_connect_unexpected_response_variant_fires_mark_free_then_deni
 
     // One route direct() call (method="new", completed) plus one mark_free
     // callback (method="mark_free", completed) = 2 entries with
-    // `completed=true`. The provisional guard was dropped (not dismissed)
-    // so its armed cleanup task fired mark_free asynchronously; the
-    // placeholder guard is unarmed so its drop is a no-op (no second
-    // mark_free).
+    // `completed=true`. The provisional guard requested mark_free before
+    // drop; the placeholder guard is unarmed so its drop is a no-op (no
+    // second mark_free).
     wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
     assert_eq!(router.completed_direct_count(), 2);
     assert_eq!(router.method_call_count("mark_free"), 1);
@@ -1497,6 +1819,7 @@ async fn route_and_connect_stream_cancelled_in_band_truncates_stream() {
         None,
         make_worker_request(),
         0,
+        true,
         true,
         Duration::from_secs(60),
     )
@@ -1559,6 +1882,7 @@ async fn route_and_connect_lifecycle_mark_prefill_then_mark_free_order() {
         make_worker_request(),
         0,
         true,
+        true,
         Duration::from_secs(60),
     )
     .await
@@ -1604,6 +1928,55 @@ async fn route_and_connect_lifecycle_mark_prefill_then_mark_free_order() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn route_and_connect_slow_mark_free_callback_still_completes_once() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    router.set_mark_free_callback_delay(
+        ROUTER_GUARD_CLEANUP_GRACE_PERIOD + Duration::from_millis(100),
+    );
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    let context = build_test_context("test-slow-mark-free");
+
+    let outcome = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-slow-mark-free",
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("ok");
+
+    let (guard, _worker_id, _stream) = match outcome {
+        RouteAndConnectOutcome::Connected {
+            guard,
+            worker_id,
+            stream,
+        } => (guard, worker_id, stream),
+        other => panic!("expected Connected, got {:?}", other),
+    };
+
+    guard.mark_free();
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    drop(guard);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let methods: Vec<String> = router
+        .detailed_calls()
+        .iter()
+        .map(|c| c.method.clone())
+        .collect();
+    assert_eq!(methods, vec!["new".to_string(), "mark_free".to_string()]);
+    assert_eq!(router.method_call_count("mark_free"), 1);
+}
+
 #[tokio::test]
 async fn route_and_connect_mark_free_preempts_in_flight_mark_prefill() {
     // A slow/stuck mark_prefill callback must not delay freeing the router slot.
@@ -1624,6 +1997,7 @@ async fn route_and_connect_mark_free_preempts_in_flight_mark_prefill() {
         None,
         make_worker_request(),
         0,
+        true,
         true,
         Duration::from_secs(60),
     )
@@ -1695,6 +2069,7 @@ async fn route_and_connect_detached_setup_completes_after_outer_abort() {
             None,
             worker_request,
             0,
+            true,
             false,
             Duration::from_secs(60),
         )
@@ -1754,6 +2129,7 @@ async fn shield_route_and_connect_no_taker_drains_connected_worker_stream() {
         make_worker_request(),
         0,
         false,
+        false,
         Duration::from_secs(60),
         false,
     );
@@ -1802,6 +2178,7 @@ async fn route_and_connect_cancellable_setup_drops_on_outer_abort() {
             None,
             worker_request,
             0,
+            true,
             true,
             Duration::from_secs(60),
         )
