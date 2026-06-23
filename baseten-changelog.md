@@ -674,6 +674,15 @@ Focused validation from the current replay:
 - `cargo test -p dynamo-kv-router test_do_not_queue_backpressures_instead_of_queueing --lib`
 - `cargo test -p dynamo-llm b10_worker_selector --lib`
 
+Upstream sync note:
+
+- ai-dynamo/dynamo#10887 (fix: cancel `RouterRequest::New` while waiting for
+  KV router scheduler admission, closes ai-dynamo/dynamo#10878) has been
+  merged upstream and is folded into this branch. The replay races scheduler
+  selection against `ctx.context().stopped()` / `killed()` and calls
+  `self.free(&context_id)` to release scheduler state before returning a
+  `Cancelled` error.
+
 ## PATCH-005: Router Metrics, Tracing, and Observability
 
 Status: `keep`
