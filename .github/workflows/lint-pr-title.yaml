@@ -12,8 +12,73 @@ jobs:
   conventional-commits:
     name: Validate PR title and add label
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
-      - uses:  ytanikin/pr-conventional-commits@b628c5a234cc32513014b7bfdd1e47b532124d98
+      - uses: actions/github-script@v7
         with:
-          task_types: '["feat", "fix", "docs", "test", "ci", "refactor", "perf", "chore", "revert", "style", "build"]'
-          add_label: 'true'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const allowedTypes = [
+              "feat",
+              "fix",
+              "docs",
+              "test",
+              "ci",
+              "refactor",
+              "perf",
+              "chore",
+              "revert",
+              "style",
+              "build",
+            ];
+            const title = context.payload.pull_request.title.trim();
+            const existingLabels = context.payload.pull_request.labels.map(
+              (label) => label.name,
+            );
+            const conventionalPattern = new RegExp(
+              `^(?<type>${allowedTypes.join("|")})(\\([^)]+\\))?(!)?:\\s+.+$`,
+              "i",
+            );
+
+            let type = conventionalPattern.exec(title)?.groups?.type?.toLowerCase();
+            if (!type && /^revert\b/i.test(title)) {
+              type = "revert";
+            }
+
+            if (!type) {
+              core.setFailed(
+                `Invalid PR title: "${title}". Start the title with one of ` +
+                  `${allowedTypes.join(", ")} (for example: "fix: ..."). ` +
+                  `Revert PR titles that start with "Revert" are also allowed.`,
+              );
+              return;
+            }
+
+            const { data: repoLabels } = await github.rest.issues.listLabelsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const repoLabelNames = new Set(repoLabels.map((label) => label.name));
+
+            if (!repoLabelNames.has(type)) {
+              core.info(
+                `PR title type "${type}" is valid, but no matching repository label exists.`,
+              );
+              return;
+            }
+
+            if (existingLabels.includes(type)) {
+              core.info(`PR already has the "${type}" label.`);
+              return;
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: [type],
+            });
+            core.info(`Added "${type}" label based on the PR title.`);

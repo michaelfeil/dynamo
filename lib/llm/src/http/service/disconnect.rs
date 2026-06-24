@@ -36,7 +36,37 @@ use std::time::Duration;
 
 use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
 
-use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
+use dynamo_runtime::config::environment_names::llm::{
+    DYN_CLIENT_DISCONNECT_BEHAVIOR as CLIENT_DISCONNECT_BEHAVIOR_ENV,
+    DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientDisconnectBehavior {
+    Stop,
+    Kill,
+}
+
+fn client_disconnect_behavior() -> ClientDisconnectBehavior {
+    match std::env::var(CLIENT_DISCONNECT_BEHAVIOR_ENV) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "stop" => ClientDisconnectBehavior::Stop,
+            "kill" => ClientDisconnectBehavior::Kill,
+            _ => panic!("invalid {CLIENT_DISCONNECT_BEHAVIOR_ENV}; expected \"stop\" or \"kill\""),
+        },
+        Err(std::env::VarError::NotPresent) => ClientDisconnectBehavior::Kill,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("invalid {CLIENT_DISCONNECT_BEHAVIOR_ENV}; expected valid unicode")
+        }
+    }
+}
+
+fn cancel_for_client_disconnect(context: &dyn AsyncEngineContext, reason: &'static str) {
+    match client_disconnect_behavior() {
+        ClientDisconnectBehavior::Stop => context.stop_generating_with_reason(Some(reason)),
+        ClientDisconnectBehavior::Kill => context.kill_with_reason(Some(reason)),
+    }
+}
 
 /// Read the backend stream inactivity timeout from the environment.
 /// Returns `None` if unset or zero (timeout disabled).
@@ -152,13 +182,12 @@ async fn connection_monitor(
 ) {
     match connection_rx.await {
         Err(_) | Ok(ConnectionStatus::ClosedUnexpectedly) => {
-            // the client has disconnected, no need to gracefully cancel, just kill the context
             tracing::warn!("Connection closed unexpectedly; issuing cancellation");
             if let Some(metrics) = &metrics {
                 metrics.inc_client_disconnect();
                 metrics.inc_cancellation(&cancellation_labels);
             }
-            engine_context.kill_with_reason(Some("connection_closed_unexpectedly"));
+            cancel_for_client_disconnect(engine_context.as_ref(), "connection_closed_unexpectedly");
         }
         Ok(ConnectionStatus::ClosedGracefully) => {
             tracing::trace!("Connection closed gracefully");
@@ -173,7 +202,7 @@ async fn connection_monitor(
                 metrics.inc_client_disconnect();
                 metrics.inc_cancellation(&cancellation_labels);
             }
-            engine_context.kill_with_reason(Some("stream_closed_unexpectedly"));
+            cancel_for_client_disconnect(engine_context.as_ref(), "stream_closed_unexpectedly");
         }
         Ok(ConnectionStatus::ClosedGracefully) => {
             tracing::trace!("Stream closed gracefully");
@@ -311,12 +340,19 @@ mod tests {
     use crate::http::service::metrics::{Endpoint, ErrorType, RequestType, Status};
     use futures::StreamExt;
     use serial_test::serial;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
-    struct MockContext;
+    struct MockContext {
+        stopped: AtomicUsize,
+        killed: AtomicUsize,
+    }
     impl MockContext {
         fn new() -> Self {
-            Self
+            Self {
+                stopped: AtomicUsize::new(0),
+                killed: AtomicUsize::new(0),
+            }
         }
     }
     #[async_trait::async_trait]
@@ -327,6 +363,12 @@ mod tests {
         fn stop(&self) {}
         fn stop_generating(&self) {}
         fn kill(&self) {}
+        fn stop_generating_with_reason(&self, _: Option<&str>) {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+        }
+        fn kill_with_reason(&self, _: Option<&str>) {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+        }
         fn is_stopped(&self) -> bool {
             false
         }
@@ -387,6 +429,33 @@ mod tests {
 
     fn cleanup_env() {
         unsafe { std::env::remove_var(BACKEND_STREAM_TIMEOUT_ENV) };
+        unsafe { std::env::remove_var(CLIENT_DISCONNECT_BEHAVIOR_ENV) };
+    }
+
+    #[test]
+    #[serial]
+    fn test_client_disconnect_behavior_defaults_to_kill_and_can_stop() {
+        cleanup_env();
+        let ctx = MockContext::new();
+        cancel_for_client_disconnect(&ctx, "test_disconnect");
+        assert_eq!(ctx.stopped.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.killed.load(Ordering::SeqCst), 1);
+
+        unsafe { std::env::set_var(CLIENT_DISCONNECT_BEHAVIOR_ENV, "stop") };
+        cancel_for_client_disconnect(&ctx, "test_disconnect");
+        cleanup_env();
+        assert_eq!(ctx.stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.killed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_client_disconnect_behavior_unknown_value_panics() {
+        cleanup_env();
+        unsafe { std::env::set_var(CLIENT_DISCONNECT_BEHAVIOR_ENV, "pause") };
+        let result = std::panic::catch_unwind(client_disconnect_behavior);
+        cleanup_env();
+        assert!(result.is_err());
     }
 
     /// Zombie backend with hanging stream is terminated by inactivity timeout.

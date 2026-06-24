@@ -277,6 +277,14 @@ The Python `dynamo_worker` decorator also accepts the Baseten
 runtime shutdown hooks. This is a narrow binding compatibility restore rather
 than a broader NATS lifecycle replay.
 
+Baseten can opt frontend client disconnects into stopping the request context
+instead of killing it by setting `DYN_CLIENT_DISCONNECT_BEHAVIOR=stop`. Leaving
+the variable unset preserves the existing hard-kill behavior. Stopping lets
+engines continue their cancellation path long enough to emit billing information
+for cancelled streams and run cleanup/GC for in-flight prefill-decode requests,
+including cases where decode invalidates an RDMA transfer. Unknown values panic
+rather than silently selecting a behavior.
+
 Runtime shutdown Phase 2 now has a Baseten-owned safety cap around the
 graceful endpoint drain wait. If `tracker.wait_for_completion()` does not
 finish, the runtime logs the remaining graceful endpoint count and proceeds to
