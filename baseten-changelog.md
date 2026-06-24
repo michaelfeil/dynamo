@@ -620,6 +620,13 @@ Queue admission fields to replay:
   still comes from `priority_jump` through the queue policy's enqueue key. The
   percent only changes the rejection threshold used when the queue is already
   active and pending-ISL caps are configured.
+- `4d01df101` redefines the unused `b10-fair-wspt` queue policy as a static
+  FCFS policy with bounded missing-prefill credit instead of a dynamic aging
+  WSPT policy. The enqueue score is `priority_jump - arrival_offset + credit`,
+  where credit is `15s` at `0` missing prefill tokens, linearly fades to `0s`
+  at `8192` missing prefill tokens, and remains `0s` beyond that. This keeps
+  the queue non-dynamic, preserves FCFS pressure behavior, and still promotes
+  requests that should have better TTFT because little prefill work remains.
 - Backpressure responses for cap rejection should report the cap that was
   actually applied to that request. For a priority request this means
   `max_queued_isl_tokens` can be the boosted cap, not the base tier cap.

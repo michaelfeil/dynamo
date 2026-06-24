@@ -106,9 +106,8 @@ impl SchedulingPolicy for WsptPolicy {
     }
 }
 
-const B10_FAIR_WSPT_BLEND_SECS: f64 = 15.0;
-const B10_FAIR_WSPT_CREDIT_SCALE_SECS: f64 = 15.0;
-const B10_FAIR_WSPT_REFERENCE_TOKENS: f64 = 1024.0;
+const B10_FAIR_WSPT_MAX_PREFILL_CREDIT_SECS: f64 = 15.0;
+const B10_FAIR_WSPT_ZERO_CREDIT_MISSING_TOKENS: f64 = 8192.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct B10FairWsptKey {
@@ -131,23 +130,26 @@ impl PartialOrd for B10FairWsptKey {
     }
 }
 
-/// B10 fair WSPT hybrid:
-/// FCFS with a bounded WSPT credit that linearly fades to zero over 15s.
+/// FCFS with a bounded missing-prefill credit.
+///
+/// A request with no missing prefill receives 15s of FCFS credit. Requests with
+/// 8192 or more missing prefill tokens receive no credit. Values in between
+/// scale linearly. This preserves FCFS ordering under sustained pressure while
+/// improving median TTFT when little prefill work remains.
 pub struct B10FairWsptPolicy;
 
 impl B10FairWsptPolicy {
     fn key<C: WorkerConfigLike>(
-        now: Duration,
         arrival_offset: Duration,
         ctx: SchedulingContext<'_, C>,
     ) -> B10FairWsptKey {
-        let age_secs = now.saturating_sub(arrival_offset).as_secs_f64().max(0.0);
-        let wspt_weight = (1.0 - age_secs / B10_FAIR_WSPT_BLEND_SECS).clamp(0.0, 1.0);
         let priority_jump = ctx.request().priority_jump.max(0.0);
-        let effective_new_tokens = ctx.best_effective_prefill_tokens().max(1) as f64;
-        let wspt_credit = B10_FAIR_WSPT_CREDIT_SCALE_SECS * B10_FAIR_WSPT_REFERENCE_TOKENS
-            / (B10_FAIR_WSPT_REFERENCE_TOKENS + effective_new_tokens);
-        let score = priority_jump - arrival_offset.as_secs_f64() + wspt_weight * wspt_credit;
+        let missing_prefill_tokens = ctx.best_effective_prefill_tokens() as f64;
+        let prefill_credit_ratio =
+            1.0 - missing_prefill_tokens / B10_FAIR_WSPT_ZERO_CREDIT_MISSING_TOKENS;
+        let prefill_credit =
+            B10_FAIR_WSPT_MAX_PREFILL_CREDIT_SECS * prefill_credit_ratio.clamp(0.0, 1.0);
+        let score = priority_jump - arrival_offset.as_secs_f64() + prefill_credit;
 
         B10FairWsptKey {
             score: OrderedFloat(score),
@@ -159,23 +161,12 @@ impl B10FairWsptPolicy {
 impl SchedulingPolicy for B10FairWsptPolicy {
     type Key = B10FairWsptKey;
 
-    const DYNAMIC: bool = true;
-
     fn enqueue_key<C: WorkerConfigLike>(
         &self,
         arrival_offset: Duration,
         ctx: SchedulingContext<'_, C>,
     ) -> Self::Key {
-        Self::key(arrival_offset, arrival_offset, ctx)
-    }
-
-    fn rekey<C: WorkerConfigLike>(
-        &self,
-        now: Duration,
-        old_key: &Self::Key,
-        ctx: SchedulingContext<'_, C>,
-    ) -> Self::Key {
-        Self::key(now, old_key.arrival_offset, ctx)
+        Self::key(arrival_offset, ctx)
     }
 }
 
@@ -203,12 +194,6 @@ impl RouterSchedulingPolicy {
 impl SchedulingPolicy for RouterSchedulingPolicy {
     type Key = RouterSchedulingKey;
 
-    const DYNAMIC: bool = true;
-
-    fn is_dynamic(&self) -> bool {
-        matches!(self, Self::B10FairWspt(_))
-    }
-
     fn enqueue_key<C: WorkerConfigLike>(
         &self,
         arrival_offset: Duration,
@@ -221,20 +206,6 @@ impl SchedulingPolicy for RouterSchedulingPolicy {
             Self::B10FairWspt(p) => {
                 RouterSchedulingKey::B10FairWspt(p.enqueue_key(arrival_offset, ctx))
             }
-        }
-    }
-
-    fn rekey<C: WorkerConfigLike>(
-        &self,
-        now: Duration,
-        old_key: &Self::Key,
-        ctx: SchedulingContext<'_, C>,
-    ) -> Self::Key {
-        match (self, old_key) {
-            (Self::B10FairWspt(p), RouterSchedulingKey::B10FairWspt(key)) => {
-                RouterSchedulingKey::B10FairWspt(p.rekey(now, key, ctx))
-            }
-            _ => old_key.clone(),
         }
     }
 }
@@ -430,67 +401,66 @@ mod tests {
     }
 
     #[test]
-    fn router_scheduling_policy_dynamic_only_for_b10_fair_wspt() {
+    fn router_scheduling_policies_are_static() {
         assert!(!RouterSchedulingPolicy::new(RouterQueuePolicy::Fcfs).is_dynamic());
         assert!(!RouterSchedulingPolicy::new(RouterQueuePolicy::Lcfs).is_dynamic());
         assert!(!RouterSchedulingPolicy::new(RouterQueuePolicy::Wspt).is_dynamic());
-        assert!(RouterSchedulingPolicy::new(RouterQueuePolicy::B10FairWspt).is_dynamic());
+        assert!(!RouterSchedulingPolicy::new(RouterQueuePolicy::B10FairWspt).is_dynamic());
     }
 
     // ---- B10 fair WSPT policy tests ----
 
     #[test]
-    fn b10_fair_wspt_shorter_request_gets_early_credit() {
+    fn b10_fair_wspt_8192_missing_prefill_has_zero_credit() {
         let policy = B10FairWsptPolicy;
-        let short = request_with(100, 0.0, OverlapScores::default());
-        let long = request_with(10_000, 0.0, OverlapScores::default());
+        let no_bonus = request_with(8192, 0.0, OverlapScores::default());
+        let also_no_bonus = request_with(10_000, 0.0, OverlapScores::default());
 
+        assert_eq!(
+            enqueue_key(&policy, Duration::ZERO, &no_bonus),
+            enqueue_key(&policy, Duration::ZERO, &also_no_bonus),
+            "missing prefill at or above 8192 tokens should receive no credit"
+        );
         assert!(
-            enqueue_key(&policy, Duration::ZERO, &short)
-                > enqueue_key(&policy, Duration::ZERO, &long),
-            "fresh queued requests should be WSPT-like"
+            enqueue_key(&policy, Duration::ZERO, &no_bonus)
+                > enqueue_key(&policy, Duration::from_secs(1), &also_no_bonus),
+            "once credit is zero, earlier arrivals should win"
         );
     }
 
     #[test]
-    fn b10_fair_wspt_short_newer_request_can_beat_early_longer_request() {
+    fn b10_fair_wspt_zero_missing_prefill_is_worth_15_seconds() {
         let policy = B10FairWsptPolicy;
-        let old_long = request_with(10_000, 0.0, OverlapScores::default());
-        let newer_short = request_with(100, 0.0, OverlapScores::default());
+        let no_bonus = request_with(8192, 0.0, OverlapScores::default());
+        let zero_missing = request_with(1024, 0.0, overlaps_from(&[(0, 64)]));
 
         assert!(
-            enqueue_key(&policy, Duration::from_secs(5), &newer_short)
-                > enqueue_key(&policy, Duration::ZERO, &old_long),
-            "bounded WSPT credit should allow early short-request promotion"
+            enqueue_key(&policy, Duration::from_millis(14_999), &zero_missing)
+                > enqueue_key(&policy, Duration::ZERO, &no_bonus),
+            "zero missing prefill should beat a no-credit request that is just under 15s older"
+        );
+        assert!(
+            enqueue_key(&policy, Duration::ZERO, &no_bonus)
+                > enqueue_key(&policy, Duration::from_secs(15), &zero_missing),
+            "zero missing prefill should not beat a no-credit request that is 15s older"
         );
     }
 
     #[test]
-    fn b10_fair_wspt_ages_into_fcfs_after_15_seconds() {
+    fn b10_fair_wspt_missing_prefill_credit_scales_linearly() {
         let policy = B10FairWsptPolicy;
-        let old_long = request_with(10_000, 0.0, OverlapScores::default());
-        let newer_short = request_with(100, 0.0, OverlapScores::default());
-
-        let old_key = enqueue_key(&policy, Duration::ZERO, &old_long);
-        let newer_key = enqueue_key(&policy, Duration::from_secs(5), &newer_short);
-        assert!(newer_key > old_key);
-
-        let old_workers = workers_for_request(&old_long);
-        let newer_workers = workers_for_request(&newer_short);
-        let aged_old_key = policy.rekey(
-            Duration::from_secs(15),
-            &old_key,
-            SchedulingContext::new(&old_long, &old_workers),
-        );
-        let aged_newer_key = policy.rekey(
-            Duration::from_secs(15),
-            &newer_key,
-            SchedulingContext::new(&newer_short, &newer_workers),
-        );
+        let no_bonus = request_with(8192, 0.0, OverlapScores::default());
+        let half_missing = request_with(8192, 0.0, overlaps_from(&[(0, 256)]));
 
         assert!(
-            aged_old_key > aged_newer_key,
-            "a 15s-old request should fall back to FCFS ahead of newer requests"
+            enqueue_key(&policy, Duration::from_millis(7_499), &half_missing)
+                > enqueue_key(&policy, Duration::ZERO, &no_bonus),
+            "4096 missing prefill tokens should beat a no-credit request that is just under 7.5s older"
+        );
+        assert!(
+            enqueue_key(&policy, Duration::ZERO, &no_bonus)
+                > enqueue_key(&policy, Duration::from_millis(7_500), &half_missing),
+            "4096 missing prefill tokens should not beat a no-credit request that is 7.5s older"
         );
     }
 
@@ -508,15 +478,20 @@ mod tests {
     }
 
     #[test]
-    fn b10_fair_wspt_overlap_increases_early_credit() {
+    fn b10_fair_wspt_short_uncached_prefill_gets_missing_token_credit() {
         let policy = B10FairWsptPolicy;
-        let no_cache = request_with(1024, 0.0, OverlapScores::default());
-        let cached = request_with(1024, 0.0, overlaps_from(&[(0, 60)]));
+        let no_bonus = request_with(8192, 0.0, OverlapScores::default());
+        let short_uncached = request_with(4096, 0.0, OverlapScores::default());
 
         assert!(
-            enqueue_key(&policy, Duration::ZERO, &cached)
-                > enqueue_key(&policy, Duration::ZERO, &no_cache),
-            "effective cache overlap should increase early WSPT credit"
+            enqueue_key(&policy, Duration::from_millis(7_499), &short_uncached)
+                > enqueue_key(&policy, Duration::ZERO, &no_bonus),
+            "4096 uncached prefill tokens should get the same 7.5s credit as any other 4096-missing request"
+        );
+        assert!(
+            enqueue_key(&policy, Duration::ZERO, &no_bonus)
+                > enqueue_key(&policy, Duration::from_millis(7_500), &short_uncached),
+            "4096 uncached prefill tokens should not exceed the 7.5s credit bound"
         );
     }
 

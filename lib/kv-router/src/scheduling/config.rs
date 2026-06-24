@@ -602,7 +602,7 @@ pub struct KvRouterConfig {
     /// Scheduling policy for the router queue.
     /// "fcfs" (default): first-come first-served with priority bumps — optimizes tail TTFT.
     /// "wspt": weighted shortest processing time (Smith's rule) — optimizes average TTFT.
-    /// "b10-fair-wspt": WSPT-heavy for fresh requests, then ages into FCFS by 15s.
+    /// "b10-fair-wspt": FCFS plus up to 15s of missing-prefill credit.
     pub router_queue_policy: RouterQueuePolicy,
 
     /// Whether to query a remote KV indexer served from the worker component
