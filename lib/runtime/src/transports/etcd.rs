@@ -33,6 +33,11 @@ pub use lock::*;
 use super::utils::build_in_runtime;
 use crate::config::environment_names::etcd as env_etcd;
 
+/// How long to quietly retry the initial etcd connection / lease creation
+/// before giving up and surfacing an error. Tolerates etcd and dynamo starting
+/// at the same time.
+const STARTUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// ETCD Client
 #[derive(Clone)]
 pub struct Client {
@@ -72,30 +77,59 @@ impl Client {
                 let etcd_urls = config.etcd_url.clone();
                 let connect_options = config.etcd_connect_options.clone();
 
-                // Create the connector
-                let connector = Connector::new(etcd_urls, connect_options)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Unable to connect to etcd server at {}. Check etcd server status",
-                            config.etcd_url.join(", ")
-                        )
-                    })?;
+                // Handle a race where etcd and dynamo are coming up at the same
+                // time more gracefully: retry the initial connection / lease
+                // creation for up to STARTUP_CONNECT_TIMEOUT before surfacing an error.
+                let deadline = tokio::time::Instant::now() + STARTUP_CONNECT_TIMEOUT;
+                let mut backoff = Duration::from_secs(5);
+                const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-                let lease_id = if config.attach_lease {
-                    create_lease(connector.clone(), 10, token)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Unable to create lease. Check etcd server status at {}",
-                                config.etcd_url.join(", ")
-                            )
-                        })?
-                } else {
-                    0
-                };
+                loop {
+                    let attempt = async {
+                        // Create the connector
+                        let connector =
+                            Connector::new(etcd_urls.clone(), connect_options.clone())
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "Unable to connect to etcd server at {}. Check etcd server status",
+                                        etcd_urls.join(", ")
+                                    )
+                                })?;
 
-                Ok((connector, lease_id))
+                        let lease_id = if config.attach_lease {
+                            create_lease(connector.clone(), 10, token.clone())
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "Unable to create lease. Check etcd server status at {}",
+                                        etcd_urls.join(", ")
+                                    )
+                                })?
+                        } else {
+                            0
+                        };
+
+                        anyhow::Ok((connector, lease_id))
+                    }
+                    .await;
+
+                    match attempt {
+                        Ok(connection) => break Ok(connection),
+                        Err(err) => {
+                            if tokio::time::Instant::now() >= deadline {
+                                break Err(err);
+                            }
+                            tracing::info!(
+                                error = %err,
+                                "etcd not reachable yet; retrying (waiting up to {:?} for etcd to become ready)",
+                                STARTUP_CONNECT_TIMEOUT
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                        }
+                    }
+                }
             },
             1,
         )
