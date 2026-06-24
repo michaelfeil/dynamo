@@ -54,7 +54,7 @@ fn client_disconnect_behavior() -> ClientDisconnectBehavior {
             "kill" => ClientDisconnectBehavior::Kill,
             _ => panic!("invalid {CLIENT_DISCONNECT_BEHAVIOR_ENV}; expected \"stop\" or \"kill\""),
         },
-        Err(std::env::VarError::NotPresent) => ClientDisconnectBehavior::Kill,
+        Err(std::env::VarError::NotPresent) => ClientDisconnectBehavior::Stop,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!("invalid {CLIENT_DISCONNECT_BEHAVIOR_ENV}; expected valid unicode")
         }
@@ -434,14 +434,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_client_disconnect_behavior_defaults_to_kill_and_can_stop() {
+    fn test_client_disconnect_behavior_defaults_to_stop_and_can_kill() {
         cleanup_env();
         let ctx = MockContext::new();
         cancel_for_client_disconnect(&ctx, "test_disconnect");
-        assert_eq!(ctx.stopped.load(Ordering::SeqCst), 0);
-        assert_eq!(ctx.killed.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.killed.load(Ordering::SeqCst), 0);
 
-        unsafe { std::env::set_var(CLIENT_DISCONNECT_BEHAVIOR_ENV, "stop") };
+        unsafe { std::env::set_var(CLIENT_DISCONNECT_BEHAVIOR_ENV, "kill") };
         cancel_for_client_disconnect(&ctx, "test_disconnect");
         cleanup_env();
         assert_eq!(ctx.stopped.load(Ordering::SeqCst), 1);

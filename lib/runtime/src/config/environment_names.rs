@@ -313,7 +313,7 @@ pub mod llm {
     /// Set to `0` or leave unset to disable the timeout (default: disabled).
     pub const DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS: &str = "DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS";
 
-    /// Frontend client disconnect behavior: "kill" (default) or "stop".
+    /// Frontend client disconnect behavior: "stop" (default) or "kill".
     pub const DYN_CLIENT_DISCONNECT_BEHAVIOR: &str = "DYN_CLIENT_DISCONNECT_BEHAVIOR";
 
     /// Enable the LoRA allocation controller (set to "true" to enable)
