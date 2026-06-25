@@ -138,7 +138,7 @@ fn default_router_temperature() -> f64 {
     std::env::var("KV_ROUTER_TEMPERATURE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0.15)
+        .unwrap_or(0.01)
 }
 
 fn default_router_overlap_score_weight() -> f64 {
@@ -152,7 +152,7 @@ fn default_router_prefill_token_discount() -> f64 {
     std::env::var("B10_KV_ROUTER_PREFILL_TOKEN_DISCOUNT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0.5)
+        .unwrap_or(0.35)
 }
 
 fn default_router_decode_token_discount() -> f64 {
@@ -208,7 +208,7 @@ fn default_router_cache_miss_weight() -> f64 {
     std::env::var("B10_KV_ROUTER_CACHE_MISS_WEIGHT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0)
+        .unwrap_or(0.02)
 }
 
 fn default_router_cache_miss_min_isl() -> usize {
@@ -216,7 +216,7 @@ fn default_router_cache_miss_min_isl() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         // a new worker coming up does not have the system prompt. If a isl is only 512 tokens, its around system prompt.
-        .unwrap_or(512)
+        .unwrap_or(4096)
 }
 
 /// Override configuration structure
@@ -580,9 +580,9 @@ mod tests {
         let config = HotReloadableConfig::default();
         let unified_config = config.get();
 
-        assert_eq!(unified_config.routing.router_temperature, 0.15);
+        assert_eq!(unified_config.routing.router_temperature, 0.01);
         assert_eq!(unified_config.routing.router_overlap_score_weight, 3.5);
-        assert_eq!(unified_config.routing.router_prefill_token_discount, 0.5);
+        assert_eq!(unified_config.routing.router_prefill_token_discount, 0.35);
         assert_eq!(unified_config.routing.router_decode_token_discount, 0.8);
         assert_eq!(
             unified_config.routing.router_active_request_dp_blend,
