@@ -971,11 +971,6 @@ from commit `fce8920c3` that was dropped on the v1.1 follow-default in this sect
 Drop once upstream `async-openai` exposes an equivalent `token_id` field on
 `ChatCompletionTokenLogprob`.
 
-`reasoning_effort: "max"` is now accepted in the OpenAI Chat Completions request
-type, and Responses `reasoning.effort: "max"` uses the same widened enum. This
-keeps both frontend routes from rejecting Baseten max-thinking requests during
-Rust deserialization before Python/template policy handling can run.
-
 The response-only null-omission patch should be preserved on v1.2. The target
 already omits absent `Choice.logprobs` and `Choice.finish_reason` through
 upstream `async-openai`, but Dynamo's local chat response types and completion

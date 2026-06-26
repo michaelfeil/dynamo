@@ -157,7 +157,7 @@ impl ResponseStreamConverter {
             prompt: None,
             prompt_cache_key: self.params.prompt_cache_key.clone(),
             prompt_cache_retention: self.params.prompt_cache_retention,
-            reasoning: None,
+            reasoning: self.params.reasoning.clone(),
             safety_identifier: self.params.safety_identifier.clone(),
             service_tier: Some(self.params.service_tier.unwrap_or(ServiceTier::Auto)),
             top_logprobs: Some(0),
@@ -569,7 +569,6 @@ impl ResponseStreamConverter {
                 self.params.presence_penalty.unwrap_or(0.0),
                 self.params.frequency_penalty.unwrap_or(0.0),
                 self.params.store.unwrap_or(false),
-                self.params.reasoning.as_ref(),
             );
         }
         let data = serde_json::to_string(&value)?;
