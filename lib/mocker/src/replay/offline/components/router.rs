@@ -167,6 +167,7 @@ impl PendingRequest {
             decode_blocks,
             prefill_tokens,
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: self.track_prefill_tokens,
             router_config_override: None,
             update_states: true,

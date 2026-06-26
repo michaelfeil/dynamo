@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use rand::Rng;
 use rustc_hash::FxHashMap;
@@ -22,6 +23,10 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
         eligibility: RoutingEligibility<'_>,
         block_size: u32,
     ) -> Result<WorkerSelectionResult, KvSchedulerError>;
+
+    fn residency_eviction_half_life(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Helper function for softmax sampling.
@@ -450,6 +455,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -599,6 +605,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -738,6 +745,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -787,6 +795,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -854,6 +863,7 @@ mod tests {
                 decode_blocks,
                 prefill_tokens: FxHashMap::default(),
                 active_requests: HashMap::new(),
+                eviction_costs: HashMap::new(),
                 track_prefill_tokens: true,
                 router_config_override: None,
                 update_states: false,
@@ -919,6 +929,7 @@ mod tests {
             decode_blocks,
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -980,6 +991,7 @@ mod tests {
             decode_blocks,
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -1057,6 +1069,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -1125,6 +1138,7 @@ mod tests {
             decode_blocks,
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -1188,6 +1202,7 @@ mod tests {
             decode_blocks,
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -1241,6 +1256,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,

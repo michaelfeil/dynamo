@@ -18,7 +18,7 @@ use dynamo_kv_router::scheduling::{
 use dynamo_kv_router::selector::{WorkerSelector, softmax_sample};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Returns whether DP routing should be strict for the already-selected DP rank.
 ///
@@ -78,6 +78,7 @@ struct B10Score {
     active_requests: f64,
     active_request_dp_blend: f64,
     cache_miss_absolute_tokens: usize,
+    residency_eviction_cost: f64,
 }
 
 impl B10WorkerSelector {
@@ -144,6 +145,7 @@ fn score_worker<C: WorkerConfigLike>(
     cache_miss_min_isl: usize,
     active_request_weight: f64,
     active_request_dp_blend: f64,
+    residency_eviction_cost_weight: f64,
 ) -> B10Score {
     let prefill_token = request.prefill_tokens_for(worker);
     let potential_prefill_block = (prefill_token as f64) / (block_size as f64);
@@ -168,11 +170,14 @@ fn score_worker<C: WorkerConfigLike>(
     let active_requests_worker = request.active_requests_for(worker) as f64;
     let active_requests = active_requests_worker * (1.0 - active_request_dp_blend)
         + mean_active_requests_for_worker(workers, request, worker) * active_request_dp_blend;
+    let residency_eviction_cost =
+        residency_eviction_cost_weight * request.eviction_cost_for(worker);
 
     let logit = overlap_weight * potential_prefill_block
         + decode_block
         + active_request_weight * active_requests
-        + cache_miss_weight * (cache_miss_absolute_tokens as f64);
+        + cache_miss_weight * (cache_miss_absolute_tokens as f64)
+        + residency_eviction_cost;
 
     B10Score {
         logit,
@@ -181,10 +186,18 @@ fn score_worker<C: WorkerConfigLike>(
         active_requests,
         active_request_dp_blend,
         cache_miss_absolute_tokens,
+        residency_eviction_cost,
     }
 }
 
 impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
+    fn residency_eviction_half_life(&self) -> Option<Duration> {
+        let config = b10hotreloadablecm::get_config().get();
+        let routing = &config.routing;
+        (routing.router_residency_eviction_cost > 0.0)
+            .then(|| Duration::from_secs_f64(routing.router_residency_half_life))
+    }
+
     fn select_worker(
         &self,
         workers: &HashMap<WorkerId, ModelRuntimeConfig>,
@@ -228,6 +241,8 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         let cache_miss_min_isl = hot_reloadable_config.routing.router_cache_miss_min_isl;
         let active_request_weight = hot_reloadable_config.routing.router_active_request_weight;
         let active_request_dp_blend = hot_reloadable_config.routing.router_active_request_dp_blend;
+        let residency_eviction_cost_weight =
+            hot_reloadable_config.routing.router_residency_eviction_cost;
         let temperature = request
             .router_config_override
             .as_ref()
@@ -245,6 +260,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                 cache_miss_min_isl,
                 active_request_weight,
                 active_request_dp_blend,
+                residency_eviction_cost_weight,
             )
         };
 
@@ -269,7 +285,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             let cached_tokens = request.effective_cached_tokens_for(worker);
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={}",
+                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3}",
                     worker.worker_id,
                     worker.dp_rank,
                     score.logit,
@@ -280,7 +296,8 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                     score.active_requests,
                     score.active_request_dp_blend,
                     cache_miss_weight,
-                    score.cache_miss_absolute_tokens
+                    score.cache_miss_absolute_tokens,
+                    score.residency_eviction_cost
                 );
             }
 
@@ -306,7 +323,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             let score = score_worker(worker);
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={}",
+                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3}",
                     worker.worker_id,
                     worker.dp_rank,
                     score.logit,
@@ -317,7 +334,8 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                     score.active_requests,
                     score.active_request_dp_blend,
                     cache_miss_weight,
-                    score.cache_miss_absolute_tokens
+                    score.cache_miss_absolute_tokens,
+                    score.residency_eviction_cost
                 );
             }
             worker_logits.insert(worker, score.logit);
@@ -396,6 +414,7 @@ mod tests {
             decode_blocks: Default::default(),
             prefill_tokens: Default::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,
@@ -420,7 +439,18 @@ mod tests {
         request.effective_cached_tokens.insert(worker, 63);
         request.prefill_tokens.insert(worker, 0);
 
-        let score = score_worker(&workers, &request, worker, 64, 0.0, 1.0, 0, 0.0, 2.0 / 3.0);
+        let score = score_worker(
+            &workers,
+            &request,
+            worker,
+            64,
+            0.0,
+            1.0,
+            0,
+            0.0,
+            2.0 / 3.0,
+            0.0,
+        );
 
         assert_eq!(score.cache_miss_absolute_tokens, 2);
         assert_eq!(score.logit, 2.0);
@@ -436,7 +466,18 @@ mod tests {
         request.active_requests.insert(worker1, 3);
         request.prefill_tokens.insert(worker0, 0);
 
-        let score = score_worker(&workers, &request, worker0, 64, 0.0, 0.0, 0, 1.0, 2.0 / 3.0);
+        let score = score_worker(
+            &workers,
+            &request,
+            worker0,
+            64,
+            0.0,
+            0.0,
+            0,
+            1.0,
+            2.0 / 3.0,
+            0.0,
+        );
 
         assert!((score.active_requests - (9.0 / 3.0 + 6.0 * 2.0 / 3.0)).abs() < 1e-9);
         assert!((score.logit - score.active_requests).abs() < 1e-9);

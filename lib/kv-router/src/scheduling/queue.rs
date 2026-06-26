@@ -26,6 +26,7 @@ use super::types::{
 };
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, RouterBackpressureReason, WorkerConfigLike, WorkerId,
+    WorkerWithDpRank,
 };
 use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRequest};
 
@@ -646,6 +647,11 @@ impl<
         request.decode_blocks = decode_blocks;
         request.prefill_tokens = prefill_tokens;
         request.active_requests = self.slots.active_request_counts();
+        if self.slots.tracks_residency()
+            && let Some(half_life) = self.selector.residency_eviction_half_life()
+        {
+            request.eviction_costs = self.residency_eviction_costs(&request, half_life, decay_now);
+        }
 
         let selection = {
             let workers = self.workers_with_configs.borrow();
@@ -703,6 +709,39 @@ impl<
         ) {
             tracing::warn!("Failed to add request {request_id}: {e}");
         }
+    }
+
+    fn residency_eviction_costs(
+        &self,
+        request: &SchedulingRequest,
+        half_life: Duration,
+        now: Instant,
+    ) -> HashMap<WorkerWithDpRank, f64> {
+        let request_blocks = request.request_blocks(self.block_size);
+        let workers = self.workers_with_configs.borrow();
+        let eligibility = request.eligibility();
+        let mut eviction_costs = HashMap::new();
+
+        eligibility.for_each_eligible_worker_rank(&workers, |worker, _| {
+            let overlap_blocks = request
+                .tier_overlap_blocks
+                .device
+                .get(&worker)
+                .copied()
+                .unwrap_or(0) as u64;
+            let additional_blocks = request_blocks.saturating_sub(overlap_blocks);
+            let pressure = self.slots.eviction_pressure_for_new_blocks_at(
+                worker,
+                additional_blocks,
+                half_life,
+                now,
+            );
+            if pressure.eviction_cost != 0.0 {
+                eviction_costs.insert(worker, pressure.eviction_cost);
+            }
+        });
+
+        eviction_costs
     }
 
     fn prefill_load_hint_for(
@@ -1290,6 +1329,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: true,
@@ -1939,6 +1979,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: true,

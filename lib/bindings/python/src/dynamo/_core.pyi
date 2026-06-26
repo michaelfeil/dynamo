@@ -2070,6 +2070,7 @@ class KvRouterConfig:
         shared_cache_type: str = "none",
         router_predicted_ttl_secs: Optional[float] = None,
         *,
+        router_track_residency: bool = False,
         overlap_score_credit: float = 1.0,
         prefill_load_scale: float = 1.0,
         router_queue_by_incoming_missing_isl: Optional[list[tuple[int, int]]] = None,
@@ -2090,6 +2091,7 @@ class KvRouterConfig:
                 (local_indexer mode) is now the recommended path.
             router_replica_sync: Enable replica synchronization (default: False)
             router_track_active_blocks: Track active blocks for load balancing (default: True)
+            router_track_residency: Track per-worker KV residency for eviction-aware routing (default: False).
             router_track_output_blocks: Track output blocks during generation (default: False).
                 When enabled, the router adds placeholder blocks as tokens are generated
                 and applies fractional decay based on progress toward expected output

@@ -654,10 +654,22 @@ Opt-in router residency tracking:
   `router_track_residency`. Off by default.
 - Touch is taken before `slot.sequences.write()` and `configure_residency`
   trims per-worker outside the outer `workers.write()` lock.
-- Exposes `eviction_pressure_for_new_blocks_at` for future selector use; not
-  wired into `B10WorkerSelector`/`DefaultWorkerSelector` yet.
+- Exposes `eviction_pressure_for_new_blocks_at` for selector use.
 - Capacity hard-capped at 200k blocks per worker (CPU-router memory budget,
   not a device KV-cache mirror).
+
+Residency eviction cost wired into `B10WorkerSelector` (#348):
+
+- Adds hot-reloadable `router_residency_eviction_cost` (weight, default 0 = off)
+  and `router_residency_half_life` (recency decay, default 120s), with env
+  overrides and finite/non-negative sanitization.
+- `admit_one` computes per-worker eviction cost only when residency tracking is
+  on **and** the weight is `> 0`; the result is added to the `B10WorkerSelector`
+  logit (`+ rec` term), penalizing workers that would evict recently-used
+  blocks. Default behavior is unchanged.
+- Cost path acquires the multi-worker residency read lock once per eligible
+  worker per request; gated off by default. A batched single-lock query is a
+  follow-up if the weight is enabled at scale.
 
 Compatibility and API notes:
 

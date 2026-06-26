@@ -20,6 +20,8 @@ const RELOAD_INTERVAL_SECS: u64 = 15; // Reload every 15 seconds
 const DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND: f64 = 2.0 / 3.0;
 const ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN: f64 = 0.0001;
 const ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX: f64 = 0.9999;
+const DEFAULT_ROUTER_RESIDENCY_EVICTION_COST: f64 = 0.0;
+const DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS: f64 = 120.0;
 
 fn is_warning_disabled() -> bool {
     static DISABLE_WARNING: OnceLock<bool> = OnceLock::new();
@@ -42,6 +44,8 @@ struct B10RoutingConfigOverride {
     router_active_replicas: Option<usize>,
     router_cache_miss_weight: Option<f64>,
     router_cache_miss_min_isl: Option<usize>,
+    router_residency_eviction_cost: Option<f64>,
+    router_residency_half_life: Option<f64>,
     router_queue_threshold: Option<Option<f64>>,
 }
 
@@ -75,6 +79,13 @@ pub struct B10RoutingConfig {
 
     #[serde(default = "default_router_cache_miss_min_isl")]
     pub router_cache_miss_min_isl: usize,
+
+    #[serde(default = "default_router_residency_eviction_cost")]
+    pub router_residency_eviction_cost: f64,
+
+    /// Half-life in seconds for residency eviction recency cost.
+    #[serde(default = "default_router_residency_half_life")]
+    pub router_residency_half_life: f64,
 
     /// Queue admission threshold fraction of max_num_batched_tokens.
     /// None means "not configured here"; use 0 to explicitly disable queueing.
@@ -111,6 +122,12 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_cache_miss_min_isl {
             self.router_cache_miss_min_isl = value;
         }
+        if let Some(value) = overrides.router_residency_eviction_cost {
+            self.router_residency_eviction_cost = value;
+        }
+        if let Some(value) = overrides.router_residency_half_life {
+            self.router_residency_half_life = value;
+        }
         if let Some(value) = overrides.router_queue_threshold {
             self.router_queue_threshold = value;
         }
@@ -129,6 +146,8 @@ impl Default for B10RoutingConfig {
             router_active_replicas: default_router_active_replicas(),
             router_cache_miss_weight: default_router_cache_miss_weight(),
             router_cache_miss_min_isl: default_router_cache_miss_min_isl(),
+            router_residency_eviction_cost: default_router_residency_eviction_cost(),
+            router_residency_half_life: default_router_residency_half_life(),
             router_queue_threshold: None,
         }
     }
@@ -217,6 +236,48 @@ fn default_router_cache_miss_min_isl() -> usize {
         .and_then(|s| s.parse().ok())
         // a new worker coming up does not have the system prompt. If a isl is only 512 tokens, its around system prompt.
         .unwrap_or(4096)
+}
+
+fn default_router_residency_eviction_cost() -> f64 {
+    std::env::var("B10_KV_ROUTER_RESIDENCY_EVICTION_COST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(sanitize_router_residency_eviction_cost)
+        .unwrap_or(DEFAULT_ROUTER_RESIDENCY_EVICTION_COST)
+}
+
+fn default_router_residency_half_life() -> f64 {
+    std::env::var("B10_KV_ROUTER_RESIDENCY_HALF_LIFE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(sanitize_router_residency_half_life)
+        .unwrap_or(DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS)
+}
+
+fn sanitize_router_residency_eviction_cost(cost: f64) -> f64 {
+    if cost.is_finite() && cost >= 0.0 {
+        return cost;
+    }
+
+    tracing::error!(
+        configured_cost = ?cost,
+        sanitized_cost = DEFAULT_ROUTER_RESIDENCY_EVICTION_COST,
+        "router_residency_eviction_cost must be finite and >= 0, using default"
+    );
+    DEFAULT_ROUTER_RESIDENCY_EVICTION_COST
+}
+
+fn sanitize_router_residency_half_life(half_life: f64) -> f64 {
+    if half_life.is_finite() && half_life > 0.0 {
+        return half_life;
+    }
+
+    tracing::error!(
+        configured_half_life = ?half_life,
+        sanitized_half_life = DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS,
+        "router_residency_half_life must be finite and > 0, using default"
+    );
+    DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS
 }
 
 /// Override configuration structure
@@ -406,13 +467,13 @@ impl HotReloadableConfig {
             }
         }
 
-        root_config
-            .b10_routing_config
-            .router_active_request_dp_blend = sanitize_router_active_request_dp_blend(
-            root_config
-                .b10_routing_config
-                .router_active_request_dp_blend,
-        );
+        let routing = &mut root_config.b10_routing_config;
+        routing.router_active_request_dp_blend =
+            sanitize_router_active_request_dp_blend(routing.router_active_request_dp_blend);
+        routing.router_residency_eviction_cost =
+            sanitize_router_residency_eviction_cost(routing.router_residency_eviction_cost);
+        routing.router_residency_half_life =
+            sanitize_router_residency_half_life(routing.router_residency_half_life);
 
         // Build UnifiedConfig with separate routing and runtime configs
         let runtime_config = LLMRuntimeConfig {
@@ -435,12 +496,14 @@ impl HotReloadableConfig {
         );
 
         tracing::info!(
-            "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
+            "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
             path,
             unified_config.routing.router_prefill_token_discount,
             unified_config.routing.router_decode_token_discount,
             unified_config.routing.router_temperature,
             unified_config.routing.router_active_request_dp_blend,
+            unified_config.routing.router_residency_eviction_cost,
+            unified_config.routing.router_residency_half_life,
             unified_config.router_active_replicas,
             unified_config.runtime.tensor_parallel_size,
             unified_config.runtime.enable_attention_dp,
@@ -543,6 +606,16 @@ pub fn get_router_cache_miss_weight() -> f64 {
 /// Convenience function to get router cache miss min isl
 pub fn get_router_cache_miss_min_isl() -> usize {
     get_config().get().routing.router_cache_miss_min_isl
+}
+
+/// Convenience function to get router residency eviction cost weight
+pub fn get_router_residency_eviction_cost() -> f64 {
+    get_config().get().routing.router_residency_eviction_cost
+}
+
+/// Convenience function to get router residency half-life in seconds
+pub fn get_router_residency_half_life() -> f64 {
+    get_config().get().routing.router_residency_half_life
 }
 
 pub fn get_router_queue_threshold() -> Option<f64> {

@@ -115,6 +115,7 @@ pub struct SchedulingRequest {
     pub decode_blocks: FxHashMap<WorkerWithDpRank, usize>,
     pub prefill_tokens: FxHashMap<WorkerWithDpRank, usize>,
     pub active_requests: HashMap<WorkerWithDpRank, usize>,
+    pub eviction_costs: HashMap<WorkerWithDpRank, f64>,
 
     // Scheduling side effects and lifecycle controls.
     pub update_states: bool,
@@ -224,6 +225,10 @@ impl SchedulingRequest {
 
     pub fn active_requests_for(&self, worker: WorkerWithDpRank) -> usize {
         self.active_requests.get(&worker).copied().unwrap_or(0)
+    }
+
+    pub fn eviction_cost_for(&self, worker: WorkerWithDpRank) -> f64 {
+        self.eviction_costs.get(&worker).copied().unwrap_or(0.0)
     }
 
     pub fn is_worker_allowed(&self, worker_id: WorkerId) -> bool {
