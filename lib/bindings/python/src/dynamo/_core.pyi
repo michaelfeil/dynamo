@@ -399,6 +399,18 @@ class CancellationPolicy:
     ...
 
 
+class FirstEventMutation:
+    """
+    Optional first-event behavior for
+    :meth:`RouterWorkerCoordinator.route_and_worker`. Pass ``None`` for the
+    default/no-op behavior.
+    """
+
+    Swallow: "FirstEventMutation"
+    WaitAndReturn: "FirstEventMutation"
+    ...
+
+
 class PyRouterRequestNew:
     """
     Typed carrier of the six ``RouterRequest::New`` wire-body fields (minus the
@@ -456,6 +468,7 @@ class RouterWorkerCoordinator:
             cancellation: CancellationPolicy = CancellationPolicy.Cancellable,
             max_reroutes: int = 1,
             tracing_enabled: bool = False,
+            first_event_mutation: FirstEventMutation | None = None,
         ) -> AdmittedRequest | DeniedRequest:
         """
         Route a KV-router ``new`` request, then generate on the routed worker.
@@ -497,6 +510,14 @@ class RouterWorkerCoordinator:
         trace context is available. Slow potential-load checks still warn
         regardless of this flag.
 
+        When ``first_event_mutation`` is ``FirstEventMutation.Swallow``, worker
+        setup waits for the first non-error item from the returned worker stream
+        and drops it before handing the remaining stream back. When it is
+        ``FirstEventMutation.WaitAndReturn``, setup waits for that first item
+        and then returns it as the first visible stream item. If the first item
+        is missing or is an error, the result is
+        ``DeniedRequest.FirstWorkerEventFailed`` rather than a raised exception.
+
         ``cancellation`` (a :class:`CancellationPolicy`, default
         ``CancellationPolicy.Cancellable``) selects which of three phases — the
         ``route_and_connect`` loop (``routing``), each per-attempt ``direct()``
@@ -518,8 +539,9 @@ class RouterWorkerCoordinator:
         Returns :class:`AdmittedRequest` on a successful route or
         :class:`DeniedRequest` when the router is backpressured, a
         ``require_available`` component is down, the preflight overflows, the
-        preflight cannot reach the router, or the stale-route reroute loop is
-        exhausted -- never raising in those cases. A non-stale worker-open
+        preflight cannot reach the router, the stale-route reroute loop is
+        exhausted, or ``first_event_mutation`` cannot read the first worker
+        stream item -- never raising in those cases. A non-stale worker-open
         failure (or non-object ``worker_args``) is raised, not returned as a
         ``DeniedRequest``. Discriminate with
         ``isinstance(result, AdmittedRequest)`` /
@@ -622,6 +644,16 @@ class DeniedRequest:
         """
         received: str
         """Debug representation of the unexpected ``RouterResponse`` variant."""
+        ...
+
+    class FirstWorkerEventFailed:
+        """
+        ``first_event_mutation`` waited for the routed worker stream's first
+        event, but the stream ended or produced an error before that event could
+        be handled.
+        """
+        error: str
+        """The error encountered while waiting for the first worker stream event."""
         ...
 
     ...

@@ -4,7 +4,8 @@ use super::coordinator::{
 };
 use super::guard::{ROUTER_GUARD_CLEANUP_GRACE_PERIOD, RouterRequestGuard};
 use super::types::{
-    DeniedRequest, MinReplicaAvailable, PotentialLoadsCheckData, PreflightInputs, RouterRequestNew,
+    DeniedRequest, FirstEventMutation, MinReplicaAvailable, PotentialLoadsCheckData,
+    PreflightInputs, RouterRequestNew,
 };
 use crate::context;
 use anyhow::Result;
@@ -731,6 +732,7 @@ async fn connect(
         max_reroutes,
         allow_cancel_routing,
         allow_cancel_setup,
+        None,
         notify_timeout,
         false,
     )
@@ -849,6 +851,171 @@ async fn route_and_connect_happy_router_response_inject_and_mark_free_on_drop() 
     wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
     assert_eq!(router.method_call_count("mark_free"), 1);
     assert_eq!(worker.method_call_count("mark_free"), 0);
+}
+
+#[tokio::test]
+async fn route_and_connect_swallow_first_event_waits_and_omits_item() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
+    worker.set_stream_chunks(vec![vec![
+        serde_json::json!({"internal_health": true}),
+        serde_json::json!({"chunk": 1}),
+        serde_json::json!({"chunk": 2}),
+    ]]);
+    let context = build_test_context("test-swallow-first-event");
+
+    let outcome = route_and_connect(
+        router.clone() as Arc<dyn RouterGuardClient>,
+        worker.clone() as Arc<dyn RouterGuardClient>,
+        make_routing_request(),
+        "req-swallow-first-event".to_string(),
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Some(FirstEventMutation::Swallow),
+        Duration::from_secs(60),
+        false,
+    )
+    .await
+    .expect("connect");
+
+    let (guard, worker_id, mut stream) = match outcome {
+        RouteAndConnectOutcome::Connected {
+            guard,
+            worker_id,
+            stream,
+        } => (guard, worker_id, stream),
+        other => panic!("expected Connected, got {:?}", other),
+    };
+
+    assert_eq!(worker_id, 1);
+    assert_eq!(
+        worker.stream_items_polled_count(),
+        1,
+        "setup should consume exactly the readiness event before returning"
+    );
+
+    let first_visible = take_one_from_stream(&mut stream)
+        .await
+        .expect("remaining stream should contain first visible item");
+    assert_eq!(first_visible.data, Some(serde_json::json!({"chunk": 1})));
+
+    let second_visible = take_one_from_stream(&mut stream)
+        .await
+        .expect("remaining stream should contain second visible item");
+    assert_eq!(second_visible.data, Some(serde_json::json!({"chunk": 2})));
+
+    assert_eq!(worker.stream_items_polled_count(), 3);
+    drop(stream);
+    drop(guard);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn route_and_connect_wait_and_return_first_event_waits_and_replays_item() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
+    worker.set_stream_chunks(vec![vec![
+        serde_json::json!({"internal_health": true}),
+        serde_json::json!({"chunk": 1}),
+    ]]);
+    let context = build_test_context("test-wait-and-return-first-event");
+
+    let outcome = route_and_connect(
+        router.clone() as Arc<dyn RouterGuardClient>,
+        worker.clone() as Arc<dyn RouterGuardClient>,
+        make_routing_request(),
+        "req-wait-and-return-first-event".to_string(),
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Some(FirstEventMutation::WaitAndReturn),
+        Duration::from_secs(60),
+        false,
+    )
+    .await
+    .expect("connect");
+
+    let (guard, _worker_id, mut stream) = match outcome {
+        RouteAndConnectOutcome::Connected {
+            guard,
+            worker_id,
+            stream,
+        } => (guard, worker_id, stream),
+        other => panic!("expected Connected, got {:?}", other),
+    };
+
+    assert_eq!(
+        worker.stream_items_polled_count(),
+        1,
+        "setup should wait for exactly the first event before returning"
+    );
+
+    let first_visible = take_one_from_stream(&mut stream)
+        .await
+        .expect("first event should be replayed");
+    assert_eq!(
+        first_visible.data,
+        Some(serde_json::json!({"internal_health": true}))
+    );
+
+    let second_visible = take_one_from_stream(&mut stream)
+        .await
+        .expect("remaining stream should follow replayed first event");
+    assert_eq!(second_visible.data, Some(serde_json::json!({"chunk": 1})));
+
+    drop(stream);
+    drop(guard);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn route_and_connect_swallow_first_event_failure_returns_denied() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
+    worker.set_stream_chunks(vec![vec![]]);
+    let context = build_test_context("test-swallow-first-event-denied");
+
+    let outcome = route_and_connect(
+        router.clone() as Arc<dyn RouterGuardClient>,
+        worker.clone() as Arc<dyn RouterGuardClient>,
+        make_routing_request(),
+        "req-swallow-first-event-denied".to_string(),
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Some(FirstEventMutation::Swallow),
+        Duration::from_secs(60),
+        false,
+    )
+    .await
+    .expect("first event failure should be a denial, not a raised error");
+
+    match outcome {
+        RouteAndConnectOutcome::Denied(DeniedRequest::FirstWorkerEventFailed { error }) => {
+            assert!(
+                error.contains("worker stream ended before first event"),
+                "unexpected error: {error}"
+            );
+        }
+        other => panic!("expected Denied(FirstWorkerEventFailed), got {:?}", other),
+    }
+
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(worker.method_call_count("generate"), 1);
+    assert_eq!(router.method_call_count("mark_free"), 1);
 }
 
 #[tokio::test]
@@ -2130,6 +2297,7 @@ async fn shield_route_and_connect_no_taker_drains_connected_worker_stream() {
         0,
         false,
         false,
+        None,
         Duration::from_secs(60),
         false,
     );

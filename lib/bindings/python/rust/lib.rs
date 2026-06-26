@@ -191,6 +191,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<b10_client::RouterCoordinatorPotentialLoadsCheck>()?;
     m.add_class::<b10_client::PyRouterRequestNew>()?;
     m.add_class::<b10_client::CancellationPolicy>()?;
+    m.add_class::<b10_client::FirstEventMutation>()?;
     m.add_class::<AsyncResponseStream>()?;
     m.add_class::<llm::entrypoint::EntrypointArgs>()?;
     m.add_class::<llm::entrypoint::EngineConfig>()?;

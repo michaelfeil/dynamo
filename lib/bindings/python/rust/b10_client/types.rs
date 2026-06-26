@@ -159,6 +159,21 @@ impl CancellationPolicy {
     }
 }
 
+/// Optional first-event behavior for
+/// [`super::RouterWorkerCoordinator::route_and_worker`]. Python callers pass
+/// `None` for the default/no-op behavior, or one of these variants to make
+/// setup wait until the routed worker stream yields its first item.
+#[pyclass(eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstEventMutation {
+    /// Wait for the first worker stream event during setup and drop it before
+    /// returning the stream to the caller.
+    Swallow,
+    /// Wait for the first worker stream event during setup, then return it as
+    /// the first visible item by prepending it back onto the returned stream.
+    WaitAndReturn,
+}
+
 /// Python-side carrier of the six [`RouterRequest::New`] wire-body fields
 /// (minus the `method` tag, supplied by the coordinator). Sent as the
 /// REQUIRED `routing_kwargs` argument to
@@ -262,7 +277,8 @@ pub(super) struct PreflightInputs {
 /// these is returned (never raised) instead of a `AdmittedRequest` when the
 /// router is backpressured, a `require_available` component is down, the
 /// optional `potential_loads_next_check` preflight found the next request
-/// would overfill the router, or that preflight could not reach the router.
+/// would overfill the router, that preflight could not reach the router, or
+/// `first_event_mutation` could not read a first worker event.
 ///
 /// In Python this is a typed enum: discriminate with `isinstance(result,
 /// DeniedRequest.<Variant>)` and read fields as attributes, e.g.
@@ -310,6 +326,14 @@ pub(crate) enum DeniedRequest {
         /// Debug representation of the unexpected `RouterResponse` variant
         /// received from the downstream router, for diagnostics.
         received: String,
+    },
+    /// `first_event_mutation` waited for the routed worker stream's first
+    /// event, but the stream ended or produced an error before that event could
+    /// be handled.
+    FirstWorkerEventFailed {
+        /// The error encountered while waiting for the first worker stream
+        /// event.
+        error: String,
     },
 }
 

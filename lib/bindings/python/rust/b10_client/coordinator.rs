@@ -23,7 +23,7 @@ use dynamo_kv_router::protocols::{
     BlockExtraInfo, RouterBackpressureReason, RouterRequest, RouterResponse as RsRouterResponse,
 };
 use dynamo_runtime::pipeline::{
-    AsyncEngineContextProvider, EngineStream, PushRouter, async_trait,
+    AsyncEngineContextProvider, EngineStream, PushRouter, ResponseStream, async_trait,
     context::Context as RsContext,
 };
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
@@ -39,8 +39,8 @@ use super::guard::{
     ROUTER_GUARD_RETRY_DELAY, RouterRequestGuard,
 };
 use super::types::{
-    DeniedRequest, MinReplicaAvailable, NextRouterBackpressureInfo, PotentialLoadsCheckData,
-    PreflightInputs,
+    DeniedRequest, FirstEventMutation, MinReplicaAvailable, NextRouterBackpressureInfo,
+    PotentialLoadsCheckData, PreflightInputs,
 };
 
 /// JSON-typed push router used to talk to KV router instances.
@@ -1180,9 +1180,10 @@ async fn route_once(
 
 /// Outcome of one [`connect_worker`] attempt: the worker stream opened (armed
 /// guard handed back to pack into `AdmittedRequest`), the routed worker is no
-/// longer present (`Stale` -- retry the route), or the open failed for any
-/// other reason (`Other` -- raise). The guard is moved INTO `open_fut` so an
-/// outer cancellation during a shielded open does not drop the guard
+/// longer present (`Stale` -- retry the route), setup reached a typed denial
+/// (`Denied`), or the open failed for any other reason (`Other` -- raise). The
+/// guard is moved INTO `open_fut` so an outer cancellation during a shielded open
+/// does not drop the guard
 /// mid-setup (which would race `mark_free` with the worker open completing);
 /// instead the guard is dropped inside the shielded task (or inside
 /// `open_fut`'s frame on cancel) so `mark_free` fires AFTER the open future
@@ -1196,7 +1197,28 @@ enum OpenResult {
         stream: EngineStream<RsAnnotated<serde_json::Value>>,
     },
     Stale,
+    Denied(DeniedRequest),
     Other(anyhow::Error),
+}
+
+async fn wait_for_first_worker_event(
+    stream: &mut EngineStream<RsAnnotated<serde_json::Value>>,
+    worker_id: u64,
+) -> Result<RsAnnotated<serde_json::Value>> {
+    let first = stream
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("worker stream ended before first event"))?;
+
+    let first = first
+        .ok()
+        .map_err(|err| anyhow::anyhow!("worker stream first event was an error: {err}"))?;
+
+    tracing::debug!(
+        worker_id,
+        "connect_worker: observed first worker stream event during setup"
+    );
+    Ok(first)
 }
 
 /// Open the worker generation stream on the routed `worker_id`. A route is
@@ -1218,6 +1240,9 @@ enum OpenResult {
 ///
 /// When `allow_cancel_setup` is false the open is detached via
 /// [`shield_to_completion`] so a Python cancellation cannot abort the setup.
+/// When `first_event_mutation` is set, setup includes waiting for the first
+/// non-error worker stream event. `Swallow` drops it before returning the
+/// remaining stream; `WaitAndReturn` prepends it back onto the returned stream.
 async fn connect_worker(
     worker_guard_client: Arc<dyn RouterGuardClient>,
     worker_id: u64,
@@ -1225,6 +1250,7 @@ async fn connect_worker(
     worker_request: serde_json::Value,
     context: context::Context,
     allow_cancel_setup: bool,
+    first_event_mutation: Option<FirstEventMutation>,
 ) -> OpenResult {
     if !worker_guard_client.instance_ids().contains(&worker_id) {
         tracing::info!(
@@ -1254,11 +1280,39 @@ async fn connect_worker(
             .instrument(span)
             .await;
         match stream_result {
-            Ok(stream) => OpenResult::Ok {
-                guard,
-                worker_id,
-                stream,
-            },
+            Ok(mut stream) => {
+                if let Some(mutation) = first_event_mutation {
+                    let first = match wait_for_first_worker_event(&mut stream, worker_id).await {
+                        Ok(first) => first,
+                        Err(err) => {
+                            tracing::warn!(
+                                worker_id,
+                                error = %err,
+                                "connect_worker: failed while waiting for first worker stream event"
+                            );
+                            drop(guard);
+                            return OpenResult::Denied(DeniedRequest::FirstWorkerEventFailed {
+                                error: err.to_string(),
+                            });
+                        }
+                    };
+
+                    match mutation {
+                        FirstEventMutation::Swallow => {}
+                        FirstEventMutation::WaitAndReturn => {
+                            let stream_context = stream.context();
+                            let replay_stream =
+                                futures::stream::once(async move { first }).chain(stream);
+                            stream = ResponseStream::new(Box::pin(replay_stream), stream_context);
+                        }
+                    }
+                }
+                OpenResult::Ok {
+                    guard,
+                    worker_id,
+                    stream,
+                }
+            }
             Err(err) => {
                 if wgc.instance_ids().contains(&worker_id) {
                     tracing::warn!(
@@ -1394,6 +1448,7 @@ pub(super) async fn route_and_connect(
     max_reroutes: u64,
     allow_cancel_routing: bool,
     allow_cancel_setup: bool,
+    first_event_mutation: Option<FirstEventMutation>,
     notify_timeout: Duration,
     tracing_enabled: bool,
 ) -> Result<RouteAndConnectOutcome> {
@@ -1446,6 +1501,7 @@ pub(super) async fn route_and_connect(
             req,
             context.clone(),
             allow_cancel_setup,
+            first_event_mutation,
         )
         .await
         {
@@ -1472,6 +1528,7 @@ pub(super) async fn route_and_connect(
                 attempt += 1;
                 continue;
             }
+            OpenResult::Denied(denied) => return Ok(RouteAndConnectOutcome::Denied(denied)),
             OpenResult::Other(err) => return Err(err),
         }
     }

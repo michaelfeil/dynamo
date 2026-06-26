@@ -4,9 +4,10 @@
 //! The module is split across four submodules:
 //! - [`types`] holds the PyO3 pyclasses (`PyRouterRequestNew`,
 //!   `CancellationPolicy`, `DeniedRequest`, `AdmittedRequest`,
-//!   `RouterCoordinatorPotentialLoadsCheck`) plus the cross-module wire
-//!   structs (`RouterRequestNew`, `PreflightInputs`, `MinReplicaAvailable`,
-//!   `PotentialLoadsCheckData`, `NextRouterBackpressureInfo`).
+//!   `RouterCoordinatorPotentialLoadsCheck`, `FirstEventMutation`) plus the
+//!   cross-module wire structs (`RouterRequestNew`, `PreflightInputs`,
+//!   `MinReplicaAvailable`, `PotentialLoadsCheckData`,
+//!   `NextRouterBackpressureInfo`).
 //! - [`guard`] holds the per-request lifecycle guard (`mark_prefill` /
 //!   `mark_free`, the detached cleanup task on drop) plus the
 //!   `ROUTER_GUARD_*` timeouts.
@@ -37,7 +38,7 @@ mod tests;
 // Pyclasses are `pub(crate)` in `types` (and `pub(crate)` here on
 // `RouterWorkerCoordinator`); glob re-export would miss them.
 pub(crate) use types::{
-    AdmittedRequest, CancellationPolicy, DeniedRequest, PyRouterRequestNew,
+    AdmittedRequest, CancellationPolicy, DeniedRequest, FirstEventMutation, PyRouterRequestNew,
     RouterCoordinatorPotentialLoadsCheck,
 };
 
@@ -114,22 +115,31 @@ impl RouterWorkerCoordinator {
     /// `cancellation.allow_cancel_routing()` is false.
     /// `tracing_enabled=true` emits route/preflight step breadcrumbs with whether
     /// a trace context is available; slow potential-load checks still warn
-    /// regardless of this flag.
+    /// regardless of this flag. When `first_event_mutation` is
+    /// `FirstEventMutation.Swallow`, worker setup waits for the first non-error
+    /// item from the returned worker stream and drops it. When it is
+    /// `FirstEventMutation.WaitAndReturn`, setup waits for that first item and
+    /// then prepends it back onto the returned stream. Both variants let a
+    /// component emit a readiness event (for example, `{"internal_health": true}`)
+    /// so the awaitable does not complete until the worker has produced data.
     ///
     /// Returns a [`AdmittedRequest`] on a successful route (with the worker
     /// generation stream, the lifecycle guard, and the chosen `worker_id`) or a
     /// [`DeniedRequest`] when the router is backpressured, a `require_available`
     /// component is down, the preflight overflows, the preflight cannot reach
-    /// the router, or the stale-route reroute loop is exhausted — never raising
-    /// in those cases. Discriminate in Python with
+    /// the router, the stale-route reroute loop is exhausted, or
+    /// `first_event_mutation` cannot read the first worker stream item —
+    /// never raising in those cases. Discriminate in Python with
     /// `isinstance(result, AdmittedRequest)` / `isinstance(result, DeniedRequest)`
     /// (and `isinstance(result, DeniedRequest.<Variant>)` for the denial reason);
+    /// first-event failures are returned as
+    /// `DeniedRequest.FirstWorkerEventFailed`, not raised.
     /// on a successful route, `response_stream()` yields the worker generation
     /// tokens and `mark_prefill()` / `mark_free()` drive the KV-lifecycle
     /// callbacks to the router. A non-stale worker-open failure (or a
     /// non-object `worker_args`) IS raised, not returned as a `DeniedRequest`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false))]
+    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, first_event_mutation=None))]
     fn route_and_worker<'p>(
         &self,
         py: Python<'p>,
@@ -142,6 +152,7 @@ impl RouterWorkerCoordinator {
         cancellation: CancellationPolicy,
         max_reroutes: u64,
         tracing_enabled: bool,
+        first_event_mutation: Option<FirstEventMutation>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let annotated = annotated.unwrap_or(false);
         let allow_cancel_routing = cancellation.allow_cancel_routing();
@@ -296,6 +307,7 @@ impl RouterWorkerCoordinator {
                 max_reroutes,
                 allow_cancel_routing,
                 allow_cancel_setup,
+                first_event_mutation,
                 ROUTER_GUARD_NOTIFY_TIMEOUT,
                 tracing_enabled,
             );
