@@ -67,6 +67,27 @@ where
             .collect()
     }
 
+    fn worker_residency_capacities(
+        workers: &HashMap<WorkerId, C>,
+    ) -> HashMap<WorkerWithDpRank, Option<u64>> {
+        let rank_count = workers
+            .values()
+            .map(|cfg| cfg.data_parallel_size() as usize)
+            .sum();
+        let mut capacities = HashMap::with_capacity(rank_count);
+        for (&worker_id, cfg) in workers {
+            let start = cfg.data_parallel_start_rank();
+            let end = start.saturating_add(cfg.data_parallel_size());
+            for dp_rank in start..end {
+                capacities.insert(
+                    WorkerWithDpRank::new(worker_id, dp_rank),
+                    cfg.total_kv_blocks(),
+                );
+            }
+        }
+        capacities
+    }
+
     /// Construct a scheduler with dequeue-time overlap refresh.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_overlap_refresh(
@@ -80,12 +101,19 @@ where
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        track_residency: bool,
         recheck_interval: Duration,
         track_prefill_tokens_default: bool,
         cancellation_token: CancellationToken,
         worker_type: &'static str,
         monitor_worker_configs: bool,
     ) -> Self {
+        if track_residency {
+            slots.configure_residency(&Self::worker_residency_capacities(
+                &workers_with_configs.borrow(),
+            ));
+        }
+
         if monitor_worker_configs {
             let slots_monitor = Arc::clone(&slots);
             let mut monitor_rx = workers_with_configs.clone();
@@ -115,6 +143,13 @@ where
 
                     let dp_range = Self::worker_dp_range(&current_workers);
                     slots_monitor.update_workers(&dp_range);
+                    if slots_monitor.tracks_residency() {
+                        let current_capacities =
+                            Self::worker_residency_capacities(&current_workers);
+                        if current_capacities != Self::worker_residency_capacities(&last_workers) {
+                            slots_monitor.configure_residency(&current_capacities);
+                        }
+                    }
                     last_workers = current_workers;
                 }
             });
@@ -445,6 +480,7 @@ where
             policy,
             prefill_load_estimator,
             None,
+            false,
             recheck_interval,
             track_prefill_tokens_default,
             cancellation_token,
@@ -466,6 +502,7 @@ where
         policy: S,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        track_residency: bool,
         recheck_interval: Duration,
         track_prefill_tokens_default: bool,
         cancellation_token: CancellationToken,
@@ -483,6 +520,7 @@ where
             prefill_load_estimator,
             None,
             overloaded_worker_provider,
+            track_residency,
             recheck_interval,
             track_prefill_tokens_default,
             cancellation_token,

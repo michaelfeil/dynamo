@@ -7,6 +7,7 @@ mod prefill_tracker;
 mod prompt_membership_trie;
 mod prompt_registry;
 mod request_maps;
+mod residency;
 pub mod single;
 mod topology;
 
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use multi_worker::*;
 pub use prefill_tracker::PrefillTokenDeltas;
+pub use residency::EvictionPressure;
 pub use single::*;
 
 static PREFILL_TOKEN_DISCOUNT: AtomicU64 = AtomicU64::new(1.0f64.to_bits());

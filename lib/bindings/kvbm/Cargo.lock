@@ -1525,6 +1525,7 @@ dependencies = [
  "dynamo-runtime",
  "dynamo-tokens",
  "flume",
+ "lru 0.12.5",
  "ordered-float 4.6.0",
  "parking_lot",
  "prometheus",

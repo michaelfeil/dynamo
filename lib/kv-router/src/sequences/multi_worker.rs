@@ -14,7 +14,10 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +27,7 @@ use super::PrefillTokenDeltas;
 use super::prompt_membership_trie::lookup_live_hashes;
 use super::prompt_registry::{PromptRegistry, WorkerLoadSnapshot};
 use super::request_maps::RequestIndex;
+use super::residency::EvictionPressure;
 use super::single::{ActiveSequences, PromptMembershipDelta, RequestId};
 use super::topology::WorkerTable;
 use crate::protocols::{
@@ -125,6 +129,7 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     remote_state_updates: watch::Sender<()>,
     replica_sync: bool,
     worker_type: &'static str,
+    track_residency: AtomicBool,
 }
 
 impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
@@ -154,6 +159,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             remote_state_updates,
             replica_sync,
             worker_type,
+            track_residency: AtomicBool::new(false),
         }
     }
 
@@ -314,6 +320,13 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                                 );
                                 let (expired_request_ids, load) = {
                                     let slot = &table.slots[idx];
+                                    if let (Some(residency), Some(sequence_hashes)) =
+                                        (&slot.residency, token_sequence.as_deref())
+                                    {
+                                        residency
+                                            .write()
+                                            .touch_sequence_hashes(sequence_hashes, decay_now);
+                                    }
                                     let mut seq = slot.sequences.write();
                                     let outcome = seq.add_request_with_prefill_tracking(
                                         event.request_id.clone(),
@@ -429,6 +442,47 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             table.reconcile(self.block_size, new_dp_range)
         };
 
+        self.apply_worker_topology_change(change);
+    }
+
+    pub(crate) fn configure_residency(
+        &self,
+        worker_kv_blocks: &HashMap<WorkerWithDpRank, Option<u64>>,
+    ) {
+        self.track_residency.store(true, AtomicOrdering::Relaxed);
+        let updates = {
+            let mut table = self.workers.write();
+            table.configure_residency(worker_kv_blocks)
+        };
+        for (residency, capacity_blocks) in updates {
+            residency.write().set_capacity(capacity_blocks);
+        }
+    }
+
+    pub(crate) fn tracks_residency(&self) -> bool {
+        self.track_residency.load(AtomicOrdering::Relaxed)
+    }
+
+    pub fn eviction_pressure_for_new_blocks_at(
+        &self,
+        worker: WorkerWithDpRank,
+        additional_blocks: u64,
+        half_life: Duration,
+        now: Instant,
+    ) -> EvictionPressure {
+        let table = self.workers.read();
+        let Some(&idx) = table.index.get(&worker) else {
+            return EvictionPressure::empty(additional_blocks);
+        };
+        let Some(residency) = &table.slots[idx].residency else {
+            return EvictionPressure::empty(additional_blocks);
+        };
+        residency
+            .read()
+            .eviction_pressure_for_new_blocks_at(additional_blocks, half_life, now)
+    }
+
+    fn apply_worker_topology_change(&self, change: super::topology::WorkerTopologyChange) {
         for removed in &change.removed {
             tracing::warn!("Removing worker {:?}", removed.worker);
             self.request_index.remove_worker_requests(removed.worker);
@@ -460,6 +514,19 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         self.add_request_local(req, decay_now)?;
         self.spawn_publish_event(event);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn residency_test_state(
+        &self,
+        worker: WorkerWithDpRank,
+    ) -> Option<(Option<u64>, u64)> {
+        let table = self.workers.read();
+        let idx = *table.index.get(&worker)?;
+        table.slots[idx]
+            .residency
+            .as_ref()
+            .map(|residency| residency.read().test_state())
     }
 
     /// Free all blocks associated with a request.
@@ -746,6 +813,13 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 });
             }
             let slot = &table.slots[idx];
+            if let (Some(residency), Some(sequence_hashes)) =
+                (&slot.residency, token_sequence.as_deref())
+            {
+                residency
+                    .write()
+                    .touch_sequence_hashes(sequence_hashes, decay_now);
+            }
             let mut seq = slot.sequences.write();
             let outcome = seq.add_request_with_prefill_tracking(
                 request_id,
@@ -1063,6 +1137,88 @@ mod tests {
         assert_eq!(
             sequences.active_tokens(decay_now).get(&worker).copied(),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn residency_survives_request_free() {
+        let sequences = make_sequences();
+        let worker = WorkerWithDpRank::new(1, 0);
+        let decay_now = Instant::now();
+        sequences.configure_residency(&HashMap::from([(worker, Some(4))]));
+
+        sequences
+            .add_request(
+                SequenceRequest {
+                    request_id: "req-1".to_string(),
+                    token_sequence: Some(vec![1, 2, 3]),
+                    track_prefill_tokens: false,
+                    expected_output_tokens: None,
+                    prefill_load_hint: None,
+                    worker,
+                    lora_name: None,
+                },
+                decay_now,
+            )
+            .unwrap();
+        sequences.free(&"req-1".to_string(), decay_now).unwrap();
+
+        assert_eq!(
+            sequences.residency_test_state(worker).unwrap(),
+            (Some(4), 3)
+        );
+        assert_eq!(sequences.active_blocks().get(&worker).copied(), Some(0));
+
+        let pressure = sequences.eviction_pressure_for_new_blocks_at(
+            worker,
+            2,
+            Duration::from_secs(60),
+            decay_now,
+        );
+        assert_eq!(pressure.resident_blocks, 3);
+        assert_eq!(pressure.capacity_blocks, Some(4));
+        assert_eq!(pressure.new_blocks, 2);
+        assert_eq!(pressure.would_evict_blocks, 1);
+    }
+
+    #[tokio::test]
+    async fn replica_sync_add_request_touches_residency() {
+        let sequences = make_sequences();
+        let worker = WorkerWithDpRank::new(1, 0);
+        sequences.configure_residency(&HashMap::from([(worker, Some(4))]));
+
+        sequences
+            .run_replica_sync(
+                VecSubscriber {
+                    events: VecDeque::from([Ok(ActiveSequenceEvent {
+                        request_id: "remote-req".to_string(),
+                        worker,
+                        data: ActiveSequenceEventData::AddRequest {
+                            token_sequence: Some(vec![1, 2, 3]),
+                            track_prefill_tokens: false,
+                            expected_output_tokens: None,
+                            prefill_load_hint: None,
+                        },
+                        router_id: 42,
+                        lora_name: None,
+                    })]),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(sequences.residency_test_state(worker).unwrap().1, 3);
+        assert_eq!(
+            sequences
+                .eviction_pressure_for_new_blocks_at(
+                    worker,
+                    2,
+                    Duration::from_secs(60),
+                    Instant::now()
+                )
+                .would_evict_blocks,
+            1
         );
     }
 

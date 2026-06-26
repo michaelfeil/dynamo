@@ -648,6 +648,17 @@ Queue admission fields to replay:
   unless the replay also adds a higher-level request hint. Mocker replay paths
   should also pass `false` to preserve prior behavior.
 
+Opt-in router residency tracking:
+
+- Adds per-worker `WorkerResidency` LRU (`SequenceHash -> Instant`) gated by
+  `router_track_residency`. Off by default.
+- Touch is taken before `slot.sequences.write()` and `configure_residency`
+  trims per-worker outside the outer `workers.write()` lock.
+- Exposes `eviction_pressure_for_new_blocks_at` for future selector use; not
+  wired into `B10WorkerSelector`/`DefaultWorkerSelector` yet.
+- Capacity hard-capped at 200k blocks per worker (CPU-router memory budget,
+  not a device KV-cache mirror).
+
 Compatibility and API notes:
 
 - `RouterRequest::New` remains backwards-compatible for older JSON clients:

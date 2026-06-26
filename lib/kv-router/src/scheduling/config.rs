@@ -430,6 +430,7 @@ struct KvRouterConfigSerde {
     router_track_active_blocks: bool,
     router_track_output_blocks: bool,
     router_assume_kv_reuse: bool,
+    router_track_residency: bool,
     router_track_prefill_tokens: bool,
     router_prefill_load_model: RouterPrefillLoadModel,
     router_snapshot_threshold: Option<u32>,
@@ -465,6 +466,7 @@ impl Default for KvRouterConfigSerde {
             router_track_active_blocks: config.router_track_active_blocks,
             router_track_output_blocks: config.router_track_output_blocks,
             router_assume_kv_reuse: config.router_assume_kv_reuse,
+            router_track_residency: config.router_track_residency,
             router_track_prefill_tokens: config.router_track_prefill_tokens,
             router_prefill_load_model: config.router_prefill_load_model,
             router_snapshot_threshold: config.router_snapshot_threshold,
@@ -532,6 +534,10 @@ pub struct KvRouterConfig {
     /// When true, computes actual block hashes for sequence tracking.
     /// When false, generates random hashes (assuming no KV cache reuse).
     pub router_assume_kv_reuse: bool,
+
+    /// Whether to keep worker-local residency LRU state after requests are freed.
+    #[serde(default)]
+    pub router_track_residency: bool,
 
     /// Whether to include prompt-side prefill tokens in active load accounting (default: true).
     /// When false, prompt tokens are excluded from active prefill token tracking, queue pressure,
@@ -651,6 +657,7 @@ impl Default for KvRouterConfig {
             router_track_active_blocks: true,
             router_track_output_blocks: false,
             router_assume_kv_reuse: true,
+            router_track_residency: false,
             router_track_prefill_tokens: default_track_prefill_tokens(),
             router_prefill_load_model: RouterPrefillLoadModel::default(),
             router_snapshot_threshold: Some(1000000),
@@ -698,6 +705,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_track_active_blocks: compat.router_track_active_blocks,
             router_track_output_blocks: compat.router_track_output_blocks,
             router_assume_kv_reuse: compat.router_assume_kv_reuse,
+            router_track_residency: compat.router_track_residency,
             router_track_prefill_tokens: compat.router_track_prefill_tokens,
             router_prefill_load_model: compat.router_prefill_load_model,
             router_snapshot_threshold: compat.router_snapshot_threshold,
@@ -733,6 +741,11 @@ fn validate_kv_router_config(config: &KvRouterConfig) -> Result<(), ValidationEr
     if config.router_track_output_blocks && !config.router_track_active_blocks {
         return Err(ValidationError::new(
             "router_track_output_blocks requires router_track_active_blocks=true",
+        ));
+    }
+    if config.router_track_residency && !config.router_track_active_blocks {
+        return Err(ValidationError::new(
+            "router_track_residency currently requires router_track_active_blocks=true",
         ));
     }
     if config.router_prefill_load_model.is_enabled() && !config.router_track_prefill_tokens {
@@ -798,12 +811,12 @@ impl KvRouterConfig {
             .unwrap_or(self.router_track_prefill_tokens)
     }
 
-    /// Compute sequence hashes for active block tracking based on configuration.
+    /// Compute sequence hashes for active block or residency tracking based on configuration.
     ///
     /// Returns:
-    /// - `None` if `router_track_active_blocks` is false
-    /// - Random hashes if `router_track_active_blocks` is true but `router_assume_kv_reuse` is false
-    /// - Actual sequence hashes if both are true
+    /// - `None` if neither active-block nor residency tracking needs hashes
+    /// - Random hashes if tracking is enabled but `router_assume_kv_reuse` is false
+    /// - Actual sequence hashes if tracking is enabled and `router_assume_kv_reuse` is true
     pub fn compute_seq_hashes_for_tracking(
         &self,
         tokens: &[u32],
@@ -812,7 +825,7 @@ impl KvRouterConfig {
         hash_options: BlockHashOptions<'_>,
         precomputed_block_hashes: Option<&[LocalBlockHash]>,
     ) -> Option<Vec<u64>> {
-        if !self.router_track_active_blocks {
+        if !self.router_track_active_blocks && !self.router_track_residency {
             return None;
         }
 

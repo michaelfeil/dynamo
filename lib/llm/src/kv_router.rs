@@ -502,7 +502,7 @@ where
             .in_scope(|| compute_block_hash_for_seq(tokens, self.block_size, hash_options));
         log_routing_input_hashes(context_id, self.block_size, tokens, &block_hashes);
         let hash_elapsed = start.elapsed();
-        // Compute seq_hashes only if scheduler needs it for active blocks tracking
+        // Compute seq_hashes only if active-block or residency tracking needs them.
         let maybe_seq_hashes = tracing::info_span!("kv_router.compute_seq_hashes").in_scope(|| {
             self.kv_router_config.compute_seq_hashes_for_tracking(
                 tokens,

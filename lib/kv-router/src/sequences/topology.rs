@@ -8,6 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 
 use super::prompt_membership_trie::WorkerLookup;
+use super::residency::WorkerResidency;
 use super::single::ActiveSequences;
 use crate::protocols::WorkerWithDpRank;
 
@@ -35,6 +36,7 @@ pub(super) struct WorkerSlot {
     pub(super) worker: WorkerWithDpRank,
     pub(super) sequences: RwLock<ActiveSequences>,
     pub(super) trie_lookup: Arc<RwLock<WorkerLookup>>,
+    pub(super) residency: Option<Arc<RwLock<WorkerResidency>>>,
 }
 
 impl WorkerSlot {
@@ -43,6 +45,18 @@ impl WorkerSlot {
             worker,
             sequences: RwLock::new(ActiveSequences::new(block_size)),
             trie_lookup: Arc::new(RwLock::new(WorkerLookup::default())),
+            residency: None,
+        }
+    }
+
+    fn ensure_residency(&mut self) -> Arc<RwLock<WorkerResidency>> {
+        match &self.residency {
+            Some(residency) => Arc::clone(residency),
+            None => {
+                let residency = Arc::new(RwLock::new(WorkerResidency::new(None)));
+                self.residency = Some(Arc::clone(&residency));
+                residency
+            }
         }
     }
 }
@@ -66,6 +80,20 @@ impl WorkerTable {
 
     pub(super) fn workers(&self) -> impl Iterator<Item = WorkerWithDpRank> + '_ {
         self.slots.iter().map(|slot| slot.worker)
+    }
+
+    pub(super) fn configure_residency(
+        &mut self,
+        capacity_by_worker: &HashMap<WorkerWithDpRank, Option<u64>>,
+    ) -> Vec<(Arc<RwLock<WorkerResidency>>, Option<u64>)> {
+        let mut updates = Vec::with_capacity(self.slots.len());
+        for slot in &mut self.slots {
+            updates.push((
+                slot.ensure_residency(),
+                capacity_by_worker.get(&slot.worker).copied().flatten(),
+            ));
+        }
+        updates
     }
 
     pub(super) fn register_external(

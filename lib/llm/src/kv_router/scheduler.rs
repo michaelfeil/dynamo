@@ -107,6 +107,7 @@ where
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            kv_router_config.router_track_residency,
             kv_router_config.router_queue_recheck_interval(),
             kv_router_config.router_track_prefill_tokens,
             component.drt().child_token(),
