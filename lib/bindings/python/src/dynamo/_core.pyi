@@ -2103,6 +2103,7 @@ class KvRouterConfig:
         router_predicted_ttl_secs: Optional[float] = None,
         *,
         router_track_residency: bool = False,
+        router_track_active_request_isl: bool = False,
         overlap_score_credit: float = 1.0,
         prefill_load_scale: float = 1.0,
         router_queue_by_incoming_missing_isl: Optional[list[tuple[int, int]]] = None,
@@ -2130,6 +2131,7 @@ class KvRouterConfig:
                 sequence length (agent_hints.osl in nvext).
             router_assume_kv_reuse: Assume KV cache reuse when tracking active blocks (default: True).
                 When True, computes actual block hashes. When False, generates random hashes.
+            router_track_active_request_isl: Track ISL stats for active requests (default: False).
             router_track_prefill_tokens: Include prompt-side prefill tokens in active load accounting (default: True).
             router_prefill_load_model: Prompt-side prefill load model (default: "none").
                 "none" keeps static prompt load accounting.

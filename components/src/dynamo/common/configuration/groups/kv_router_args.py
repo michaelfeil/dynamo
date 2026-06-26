@@ -36,6 +36,7 @@ _KV_ROUTER_FIELDS: tuple[str, ...] = (
     "router_track_output_blocks",
     "router_assume_kv_reuse",
     "router_track_residency",
+    "router_track_active_request_isl",
     "router_track_prefill_tokens",
     "router_prefill_load_model",
     "router_snapshot_threshold",
@@ -118,6 +119,7 @@ class KvRouterConfigBase(ConfigBase):
     router_track_output_blocks: bool
     router_assume_kv_reuse: bool
     router_track_residency: bool = False
+    router_track_active_request_isl: bool = False
     router_track_prefill_tokens: bool
     router_prefill_load_model: str
     router_snapshot_threshold: int
@@ -297,6 +299,17 @@ class KvRouterArgGroup(ArgGroup):
             help=(
                 "KV Router: Track worker-local residency LRU after requests are freed. "
                 "This is used to estimate cache disruption for new sessions."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--router-track-active-request-isl",
+            env_var="DYN_ROUTER_TRACK_ACTIVE_REQUEST_ISL",
+            default=False,
+            dest="router_track_active_request_isl",
+            help=(
+                "KV Router: Track ISL stats for active requests. "
+                "Disabled by default."
             ),
         )
         add_negatable_bool_argument(

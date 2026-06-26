@@ -431,6 +431,7 @@ struct KvRouterConfigSerde {
     router_track_output_blocks: bool,
     router_assume_kv_reuse: bool,
     router_track_residency: bool,
+    router_track_active_request_isl: bool,
     router_track_prefill_tokens: bool,
     router_prefill_load_model: RouterPrefillLoadModel,
     router_snapshot_threshold: Option<u32>,
@@ -467,6 +468,7 @@ impl Default for KvRouterConfigSerde {
             router_track_output_blocks: config.router_track_output_blocks,
             router_assume_kv_reuse: config.router_assume_kv_reuse,
             router_track_residency: config.router_track_residency,
+            router_track_active_request_isl: config.router_track_active_request_isl,
             router_track_prefill_tokens: config.router_track_prefill_tokens,
             router_prefill_load_model: config.router_prefill_load_model,
             router_snapshot_threshold: config.router_snapshot_threshold,
@@ -538,6 +540,10 @@ pub struct KvRouterConfig {
     /// Whether to keep worker-local residency LRU state after requests are freed.
     #[serde(default)]
     pub router_track_residency: bool,
+
+    /// Whether to track active-request ISL stats.
+    #[serde(default)]
+    pub router_track_active_request_isl: bool,
 
     /// Whether to include prompt-side prefill tokens in active load accounting (default: true).
     /// When false, prompt tokens are excluded from active prefill token tracking, queue pressure,
@@ -658,6 +664,7 @@ impl Default for KvRouterConfig {
             router_track_output_blocks: false,
             router_assume_kv_reuse: true,
             router_track_residency: false,
+            router_track_active_request_isl: false,
             router_track_prefill_tokens: default_track_prefill_tokens(),
             router_prefill_load_model: RouterPrefillLoadModel::default(),
             router_snapshot_threshold: Some(1000000),
@@ -706,6 +713,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             router_track_output_blocks: compat.router_track_output_blocks,
             router_assume_kv_reuse: compat.router_assume_kv_reuse,
             router_track_residency: compat.router_track_residency,
+            router_track_active_request_isl: compat.router_track_active_request_isl,
             router_track_prefill_tokens: compat.router_track_prefill_tokens,
             router_prefill_load_model: compat.router_prefill_load_model,
             router_snapshot_threshold: compat.router_snapshot_threshold,
