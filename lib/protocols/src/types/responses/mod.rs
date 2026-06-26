@@ -28,6 +28,8 @@
 
 use std::collections::HashMap;
 
+use crate::error::OpenAIError;
+use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 
 // Re-export all upstream response types (shared structures like ResponseUsage,
@@ -120,6 +122,22 @@ where
     D: serde::Deserializer<'de>,
 {
     Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+// mirror openai reasoning but widened to include `max`
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default, Builder)]
+#[builder(
+    name = "ReasoningArgs",
+    pattern = "mutable",
+    setter(into, strip_option),
+    default
+)]
+#[builder(build_fn(error = "OpenAIError"))]
+pub struct Reasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
 }
 
 /// Relaxed counterpart to upstream `OutputTextContent` for input-side content.
@@ -432,6 +450,21 @@ mod tests {
             InputContent::InputImage(img) => assert_eq!(img.detail, ImageDetail::Auto),
             other => panic!("expected InputImage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_response_accepts_max_reasoning_effort() {
+        let req: CreateResponse = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "Hello",
+            "reasoning": {"effort": "max"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            req.reasoning.and_then(|reasoning| reasoning.effort),
+            Some(ReasoningEffort::Max)
+        );
     }
 
     #[test]

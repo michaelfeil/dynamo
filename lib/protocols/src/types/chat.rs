@@ -62,7 +62,6 @@ pub use async_openai::types::chat::{
     PredictionContentContent,
     Prompt,
     PromptTokensDetails,
-    ReasoningEffort,
     ResponseFormat,
     ResponseFormatJsonSchema,
     Role,
@@ -74,6 +73,19 @@ pub use async_openai::types::chat::{
     WebSearchUserLocation,
     WebSearchUserLocationType,
 };
+
+#[derive(Clone, Serialize, Debug, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    #[default]
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct ChatChoiceLogprobs {
@@ -904,6 +916,18 @@ mod tests {
         let stop: Stop = serde_json::from_value(serde_json::json!(["token_id:576"])).unwrap();
 
         assert_eq!(stop, Stop::StringArray(vec!["token_id:576".to_string()]));
+    }
+
+    #[test]
+    fn chat_completion_request_accepts_max_reasoning_effort() {
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "reasoning_effort": "max"
+        }))
+        .unwrap();
+
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Max));
     }
 
     #[test]

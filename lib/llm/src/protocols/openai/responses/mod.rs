@@ -85,6 +85,8 @@ pub struct NvResponse {
     pub frequency_penalty: f32,
     #[serde(default)]
     pub store: bool,
+    #[serde(skip)]
+    pub reasoning: Option<Reasoning>,
 }
 
 /// Patch an already-serialized `Response` JSON object to match the
@@ -110,6 +112,7 @@ pub(crate) fn patch_response_for_spec(
     presence_penalty: f32,
     frequency_penalty: f32,
     store: bool,
+    reasoning: Option<&Reasoning>,
 ) {
     for key in dynamo_protocols::types::responses::SPEC_NULLABLE_REQUIRED_RESPONSE_FIELDS {
         obj.entry(*key).or_insert(serde_json::Value::Null);
@@ -124,6 +127,9 @@ pub(crate) fn patch_response_for_spec(
         serde_json::json!(frequency_penalty),
     );
     obj.insert("store".into(), serde_json::json!(store));
+    if let Some(reasoning) = reasoning {
+        obj.insert("reasoning".into(), serde_json::json!(reasoning));
+    }
 }
 
 impl Serialize for NvResponse {
@@ -138,6 +144,7 @@ impl Serialize for NvResponse {
             self.presence_penalty,
             self.frequency_penalty,
             self.store,
+            self.reasoning.as_ref(),
         );
 
         if let Some(nvext) = &self.nvext {
@@ -1073,7 +1080,7 @@ pub fn chat_completion_to_response(
         prompt: None,
         prompt_cache_key: params.prompt_cache_key.clone(),
         prompt_cache_retention: params.prompt_cache_retention,
-        reasoning: params.reasoning.clone(),
+        reasoning: None,
         safety_identifier: params.safety_identifier.clone(),
         service_tier: Some(params.service_tier.unwrap_or(ServiceTier::Auto)),
         top_logprobs: Some(0),
@@ -1102,6 +1109,7 @@ pub fn chat_completion_to_response(
         presence_penalty: params.presence_penalty.unwrap_or(0.0),
         frequency_penalty: params.frequency_penalty.unwrap_or(0.0),
         store: params.store.unwrap_or(false),
+        reasoning: params.reasoning.clone(),
     })
 }
 
@@ -2555,7 +2563,7 @@ thinking
 
         let params = ResponseParams {
             reasoning: Some(Reasoning {
-                effort: Some(ReasoningEffort::High),
+                effort: Some(ReasoningEffort::Max),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2576,8 +2584,8 @@ thinking
         };
 
         let resp = chat_completion_to_response(chat_resp, &params, None).unwrap();
-        let reasoning = resp.inner.reasoning.unwrap();
-        assert_eq!(reasoning.effort, Some(ReasoningEffort::High));
+        let json = serde_json::to_value(resp).unwrap();
+        assert_eq!(json["reasoning"]["effort"], "max");
     }
 
     #[test]
