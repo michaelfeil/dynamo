@@ -34,13 +34,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 
+use super::DROP_THIS_MESSAGE_KEY;
 use super::guard::{
     ROUTER_GUARD_ATTEMPTS, ROUTER_GUARD_CALLBACK_TIMEOUT, ROUTER_GUARD_CLEANUP_GRACE_PERIOD,
     ROUTER_GUARD_RETRY_DELAY, RouterRequestGuard,
 };
 use super::types::{
-    DeniedRequest, FirstEventMutation, MinReplicaAvailable, NextRouterBackpressureInfo,
-    PotentialLoadsCheckData, PreflightInputs,
+    DeniedRequest, MinReplicaAvailable, NextRouterBackpressureInfo, PotentialLoadsCheckData,
+    PreflightInputs,
 };
 
 /// JSON-typed push router used to talk to KV router instances.
@@ -54,7 +55,6 @@ const POTENTIAL_LOADS_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(590);
-
 fn create_detached_router_request_context(
     request: serde_json::Value,
     parent_ctx: &Option<context::Context>,
@@ -705,7 +705,11 @@ async fn drain_worker_stream_to_completion(
     let mut prefill_marked = false;
     while let Some(response) = stream.next().await {
         let is_error = response.is_error();
-        if !prefill_marked && !is_error {
+        if !prefill_marked
+            && !is_error
+            && response.data.is_some()
+            && !should_drop_first_worker_event(&response)
+        {
             guard.mark_prefill();
             prefill_marked = true;
         }
@@ -1221,6 +1225,24 @@ async fn wait_for_first_worker_event(
     Ok(first)
 }
 
+pub(super) fn should_drop_first_worker_event(event: &RsAnnotated<serde_json::Value>) -> bool {
+    event
+        .data
+        .as_ref()
+        .and_then(|data| data.get(DROP_THIS_MESSAGE_KEY))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn prepend_first_worker_event(
+    first: RsAnnotated<serde_json::Value>,
+    stream: EngineStream<RsAnnotated<serde_json::Value>>,
+) -> EngineStream<RsAnnotated<serde_json::Value>> {
+    let stream_context = stream.context();
+    let replay_stream = futures::stream::once(async move { first }).chain(stream);
+    ResponseStream::new(Box::pin(replay_stream), stream_context)
+}
+
 /// Open the worker generation stream on the routed `worker_id`. A route is
 /// *stale* when the worker is absent from the worker informer's instance set
 /// (its etcd entry was removed after the router chose it); that is detected
@@ -1240,9 +1262,9 @@ async fn wait_for_first_worker_event(
 ///
 /// When `allow_cancel_setup` is false the open is detached via
 /// [`shield_to_completion`] so a Python cancellation cannot abort the setup.
-/// When `first_event_mutation` is set, setup includes waiting for the first
-/// non-error worker stream event. `Swallow` drops it before returning the
-/// remaining stream; `WaitAndReturn` prepends it back onto the returned stream.
+/// When `wait_for_first_response` is true, setup includes waiting for the first
+/// non-error worker stream event. The event is dropped only when it carries the
+/// drop-message sentinel; otherwise it is prepended back onto the returned stream.
 async fn connect_worker(
     worker_guard_client: Arc<dyn RouterGuardClient>,
     worker_id: u64,
@@ -1250,7 +1272,7 @@ async fn connect_worker(
     worker_request: serde_json::Value,
     context: context::Context,
     allow_cancel_setup: bool,
-    first_event_mutation: Option<FirstEventMutation>,
+    wait_for_first_response: bool,
 ) -> OpenResult {
     if !worker_guard_client.instance_ids().contains(&worker_id) {
         tracing::info!(
@@ -1281,7 +1303,7 @@ async fn connect_worker(
             .await;
         match stream_result {
             Ok(mut stream) => {
-                if let Some(mutation) = first_event_mutation {
+                if wait_for_first_response {
                     let first = match wait_for_first_worker_event(&mut stream, worker_id).await {
                         Ok(first) => first,
                         Err(err) => {
@@ -1297,14 +1319,13 @@ async fn connect_worker(
                         }
                     };
 
-                    match mutation {
-                        FirstEventMutation::Swallow => {}
-                        FirstEventMutation::WaitAndReturn => {
-                            let stream_context = stream.context();
-                            let replay_stream =
-                                futures::stream::once(async move { first }).chain(stream);
-                            stream = ResponseStream::new(Box::pin(replay_stream), stream_context);
-                        }
+                    if should_drop_first_worker_event(&first) {
+                        tracing::debug!(
+                            worker_id,
+                            "connect_worker: swallowed first worker stream sentinel"
+                        );
+                    } else {
+                        stream = prepend_first_worker_event(first, stream);
                     }
                 }
                 OpenResult::Ok {
@@ -1448,7 +1469,7 @@ pub(super) async fn route_and_connect(
     max_reroutes: u64,
     allow_cancel_routing: bool,
     allow_cancel_setup: bool,
-    first_event_mutation: Option<FirstEventMutation>,
+    wait_for_first_response: bool,
     notify_timeout: Duration,
     tracing_enabled: bool,
 ) -> Result<RouteAndConnectOutcome> {
@@ -1501,7 +1522,7 @@ pub(super) async fn route_and_connect(
             req,
             context.clone(),
             allow_cancel_setup,
-            first_event_mutation,
+            wait_for_first_response,
         )
         .await
         {

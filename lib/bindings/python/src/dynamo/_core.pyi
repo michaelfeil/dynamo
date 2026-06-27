@@ -20,6 +20,8 @@ from typing import (
 # Import from specialized modules
 from .prometheus_metrics import RuntimeMetrics as PyRuntimeMetrics
 
+B10_DROP_THIS_MESSAGE_KEY: str
+
 def log_message(level: str, message: str, module: str, file: str, line: int) -> None:
     """
     Log a message from Python with file and line info
@@ -399,18 +401,6 @@ class CancellationPolicy:
     ...
 
 
-class FirstEventMutation:
-    """
-    Optional first-event behavior for
-    :meth:`RouterWorkerCoordinator.route_and_worker`. Pass ``None`` for the
-    default/no-op behavior.
-    """
-
-    Swallow: "FirstEventMutation"
-    WaitAndReturn: "FirstEventMutation"
-    ...
-
-
 class PyRouterRequestNew:
     """
     Typed carrier of the six ``RouterRequest::New`` wire-body fields (minus the
@@ -468,7 +458,8 @@ class RouterWorkerCoordinator:
             cancellation: CancellationPolicy = CancellationPolicy.Cancellable,
             max_reroutes: int = 1,
             tracing_enabled: bool = False,
-            first_event_mutation: FirstEventMutation | None = None,
+            wait_for_first_response: bool = False,
+            mark_prefill_on_response: bool = False,
         ) -> AdmittedRequest | DeniedRequest:
         """
         Route a KV-router ``new`` request, then generate on the routed worker.
@@ -510,13 +501,19 @@ class RouterWorkerCoordinator:
         trace context is available. Slow potential-load checks still warn
         regardless of this flag.
 
-        When ``first_event_mutation`` is ``FirstEventMutation.Swallow``, worker
-        setup waits for the first non-error item from the returned worker stream
-        and drops it before handing the remaining stream back. When it is
-        ``FirstEventMutation.WaitAndReturn``, setup waits for that first item
-        and then returns it as the first visible stream item. If the first item
-        is missing or is an error, the result is
+        When ``wait_for_first_response`` is true, worker setup waits for the
+        first non-error item from the returned worker stream and drops it only
+        when it carries the drop-message sentinel, such as
+        ``dynamo._core.B10_DROP_THIS_MESSAGE_KEY``. Otherwise, the item is
+        returned as the first visible stream item. If the first item is missing
+        or is an error, the result is
         ``DeniedRequest.FirstWorkerEventFailed`` rather than a raised exception.
+
+        When ``mark_prefill_on_response`` is true, Rust calls
+        ``mark_prefill()`` on the routed guard as soon as the worker stream
+        produces its first non-error, non-sentinel data item. Manual Python
+        ``mark_prefill()`` calls remain supported; this just makes that call
+        optional without waiting for Python to consume the stream.
 
         ``cancellation`` (a :class:`CancellationPolicy`, default
         ``CancellationPolicy.Cancellable``) selects which of three phases — the
@@ -540,7 +537,7 @@ class RouterWorkerCoordinator:
         :class:`DeniedRequest` when the router is backpressured, a
         ``require_available`` component is down, the preflight overflows, the
         preflight cannot reach the router, the stale-route reroute loop is
-        exhausted, or ``first_event_mutation`` cannot read the first worker
+        exhausted, or ``wait_for_first_response`` cannot read the first worker
         stream item -- never raising in those cases. A non-stale worker-open
         failure (or non-object ``worker_args``) is raised, not returned as a
         ``DeniedRequest``. Discriminate with
@@ -550,7 +547,9 @@ class RouterWorkerCoordinator:
         On a successful route, ``response_stream()`` yields the worker
         generation tokens, ``overlap_blocks()`` reports the router's effective
         cached blocks for the chosen worker, and ``mark_prefill()`` /
-        ``mark_free()`` drive the KV-lifecycle callbacks.
+        ``mark_free()`` drive the KV-lifecycle callbacks. When
+        ``mark_prefill_on_response`` is enabled, the prefill mark is also
+        handled automatically on the first real worker-stream item.
         """
         ...
 
@@ -648,7 +647,7 @@ class DeniedRequest:
 
     class FirstWorkerEventFailed:
         """
-        ``first_event_mutation`` waited for the routed worker stream's first
+        ``wait_for_first_response`` waited for the routed worker stream's first
         event, but the stream ended or produced an error before that event could
         be handled.
         """

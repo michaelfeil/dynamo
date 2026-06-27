@@ -180,6 +180,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(b10_health::is_healthy, m)?)?;
     m.add_function(wrap_pyfunction!(b10_health::set_poisoned, m)?)?;
     m.add_function(wrap_pyfunction!(b10_rate_limiter::set_rate_limit_level, m)?)?;
+    m.add(
+        "B10_DROP_THIS_MESSAGE_KEY",
+        b10_client::DROP_THIS_MESSAGE_KEY,
+    )?;
 
     m.add_class::<DistributedRuntime>()?;
     m.add_class::<Endpoint>()?;
@@ -191,7 +195,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<b10_client::RouterCoordinatorPotentialLoadsCheck>()?;
     m.add_class::<b10_client::PyRouterRequestNew>()?;
     m.add_class::<b10_client::CancellationPolicy>()?;
-    m.add_class::<b10_client::FirstEventMutation>()?;
     m.add_class::<AsyncResponseStream>()?;
     m.add_class::<llm::entrypoint::EntrypointArgs>()?;
     m.add_class::<llm::entrypoint::EngineConfig>()?;

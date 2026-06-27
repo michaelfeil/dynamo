@@ -3,9 +3,9 @@ use super::coordinator::{
     shield_route_and_connect,
 };
 use super::guard::{ROUTER_GUARD_CLEANUP_GRACE_PERIOD, RouterRequestGuard};
+use super::stream_with_optional_prefill_mark;
 use super::types::{
-    DeniedRequest, FirstEventMutation, MinReplicaAvailable, PotentialLoadsCheckData,
-    PreflightInputs, RouterRequestNew,
+    DeniedRequest, MinReplicaAvailable, PotentialLoadsCheckData, PreflightInputs, RouterRequestNew,
 };
 use crate::context;
 use anyhow::Result;
@@ -732,7 +732,7 @@ async fn connect(
         max_reroutes,
         allow_cancel_routing,
         allow_cancel_setup,
-        None,
+        false,
         notify_timeout,
         false,
     )
@@ -854,11 +854,11 @@ async fn route_and_connect_happy_router_response_inject_and_mark_free_on_drop() 
 }
 
 #[tokio::test]
-async fn route_and_connect_swallow_first_event_waits_and_omits_item() {
+async fn route_and_connect_wait_for_first_response_omits_sentinel() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
     worker.set_stream_chunks(vec![vec![
-        serde_json::json!({"internal_health": true}),
+        serde_json::json!({"drop_this_message": true, "internal_healthy": true}),
         serde_json::json!({"chunk": 1}),
         serde_json::json!({"chunk": 2}),
     ]]);
@@ -876,7 +876,7 @@ async fn route_and_connect_swallow_first_event_waits_and_omits_item() {
         0,
         true,
         true,
-        Some(FirstEventMutation::Swallow),
+        true,
         Duration::from_secs(60),
         false,
     )
@@ -916,20 +916,20 @@ async fn route_and_connect_swallow_first_event_waits_and_omits_item() {
 }
 
 #[tokio::test]
-async fn route_and_connect_wait_and_return_first_event_waits_and_replays_item() {
+async fn route_and_connect_wait_for_first_response_replays_non_sentinel_item() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
     worker.set_stream_chunks(vec![vec![
-        serde_json::json!({"internal_health": true}),
         serde_json::json!({"chunk": 1}),
+        serde_json::json!({"chunk": 2}),
     ]]);
-    let context = build_test_context("test-wait-and-return-first-event");
+    let context = build_test_context("test-swallow-first-event-non-health");
 
     let outcome = route_and_connect(
         router.clone() as Arc<dyn RouterGuardClient>,
         worker.clone() as Arc<dyn RouterGuardClient>,
         make_routing_request(),
-        "req-wait-and-return-first-event".to_string(),
+        "req-swallow-first-event-non-health".to_string(),
         context,
         Vec::new(),
         None,
@@ -937,7 +937,125 @@ async fn route_and_connect_wait_and_return_first_event_waits_and_replays_item() 
         0,
         true,
         true,
-        Some(FirstEventMutation::WaitAndReturn),
+        true,
+        Duration::from_secs(60),
+        false,
+    )
+    .await
+    .expect("connect");
+
+    let (guard, worker_id, mut stream) = match outcome {
+        RouteAndConnectOutcome::Connected {
+            guard,
+            worker_id,
+            stream,
+        } => (guard, worker_id, stream),
+        other => panic!("expected Connected, got {:?}", other),
+    };
+
+    assert_eq!(worker_id, 1);
+    assert_eq!(
+        worker.stream_items_polled_count(),
+        1,
+        "setup should inspect exactly the first event before returning"
+    );
+
+    let first_visible = take_one_from_stream(&mut stream)
+        .await
+        .expect("first non-health item should be replayed");
+    assert_eq!(first_visible.data, Some(serde_json::json!({"chunk": 1})));
+    assert_eq!(
+        worker.stream_items_polled_count(),
+        1,
+        "replayed first item should not poll the worker stream again"
+    );
+
+    let second_visible = take_one_from_stream(&mut stream)
+        .await
+        .expect("remaining stream should contain second item");
+    assert_eq!(second_visible.data, Some(serde_json::json!({"chunk": 2})));
+
+    drop(stream);
+    drop(guard);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn stream_prefill_mark_skips_internal_event_and_marks_first_real_item() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
+    worker.set_stream_chunks(vec![vec![
+        serde_json::json!({"drop_this_message": true, "internal_healthy": true}),
+        serde_json::json!({"chunk": 1}),
+    ]]);
+    let context = build_test_context("test-prefill-mark-first-real-item");
+
+    let outcome = connect(
+        router.clone(),
+        worker,
+        make_routing_request(),
+        "req-prefill-mark-first-real-item",
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("connect");
+
+    let (guard, mut stream) = match outcome {
+        RouteAndConnectOutcome::Connected { guard, stream, .. } => (Arc::new(guard), stream),
+        other => panic!("expected Connected, got {:?}", other),
+    };
+    stream = stream_with_optional_prefill_mark(stream, Arc::clone(&guard), true);
+
+    let internal = take_one_from_stream(&mut stream)
+        .await
+        .expect("internal event should still be forwarded without first-event mutation");
+    assert_eq!(
+        internal.data,
+        Some(serde_json::json!({"drop_this_message": true, "internal_healthy": true}))
+    );
+    assert_eq!(router.method_call_count("mark_prefill"), 0);
+
+    let first_real = take_one_from_stream(&mut stream)
+        .await
+        .expect("real worker item should follow internal event");
+    assert_eq!(first_real.data, Some(serde_json::json!({"chunk": 1})));
+    wait_for_method_call_count(&router, "mark_prefill", 1, Duration::from_secs(2)).await;
+
+    drop(stream);
+    drop(guard);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn route_and_connect_wait_for_first_response_uses_sentinel_behavior() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
+    worker.set_stream_chunks(vec![vec![
+        serde_json::json!({"drop_this_message": true, "internal_healthy": true}),
+        serde_json::json!({"chunk": 1}),
+    ]]);
+    let context = build_test_context("test-wait-and-return-first-event-sentinel");
+
+    let outcome = route_and_connect(
+        router.clone() as Arc<dyn RouterGuardClient>,
+        worker.clone() as Arc<dyn RouterGuardClient>,
+        make_routing_request(),
+        "req-wait-and-return-first-event-sentinel".to_string(),
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        true,
+        true,
         Duration::from_secs(60),
         false,
     )
@@ -961,16 +1079,8 @@ async fn route_and_connect_wait_and_return_first_event_waits_and_replays_item() 
 
     let first_visible = take_one_from_stream(&mut stream)
         .await
-        .expect("first event should be replayed");
-    assert_eq!(
-        first_visible.data,
-        Some(serde_json::json!({"internal_health": true}))
-    );
-
-    let second_visible = take_one_from_stream(&mut stream)
-        .await
-        .expect("remaining stream should follow replayed first event");
-    assert_eq!(second_visible.data, Some(serde_json::json!({"chunk": 1})));
+        .expect("sentinel should be swallowed before first visible item");
+    assert_eq!(first_visible.data, Some(serde_json::json!({"chunk": 1})));
 
     drop(stream);
     drop(guard);
@@ -978,7 +1088,7 @@ async fn route_and_connect_wait_and_return_first_event_waits_and_replays_item() 
 }
 
 #[tokio::test]
-async fn route_and_connect_swallow_first_event_failure_returns_denied() {
+async fn route_and_connect_wait_for_first_response_failure_returns_denied() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
     worker.set_stream_chunks(vec![vec![]]);
@@ -996,7 +1106,7 @@ async fn route_and_connect_swallow_first_event_failure_returns_denied() {
         0,
         true,
         true,
-        Some(FirstEventMutation::Swallow),
+        true,
         Duration::from_secs(60),
         false,
     )
@@ -2297,7 +2407,7 @@ async fn shield_route_and_connect_no_taker_drains_connected_worker_stream() {
         0,
         false,
         false,
-        None,
+        false,
         Duration::from_secs(60),
         false,
     );

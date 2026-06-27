@@ -71,6 +71,15 @@ fn guard_free_requested(state: &RouterRequestGuardState) -> bool {
     state.free_requested.load(Ordering::Acquire) || state.dropped.load(Ordering::Acquire)
 }
 
+fn request_once(flag: &AtomicBool, notify: &Notify) {
+    if flag.load(Ordering::Relaxed) {
+        return;
+    }
+    if !flag.swap(true, Ordering::Relaxed) {
+        notify.notify_one();
+    }
+}
+
 async fn wait_for_free_request(state: &RouterRequestGuardState) {
     loop {
         if guard_free_requested(state) {
@@ -324,8 +333,7 @@ impl RouterRequestGuard {
         if !self.armed {
             return;
         }
-        self.state.prefill_requested.store(true, Ordering::Release);
-        self.state.notify.notify_one();
+        request_once(&self.state.prefill_requested, &self.state.notify);
     }
 
     /// Request that the cleanup task frees the request.
@@ -333,8 +341,7 @@ impl RouterRequestGuard {
         if !self.armed {
             return;
         }
-        self.state.free_requested.store(true, Ordering::Release);
-        self.state.notify.notify_one();
+        request_once(&self.state.free_requested, &self.state.notify);
     }
 
     /// Wait until the cleanup task has reached its terminal `cleanup_done`

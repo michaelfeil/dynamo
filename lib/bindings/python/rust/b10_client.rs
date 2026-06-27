@@ -4,7 +4,7 @@
 //! The module is split across four submodules:
 //! - [`types`] holds the PyO3 pyclasses (`PyRouterRequestNew`,
 //!   `CancellationPolicy`, `DeniedRequest`, `AdmittedRequest`,
-//!   `RouterCoordinatorPotentialLoadsCheck`, `FirstEventMutation`) plus the
+//!   `RouterCoordinatorPotentialLoadsCheck`) plus the
 //!   cross-module wire structs (`RouterRequestNew`, `PreflightInputs`,
 //!   `MinReplicaAvailable`, `PotentialLoadsCheckData`,
 //!   `NextRouterBackpressureInfo`).
@@ -38,13 +38,16 @@ mod tests;
 // Pyclasses are `pub(crate)` in `types` (and `pub(crate)` here on
 // `RouterWorkerCoordinator`); glob re-export would miss them.
 pub(crate) use types::{
-    AdmittedRequest, CancellationPolicy, DeniedRequest, FirstEventMutation, PyRouterRequestNew,
+    AdmittedRequest, CancellationPolicy, DeniedRequest, PyRouterRequestNew,
     RouterCoordinatorPotentialLoadsCheck,
 };
 
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
 use crate::{AsyncResponseStream, Client, context, process_stream, to_pyerr};
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints};
+use dynamo_runtime::pipeline::{EngineStream, ResponseStream};
+use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
+use futures::StreamExt;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -53,9 +56,37 @@ use std::sync::Arc;
 use coordinator::{
     JsonRouterGuardClient, RouteAndConnectOutcome, RouteSource, RouterGuardClient,
     route_and_connect, shield_route_and_connect, shield_stream_to_completion,
+    should_drop_first_worker_event,
 };
-use guard::ROUTER_GUARD_NOTIFY_TIMEOUT;
+use guard::{ROUTER_GUARD_NOTIFY_TIMEOUT, RouterRequestGuard};
 use types::{MinReplicaAvailable, PotentialLoadsCheckData, PreflightInputs, RouterRequestNew};
+
+pub(crate) const DROP_THIS_MESSAGE_KEY: &str = "drop_this_message";
+
+fn stream_with_optional_prefill_mark(
+    stream: EngineStream<RsAnnotated<serde_json::Value>>,
+    guard: Arc<RouterRequestGuard>,
+    mark_prefill_on_response: bool,
+) -> EngineStream<RsAnnotated<serde_json::Value>> {
+    if !mark_prefill_on_response {
+        return stream;
+    }
+
+    let stream_context = stream.context();
+    let mut marked = false;
+    let stream = stream.map(move |response| {
+        if !marked
+            && !response.is_error()
+            && response.data.is_some()
+            && !should_drop_first_worker_event(&response)
+        {
+            guard.mark_prefill();
+            marked = true;
+        }
+        response
+    });
+    ResponseStream::new(Box::pin(stream), stream_context)
+}
 
 #[pyclass]
 pub(crate) struct RouterWorkerCoordinator {
@@ -115,20 +146,25 @@ impl RouterWorkerCoordinator {
     /// `cancellation.allow_cancel_routing()` is false.
     /// `tracing_enabled=true` emits route/preflight step breadcrumbs with whether
     /// a trace context is available; slow potential-load checks still warn
-    /// regardless of this flag. When `first_event_mutation` is
-    /// `FirstEventMutation.Swallow`, worker setup waits for the first non-error
-    /// item from the returned worker stream and drops it. When it is
-    /// `FirstEventMutation.WaitAndReturn`, setup waits for that first item and
-    /// then prepends it back onto the returned stream. Both variants let a
-    /// component emit a readiness event (for example, `{"internal_health": true}`)
-    /// so the awaitable does not complete until the worker has produced data.
+    /// regardless of this flag. When `wait_for_first_response=true`, worker
+    /// setup waits for the first non-error item from the returned
+    /// worker stream and drops it only when it carries the drop-message
+    /// sentinel key `dynamo._core.B10_DROP_THIS_MESSAGE_KEY`. Otherwise,
+    /// setup prepends the item back onto the returned stream. This lets a
+    /// component emit a readiness event so the awaitable does not complete
+    /// until the worker has produced data.
+    /// When `mark_prefill_on_response=true`, Rust calls `mark_prefill()` on
+    /// the routed guard as soon as the worker stream produces its first
+    /// non-error, non-sentinel data item. Manual Python `mark_prefill()` calls
+    /// remain supported; this just makes that call optional without waiting for
+    /// Python to consume the stream.
     ///
     /// Returns a [`AdmittedRequest`] on a successful route (with the worker
     /// generation stream, the lifecycle guard, and the chosen `worker_id`) or a
     /// [`DeniedRequest`] when the router is backpressured, a `require_available`
     /// component is down, the preflight overflows, the preflight cannot reach
     /// the router, the stale-route reroute loop is exhausted, or
-    /// `first_event_mutation` cannot read the first worker stream item —
+    /// `wait_for_first_response` cannot read the first worker stream item —
     /// never raising in those cases. Discriminate in Python with
     /// `isinstance(result, AdmittedRequest)` / `isinstance(result, DeniedRequest)`
     /// (and `isinstance(result, DeniedRequest.<Variant>)` for the denial reason);
@@ -139,7 +175,7 @@ impl RouterWorkerCoordinator {
     /// callbacks to the router. A non-stale worker-open failure (or a
     /// non-object `worker_args`) IS raised, not returned as a `DeniedRequest`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, first_event_mutation=None))]
+    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, wait_for_first_response=false, mark_prefill_on_response=false))]
     fn route_and_worker<'p>(
         &self,
         py: Python<'p>,
@@ -152,7 +188,8 @@ impl RouterWorkerCoordinator {
         cancellation: CancellationPolicy,
         max_reroutes: u64,
         tracing_enabled: bool,
-        first_event_mutation: Option<FirstEventMutation>,
+        wait_for_first_response: bool,
+        mark_prefill_on_response: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
         let annotated = annotated.unwrap_or(false);
         let allow_cancel_routing = cancellation.allow_cancel_routing();
@@ -307,7 +344,7 @@ impl RouterWorkerCoordinator {
                 max_reroutes,
                 allow_cancel_routing,
                 allow_cancel_setup,
-                first_event_mutation,
+                wait_for_first_response,
                 ROUTER_GUARD_NOTIFY_TIMEOUT,
                 tracing_enabled,
             );
@@ -344,11 +381,19 @@ impl RouterWorkerCoordinator {
             // Once the `AsyncResponseStream` is returned, though, that stream
             // owns consumption: dropping it closes the receiver, `process_stream`
             // stops on send failure, and the upstream worker stream is dropped.
-            // The caller drives `mark_prefill`/`mark_free` itself when it
-            // receives the guard.
+            // The caller drives `mark_free` itself when it receives the guard.
+            // By default it also drives `mark_prefill`; when
+            // `mark_prefill_on_response` is enabled, the Rust forwarding
+            // task marks prefill when the worker stream produces the first
+            // non-error, non-sentinel data item.
             let (guard, stream) = if allow_cancel_stream {
                 let (tx, rx) = tokio::sync::mpsc::channel(32);
                 let guard_for_drain = Arc::clone(&guard);
+                let stream = stream_with_optional_prefill_mark(
+                    stream,
+                    Arc::clone(&guard),
+                    mark_prefill_on_response,
+                );
                 // Clone `tx` for the `closed()` future; the original `tx` is
                 // moved into `process_stream` below. `Sender::closed()`
                 // resolves once ALL `Receiver`s are gone (i.e. the Python
@@ -382,6 +427,11 @@ impl RouterWorkerCoordinator {
                 });
                 (guard, AsyncResponseStream::new(rx, annotated))
             } else {
+                let stream = stream_with_optional_prefill_mark(
+                    stream,
+                    Arc::clone(&guard),
+                    mark_prefill_on_response,
+                );
                 let (guard, _source, rx) =
                     shield_stream_to_completion(stream, guard, RouteSource::Routed { worker_id })
                         .await
