@@ -434,7 +434,11 @@ fn b10_rate_limit_request(
     context_id: &str,
 ) -> Option<axum::response::Response> {
     if let Some((rate_limit_msg, _)) = check_rate_limit(headers) {
-        tracing::info!(context_id = %context_id, "Request is rate limited: {rate_limit_msg}");
+        tracing::info!(
+            unified_model_logs = true,
+            context_id = %context_id,
+            "Request is rate limited: {rate_limit_msg}"
+        );
         let response = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ErrorMessage {
