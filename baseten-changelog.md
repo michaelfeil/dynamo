@@ -980,6 +980,8 @@ on optional response fields. This avoids streaming chunks like
 `service_tier: null`, and `system_fingerprint: null` while leaving request-side
 serialization behaviour unchanged.
 
+The `reasoning_effort` field on chat completion requests is normalized through a process-wide alias map before deserialization. Defaults: `"max"` → `"xhigh"`. Override at runtime by setting the `REASONING_EFFORT_ALIASES` env var to a JSON object (e.g. `REASONING_EFFORT_ALIASES='{"max":"xhigh","minimum":"low"}'`); parsed once on first use, silently falls back to the hardcoded defaults if absent or unparseable.
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,

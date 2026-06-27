@@ -5,7 +5,9 @@
 // extensions on top. Types prefixed with `Dynamo` or entirely absent from the
 // upstream spec are documented with the rationale for the extension.
 
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::OnceLock;
 
 use derive_builder::Builder;
 use futures::Stream;
@@ -209,6 +211,48 @@ where
         Some(other) => Err(D::Error::custom(format!(
             "expected string or object for `arguments`, got {other}"
         ))),
+    }
+}
+
+// Maps non-standard `reasoning_effort` alias values to their canonical
+// counterparts before deserialising.
+//
+// Defaults: `"max"` → `"xhigh"`, `"minimum"` → `"low"`.
+// Override at runtime by setting the `REASONING_EFFORT_ALIASES` environment
+// variable to a JSON object, e.g. `{"max":"xhigh","minimum":"low"}`.
+// The env-var value is parsed once and cached for the lifetime of the process.
+static REASONING_EFFORT_ALIASES: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+fn reasoning_effort_aliases() -> &'static HashMap<String, String> {
+    REASONING_EFFORT_ALIASES.get_or_init(|| {
+        if let Ok(val) = std::env::var("REASONING_EFFORT_ALIASES") {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&val) {
+                return map;
+            }
+        }
+        [("max".to_string(), "xhigh".to_string())]
+            .into_iter()
+            .collect()
+    })
+}
+
+fn deserialize_reasoning_effort_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<ReasoningEffort>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let opt = Option::<String>::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(s) => {
+            let aliases = reasoning_effort_aliases();
+            let s = aliases.get(&s).cloned().unwrap_or(s);
+            serde_json::from_value::<ReasoningEffort>(serde_json::Value::String(s))
+                .map(Some)
+                .map_err(|e| D::Error::custom(e))
+        }
     }
 }
 
@@ -716,7 +760,11 @@ pub struct CreateChatCompletionRequest {
     pub mm_processor_kwargs: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reasoning_effort_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
