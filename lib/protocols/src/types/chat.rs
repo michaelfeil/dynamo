@@ -658,7 +658,8 @@ pub struct ChatCompletionRequestAssistantMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ChatCompletionRequestAssistantMessageContent>,
     /// Reasoning content from a previous assistant turn.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // b10: a customer still wants to send either "reasoning" or "reasoning_content"; accept both.
+    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<ReasoningContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,

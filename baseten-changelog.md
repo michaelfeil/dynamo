@@ -989,6 +989,8 @@ serialization behaviour unchanged.
 
 The `reasoning_effort` field on chat completion requests is normalized through a process-wide alias map before deserialization. Defaults: `"max"` → `"xhigh"`. Override at runtime by setting the `REASONING_EFFORT_ALIASES` env var to a JSON object (e.g. `REASONING_EFFORT_ALIASES='{"max":"xhigh","minimum":"low"}'`); parsed once on first use, silently falls back to the hardcoded defaults if absent or unparseable.
 
+The request-side assistant message accepts `reasoning` as a serde alias for `reasoning_content`, so prior-turn reasoning sent under either wire name (OpenRouter/newer-vLLM `reasoning` or DeepSeek/vLLM-legacy `reasoning_content`) deserializes into the canonical field and re-renders into the chat template.
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,
