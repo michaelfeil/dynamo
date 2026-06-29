@@ -832,7 +832,7 @@ fn potential_loads_outcome(
 /// Query the downstream `client`'s router (carried on `check.router`) for
 /// potential loads (the `potential_loads` method) and evaluate the response
 /// against `check`. Returns `Ok(None)` when the preflight passes; `Ok(Some(info))`
-/// when the aggregated loads exceed the configured thresholds (next-router
+/// when the selected load percentile exceeds the configured thresholds (next-router
 /// backpressure); `Err(PotentialLoadsError::Unreachable)` when the query
 /// itself could not be performed (the coordinator maps this to a
 /// `DeniedRequest::NextRouterUnreachable`); `Err(PotentialLoadsError::ProtocolError)`
@@ -1013,15 +1013,21 @@ fn evaluate_potential_loads(
             received: format!("{response:?}"),
         });
     };
-    let total_prefill: usize = loads.iter().map(|l| l.potential_prefill_tokens).sum();
-    let total_decode: usize = loads.iter().map(|l| l.potential_decode_blocks).sum();
+    let prefill_tokens = percentile_load(
+        loads.iter().map(|l| l.potential_prefill_tokens),
+        check.load_percentile,
+    );
+    let decode_blocks = percentile_load(
+        loads.iter().map(|l| l.potential_decode_blocks),
+        check.load_percentile,
+    );
     let queue_depth = *pending_count;
     let pending_isl = *pending_isl_tokens;
 
     let prefill_exceeded =
-        check.prefill_tokens_threshold != 0 && total_prefill > check.prefill_tokens_threshold;
+        check.prefill_tokens_threshold != 0 && prefill_tokens > check.prefill_tokens_threshold;
     let decode_exceeded =
-        check.decode_blocks_threshold != 0 && total_decode > check.decode_blocks_threshold;
+        check.decode_blocks_threshold != 0 && decode_blocks > check.decode_blocks_threshold;
     let queue_exceeded =
         check.queue_depth_threshold != 0 && queue_depth > check.queue_depth_threshold;
 
@@ -1029,12 +1035,58 @@ fn evaluate_potential_loads(
         Ok(Some(NextRouterBackpressureInfo {
             queue_depth,
             pending_isl_tokens: pending_isl,
-            total_prefill_tokens: total_prefill,
-            total_decode_blocks: total_decode,
+            prefill_tokens,
+            decode_blocks,
         }))
     } else {
         Ok(None)
     }
+}
+
+fn percentile_load(values: impl Iterator<Item = usize>, percentile: f64) -> usize {
+    let mut values = values.collect::<Vec<_>>();
+    let percentile = normalize_load_percentile(percentile);
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    if values.len() == 1 {
+        return values[0];
+    }
+
+    let rank = percentile * (values.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return values[lower];
+    }
+
+    let weight = rank - lower as f64;
+    let interpolated = values[lower] as f64 * (1.0 - weight) + values[upper] as f64 * weight;
+    interpolated.ceil() as usize
+}
+
+fn normalize_load_percentile(percentile: f64) -> f64 {
+    if !percentile.is_finite() {
+        tracing::warn!(
+            load_percentile = ?percentile,
+            normalized_load_percentile = 0.5,
+            "potential_loads load_percentile must be finite and between 0.0 and 1.0; using p50"
+        );
+        return 0.5;
+    }
+
+    if !(0.0..=1.0).contains(&percentile) {
+        let normalized = percentile.clamp(0.0, 1.0);
+        tracing::warn!(
+            load_percentile = percentile,
+            normalized_load_percentile = normalized,
+            "potential_loads load_percentile must be between 0.0 and 1.0; clamping"
+        );
+        return normalized;
+    }
+
+    percentile
 }
 
 /// Render a [`RouterBackpressureReason`] as its snake_case reason name (the
@@ -1138,15 +1190,15 @@ async fn route_once(
                     request_id = %request_id,
                     queue_depth = info.queue_depth,
                     pending_isl_tokens = info.pending_isl_tokens,
-                    total_prefill_tokens = info.total_prefill_tokens,
-                    total_decode_blocks = info.total_decode_blocks,
+                    total_prefill_tokens = info.prefill_tokens,
+                    total_decode_blocks = info.decode_blocks,
                     "route_once denied before routing by potential_loads preflight"
                 );
                 return RouteOnceOutcome::Denied(DeniedRequest::NextRouterBackpressure {
                     queue_depth: info.queue_depth,
                     pending_isl_tokens: info.pending_isl_tokens,
-                    total_prefill_tokens: info.total_prefill_tokens,
-                    total_decode_blocks: info.total_decode_blocks,
+                    total_prefill_tokens: info.prefill_tokens,
+                    total_decode_blocks: info.decode_blocks,
                 });
             }
             Ok(None) => {

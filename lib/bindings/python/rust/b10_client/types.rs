@@ -236,16 +236,17 @@ pub(super) struct PotentialLoadsCheckData {
     pub(super) queue_depth_threshold: usize,
     pub(super) prefill_tokens_threshold: usize,
     pub(super) decode_blocks_threshold: usize,
+    pub(super) load_percentile: f64,
 }
 
-/// Fields captured when the next-router preflight finds the aggregated router
-/// loads exceed the configured thresholds. Carried on
+/// Fields captured when the next-router preflight finds the selected router
+/// load percentile exceeds the configured thresholds. Carried on
 /// `DeniedRequest::NextRouterBackpressure`.
 pub(super) struct NextRouterBackpressureInfo {
     pub(super) queue_depth: usize,
     pub(super) pending_isl_tokens: usize,
-    pub(super) total_prefill_tokens: usize,
-    pub(super) total_decode_blocks: usize,
+    pub(super) prefill_tokens: usize,
+    pub(super) decode_blocks: usize,
 }
 
 /// Inputs for the next-router potential-loads preflight, captured up front so
@@ -296,16 +297,18 @@ pub(crate) enum DeniedRequest {
         /// The name of the down component (its endpoint id).
         name: String,
     },
-    /// The `potential_loads_next_check` preflight found the aggregated router
-    /// loads would exceed the configured thresholds.
+    /// The `potential_loads_next_check` preflight found the selected router
+    /// load percentile would exceed the configured thresholds.
     NextRouterBackpressure {
         /// Router-level pending queue depth (`pending_count`).
         queue_depth: usize,
         /// ISL tokens the router reports as currently queued.
         pending_isl_tokens: usize,
-        /// Sum of `potential_prefill_tokens` across workers.
+        /// Selected percentile of `potential_prefill_tokens` across workers.
+        /// Kept as a legacy field name for Python compatibility.
         total_prefill_tokens: usize,
-        /// Sum of `potential_decode_blocks` across workers.
+        /// Selected percentile of `potential_decode_blocks` across workers.
+        /// Kept as a legacy field name for Python compatibility.
         total_decode_blocks: usize,
     },
     /// The `potential_loads_next_check` preflight could not reach the router.
@@ -342,12 +345,13 @@ pub(crate) enum DeniedRequest {
 /// before routing, the coordinator queries the *downstream* `client` (another
 /// router further along the pipeline, e.g. the next router in a
 /// disagg-prefill topology) for the *potential loads* of all its workers (the
-/// `potential_loads` method) and denies the request when the aggregated loads
-/// would exceed the configured thresholds -- so a request is not routed onward
-/// to an already-overloaded downstream router. A threshold of `0` disables that
-/// dimension (no limit). Prefill is summed in tokens, decode in BLOCKS (no
-/// `block_size` conversion), and `queue_depth` is the router-level
-/// `pending_count`.
+/// `potential_loads` method) and denies the request when the configured load
+/// percentile exceeds the thresholds -- so a request is not routed onward to an
+/// already-overloaded downstream router. A threshold of `0` disables that
+/// dimension (no limit). Prefill is measured in tokens, decode in BLOCKS (no
+/// `block_size` conversion), both load dimensions use `load_percentile` as a
+/// `0.0` to `1.0` fraction across workers, and `queue_depth` is the
+/// router-level `pending_count`.
 ///
 /// The `client` is REQUIRED: it is the downstream router whose loads are checked
 /// (this is distinct from the routing router the coordinator routes through).
@@ -355,7 +359,7 @@ pub(crate) enum DeniedRequest {
 /// on `PyRouterRequestNew` (and is shared by the route and the preflight), not on
 /// this check. Defaults:
 /// `queue_depth_threshold=0` (disabled), `prefill_tokens_threshold=1_000_000`,
-/// `decode_blocks_threshold=16_000_000`.
+/// `decode_blocks_threshold=16_000_000`, `load_percentile=0.5` (p50).
 #[pyclass]
 pub(crate) struct RouterCoordinatorPotentialLoadsCheck {
     /// Downstream router `Client` whose potential loads are checked ahead of
@@ -368,6 +372,8 @@ pub(crate) struct RouterCoordinatorPotentialLoadsCheck {
     pub(super) prefill_tokens_threshold: usize,
     #[pyo3(get, set)]
     pub(super) decode_blocks_threshold: usize,
+    #[pyo3(get, set)]
+    pub(super) load_percentile: f64,
 }
 
 #[pymethods]
@@ -378,6 +384,7 @@ impl RouterCoordinatorPotentialLoadsCheck {
         queue_depth_threshold = 0,
         prefill_tokens_threshold = 1_000_000,
         decode_blocks_threshold = 16_000_000,
+        load_percentile = 0.5,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -385,12 +392,14 @@ impl RouterCoordinatorPotentialLoadsCheck {
         queue_depth_threshold: usize,
         prefill_tokens_threshold: usize,
         decode_blocks_threshold: usize,
+        load_percentile: f64,
     ) -> Self {
         Self {
             client,
             queue_depth_threshold,
             prefill_tokens_threshold,
             decode_blocks_threshold,
+            load_percentile,
         }
     }
 }

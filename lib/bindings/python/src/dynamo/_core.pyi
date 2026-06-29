@@ -486,13 +486,14 @@ class RouterWorkerCoordinator:
         When ``potential_loads_next_check`` is given, a *potential loads*
         preflight queries the *downstream* ``client`` it carries (another router,
         e.g. the next router in a disagg-prefill topology -- distinct from the
-        routing router) for the aggregated worker loads before sending the route
+        routing router) for worker potential loads before sending the route
         request (on the first attempt only -- a stale-route reroute does not
-        change the downstream router's loads) and denies the request when they
-        exceed the configured thresholds. This is deliberately sequential so a
-        preflight denial does not leave a newly routed request to free. The
-        preflight is part of the ``routing`` phase, so it is shielded when the
-        policy detaches routing (e.g. ``CancellationPolicy.FullyDetached``).
+        change the downstream router's loads) and denies the request when the
+        configured load percentile exceeds the thresholds. This is deliberately
+        sequential so a preflight denial does not leave a newly routed request to
+        free. The preflight is part of the ``routing`` phase, so it is shielded
+        when the policy detaches routing (e.g.
+        ``CancellationPolicy.FullyDetached``).
 
         The ``require_available`` check runs before routing, the first-attempt
         ``potential_loads_next_check`` preflight runs next, then the route is sent
@@ -646,17 +647,17 @@ class DeniedRequest:
 
     class NextRouterBackpressure:
         """
-        The ``potential_loads_next_check`` preflight found the aggregated router
-        loads would exceed the configured thresholds.
+        The ``potential_loads_next_check`` preflight found the selected router
+        load percentile would exceed the configured thresholds.
         """
         queue_depth: int
         """Router-level pending queue depth (``pending_count``)."""
         pending_isl_tokens: int
         """ISL tokens the router reports as currently queued."""
         total_prefill_tokens: int
-        """Sum of ``potential_prefill_tokens`` across workers."""
+        """Selected percentile of ``potential_prefill_tokens`` across workers."""
         total_decode_blocks: int
-        """Sum of ``potential_decode_blocks`` across workers."""
+        """Selected percentile of ``potential_decode_blocks`` across workers."""
         ...
 
     class NextRouterUnreachable:
@@ -705,18 +706,19 @@ class RouterCoordinatorPotentialLoadsCheck:
     along the pipeline, e.g. the next router in a disagg-prefill topology --
     distinct from the routing router) for the *potential loads* of all its
     workers (the ``potential_loads`` method) and denies the request when the
-    aggregated loads would exceed the configured thresholds -- so a request is
-    not routed onward to an already-overloaded downstream router. A threshold of
-    ``0`` disables that dimension (no limit). Prefill is summed in tokens,
-    decode in BLOCKS, and ``queue_depth`` is the router-level
-    ``pending_count``.
+    configured load percentile exceeds the thresholds -- so a request is not
+    routed onward to an already-overloaded downstream router. A threshold of
+    ``0`` disables that dimension (no limit). Prefill is measured in tokens,
+    decode in BLOCKS, both load dimensions use ``load_percentile`` as a
+    ``0.0`` to ``1.0`` fraction across workers, and ``queue_depth`` is the
+    router-level ``pending_count``.
 
     The ``client`` is required: it is the downstream router whose loads are
     checked. The overlap-aware ``block_mm_infos`` conditioning the reported loads
     lives on ``PyRouterRequestNew`` (shared by the route and the preflight), not
     on this check. Defaults:
     ``queue_depth_threshold=0`` (disabled), ``prefill_tokens_threshold=1_000_000``,
-    ``decode_blocks_threshold=16_000_000``.
+    ``decode_blocks_threshold=16_000_000``, ``load_percentile=0.5`` (p50).
     """
 
     def __init__(
@@ -725,6 +727,7 @@ class RouterCoordinatorPotentialLoadsCheck:
         queue_depth_threshold: int = 0,
         prefill_tokens_threshold: int = 1_000_000,
         decode_blocks_threshold: int = 16_000_000,
+        load_percentile: float = 0.5,
     ) -> None: ...
 
     @property
@@ -750,6 +753,12 @@ class RouterCoordinatorPotentialLoadsCheck:
 
     @decode_blocks_threshold.setter
     def decode_blocks_threshold(self, value: int) -> None: ...
+
+    @property
+    def load_percentile(self) -> float: ...
+
+    @load_percentile.setter
+    def load_percentile(self, value: float) -> None: ...
 
 
 class ModelCardInstanceId:

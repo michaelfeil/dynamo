@@ -680,11 +680,7 @@ fn backpressure_response(
     })
 }
 
-/// Single-worker PotentialLoads scripted response used by the preflight
-/// tests: aggregated `potential_prefill_tokens` / `potential_decode_blocks`
-/// equal the single `PotentialLoad`'s fields (the evaluator sums across
-/// the `loads` vec), so caller-supplied thresholds can be designed
-/// directly against these numbers.
+/// Single-worker PotentialLoads scripted response used by the preflight tests.
 fn potential_loads_response(
     potential_prefill_tokens: usize,
     potential_decode_blocks: usize,
@@ -699,6 +695,30 @@ fn potential_loads_response(
             potential_decode_blocks,
             active_requests: 0,
         }],
+        pending_count,
+        pending_isl_tokens,
+    })
+}
+
+fn potential_loads_response_for_workers(
+    loads: Vec<(usize, usize)>,
+    pending_count: usize,
+    pending_isl_tokens: usize,
+) -> Result<RsRouterResponse, String> {
+    Ok(RsRouterResponse::PotentialLoads {
+        loads: loads
+            .into_iter()
+            .enumerate()
+            .map(
+                |(idx, (potential_prefill_tokens, potential_decode_blocks))| RsPotentialLoad {
+                    worker_id: idx as u64 + 1,
+                    dp_rank: idx as u32,
+                    potential_prefill_tokens,
+                    potential_decode_blocks,
+                    active_requests: 0,
+                },
+            )
+            .collect(),
         pending_count,
         pending_isl_tokens,
     })
@@ -1764,7 +1784,7 @@ async fn route_and_connect_require_available_goes_down_post_route_returns_denied
 
 #[tokio::test]
 async fn route_and_connect_preflight_overflow_returns_next_router_backpressure() {
-    // Prefill tokens sum (10_000) exceed the prefill_tokens_threshold (1_000)
+    // Single-worker p50 prefill tokens (10_000) exceed the threshold (1_000)
     // -> evaluate_potential_loads returns Some(NextRouterBackpressureInfo).
     // The potential-loads preflight runs before the route, so the route request
     // is never sent and there is no routed guard to free.
@@ -1784,6 +1804,7 @@ async fn route_and_connect_preflight_overflow_returns_next_router_backpressure()
             queue_depth_threshold: 100,
             prefill_tokens_threshold: 1_000,
             decode_blocks_threshold: 100_000,
+            load_percentile: 0.5,
         },
         tokens: vec![1],
         block_mm_infos: None,
@@ -1830,6 +1851,64 @@ async fn route_and_connect_preflight_overflow_returns_next_router_backpressure()
 }
 
 #[tokio::test]
+async fn route_and_connect_preflight_uses_configured_load_percentile_not_sum() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    let next = RouterGuardClientForTesting::new(
+        vec![9],
+        vec![9],
+        vec![potential_loads_response_for_workers(
+            vec![(10, 1), (20, 2), (1_000, 100)],
+            0,
+            0,
+        )],
+    );
+    let context = build_test_context("test-preflight-percentile");
+
+    let preflight_inputs = PreflightInputs {
+        check: PotentialLoadsCheckData {
+            router: next.clone(),
+            queue_depth_threshold: 0,
+            prefill_tokens_threshold: 500,
+            decode_blocks_threshold: 500,
+            load_percentile: 0.5,
+        },
+        tokens: vec![1],
+        block_mm_infos: None,
+    };
+
+    let outcome = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-pf-percentile",
+        context,
+        Vec::new(),
+        Some(preflight_inputs),
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("ok");
+
+    match outcome {
+        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(worker_id, 1),
+        other => panic!(
+            "expected Connected because p50 load passes, got {:?}",
+            other
+        ),
+    }
+
+    assert_eq!(next.method_call_count("potential_loads"), 1);
+    assert_eq!(worker.method_call_count("generate"), 1);
+    drop(outcome);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
 async fn route_and_connect_preflight_thresholds_zero_disables_preflight() {
     // All thresholds zero disables every dimension -- even though the
     // preflight reports heavy load. The preflight returns Ok(None), the
@@ -1854,6 +1933,7 @@ async fn route_and_connect_preflight_thresholds_zero_disables_preflight() {
             queue_depth_threshold: 0,
             prefill_tokens_threshold: 0,
             decode_blocks_threshold: 0,
+            load_percentile: 0.5,
         },
         tokens: vec![1],
         block_mm_infos: None,
@@ -1908,6 +1988,7 @@ async fn route_and_connect_preflight_follows_cancellable_routing_policy() {
             queue_depth_threshold: 100,
             prefill_tokens_threshold: 100,
             decode_blocks_threshold: 100,
+            load_percentile: 0.5,
         },
         tokens: vec![1],
         block_mm_infos: None,
@@ -1963,6 +2044,7 @@ async fn route_and_connect_preflight_detaches_when_routing_cancellation_disabled
             queue_depth_threshold: 100,
             prefill_tokens_threshold: 100,
             decode_blocks_threshold: 100,
+            load_percentile: 0.5,
         },
         tokens: vec![1],
         block_mm_infos: None,
@@ -2022,6 +2104,7 @@ async fn route_and_connect_preflight_unreachable_returns_next_router_unreachable
             queue_depth_threshold: 0,
             prefill_tokens_threshold: 1_000_000,
             decode_blocks_threshold: 16_000_000,
+            load_percentile: 0.5,
         },
         tokens: vec![1],
         block_mm_infos: None,

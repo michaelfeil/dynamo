@@ -167,12 +167,12 @@ impl RouterWorkerCoordinator {
     /// When `potential_loads_next_check` is given, a *potential loads* preflight
     /// queries the *downstream* `client` it carries (another router, e.g. the
     /// next router in a disagg-prefill topology -- distinct from the routing
-    /// router) for the aggregated worker loads before the route request is sent
-    /// (on the first attempt only -- a stale-route reroute does not change the
-    /// downstream router's loads) and denies the request when they exceed the
-    /// configured thresholds. This is deliberately sequential so a preflight
-    /// denial does not leave a newly routed request to free. The preflight is part
-    /// of the `routing` phase, so it is shielded when
+    /// router) for worker potential loads before the route request is sent (on
+    /// the first attempt only -- a stale-route reroute does not change the
+    /// downstream router's loads) and denies the request when the configured
+    /// load percentile exceeds the thresholds. This is deliberately sequential
+    /// so a preflight denial does not leave a newly routed request to free. The
+    /// preflight is part of the `routing` phase, so it is shielded when
     /// `cancellation.allow_cancel_routing()` is false.
     /// `tracing_enabled=true` emits route/preflight step breadcrumbs with whether
     /// a trace context is available; slow potential-load checks still warn
@@ -288,6 +288,7 @@ impl RouterWorkerCoordinator {
                     queue_depth_threshold: borrowed.queue_depth_threshold,
                     prefill_tokens_threshold: borrowed.prefill_tokens_threshold,
                     decode_blocks_threshold: borrowed.decode_blocks_threshold,
+                    load_percentile: borrowed.load_percentile,
                 })
             }
             None => None,
