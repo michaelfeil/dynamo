@@ -40,8 +40,8 @@ use super::guard::{
     ROUTER_GUARD_RETRY_DELAY, RouterRequestGuard,
 };
 use super::types::{
-    DeniedRequest, MinReplicaAvailable, NextRouterBackpressureInfo, PotentialLoadsCheckData,
-    PreflightInputs,
+    AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, NextRouterBackpressureInfo,
+    PotentialLoadsCheckData, PreflightInputs,
 };
 
 /// JSON-typed push router used to talk to KV router instances.
@@ -1385,6 +1385,7 @@ pub(super) enum RouteAndConnectOutcome {
         guard: RouterRequestGuard,
         worker_id: u64,
         stream: EngineStream<RsAnnotated<serde_json::Value>>,
+        timings: AdmittedRequestTimings,
     },
     Denied(DeniedRequest),
 }
@@ -1420,6 +1421,7 @@ where
                     guard,
                     worker_id,
                     stream,
+                    ..
                 }) => {
                     tracing::info!(
                         worker_id,
@@ -1454,8 +1456,10 @@ where
 /// the downstream router's reported loads). Each attempt injects the per-route
 /// `RouterResponse::New` into a fresh `worker_request` clone under the
 /// `router_response` field so the worker sees `worker_id` / `dp_rank` /
-/// `overlap_blocks` / `dp_strict_rank`. The whole loop is run under the routing
-/// cancellation shield by the caller.
+/// `overlap_blocks` / `dp_strict_rank`. `block_size` must match the routed KV
+/// router so the admitted log can derive token-level overlap estimates from
+/// `overlap_blocks`. The whole loop is run under the routing cancellation shield
+/// by the caller.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn route_and_connect(
     router_guard_client: Arc<dyn RouterGuardClient>,
@@ -1466,6 +1470,7 @@ pub(super) async fn route_and_connect(
     require: Vec<MinReplicaAvailable>,
     mut preflight_inputs: Option<PreflightInputs>,
     worker_request: serde_json::Value,
+    block_size: u32,
     max_reroutes: u64,
     allow_cancel_routing: bool,
     allow_cancel_setup: bool,
@@ -1473,6 +1478,7 @@ pub(super) async fn route_and_connect(
     notify_timeout: Duration,
     tracing_enabled: bool,
 ) -> Result<RouteAndConnectOutcome> {
+    let started = Instant::now();
     let mut attempt: u64 = 0;
     loop {
         let preflight = if attempt == 0 {
@@ -1492,6 +1498,7 @@ pub(super) async fn route_and_connect(
             allow_cancel_routing,
         )
         .await;
+        let routing_new_returned_at = Instant::now();
 
         let (guard, worker_id) = match route_outcome {
             RouteOnceOutcome::Denied(denied) => {
@@ -1531,10 +1538,29 @@ pub(super) async fn route_and_connect(
                 worker_id,
                 stream,
             } => {
+                let worker_connected_at = Instant::now();
+                let estimated_overlap_tokens = guard.estimated_overlap_tokens(block_size);
+                let timings = AdmittedRequestTimings {
+                    routing_new_duration: routing_new_returned_at.duration_since(started),
+                    worker_connect_duration: worker_connected_at
+                        .duration_since(routing_new_returned_at),
+                    stale_reroutes: attempt,
+                };
+                tracing::info!(
+                    request_id = %request_id,
+                    worker_id,
+                    stale_reroutes = attempt,
+                    routing_new_duration_ms = timings.routing_new_duration.as_millis() as u64,
+                    worker_connect_duration_ms = timings.worker_connect_duration.as_millis() as u64,
+                    estimated_overlap_tokens,
+                    unified_logs = true,
+                    "route_and_connect admitted"
+                );
                 return Ok(RouteAndConnectOutcome::Connected {
                     guard,
                     worker_id,
                     stream,
+                    timings,
                 });
             }
             OpenResult::Stale => {
@@ -1546,6 +1572,11 @@ pub(super) async fn route_and_connect(
                         },
                     ));
                 }
+                // The guard cleanup wait above observes the mark_free task reaching
+                // terminal state. Keep a short grace period before reusing the
+                // request id for a fresh route so router-side free processing is
+                // much more likely to be visible to the next attempt.
+                tokio::time::sleep(ROUTER_GUARD_CLEANUP_GRACE_PERIOD).await;
                 attempt += 1;
                 continue;
             }

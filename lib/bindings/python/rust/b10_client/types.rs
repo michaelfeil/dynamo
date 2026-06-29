@@ -23,6 +23,7 @@ use dynamo_kv_router::protocols::{BlockExtraInfo, RouterRequest, RoutingConstrai
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::coordinator::RouterGuardClient;
 use super::guard::RouterRequestGuard;
@@ -258,6 +259,15 @@ pub(super) struct PreflightInputs {
     pub(super) block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
 }
 
+/// Successful route/connect phase timings and reroute count carried back on
+/// [`AdmittedRequest`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct AdmittedRequestTimings {
+    pub(super) routing_new_duration: Duration,
+    pub(super) worker_connect_duration: Duration,
+    pub(super) stale_reroutes: u64,
+}
+
 /// Why a [`super::RouterWorkerCoordinator::route_and_worker`] call was denied. One of
 /// these is returned (never raised) instead of a `AdmittedRequest` when the
 /// router is backpressured, a `require_available` component is down, the
@@ -381,13 +391,16 @@ impl RouterCoordinatorPotentialLoadsCheck {
 
 /// Outcome of a [`super::RouterWorkerCoordinator::route_and_worker`] call. Returned
 /// only when the route succeeded; carries the lifecycle guard (`mark_prefill`
-/// / `mark_free`), the worker generation stream, and the router's reported
-/// `overlap_blocks`. A denial is a [`DeniedRequest`] instead. The chosen
-/// `worker_id` is not surfaced to Python (it lives on the guard for cleanup).
+/// / `mark_free`), the worker generation stream, the estimated cached-token
+/// overlap, route/connect setup timings, and stale-reroute count. A denial is a
+/// [`DeniedRequest`] instead. The chosen `worker_id` is not surfaced to Python
+/// (it lives on the guard for cleanup).
 #[pyclass]
 pub(crate) struct AdmittedRequest {
     pub(super) guard: Arc<RouterRequestGuard>,
     pub(super) stream: std::sync::Mutex<Option<AsyncResponseStream>>,
+    pub(super) timings: AdmittedRequestTimings,
+    pub(super) block_size: u32,
 }
 
 impl AdmittedRequest {
@@ -398,23 +411,47 @@ impl AdmittedRequest {
     /// with their `Arc` clone -- a caller that takes `response_stream()` then
     /// drops the admit object does not prematurely free the routed request
     /// while the worker stream is still being consumed.
-    pub(super) fn new(guard: Arc<RouterRequestGuard>, stream: AsyncResponseStream) -> Self {
+    pub(super) fn new(
+        guard: Arc<RouterRequestGuard>,
+        stream: AsyncResponseStream,
+        timings: AdmittedRequestTimings,
+        block_size: u32,
+    ) -> Self {
         Self {
             guard,
             stream: std::sync::Mutex::new(Some(stream)),
+            timings,
+            block_size,
         }
     }
 }
 
 #[pymethods]
 impl AdmittedRequest {
-    /// The router's rounded effective cached blocks (approximate KV-cache hit,
-    /// in BLOCKS) the router reported for the chosen worker on this request:
-    /// how many KV blocks the worker likely already holds for these tokens.
-    /// `0` when the route did not arm the guard. Use to derive a per-request hit
-    /// rate against the request's decode block count.
-    fn overlap_blocks(&self) -> u32 {
-        self.guard.overlap_blocks()
+    /// Estimated cached-token overlap for the chosen worker on this request,
+    /// derived from the router response and the coordinator block size.
+    fn estimated_overlap_tokens(&self) -> u64 {
+        self.guard.estimated_overlap_tokens(self.block_size)
+    }
+
+    /// Seconds from entering route/connect setup to the successful KV-router
+    /// `new` response used for this admitted worker. Includes preflight and any
+    /// stale-route reroute work before the final accepted route.
+    fn routing_new_duration_seconds(&self) -> f64 {
+        self.timings.routing_new_duration.as_secs_f64()
+    }
+
+    /// Seconds from the successful KV-router `new` response to worker stream
+    /// connection. If `wait_for_first_response` was enabled, this includes
+    /// waiting for the first worker stream event.
+    fn worker_connect_duration_seconds(&self) -> f64 {
+        self.timings.worker_connect_duration.as_secs_f64()
+    }
+
+    /// Number of stale-route reroutes before this request was admitted. `0`
+    /// means the first route connected to its worker.
+    fn stale_reroutes(&self) -> u64 {
+        self.timings.stale_reroutes
     }
 
     /// The worker generation stream. May be called only once. Raises

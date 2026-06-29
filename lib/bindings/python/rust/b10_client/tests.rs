@@ -26,7 +26,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const TEST_BLOCK_SIZE: u32 = 32;
 
 /// When Yes, the fake's `direct()` short-circuits with
 /// `Err("cancelled by context stop")` when the request context is
@@ -729,6 +731,7 @@ async fn connect(
         require,
         preflight_inputs,
         worker_request,
+        TEST_BLOCK_SIZE,
         max_reroutes,
         allow_cancel_routing,
         allow_cancel_setup,
@@ -873,6 +876,7 @@ async fn route_and_connect_wait_for_first_response_omits_sentinel() {
         Vec::new(),
         None,
         make_worker_request(),
+        TEST_BLOCK_SIZE,
         0,
         true,
         true,
@@ -888,6 +892,7 @@ async fn route_and_connect_wait_for_first_response_omits_sentinel() {
             guard,
             worker_id,
             stream,
+            ..
         } => (guard, worker_id, stream),
         other => panic!("expected Connected, got {:?}", other),
     };
@@ -934,6 +939,7 @@ async fn route_and_connect_wait_for_first_response_replays_non_sentinel_item() {
         Vec::new(),
         None,
         make_worker_request(),
+        TEST_BLOCK_SIZE,
         0,
         true,
         true,
@@ -949,6 +955,7 @@ async fn route_and_connect_wait_for_first_response_replays_non_sentinel_item() {
             guard,
             worker_id,
             stream,
+            ..
         } => (guard, worker_id, stream),
         other => panic!("expected Connected, got {:?}", other),
     };
@@ -1052,6 +1059,7 @@ async fn route_and_connect_wait_for_first_response_uses_sentinel_behavior() {
         Vec::new(),
         None,
         make_worker_request(),
+        TEST_BLOCK_SIZE,
         0,
         true,
         true,
@@ -1067,6 +1075,7 @@ async fn route_and_connect_wait_for_first_response_uses_sentinel_behavior() {
             guard,
             worker_id,
             stream,
+            ..
         } => (guard, worker_id, stream),
         other => panic!("expected Connected, got {:?}", other),
     };
@@ -1103,6 +1112,7 @@ async fn route_and_connect_wait_for_first_response_failure_returns_denied() {
         Vec::new(),
         None,
         make_worker_request(),
+        TEST_BLOCK_SIZE,
         0,
         true,
         true,
@@ -1142,6 +1152,7 @@ async fn route_and_connect_proactive_stale_reroutes_then_connects() {
     let worker = RouterGuardClientForTesting::new(vec![], vec![2], vec![route_response_new(2)]);
     let context = build_test_context("test-proactive-stale");
 
+    let started = Instant::now();
     let outcome = connect(
         router.clone(),
         worker.clone(),
@@ -1158,9 +1169,17 @@ async fn route_and_connect_proactive_stale_reroutes_then_connects() {
     )
     .await
     .expect("connect");
+    assert!(started.elapsed() >= ROUTER_GUARD_CLEANUP_GRACE_PERIOD);
 
-    match outcome {
-        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(worker_id, 2),
+    match &outcome {
+        RouteAndConnectOutcome::Connected {
+            worker_id, timings, ..
+        } => {
+            assert_eq!(*worker_id, 2);
+            assert_eq!(timings.stale_reroutes, 1);
+            assert!(timings.routing_new_duration >= ROUTER_GUARD_CLEANUP_GRACE_PERIOD);
+            assert!(timings.worker_connect_duration < timings.routing_new_duration);
+        }
         other => panic!("expected Connected, got {:?}", other),
     }
 
@@ -1243,6 +1262,7 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
     worker.set_auto_remove_on_error(true);
     let context = build_test_context("test-reactive-stale");
 
+    let started = Instant::now();
     let outcome = connect(
         router.clone(),
         worker.clone(),
@@ -1259,9 +1279,17 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
     )
     .await
     .expect("connect");
+    assert!(started.elapsed() >= ROUTER_GUARD_CLEANUP_GRACE_PERIOD);
 
-    match outcome {
-        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(worker_id, 2),
+    match &outcome {
+        RouteAndConnectOutcome::Connected {
+            worker_id, timings, ..
+        } => {
+            assert_eq!(*worker_id, 2);
+            assert_eq!(timings.stale_reroutes, 1);
+            assert!(timings.routing_new_duration >= ROUTER_GUARD_CLEANUP_GRACE_PERIOD);
+            assert!(timings.worker_connect_duration < timings.routing_new_duration);
+        }
         other => panic!("expected Connected, got {:?}", other),
     }
 
@@ -2108,6 +2136,7 @@ async fn route_and_connect_stream_cancelled_in_band_truncates_stream() {
             stream,
             guard,
             worker_id,
+            ..
         } => (stream, guard, worker_id),
         other => panic!("expected Connected, got {:?}", other),
     };
@@ -2170,6 +2199,7 @@ async fn route_and_connect_lifecycle_mark_prefill_then_mark_free_order() {
             guard,
             worker_id,
             stream,
+            ..
         } => (guard, worker_id, stream),
         other => panic!("expected Connected, got {:?}", other),
     };
@@ -2236,6 +2266,7 @@ async fn route_and_connect_slow_mark_free_callback_still_completes_once() {
             guard,
             worker_id,
             stream,
+            ..
         } => (guard, worker_id, stream),
         other => panic!("expected Connected, got {:?}", other),
     };
@@ -2286,6 +2317,7 @@ async fn route_and_connect_mark_free_preempts_in_flight_mark_prefill() {
             guard,
             worker_id,
             stream,
+            ..
         } => (guard, worker_id, stream),
         other => panic!("expected Connected, got {:?}", other),
     };
@@ -2404,6 +2436,7 @@ async fn shield_route_and_connect_no_taker_drains_connected_worker_stream() {
         Vec::new(),
         None,
         make_worker_request(),
+        TEST_BLOCK_SIZE,
         0,
         false,
         false,

@@ -92,19 +92,32 @@ fn stream_with_optional_prefill_mark(
 pub(crate) struct RouterWorkerCoordinator {
     router: Client,
     worker: Client,
+    block_size: u32,
 }
 
 #[pymethods]
 impl RouterWorkerCoordinator {
     /// Build a coordinator that routes via `router_client` and generates via
-    /// `worker_client`. Both are existing `Client` instances.
+    /// `worker_client`. Both are existing `Client` instances. `block_size` must
+    /// match the KV router's block size so per-request overlap blocks can be
+    /// interpreted consistently.
     #[new]
-    #[pyo3(signature = (router_client, worker_client))]
-    fn new(router_client: Client, worker_client: Client) -> Self {
-        Self {
+    #[pyo3(signature = (router_client, worker_client, block_size=32))]
+    fn new(router_client: Client, worker_client: Client, block_size: u32) -> PyResult<Self> {
+        if block_size == 0 {
+            return Err(PyValueError::new_err("block_size must be positive"));
+        }
+
+        Ok(Self {
             router: router_client,
             worker: worker_client,
-        }
+            block_size,
+        })
+    }
+
+    /// KV router block size in tokens.
+    fn block_size(&self) -> u32 {
+        self.block_size
     }
 
     /// Route a KV-router `new` request, then generate on the routed worker.
@@ -160,7 +173,8 @@ impl RouterWorkerCoordinator {
     /// Python to consume the stream.
     ///
     /// Returns a [`AdmittedRequest`] on a successful route (with the worker
-    /// generation stream, the lifecycle guard, and the chosen `worker_id`) or a
+    /// generation stream, lifecycle guard, setup timing/reroute accessors, and
+    /// chosen `worker_id`) or a
     /// [`DeniedRequest`] when the router is backpressured, a `require_available`
     /// component is down, the preflight overflows, the preflight cannot reach
     /// the router, the stale-route reroute loop is exhausted, or
@@ -170,9 +184,10 @@ impl RouterWorkerCoordinator {
     /// (and `isinstance(result, DeniedRequest.<Variant>)` for the denial reason);
     /// first-event failures are returned as
     /// `DeniedRequest.FirstWorkerEventFailed`, not raised.
-    /// on a successful route, `response_stream()` yields the worker generation
-    /// tokens and `mark_prefill()` / `mark_free()` drive the KV-lifecycle
-    /// callbacks to the router. A non-stale worker-open failure (or a
+    /// On a successful route, `response_stream()` yields the worker generation
+    /// tokens, timing/reroute accessors report route/connect setup seconds and
+    /// stale reroutes, and `mark_prefill()` / `mark_free()` drive the
+    /// KV-lifecycle callbacks to the router. A non-stale worker-open failure (or a
     /// non-object `worker_args`) IS raised, not returned as a `DeniedRequest`.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, wait_for_first_response=false, mark_prefill_on_response=false))]
@@ -302,6 +317,7 @@ impl RouterWorkerCoordinator {
         let request_id = context.inner().id().to_string();
         let router_router = self.router.router.clone();
         let worker_router = self.worker.router.clone();
+        let block_size = self.block_size;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // `worker_args` must be a JSON object so the per-route
@@ -341,6 +357,7 @@ impl RouterWorkerCoordinator {
                 require,
                 preflight_inputs,
                 worker_request,
+                block_size,
                 max_reroutes,
                 allow_cancel_routing,
                 allow_cancel_setup,
@@ -354,7 +371,7 @@ impl RouterWorkerCoordinator {
                 shield_route_and_connect(loop_fut).await.map_err(to_pyerr)?
             };
 
-            let (guard, worker_id, stream) = match outcome {
+            let (guard, worker_id, stream, timings) = match outcome {
                 RouteAndConnectOutcome::Denied(denied) => {
                     return Python::with_gil(|py| denied.into_py_any(py));
                 }
@@ -362,7 +379,8 @@ impl RouterWorkerCoordinator {
                     guard,
                     worker_id,
                     stream,
-                } => (guard, worker_id, stream),
+                    timings,
+                } => (guard, worker_id, stream, timings),
             };
 
             // The guard is wrapped in an `Arc` shared with the background
@@ -439,7 +457,7 @@ impl RouterWorkerCoordinator {
                 (guard, AsyncResponseStream::new(rx, annotated))
             };
 
-            let admitted = AdmittedRequest::new(guard, stream);
+            let admitted = AdmittedRequest::new(guard, stream, timings, block_size);
             Python::with_gil(|py| admitted.into_py_any(py))
         })
     }

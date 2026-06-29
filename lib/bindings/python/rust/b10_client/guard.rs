@@ -315,14 +315,13 @@ impl RouterRequestGuard {
         }
     }
 
-    /// The rounded effective cached blocks (approximate cache hit, in BLOCKS)
-    /// the router reported for a routed [`RouterResponse::New`]: how many KV
-    /// blocks the chosen worker likely already holds for this request. Surfaced
-    /// on [`super::types::AdmittedRequest::overlap_blocks`] so Python can derive a hit rate.
+    /// Estimated cached-token overlap the router reported for a routed
+    /// [`RouterResponse::New`], derived from router-native `overlap_blocks` and
+    /// the coordinator block size.
     /// `0` when the route did not arm the guard (the response is not `New`).
-    pub(super) fn overlap_blocks(&self) -> u32 {
+    pub(super) fn estimated_overlap_tokens(&self, block_size: u32) -> u64 {
         if let Some(RsRouterResponse::New { overlap_blocks, .. }) = self.response.as_ref() {
-            *overlap_blocks
+            u64::from(*overlap_blocks) * u64::from(block_size)
         } else {
             0
         }

@@ -443,9 +443,17 @@ class RouterWorkerCoordinator:
 
     ``router_client`` decides which worker a request goes to (via its KV
     router); ``worker_client`` runs generation on the routed worker.
+    ``block_size`` is the KV router block size in tokens and is used to
+    interpret per-request overlap blocks.
     """
 
-    def __init__(self, router_client: Client, worker_client: Client) -> None: ...
+    def __init__(
+        self, router_client: Client, worker_client: Client, block_size: int = 32
+    ) -> None: ...
+
+    def block_size(self) -> int:
+        """KV router block size in tokens."""
+        ...
 
     async def route_and_worker(
             self,
@@ -472,10 +480,8 @@ class RouterWorkerCoordinator:
         both live on the pyclass now. ``worker_args`` is the body sent to the
         worker for generation; on a successful route the decoded
         ``RouterResponse::New`` is added to it under the ``router_response``
-        field -- carrying ``worker_id``, ``overlap_blocks`` (potential cache
-        hit) and ``dp_rank`` / ``dp_strict_rank`` (the dp-rank instruction for
-        the worker) -- so the worker (or a further forwarder) receives the
-        routing decision.
+        field, so the worker (or a further forwarder) receives the routing
+        decision, overlap estimate, and dp-rank instruction.
 
         When ``potential_loads_next_check`` is given, a *potential loads*
         preflight queries the *downstream* ``client`` it carries (another router,
@@ -545,10 +551,11 @@ class RouterWorkerCoordinator:
         ``isinstance(result, DeniedRequest)`` (and
         ``isinstance(result, DeniedRequest.<Variant>)`` for the denial reason).
         On a successful route, ``response_stream()`` yields the worker
-        generation tokens, ``overlap_blocks()`` reports the router's effective
-        cached blocks for the chosen worker, and ``mark_prefill()`` /
-        ``mark_free()`` drive the KV-lifecycle callbacks. When
-        ``mark_prefill_on_response`` is enabled, the prefill mark is also
+        generation tokens, ``estimated_overlap_tokens()`` reports the estimated
+        cached-token overlap for the chosen worker, route/connect timing methods
+        report seconds for metrics, ``stale_reroutes()`` reports retry count, and
+        ``mark_prefill()`` / ``mark_free()`` drive the KV-lifecycle callbacks.
+        When ``mark_prefill_on_response`` is enabled, the prefill mark is also
         handled automatically on the first real worker-stream item.
         """
         ...
@@ -558,16 +565,37 @@ class AdmittedRequest:
     """
     Outcome of :meth:`RouterWorkerCoordinator.route_and_worker` on a successful
     route. Carries the lifecycle guard (``mark_prefill`` / ``mark_free``), the
-    worker generation stream, and the router's reported ``overlap_blocks``. A
-    denial is a :class:`DeniedRequest` instead. The chosen ``worker_id`` is not
-    surfaced to Python.
+    worker generation stream, the estimated cached-token overlap, route/connect
+    setup timings in seconds, and stale-reroute count. A denial is a
+    :class:`DeniedRequest` instead. The chosen ``worker_id`` is not surfaced to
+    Python.
     """
 
-    def overlap_blocks(self) -> int:
+    def estimated_overlap_tokens(self) -> int:
         """
-        The router's rounded effective cached blocks (approximate KV-cache hit,
-        in BLOCKS) the router reported for the chosen worker on this request.
-        ``0`` when the route did not arm the guard.
+        Estimated cached-token overlap for the chosen worker on this request,
+        derived from the router response and the coordinator block size.
+        """
+        ...
+
+    def routing_new_duration_seconds(self) -> float:
+        """
+        Seconds from route/connect start to the successful KV-router ``new``
+        response used for this admitted worker.
+        """
+        ...
+
+    def worker_connect_duration_seconds(self) -> float:
+        """
+        Seconds from the successful KV-router ``new`` response to worker stream
+        connection. Includes first-worker-event wait when enabled.
+        """
+        ...
+
+    def stale_reroutes(self) -> int:
+        """
+        Number of stale-route reroutes before this request was admitted. ``0``
+        means the first route connected to its worker.
         """
         ...
 
