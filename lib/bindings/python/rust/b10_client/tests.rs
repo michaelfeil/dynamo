@@ -1396,6 +1396,184 @@ async fn route_and_connect_router_backpressure_returns_denied() {
 }
 
 #[tokio::test]
+async fn route_and_connect_router_queue_backpressure_reason_is_preserved() {
+    let router = RouterGuardClientForTesting::new(
+        vec![7],
+        vec![7],
+        vec![backpressure_response(
+            RouterBackpressureReason::MaxQueuedIslTokensExceeded,
+            512,
+            Some(512),
+        )],
+    );
+    let worker = RouterGuardClientForTesting::new(vec![], vec![], vec![]);
+    let context = build_test_context("test-router-queue-backpressure");
+
+    let outcome = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-router-queue-bp",
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("denied, not raised");
+
+    match outcome {
+        RouteAndConnectOutcome::Denied(DeniedRequest::RouterBackpressure {
+            reason,
+            queued_isl_tokens,
+            max_queued_isl_tokens,
+        }) => {
+            assert_eq!(reason, "max_queued_isl_tokens_exceeded");
+            assert_eq!(queued_isl_tokens, 512);
+            assert_eq!(max_queued_isl_tokens, Some(512));
+        }
+        other => panic!("expected Denied(RouterBackpressure), got {:?}", other),
+    }
+
+    assert_eq!(router.method_call_count("mark_free"), 0);
+    assert_eq!(worker.method_call_count("generate"), 0);
+}
+
+#[tokio::test]
+async fn route_and_connect_cancellable_routing_frees_late_new_after_parent_stop() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    router.set_open_delay(Duration::from_millis(200));
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    let context = build_test_context("test-route-late-new-cancelled");
+
+    let router_for_task = router.clone();
+    let worker_for_task = worker.clone();
+    let context_for_task = context.clone();
+    let task = tokio::spawn(async move {
+        connect(
+            router_for_task,
+            worker_for_task,
+            make_routing_request(),
+            "req-route-late-new-cancelled",
+            context_for_task,
+            Vec::new(),
+            None,
+            make_worker_request(),
+            0,
+            true,
+            true,
+            Duration::from_secs(60),
+        )
+        .await
+    });
+
+    wait_for_call_count(&router, 1).await;
+    context.inner().stop_generating();
+
+    let outcome = task
+        .await
+        .expect("task should not panic")
+        .expect("cancelled denial should not raise");
+    assert!(matches!(
+        outcome,
+        RouteAndConnectOutcome::Denied(DeniedRequest::Cancelled())
+    ));
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(router.method_call_count("mark_free"), 1);
+    assert_eq!(worker.method_call_count("generate"), 0);
+}
+
+#[tokio::test]
+async fn route_and_connect_cancellable_setup_frees_late_stream_after_parent_stop() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    worker.set_open_delay(Duration::from_millis(200));
+    let context = build_test_context("test-setup-late-stream-cancelled");
+
+    let router_for_task = router.clone();
+    let worker_for_task = worker.clone();
+    let context_for_task = context.clone();
+    let task = tokio::spawn(async move {
+        connect(
+            router_for_task,
+            worker_for_task,
+            make_routing_request(),
+            "req-setup-late-stream-cancelled",
+            context_for_task,
+            Vec::new(),
+            None,
+            make_worker_request(),
+            0,
+            true,
+            true,
+            Duration::from_secs(60),
+        )
+        .await
+    });
+
+    wait_for_call_count(&worker, 1).await;
+    context.inner().stop_generating();
+
+    let outcome = task
+        .await
+        .expect("task should not panic")
+        .expect("cancelled denial should not raise");
+    assert!(matches!(
+        outcome,
+        RouteAndConnectOutcome::Denied(DeniedRequest::Cancelled())
+    ));
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(router.method_call_count("mark_free"), 1);
+    assert_eq!(worker.method_call_count("generate"), 1);
+}
+
+#[tokio::test]
+async fn route_and_connect_detached_setup_ignores_already_stopped_parent() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    router.set_respect_cancel(CancelRespect::Yes);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    worker.set_respect_cancel(CancelRespect::Yes);
+    let context = build_test_context("test-detached-setup-stopped-parent");
+    context.inner().stop_generating();
+
+    let outcome = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-detached-setup-stopped-parent",
+        context,
+        Vec::new(),
+        None,
+        make_worker_request(),
+        0,
+        false,
+        false,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("detached route/setup should ignore already stopped parent");
+
+    match &outcome {
+        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(*worker_id, 1),
+        other => panic!("expected Connected, got {:?}", other),
+    }
+
+    let route_contexts = router.route_contexts();
+    assert_eq!(route_contexts.len(), 1);
+    assert!(!route_contexts[0].is_stopped());
+    let worker_contexts = worker.route_contexts();
+    assert_eq!(worker_contexts.len(), 1);
+    assert!(!worker_contexts[0].is_stopped());
+
+    drop(outcome);
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
 async fn route_request_parent_kill_kills_detached_route_context_when_cancellable() {
     async fn wait_for_context_killed(
         context: Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>,
@@ -1752,29 +1930,17 @@ async fn route_and_connect_preflight_follows_cancellable_routing_policy() {
     .await
     .expect("denied, not raised");
 
-    match outcome {
-        RouteAndConnectOutcome::Denied(DeniedRequest::NextRouterUnreachable { error }) => {
-            assert!(
-                error.contains("failed to query potential loads through any KV router"),
-                "error: {}",
-                error
-            );
-            assert!(
-                error.contains("cancelled by context stop"),
-                "error: {}",
-                error
-            );
-        }
-        other => panic!("expected Denied(NextRouterUnreachable), got {:?}", other),
-    }
+    assert!(matches!(
+        outcome,
+        RouteAndConnectOutcome::Denied(DeniedRequest::Cancelled())
+    ));
 
-    assert_eq!(next.calls().len(), 2);
-    assert_eq!(next.method_call_count("potential_loads"), 2);
+    assert_eq!(next.calls().len(), 0);
+    assert_eq!(next.method_call_count("potential_loads"), 0);
     assert_eq!(router.method_call_count("new"), 0);
     assert_eq!(worker.method_call_count("generate"), 0);
     let preflight_contexts = next.route_contexts();
-    assert_eq!(preflight_contexts.len(), 2);
-    assert!(preflight_contexts.iter().all(|ctx| ctx.is_stopped()));
+    assert!(preflight_contexts.is_empty());
 }
 
 #[tokio::test]
@@ -1813,7 +1979,7 @@ async fn route_and_connect_preflight_detaches_when_routing_cancellation_disabled
         make_worker_request(),
         0,
         false,
-        true,
+        false,
         Duration::from_secs(60),
     )
     .await
@@ -1898,20 +2064,17 @@ async fn route_and_connect_preflight_unreachable_returns_next_router_unreachable
 }
 
 #[tokio::test(start_paused = true)]
-async fn route_and_connect_routing_cancelled_in_band_returns_denied_next_router_unreachable() {
-    // Stop the parent context BEFORE awaiting route_and_connect. Each
-    // detached route attempt copies that already-stopped state onto its
-    // request context, so the router fake's respect_cancel=Yes short-circuits
-    // direct() to Err("cancelled by context stop"). Failed setup kills that
-    // detached route context and backs off before the retry.
+async fn route_and_connect_cancellable_routing_checks_stopped_context_before_direct() {
+    // Stop the parent context BEFORE awaiting route_and_connect. Cancellable
+    // routing now checks the parent context before making a router direct()
+    // call, so cancellation is classified as Cancelled instead of as a router
+    // reachability failure.
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     router.set_respect_cancel(CancelRespect::Yes);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
     let context = build_test_context("test-routing-cancel");
-    // Stop BEFORE the await so each detached route context starts stopped.
     context.inner().stop_generating();
 
-    let started = tokio::time::Instant::now();
     let outcome = connect(
         router.clone(),
         worker.clone(),
@@ -1929,33 +2092,18 @@ async fn route_and_connect_routing_cancelled_in_band_returns_denied_next_router_
     .await
     .expect("denied, not raised");
 
-    match outcome {
-        RouteAndConnectOutcome::Denied(DeniedRequest::NextRouterUnreachable { error }) => {
-            assert!(
-                error.contains("failed to route request through any KV router"),
-                "error: {}",
-                error
-            );
-            assert!(
-                error.contains("cancelled by context stop"),
-                "error: {}",
-                error
-            );
-        }
-        other => panic!("expected Denied(NextRouterUnreachable), got {:?}", other),
-    }
+    assert!(matches!(
+        outcome,
+        RouteAndConnectOutcome::Denied(DeniedRequest::Cancelled())
+    ));
 
-    // Both attempts reached direct (recorded in calls() + detailed_calls),
-    // both incomplete; no mark_free (cancelled routes produce no armed
-    // guard); no worker direct.
-    assert!(started.elapsed() >= ROUTER_GUARD_CLEANUP_GRACE_PERIOD);
-    assert_eq!(router.calls().len(), 2);
+    // The policy-gated boundary check rejects before calling the router.
+    assert_eq!(router.calls().len(), 0);
     assert_eq!(router.completed_direct_count(), 0);
     assert_eq!(router.method_call_count("mark_free"), 0);
     assert_eq!(worker.method_call_count("generate"), 0);
     let route_contexts = router.route_contexts();
-    assert_eq!(route_contexts.len(), 2);
-    assert!(route_contexts.iter().all(|ctx| ctx.is_killed()));
+    assert!(route_contexts.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

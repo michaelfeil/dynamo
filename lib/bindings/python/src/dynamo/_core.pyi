@@ -532,7 +532,10 @@ class RouterWorkerCoordinator:
         when the phase finishes, so the router is never orphaned. Cancellation
         is NEVER a tokio task-drop — it propagates through ``context.is_stopped()
         || is_killed()`` to the underlying ``direct()`` open and the worker
-        stream. Routing and setup are INDEPENDENT axes; see
+        stream, and the coordinator also checks the context at policy-cancellable
+        phase boundaries. If cancellation wins after the router admitted a
+        request, the guard requests ``mark_free`` before returning
+        ``DeniedRequest.Cancelled``. Routing and setup are INDEPENDENT axes; see
         :class:`CancellationPolicy` for the full matrix.
         ``DetachToWorkerStreamConnected`` detaches routing/setup until the worker
         stream is connected and handed back, then stream consumption follows the
@@ -543,9 +546,10 @@ class RouterWorkerCoordinator:
         :class:`DeniedRequest` when the router is backpressured, a
         ``require_available`` component is down, the preflight overflows, the
         preflight cannot reach the router, the stale-route reroute loop is
-        exhausted, or ``wait_for_first_response`` cannot read the first worker
-        stream item -- never raising in those cases. A non-stale worker-open
-        failure (or non-object ``worker_args``) is raised, not returned as a
+        exhausted, policy-allowed cancellation wins, or
+        ``wait_for_first_response`` cannot read the first worker stream item --
+        never raising in those cases. A non-stale worker-open failure (or
+        non-object ``worker_args``) is raised, not returned as a
         ``DeniedRequest``. Discriminate with
         ``isinstance(result, AdmittedRequest)`` /
         ``isinstance(result, DeniedRequest)`` (and
@@ -671,6 +675,13 @@ class DeniedRequest:
         """
         received: str
         """Debug representation of the unexpected ``RouterResponse`` variant."""
+        ...
+
+    class Cancelled:
+        """
+        The request context was stopped or killed at a phase boundary where the
+        selected cancellation policy allows cancellation.
+        """
         ...
 
     class FirstWorkerEventFailed:

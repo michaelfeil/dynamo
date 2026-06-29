@@ -154,6 +154,47 @@ fn log_route_step(
     );
 }
 
+fn cancellation_denial_for_context(
+    context: &context::Context,
+    allow: bool,
+) -> Option<DeniedRequest> {
+    if !allow {
+        return None;
+    }
+
+    let inner = context.inner();
+    if inner.is_killed() || inner.is_stopped() {
+        Some(DeniedRequest::Cancelled())
+    } else {
+        None
+    }
+}
+
+fn cancellation_denial_for_optional_context(
+    context: &Option<context::Context>,
+    allow: bool,
+) -> Option<DeniedRequest> {
+    context
+        .as_ref()
+        .and_then(|ctx| cancellation_denial_for_context(ctx, allow))
+}
+
+fn create_worker_request_context(
+    request: serde_json::Value,
+    parent_ctx: &context::Context,
+    follow_parent_during_setup: bool,
+) -> RsContext<serde_json::Value> {
+    if follow_parent_during_setup {
+        create_request_context(request, &Some(parent_ctx.clone()))
+    } else {
+        RsContext::with_id_and_metadata(
+            request,
+            parent_ctx.inner().id().to_string(),
+            parent_ctx.metadata_snapshot(),
+        )
+    }
+}
+
 /// Why a [`route_request`] call resolved the way it did. The coordinator maps
 /// these onto `DeniedRequest::RouterBackpressure` /
 /// `DeniedRequest::RequiredComponentsDown` /
@@ -1039,6 +1080,14 @@ async fn route_once(
 ) -> RouteOnceOutcome {
     log_route_step(tracing_enabled, &context, &request_id, "route_once_start");
 
+    if let Some(denied) = cancellation_denial_for_optional_context(&context, allow_cancel_routing) {
+        tracing::info!(
+            request_id = %request_id,
+            "route_once denied before routing because context was cancelled"
+        );
+        return RouteOnceOutcome::Denied(denied);
+    }
+
     // Short-circuit when a `require_available` component is already down before
     // any downstream network call.
     if let Some(name) = required_down_name(&require) {
@@ -1062,7 +1111,7 @@ async fn route_once(
             &request_id,
             "potential_loads_preflight_start",
         );
-        match query_potential_loads(
+        let preflight_result = query_potential_loads(
             tokens,
             block_mm_infos,
             context.clone(),
@@ -1071,8 +1120,19 @@ async fn route_once(
             tracing_enabled,
             allow_cancel_routing,
         )
-        .await
+        .await;
+
+        if let Some(denied) =
+            cancellation_denial_for_optional_context(&context, allow_cancel_routing)
         {
+            tracing::info!(
+                request_id = %request_id,
+                "route_once denied after potential_loads because context was cancelled"
+            );
+            return RouteOnceOutcome::Denied(denied);
+        }
+
+        match preflight_result {
             Ok(Some(info)) => {
                 tracing::info!(
                     request_id = %request_id,
@@ -1135,50 +1195,76 @@ async fn route_once(
     .await;
 
     match route_res {
-        Ok((guard, RouteSource::Routed { worker_id })) => {
-            log_route_step(
-                tracing_enabled,
-                &context,
-                &request_id,
-                "route_request_admitted",
-            );
-            // Post-route required re-check: a component may have gone down while
-            // the route was in flight.
-            if let Some(name) = required_down_name(&require) {
+        Ok((guard, source)) => {
+            if let Some(denied) =
+                cancellation_denial_for_optional_context(&context, allow_cancel_routing)
+            {
+                guard.mark_free();
                 drop(guard);
-                return RouteOnceOutcome::Denied(DeniedRequest::RequiredComponentsDown { name });
+                tracing::info!(
+                    request_id = %request_id,
+                    "route_once denied after route_request because context was cancelled"
+                );
+                return RouteOnceOutcome::Denied(denied);
             }
-            RouteOnceOutcome::Route { guard, worker_id }
+
+            match source {
+                RouteSource::Routed { worker_id } => {
+                    log_route_step(
+                        tracing_enabled,
+                        &context,
+                        &request_id,
+                        "route_request_admitted",
+                    );
+                    // Post-route required re-check: a component may have gone down while
+                    // the route was in flight.
+                    if let Some(name) = required_down_name(&require) {
+                        guard.mark_free();
+                        drop(guard);
+                        return RouteOnceOutcome::Denied(DeniedRequest::RequiredComponentsDown {
+                            name,
+                        });
+                    }
+                    RouteOnceOutcome::Route { guard, worker_id }
+                }
+                RouteSource::RouterBackpressure => {
+                    let (reason, queued_isl_tokens, max_queued_isl_tokens) = guard
+                        .backpressure_fields()
+                        .unwrap_or((RouterBackpressureReason::DoNotQueue, 0, None));
+                    drop(guard);
+                    RouteOnceOutcome::Denied(DeniedRequest::RouterBackpressure {
+                        reason: reason_to_string(&reason),
+                        queued_isl_tokens,
+                        max_queued_isl_tokens,
+                    })
+                }
+                // Unreachable in production: route_request is called with an empty
+                // require list, so it can never return RequiredDown. Defended anyway.
+                RouteSource::RequiredDown { name } => {
+                    drop(guard);
+                    RouteOnceOutcome::Denied(DeniedRequest::RequiredComponentsDown { name })
+                }
+                // The router replied with a variant that is not a clean admit
+                // (`New`) or clean denial (`Backpressure`) for a `new` request.
+                // `route_request` already failed closed (requested mark_free, dropped
+                // the provisional guard) and returned an unarmed placeholder guard.
+                // Surface the protocol error to the caller.
+                RouteSource::ProtocolError { received } => {
+                    drop(guard);
+                    RouteOnceOutcome::Denied(DeniedRequest::ProtocolError { received })
+                }
+            }
         }
-        Ok((guard, RouteSource::RouterBackpressure)) => {
-            let (reason, queued_isl_tokens, max_queued_isl_tokens) = guard
-                .backpressure_fields()
-                .unwrap_or((RouterBackpressureReason::DoNotQueue, 0, None));
-            drop(guard);
-            RouteOnceOutcome::Denied(DeniedRequest::RouterBackpressure {
-                reason: reason_to_string(&reason),
-                queued_isl_tokens,
-                max_queued_isl_tokens,
+        Err(route_err) => {
+            if let Some(denied) =
+                cancellation_denial_for_optional_context(&context, allow_cancel_routing)
+            {
+                return RouteOnceOutcome::Denied(denied);
+            }
+            RouteOnceOutcome::Denied(DeniedRequest::NextRouterUnreachable {
+                error: route_err.to_string(),
             })
         }
-        // Unreachable in production: route_request is called with an empty
-        // require list, so it can never return RequiredDown. Defended anyway.
-        Ok((_guard, RouteSource::RequiredDown { name })) => {
-            drop(_guard);
-            RouteOnceOutcome::Denied(DeniedRequest::RequiredComponentsDown { name })
-        }
-        // The router replied with a variant that is not a clean admit
-        // (`New`) or clean denial (`Backpressure`) for a `new` request.
-        // `route_request` already failed closed (requested mark_free, dropped
-        // the provisional guard) and returned an unarmed placeholder guard.
-        // Surface the protocol error to the caller.
-        Ok((_guard, RouteSource::ProtocolError { received })) => {
-            drop(_guard);
-            RouteOnceOutcome::Denied(DeniedRequest::ProtocolError { received })
-        }
-        Err(route_err) => RouteOnceOutcome::Denied(DeniedRequest::NextRouterUnreachable {
-            error: route_err.to_string(),
-        }),
     }
 }
 
@@ -1296,7 +1382,8 @@ async fn connect_worker(
     // future resolves. The proactive stale pre-check above returns before
     // `open_fut` is constructed, so it does not move the guard.
     let open_fut = async move {
-        let worker_request_ctx = create_request_context(worker_request, &Some(open_ctx));
+        let worker_request_ctx =
+            create_worker_request_context(worker_request, &open_ctx, allow_cancel_setup);
         let stream_result = wgc
             .direct(worker_request_ctx, worker_id)
             .instrument(span)
@@ -1538,6 +1625,19 @@ pub(super) async fn route_and_connect(
                 worker_id,
                 stream,
             } => {
+                if let Some(denied) = cancellation_denial_for_context(&context, allow_cancel_setup)
+                {
+                    guard.mark_free();
+                    drop(stream);
+                    drop(guard);
+                    tracing::info!(
+                        request_id = %request_id,
+                        worker_id,
+                        "route_and_connect denied after worker setup because context was cancelled"
+                    );
+                    return Ok(RouteAndConnectOutcome::Denied(denied));
+                }
+
                 let worker_connected_at = Instant::now();
                 let estimated_overlap_tokens = guard.estimated_overlap_tokens(block_size);
                 let timings = AdmittedRequestTimings {
@@ -1565,6 +1665,11 @@ pub(super) async fn route_and_connect(
             }
             OpenResult::Stale => {
                 // The guard was freed + waited-for-cleanup inside `connect_worker`.
+                if let Some(denied) = cancellation_denial_for_context(&context, allow_cancel_setup)
+                    .or_else(|| cancellation_denial_for_context(&context, allow_cancel_routing))
+                {
+                    return Ok(RouteAndConnectOutcome::Denied(denied));
+                }
                 if attempt >= max_reroutes {
                     return Ok(RouteAndConnectOutcome::Denied(
                         DeniedRequest::NextRouterUnreachable {
@@ -1580,8 +1685,22 @@ pub(super) async fn route_and_connect(
                 attempt += 1;
                 continue;
             }
-            OpenResult::Denied(denied) => return Ok(RouteAndConnectOutcome::Denied(denied)),
-            OpenResult::Other(err) => return Err(err),
+            OpenResult::Denied(denied) => {
+                if let Some(cancelled) =
+                    cancellation_denial_for_context(&context, allow_cancel_setup)
+                {
+                    return Ok(RouteAndConnectOutcome::Denied(cancelled));
+                }
+                return Ok(RouteAndConnectOutcome::Denied(denied));
+            }
+            OpenResult::Other(err) => {
+                if let Some(cancelled) =
+                    cancellation_denial_for_context(&context, allow_cancel_setup)
+                {
+                    return Ok(RouteAndConnectOutcome::Denied(cancelled));
+                }
+                return Err(err);
+            }
         }
     }
 }

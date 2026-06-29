@@ -88,6 +88,20 @@ fn stream_with_optional_prefill_mark(
     ResponseStream::new(Box::pin(stream), stream_context)
 }
 
+fn attach_worker_stream_to_parent_context(
+    stream: &EngineStream<RsAnnotated<serde_json::Value>>,
+    parent: &context::Context,
+) {
+    let parent_inner = parent.inner();
+    let stream_context = stream.context();
+    parent_inner.link_child(stream_context.clone());
+    if parent_inner.is_killed() {
+        stream_context.kill_with_reason(Some("parent_context_already_killed"));
+    } else if parent_inner.is_stopped() {
+        stream_context.stop_generating_with_reason(Some("parent_context_already_stopped"));
+    }
+}
+
 #[pyclass]
 pub(crate) struct RouterWorkerCoordinator {
     router: Client,
@@ -144,7 +158,10 @@ impl RouterWorkerCoordinator {
     /// `mark_free` cleanup task) when the phase finishes, so the router is
     /// never orphaned. Cancellation is NEVER a tokio task-drop — it propagates
     /// through `context.is_stopped() || is_killed()` to the underlying
-    /// `direct()` open and the worker stream. Routing and setup are
+    /// `direct()` open and the worker stream, and the coordinator also checks
+    /// the context at policy-cancellable phase boundaries. If cancellation wins
+    /// after the router admitted a request, the guard requests `mark_free`
+    /// before returning `DeniedRequest.Cancelled`. Routing and setup are
     /// INDEPENDENT axes; see [`CancellationPolicy`] for the full matrix.
     ///
     /// When `potential_loads_next_check` is given, a *potential loads* preflight
@@ -177,9 +194,9 @@ impl RouterWorkerCoordinator {
     /// chosen `worker_id`) or a
     /// [`DeniedRequest`] when the router is backpressured, a `require_available`
     /// component is down, the preflight overflows, the preflight cannot reach
-    /// the router, the stale-route reroute loop is exhausted, or
-    /// `wait_for_first_response` cannot read the first worker stream item —
-    /// never raising in those cases. Discriminate in Python with
+    /// the router, policy-allowed cancellation wins, the stale-route reroute
+    /// loop is exhausted, or `wait_for_first_response` cannot read the first
+    /// worker stream item — never raising in those cases. Discriminate in Python with
     /// `isinstance(result, AdmittedRequest)` / `isinstance(result, DeniedRequest)`
     /// (and `isinstance(result, DeniedRequest.<Variant>)` for the denial reason);
     /// first-event failures are returned as
@@ -332,6 +349,7 @@ impl RouterWorkerCoordinator {
                 Arc::new(JsonRouterGuardClient::new(router_router));
             let worker_guard_client: Arc<dyn RouterGuardClient> =
                 Arc::new(JsonRouterGuardClient::new(worker_router));
+            let parent_context_for_stream = context.clone();
 
             // --- Route + connect phase (routing shield) ---
             // The whole loop -- `route_once` running the `require_available`
@@ -382,6 +400,10 @@ impl RouterWorkerCoordinator {
                     timings,
                 } => (guard, worker_id, stream, timings),
             };
+
+            if allow_cancel_stream && !allow_cancel_setup {
+                attach_worker_stream_to_parent_context(&stream, &parent_context_for_stream);
+            }
 
             // The guard is wrapped in an `Arc` shared with the background
             // stream-drain task so `mark_free` (fired on `Drop`) is deferred

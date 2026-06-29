@@ -272,7 +272,8 @@ pub(super) struct AdmittedRequestTimings {
 /// these is returned (never raised) instead of a `AdmittedRequest` when the
 /// router is backpressured, a `require_available` component is down, the
 /// optional `potential_loads_next_check` preflight found the next request
-/// would overfill the router, that preflight could not reach the router, or
+/// would overfill the router, that preflight could not reach the router,
+/// policy-allowed cancellation wins at a phase boundary, or
 /// `wait_for_first_response` could not read a first worker event.
 ///
 /// In Python this is a typed enum: discriminate with `isinstance(result,
@@ -322,6 +323,11 @@ pub(crate) enum DeniedRequest {
         /// received from the downstream router, for diagnostics.
         received: String,
     },
+    /// The request context was stopped or killed at a phase boundary where the
+    /// selected [`CancellationPolicy`] allows cancellation. If the router had
+    /// already admitted the request, the coordinator requested `mark_free`
+    /// before returning this denial.
+    Cancelled(),
     /// `wait_for_first_response` waited for the routed worker stream's first
     /// event, but the stream ended or produced an error before that event could
     /// be handled.
