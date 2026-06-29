@@ -893,6 +893,13 @@ new endpoint-specific tests fail. Broader protocol work remains open only for
 response-shape or tolerance decisions not already covered by `baseten_ext` and
 Anthropic conformance slices.
 
+The v1.2 health replay also ties readiness to runtime lifetime. The B10 router
+registers the `DistributedRuntime` primary cancellation token with B10 health,
+and `/health_file` returns unhealthy once that token is cancelled even if the
+last heartbeat is still fresh. The router keeps the 60s initial heartbeat grace
+period before publishing health, so the endpoint remains unhealthy during
+startup unless another caller explicitly sets health.
+
 Baseten owns its own `context_id` format, built at HTTP ingress in the fork-only
 file `lib/llm/src/http/service/b10_context_id.rs`. The format is
 `{org_namespace}--{b10_request_id}--{model_version_id}[--{extras}]`:
@@ -1060,6 +1067,10 @@ It creates a fresh cancellation controller while carrying metadata, trace contex
 and the captured `engine.generate` span. This is needed because decode requests
 detach cancellation ownership after prefill without splitting TRT-LLM/Honeycomb
 backend spans from the original Dynamo request. Drop after upstream has this API.
+
+Also expose `b10_health.register_runtime(runtime)` so Python-owned runtime
+startup paths can attach the same runtime cancellation token that the Rust B10
+router registers automatically.
 
 v1.2 b10_client portability note:
 

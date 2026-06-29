@@ -1,14 +1,25 @@
-use std::sync::Mutex;
+use std::sync::{LazyLock, RwLock};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 
-static LAST_HEALTH_UPDATE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
-static UNRECOVERABLE_DOWN: Mutex<bool> = Mutex::new(false);
+#[derive(Default)]
+struct HealthState {
+    last_health_update: Option<(Instant, bool)>,
+    unrecoverable_down: bool,
+    runtime_cancel_token: Option<CancellationToken>,
+}
+
+static HEALTH_STATE: LazyLock<RwLock<HealthState>> =
+    LazyLock::new(|| RwLock::new(HealthState::default()));
 
 pub fn set_health(healthy: bool, reason: &str) {
-    let mut guard = LAST_HEALTH_UPDATE.lock().unwrap();
-    let previous_state = guard.map(|(_, was_healthy)| was_healthy);
+    let mut state = HEALTH_STATE.write().unwrap();
+    let previous_state = state
+        .last_health_update
+        .as_ref()
+        .map(|(_, was_healthy)| *was_healthy);
     let state_changed = previous_state != Some(healthy);
 
     if state_changed {
@@ -19,26 +30,36 @@ pub fn set_health(healthy: bool, reason: &str) {
         }
     }
 
-    *guard = Some((Instant::now(), healthy));
+    state.last_health_update = Some((Instant::now(), healthy));
 }
 
 pub fn set_poisoned() {
-    let mut unrecoverable_guard = UNRECOVERABLE_DOWN.lock().unwrap();
-    if !(*unrecoverable_guard) {
+    let mut state = HEALTH_STATE.write().unwrap();
+    if !state.unrecoverable_down {
         tracing::warn!("Health state changed to POISONED");
     }
-    *unrecoverable_guard = true;
+    state.unrecoverable_down = true;
+}
+
+pub fn register_runtime_cancel_token(token: CancellationToken) {
+    HEALTH_STATE.write().unwrap().runtime_cancel_token = Some(token);
 }
 
 pub fn is_healthy() -> bool {
-    let unrecoverable_guard = UNRECOVERABLE_DOWN.lock().unwrap();
-    if *unrecoverable_guard {
+    let state = HEALTH_STATE.read().unwrap();
+    if state.unrecoverable_down {
         return false;
     }
-    drop(unrecoverable_guard);
 
-    let guard = LAST_HEALTH_UPDATE.lock().unwrap();
-    match *guard {
+    let runtime_cancel_token = state.runtime_cancel_token.clone();
+    let last_health_update = state.last_health_update;
+    drop(state);
+
+    if runtime_cancel_token.is_some_and(|token| token.is_cancelled()) {
+        return false;
+    }
+
+    match last_health_update {
         Some((last_update, was_healthy)) => was_healthy && last_update.elapsed() <= HEALTH_TIMEOUT,
         None => false,
     }
@@ -51,12 +72,7 @@ mod tests {
     use std::thread;
 
     fn cleanup_health_state() {
-        let mut last_update_guard = LAST_HEALTH_UPDATE.lock().unwrap();
-        *last_update_guard = None;
-        drop(last_update_guard);
-
-        let mut unrecoverable_guard = UNRECOVERABLE_DOWN.lock().unwrap();
-        *unrecoverable_guard = false;
+        *HEALTH_STATE.write().unwrap() = HealthState::default();
     }
 
     #[test]
@@ -84,8 +100,8 @@ mod tests {
         assert!(is_healthy());
 
         {
-            let mut last_update_guard = LAST_HEALTH_UPDATE.lock().unwrap();
-            *last_update_guard = Some((Instant::now() - Duration::from_secs(65), true));
+            let mut state = HEALTH_STATE.write().unwrap();
+            state.last_health_update = Some((Instant::now() - Duration::from_secs(65), true));
         }
 
         assert!(!is_healthy());
@@ -123,5 +139,36 @@ mod tests {
 
         set_health(true, "test: attempt recovery after poison");
         assert!(!is_healthy());
+    }
+
+    #[test]
+    #[serial]
+    fn test_registered_runtime_cancel_token_makes_health_unhealthy() {
+        cleanup_health_state();
+        let token = CancellationToken::new();
+        register_runtime_cancel_token(token.clone());
+
+        set_health(true, "test: initial healthy state");
+        assert!(is_healthy());
+
+        token.cancel();
+        assert!(!is_healthy());
+    }
+
+    #[test]
+    #[serial]
+    fn test_registered_runtime_cancel_token_can_be_replaced() {
+        cleanup_health_state();
+        let old_token = CancellationToken::new();
+        register_runtime_cancel_token(old_token.clone());
+        set_health(true, "test: initial healthy state");
+        assert!(is_healthy());
+
+        old_token.cancel();
+        assert!(!is_healthy());
+
+        let new_token = CancellationToken::new();
+        register_runtime_cancel_token(new_token.clone());
+        assert!(is_healthy());
     }
 }

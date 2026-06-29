@@ -29,7 +29,7 @@ use rand::Rng;
 use dynamo_kv_router::config::KvRouterConfig;
 use dynamo_kv_router::indexer::KvIndexerMetrics;
 use dynamo_kv_router::selector::WorkerSelector;
-use dynamo_llm::b10_health::set_health;
+use dynamo_llm::b10_health::{register_runtime_cancel_token, set_health};
 use dynamo_llm::kv_router::{
     KvRouter,
     b10_worker_selector::B10WorkerSelector,
@@ -170,7 +170,7 @@ async fn run_with_selector<Sel>(
 where
     Sel: WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
 {
-    let _ = runtime; // currently unused; reserved for future hooks
+    register_runtime_cancel_token(runtime.primary_token());
 
     // Memoize metrics with the router component so they appear on the router's
     // metrics port (ComponentMetricsServer). Both use OnceLock; whoever calls
@@ -194,6 +194,10 @@ where
     // is alive so the deployment health probe doesn't time out.
     let _abort_guard = {
         let task = tokio::spawn(async {
+            // Give the router 60s before publishing the first health heartbeat.
+            // During that grace period, `/health_file` remains unhealthy unless
+            // another caller has explicitly set health.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             loop {
                 set_health(true, "router health heartbeat");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;

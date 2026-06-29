@@ -177,6 +177,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(llm::entrypoint::run_input, m)?)?;
     m.add_function(wrap_pyfunction!(llm::b10_router::start_router, m)?)?;
     m.add_function(wrap_pyfunction!(b10_health::set_health, m)?)?;
+    m.add_function(wrap_pyfunction!(b10_health::register_runtime, m)?)?;
     m.add_function(wrap_pyfunction!(b10_health::is_healthy, m)?)?;
     m.add_function(wrap_pyfunction!(b10_health::set_poisoned, m)?)?;
     m.add_function(wrap_pyfunction!(b10_rate_limiter::set_rate_limit_level, m)?)?;

@@ -1916,6 +1916,10 @@ def set_health(healthy: bool, reason: str = "") -> None:
     """Set the B10 health-file readiness state."""
     ...
 
+def register_runtime(runtime: DistributedRuntime) -> None:
+    """Tie B10 health-file readiness to a DistributedRuntime cancellation token (cancelled on shutdown)."""
+    ...
+
 def is_healthy() -> bool:
     """Return the current B10 health-file readiness state."""
     ...
