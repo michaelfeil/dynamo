@@ -155,16 +155,18 @@ fn active_request_isl_penalty(
         return 0.0;
     };
 
+    let ramp_width = penalty_full_tokens - penalty_start_tokens;
+    let factor_for = |tokens: f64| ((tokens - penalty_start_tokens) / ramp_width).clamp(0.0, 1.0);
+
     let penalty_for = |stats: &IslStats| -> f64 {
-        if stats.count == 0 || !stats.mean.is_finite() {
+        if stats.count == 0 || !stats.mean.is_finite() || !stats.stddev.is_finite() {
             return 0.0;
         }
 
         let incoming_isl = request.isl_tokens as f64;
         let center = stats.mean.max(0.0);
         let distance = (incoming_isl - center).abs();
-        let ramp_width = penalty_full_tokens - penalty_start_tokens;
-        let factor = ((distance - penalty_start_tokens) / ramp_width).clamp(0.0, 1.0);
+        let factor = factor_for(distance).max(factor_for(stats.stddev.max(0.0)));
 
         mismatch_penalty * factor
     };
