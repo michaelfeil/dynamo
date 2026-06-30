@@ -3,17 +3,71 @@
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::collections::HashMap;
+use std::hash::Hash;
 
 use super::single::RequestId;
-use crate::protocols::WorkerWithDpRank;
+use crate::protocols::{WorkerId, WorkerWithDpRank};
+use crate::scheduling::{ActiveRequestIslStats, IslStats};
+
+#[derive(Debug, Clone, Copy, Default)]
+struct IslAccumulator {
+    count: usize,
+    sum: f64,
+    sum_sq: f64,
+}
+
+impl IslAccumulator {
+    fn add(&mut self, isl: usize) {
+        let isl = isl as f64;
+        self.count += 1;
+        self.sum += isl;
+        self.sum_sq += isl * isl;
+    }
+
+    fn remove(&mut self, isl: usize) {
+        let isl = isl as f64;
+        self.count -= 1;
+        self.sum -= isl;
+        self.sum_sq -= isl * isl;
+    }
+
+    fn snapshot(&self) -> Option<IslStats> {
+        if self.count == 0 {
+            return None;
+        }
+
+        let count = self.count as f64;
+        let mean = self.sum / count;
+        let mean_sq = self.sum_sq / count;
+        let variance = (mean_sq - mean * mean).max(0.0);
+        Some(IslStats {
+            count: self.count,
+            mean,
+            stddev: variance.sqrt(),
+        })
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct RequestIndex {
     request_to_worker: DashMap<RequestId, WorkerWithDpRank>,
     request_to_lora: DashMap<RequestId, String>,
+    /// ISL per active request. Absent means the request should not contribute
+    /// to active-request ISL stats.
+    request_to_isl: DashMap<RequestId, usize>,
+    isl_stats_by_worker: DashMap<WorkerWithDpRank, IslAccumulator>,
+    isl_stats_by_worker_id: DashMap<WorkerId, IslAccumulator>,
+    track_worker_rank_isl: bool,
 }
 
 impl RequestIndex {
+    pub(super) fn new(track_worker_rank_isl: bool) -> Self {
+        Self {
+            track_worker_rank_isl,
+            ..Default::default()
+        }
+    }
+
     pub(super) fn try_insert_request(
         &self,
         request_id: RequestId,
@@ -38,12 +92,26 @@ impl RequestIndex {
         worker: WorkerWithDpRank,
         lora_name: Option<String>,
     ) {
-        self.request_to_worker.insert(request_id.clone(), worker);
+        let previous_worker = self.request_to_worker.insert(request_id.clone(), worker);
+        let previous_isl = self.request_to_isl.remove(&request_id).map(|(_, isl)| isl);
+        if let (Some(previous_worker), Some(previous_isl)) = (previous_worker, previous_isl) {
+            self.remove_isl(previous_worker, previous_isl);
+        }
         if let Some(lora_name) = lora_name {
             self.request_to_lora.insert(request_id, lora_name);
         } else {
             self.request_to_lora.remove(&request_id);
         }
+    }
+
+    pub(super) fn set_request_isl(
+        &self,
+        request_id: RequestId,
+        worker: WorkerWithDpRank,
+        isl: usize,
+    ) {
+        self.request_to_isl.insert(request_id, isl);
+        self.add_isl(worker, isl);
     }
 
     pub(super) fn worker_for(&self, request_id: &RequestId) -> Option<WorkerWithDpRank> {
@@ -62,6 +130,11 @@ impl RequestIndex {
             .remove(request_id)
             .map(|(_request_id, worker)| worker);
         self.request_to_lora.remove(request_id);
+        if let (Some(worker), Some((_request_id, isl))) =
+            (worker, self.request_to_isl.remove(request_id))
+        {
+            self.remove_isl(worker, isl);
+        }
         worker
     }
 
@@ -99,14 +172,68 @@ impl RequestIndex {
         counts
     }
 
+    /// Mean/stddev of ISL tokens over active requests, grouped by rank views.
+    /// Stats are maintained incrementally on lifecycle changes, so
+    /// this snapshot scales with active ranks rather than active requests.
+    pub(super) fn active_request_isl_stats(&self) -> ActiveRequestIslStats {
+        ActiveRequestIslStats {
+            by_worker_with_dp_rank: self
+                .track_worker_rank_isl
+                .then(|| snapshot_isl_stats(&self.isl_stats_by_worker)),
+            by_worker_id: snapshot_isl_stats(&self.isl_stats_by_worker_id),
+        }
+    }
+
+    fn add_isl(&self, worker: WorkerWithDpRank, isl: usize) {
+        if self.track_worker_rank_isl {
+            self.isl_stats_by_worker.entry(worker).or_default().add(isl);
+        }
+        self.isl_stats_by_worker_id
+            .entry(worker.worker_id)
+            .or_default()
+            .add(isl);
+    }
+
+    fn remove_isl(&self, worker: WorkerWithDpRank, isl: usize) {
+        if self.track_worker_rank_isl {
+            remove_isl_stat(&self.isl_stats_by_worker, worker, isl);
+        }
+        remove_isl_stat(&self.isl_stats_by_worker_id, worker.worker_id, isl);
+    }
+
     #[cfg(any(test, feature = "bench"))]
     pub(super) fn is_empty(&self) -> bool {
-        self.request_to_worker.is_empty() && self.request_to_lora.is_empty()
+        self.request_to_worker.is_empty()
+            && self.request_to_lora.is_empty()
+            && self.request_to_isl.is_empty()
+            && self.isl_stats_by_worker.is_empty()
+            && self.isl_stats_by_worker_id.is_empty()
     }
 
     #[cfg(any(test, feature = "bench"))]
     pub(super) fn worker_len(&self) -> usize {
         self.request_to_worker.len()
+    }
+}
+
+fn snapshot_isl_stats<K>(map: &DashMap<K, IslAccumulator>) -> HashMap<K, IslStats>
+where
+    K: Copy + Eq + Hash,
+{
+    map.iter()
+        .filter_map(|entry| entry.value().snapshot().map(|stats| (*entry.key(), stats)))
+        .collect()
+}
+
+fn remove_isl_stat<K>(map: &DashMap<K, IslAccumulator>, key: K, isl: usize)
+where
+    K: Copy + Eq + Hash,
+{
+    if let Entry::Occupied(mut entry) = map.entry(key) {
+        entry.get_mut().remove(isl);
+        if entry.get().count == 0 {
+            entry.remove_entry();
+        }
     }
 }
 

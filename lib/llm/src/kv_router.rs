@@ -736,6 +736,7 @@ where
                 track_prefill_tokens,
                 expected_output_tokens,
                 prefill_load_hint,
+                active_request_isl_tokens: Some(isl_tokens),
                 worker,
                 lora_name,
             })

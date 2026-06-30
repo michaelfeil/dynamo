@@ -626,6 +626,8 @@ pub struct PrefillLoadHint {
 pub enum ActiveSequenceEventData {
     AddRequest {
         token_sequence: Option<Vec<SequenceHash>>,
+        #[serde(default)]
+        isl_tokens: Option<usize>,
         #[serde(default = "default_track_prefill_tokens")]
         track_prefill_tokens: bool,
         expected_output_tokens: Option<u32>,

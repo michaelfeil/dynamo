@@ -87,6 +87,19 @@ pub struct SchedulingResponse {
     pub dp_strict_rank: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IslStats {
+    pub count: usize,
+    pub mean: f64,
+    pub stddev: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveRequestIslStats {
+    pub by_worker_with_dp_rank: Option<HashMap<WorkerWithDpRank, IslStats>>,
+    pub by_worker_id: HashMap<WorkerId, IslStats>,
+}
+
 pub struct SchedulingRequest {
     // Request identity and payload.
     pub maybe_request_id: Option<String>,
@@ -115,6 +128,7 @@ pub struct SchedulingRequest {
     pub decode_blocks: FxHashMap<WorkerWithDpRank, usize>,
     pub prefill_tokens: FxHashMap<WorkerWithDpRank, usize>,
     pub active_requests: HashMap<WorkerWithDpRank, usize>,
+    pub active_request_isl_stats: Option<ActiveRequestIslStats>,
     pub eviction_costs: HashMap<WorkerWithDpRank, f64>,
 
     // Scheduling side effects and lifecycle controls.

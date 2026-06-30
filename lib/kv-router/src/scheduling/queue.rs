@@ -101,6 +101,7 @@ struct SchedulerQueueActor<
     overlap_scores_refresh: Option<Arc<RF>>,
     overlap_refresh_after: Option<Duration>,
     overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+    track_active_request_isl: bool,
 }
 
 /// Queue that gates scheduling requests behind a capacity check.
@@ -147,6 +148,7 @@ impl<
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
+        track_active_request_isl: bool,
     ) -> Self {
         if let Some(frac) = threshold_frac {
             tracing::info!("Router queue enabled with threshold fraction {frac}");
@@ -188,6 +190,7 @@ impl<
             overlap_scores_refresh,
             overlap_refresh_after,
             overloaded_worker_provider,
+            track_active_request_isl,
         };
         tokio::spawn(actor.run(admission_rx));
         Self {
@@ -231,6 +234,7 @@ impl<
             prefill_load_estimator,
             None,
             None,
+            false,
         )
     }
 
@@ -257,6 +261,7 @@ impl<
             prefill_load_estimator,
             None,
             overloaded_worker_provider,
+            false,
         )
     }
 }
@@ -647,6 +652,9 @@ impl<
         request.decode_blocks = decode_blocks;
         request.prefill_tokens = prefill_tokens;
         request.active_requests = self.slots.active_request_counts();
+        request.active_request_isl_stats = self
+            .track_active_request_isl
+            .then(|| self.slots.active_request_isl_stats());
         if self.slots.tracks_residency()
             && let Some(half_life) = self.selector.residency_eviction_half_life()
         {
@@ -702,6 +710,9 @@ impl<
                 track_prefill_tokens: request.track_prefill_tokens,
                 expected_output_tokens: request.expected_output_tokens,
                 prefill_load_hint,
+                active_request_isl_tokens: self
+                    .track_active_request_isl
+                    .then_some(request.isl_tokens),
                 worker: selection.worker,
                 lora_name: request.lora_name.clone(),
             },
@@ -1246,6 +1257,7 @@ mod tests {
             None,
             Some(refresher),
             None,
+            false,
         ));
 
         (queue, slots)
@@ -1304,6 +1316,7 @@ mod tests {
             None,
             Some(refresher),
             None,
+            false,
         ));
 
         (queue, slots)
@@ -1329,6 +1342,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            active_request_isl_stats: None,
             eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
@@ -1979,6 +1993,7 @@ mod tests {
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            active_request_isl_stats: None,
             eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,
@@ -2273,6 +2288,7 @@ mod tests {
                         initial_effective_prefill_tokens: isl,
                         expected_prefill_duration: None,
                     }),
+                    active_request_isl_tokens: None,
                     worker: WorkerWithDpRank::new(0, 0),
                     lora_name: None,
                 },

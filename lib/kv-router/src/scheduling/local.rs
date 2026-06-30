@@ -44,6 +44,7 @@ pub struct LocalScheduler<
     queue: Arc<SchedulerQueue<P, C, S, Sel, RF>>,
     queue_updates: watch::Sender<()>,
     track_prefill_tokens_default: bool,
+    track_active_request_isl: bool,
     worker_type: &'static str,
 }
 
@@ -102,6 +103,7 @@ where
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
         track_residency: bool,
+        track_active_request_isl: bool,
         recheck_interval: Duration,
         track_prefill_tokens_default: bool,
         cancellation_token: CancellationToken,
@@ -166,6 +168,7 @@ where
             prefill_load_estimator,
             overlap_scores_refresh,
             overloaded_worker_provider,
+            track_active_request_isl,
         ));
         let (queue_updates, _) = watch::channel(());
         let queue_remote_updates = Arc::clone(&queue);
@@ -217,6 +220,7 @@ where
             queue,
             queue_updates,
             track_prefill_tokens_default,
+            track_active_request_isl,
             worker_type,
         }
     }
@@ -305,6 +309,7 @@ where
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
             active_requests: HashMap::new(),
+            active_request_isl_stats: None,
             eviction_costs: HashMap::new(),
             track_prefill_tokens,
             routing_constraints,
@@ -334,7 +339,10 @@ where
         self.queue.register_workers(worker_ids);
     }
 
-    pub async fn add_request(&self, req: SequenceRequest) -> Result<(), SequenceError> {
+    pub async fn add_request(&self, mut req: SequenceRequest) -> Result<(), SequenceError> {
+        if !self.track_active_request_isl {
+            req.active_request_isl_tokens = None;
+        }
         self.slots.add_request(req, Instant::now())
     }
 
@@ -482,6 +490,7 @@ where
             prefill_load_estimator,
             None,
             false,
+            false,
             recheck_interval,
             track_prefill_tokens_default,
             cancellation_token,
@@ -504,6 +513,7 @@ where
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
         track_residency: bool,
+        track_active_request_isl: bool,
         recheck_interval: Duration,
         track_prefill_tokens_default: bool,
         cancellation_token: CancellationToken,
@@ -522,6 +532,7 @@ where
             None,
             overloaded_worker_provider,
             track_residency,
+            track_active_request_isl,
             recheck_interval,
             track_prefill_tokens_default,
             cancellation_token,

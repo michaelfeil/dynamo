@@ -106,6 +106,7 @@ pub struct SequenceRequest {
     pub track_prefill_tokens: bool,
     pub expected_output_tokens: Option<u32>,
     pub prefill_load_hint: Option<PrefillLoadHint>,
+    pub active_request_isl_tokens: Option<usize>,
     pub worker: WorkerWithDpRank,
     pub lora_name: Option<String>,
 }
@@ -148,10 +149,11 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         let (remote_state_updates, _) = watch::channel(());
         let workers = WorkerTable::new(block_size, &dp_range);
         let prompt_registry = PromptRegistry::new(workers.workers());
+        let track_worker_rank_isl = dp_range.values().any(|(_, dp_size)| *dp_size > 1);
 
         Self {
             workers: RwLock::new(workers),
-            request_index: RequestIndex::default(),
+            request_index: RequestIndex::new(track_worker_rank_isl),
             prompt_registry,
             block_size,
             router_id,
@@ -306,6 +308,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                     match &event.data {
                         ActiveSequenceEventData::AddRequest {
                             token_sequence,
+                            isl_tokens,
                             track_prefill_tokens,
                             expected_output_tokens,
                             prefill_load_hint,
@@ -318,6 +321,13 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                                     event.worker,
                                     event.lora_name.clone(),
                                 );
+                                if let Some(isl) = *isl_tokens {
+                                    self.request_index.set_request_isl(
+                                        event.request_id.clone(),
+                                        event.worker,
+                                        isl,
+                                    );
+                                }
                                 let (expired_request_ids, load) = {
                                     let slot = &table.slots[idx];
                                     if let (Some(residency), Some(sequence_hashes)) =
@@ -504,6 +514,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             worker: req.worker,
             data: ActiveSequenceEventData::AddRequest {
                 token_sequence: req.token_sequence.clone(),
+                isl_tokens: req.active_request_isl_tokens,
                 track_prefill_tokens: req.track_prefill_tokens,
                 expected_output_tokens: req.expected_output_tokens,
                 prefill_load_hint: req.prefill_load_hint,
@@ -684,6 +695,11 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         self.request_index.active_request_counts()
     }
 
+    /// Mean/stddev of active-request ISL tokens by rank views.
+    pub fn active_request_isl_stats(&self) -> crate::scheduling::ActiveRequestIslStats {
+        self.request_index.active_request_isl_stats()
+    }
+
     /// Return true if any worker satisfies the provided predicate on active token count.
     pub fn any_worker_matches_active_tokens(
         &self,
@@ -791,6 +807,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             track_prefill_tokens,
             expected_output_tokens,
             prefill_load_hint,
+            active_request_isl_tokens,
             worker,
             lora_name,
         } = req;
@@ -811,6 +828,10 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                     request_id,
                     worker: existing_worker,
                 });
+            }
+            if let Some(isl) = active_request_isl_tokens {
+                self.request_index
+                    .set_request_isl(request_id.clone(), worker, isl);
             }
             let slot = &table.slots[idx];
             if let (Some(residency), Some(sequence_hashes)) =
@@ -1127,6 +1148,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },
@@ -1155,6 +1177,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },
@@ -1195,6 +1218,7 @@ mod tests {
                         worker,
                         data: ActiveSequenceEventData::AddRequest {
                             token_sequence: Some(vec![1, 2, 3]),
+                            isl_tokens: None,
                             track_prefill_tokens: false,
                             expected_output_tokens: None,
                             prefill_load_hint: None,
@@ -1237,6 +1261,7 @@ mod tests {
                     track_prefill_tokens: true,
                     expected_output_tokens: None,
                     prefill_load_hint: tracking_hint(12),
+                    active_request_isl_tokens: None,
                     worker: worker_a,
                     lora_name: None,
                 },
@@ -1258,6 +1283,7 @@ mod tests {
                     track_prefill_tokens: true,
                     expected_output_tokens: None,
                     prefill_load_hint: tracking_hint(12),
+                    active_request_isl_tokens: None,
                     worker: worker_b,
                     lora_name: None,
                 },
@@ -1297,6 +1323,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },
@@ -1333,6 +1360,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker: worker_a,
                     lora_name: None,
                 },
@@ -1347,6 +1375,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker: worker_b,
                     lora_name: Some("adapter-a".to_string()),
                 },
@@ -1393,6 +1422,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker: worker_a,
                     lora_name: None,
                 },
@@ -1407,6 +1437,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker: worker_b,
                     lora_name: None,
                 },
@@ -1463,6 +1494,7 @@ mod tests {
                     track_prefill_tokens: true,
                     expected_output_tokens: None,
                     prefill_load_hint: tracking_hint(12),
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },
@@ -1491,6 +1523,7 @@ mod tests {
                     track_prefill_tokens: true,
                     expected_output_tokens: None,
                     prefill_load_hint: tracking_hint(12),
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },
@@ -1508,6 +1541,7 @@ mod tests {
                     track_prefill_tokens: true,
                     expected_output_tokens: None,
                     prefill_load_hint: tracking_hint(12),
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },
@@ -1550,6 +1584,7 @@ mod tests {
                     worker,
                     data: ActiveSequenceEventData::AddRequest {
                         token_sequence: Some(vec![1, 2, 3]),
+                        isl_tokens: Some(3),
                         track_prefill_tokens: true,
                         expected_output_tokens: None,
                         prefill_load_hint: tracking_hint(12),
@@ -1594,6 +1629,7 @@ mod tests {
                 worker,
                 data: ActiveSequenceEventData::AddRequest {
                     token_sequence: Some(vec![1, 2, 3]),
+                    isl_tokens: Some(3),
                     track_prefill_tokens: true,
                     expected_output_tokens: None,
                     prefill_load_hint: tracking_hint(12),
@@ -1631,6 +1667,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },
@@ -1663,6 +1700,7 @@ mod tests {
                     track_prefill_tokens: false,
                     expected_output_tokens: None,
                     prefill_load_hint: None,
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },
@@ -1716,6 +1754,7 @@ mod tests {
                         initial_effective_prefill_tokens: 100,
                         expected_prefill_duration: Some(Duration::from_secs(10)),
                     }),
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },

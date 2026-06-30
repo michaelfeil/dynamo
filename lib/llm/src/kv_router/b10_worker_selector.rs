@@ -414,6 +414,7 @@ mod tests {
             decode_blocks: Default::default(),
             prefill_tokens: Default::default(),
             active_requests: HashMap::new(),
+            active_request_isl_stats: None,
             eviction_costs: HashMap::new(),
             track_prefill_tokens: true,
             router_config_override: None,

@@ -315,6 +315,7 @@ async fn apply_entry(
                         initial_effective_prefill_tokens: isl,
                         expected_prefill_duration: None,
                     }),
+                    active_request_isl_tokens: None,
                     worker,
                     lora_name: None,
                 },

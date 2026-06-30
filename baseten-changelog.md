@@ -599,6 +599,10 @@ admission behavior described below.
 - The selector keeps the v1.0 strict-DP decision: strict rank is returned when
   the selected rank has more than a 5% score advantage over the worst
   same-worker alternative.
+- Keep this scheduler PR in the v1.2 replay to preserve ISL tracking at both
+  scopes: per worker and per DP rank. The scheduler now records running mean
+  and variance for each worker, and for each worker/rank pair when DP is
+  active, so rank-local versus worker-global ISL pressure remains observable.
 
 Queue admission fields to replay:
 
