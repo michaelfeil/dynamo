@@ -465,7 +465,9 @@ impl HotReloadableConfig {
             && let Some(overrides) = &root_config.override_args
             && let Some(group_config) = overrides.get(&override_group)
         {
-            tracing::info!("Applying override group '{}'", override_group);
+            if log_no_changes() {
+                tracing::info!("Applying override group '{}'", override_group);
+            }
             if let Some(routing_override) = &group_config.b10_routing_config {
                 root_config
                     .b10_routing_config
@@ -507,20 +509,22 @@ impl HotReloadableConfig {
             unified_config.routing.router_decode_token_discount,
         );
 
-        tracing::info!(
-            "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
-            path,
-            unified_config.routing.router_prefill_token_discount,
-            unified_config.routing.router_decode_token_discount,
-            unified_config.routing.router_temperature,
-            unified_config.routing.router_active_request_dp_blend,
-            unified_config.routing.router_residency_eviction_cost,
-            unified_config.routing.router_residency_half_life,
-            unified_config.router_active_replicas,
-            unified_config.runtime.tensor_parallel_size,
-            unified_config.runtime.enable_attention_dp,
-            data_parallel_size
-        );
+        if log_no_changes() {
+            tracing::info!(
+                "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
+                path,
+                unified_config.routing.router_prefill_token_discount,
+                unified_config.routing.router_decode_token_discount,
+                unified_config.routing.router_temperature,
+                unified_config.routing.router_active_request_dp_blend,
+                unified_config.routing.router_residency_eviction_cost,
+                unified_config.routing.router_residency_half_life,
+                unified_config.router_active_replicas,
+                unified_config.runtime.tensor_parallel_size,
+                unified_config.runtime.enable_attention_dp,
+                data_parallel_size
+            );
+        }
 
         Ok(unified_config)
     }
