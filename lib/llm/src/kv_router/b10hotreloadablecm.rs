@@ -25,6 +25,7 @@ const ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN: f64 = 0.0001;
 const ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX: f64 = 0.9999;
 const DEFAULT_ROUTER_RESIDENCY_EVICTION_COST: f64 = 0.0;
 const DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS: f64 = 120.0;
+const DEFAULT_ROUTER_ACTIVE_REQUEST_ISL_PENALTY_RAMP: (f64, f64) = (2048.0, 32_768.0);
 static LOG_NO_CHANGES: AtomicBool = AtomicBool::new(false);
 
 pub fn set_log_no_changes(enabled: bool) {
@@ -59,6 +60,8 @@ struct B10RoutingConfigOverride {
     router_residency_eviction_cost: Option<f64>,
     router_residency_half_life: Option<f64>,
     router_queue_threshold: Option<Option<f64>>,
+    router_active_request_isl_mismatch_penalty: Option<f64>,
+    router_active_request_isl_penalty_ramp: Option<(f64, f64)>,
 }
 
 /// B10 Routing configuration parameters
@@ -103,6 +106,12 @@ pub struct B10RoutingConfig {
     /// None means "not configured here"; use 0 to explicitly disable queueing.
     #[serde(default)]
     pub router_queue_threshold: Option<f64>,
+
+    #[serde(default)]
+    pub router_active_request_isl_mismatch_penalty: f64,
+
+    #[serde(default = "default_router_active_request_isl_penalty_ramp")]
+    pub router_active_request_isl_penalty_ramp: (f64, f64),
 }
 
 impl B10RoutingConfig {
@@ -143,6 +152,12 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_queue_threshold {
             self.router_queue_threshold = value;
         }
+        if let Some(value) = overrides.router_active_request_isl_mismatch_penalty {
+            self.router_active_request_isl_mismatch_penalty = value;
+        }
+        if let Some(value) = overrides.router_active_request_isl_penalty_ramp {
+            self.router_active_request_isl_penalty_ramp = value;
+        }
     }
 }
 
@@ -161,6 +176,9 @@ impl Default for B10RoutingConfig {
             router_residency_eviction_cost: default_router_residency_eviction_cost(),
             router_residency_half_life: default_router_residency_half_life(),
             router_queue_threshold: None,
+            router_active_request_isl_mismatch_penalty: 0.0,
+            router_active_request_isl_penalty_ramp: default_router_active_request_isl_penalty_ramp(
+            ),
         }
     }
 }
@@ -264,6 +282,10 @@ fn default_router_residency_half_life() -> f64 {
         .and_then(|s| s.parse().ok())
         .map(sanitize_router_residency_half_life)
         .unwrap_or(DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS)
+}
+
+fn default_router_active_request_isl_penalty_ramp() -> (f64, f64) {
+    DEFAULT_ROUTER_ACTIVE_REQUEST_ISL_PENALTY_RAMP
 }
 
 fn sanitize_router_residency_eviction_cost(cost: f64) -> f64 {
@@ -488,7 +510,6 @@ impl HotReloadableConfig {
             sanitize_router_residency_eviction_cost(routing.router_residency_eviction_cost);
         routing.router_residency_half_life =
             sanitize_router_residency_half_life(routing.router_residency_half_life);
-
         // Build UnifiedConfig with separate routing and runtime configs
         let runtime_config = LLMRuntimeConfig {
             tensor_parallel_size: root_config.tensor_parallel_size,

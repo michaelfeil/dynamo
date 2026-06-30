@@ -13,7 +13,7 @@ use dynamo_kv_router::protocols::{
     WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
 };
 use dynamo_kv_router::scheduling::{
-    KvSchedulerError, RoutingEligibility, SchedulingRequest, WorkerEligibilityError,
+    IslStats, KvSchedulerError, RoutingEligibility, SchedulingRequest, WorkerEligibilityError,
 };
 use dynamo_kv_router::selector::{WorkerSelector, softmax_sample};
 use std::collections::HashMap;
@@ -79,6 +79,7 @@ struct B10Score {
     active_request_dp_blend: f64,
     cache_miss_absolute_tokens: usize,
     residency_eviction_cost: f64,
+    active_request_isl_penalty: f64,
 }
 
 impl B10WorkerSelector {
@@ -134,6 +135,57 @@ fn mean_active_requests_for_worker<C: WorkerConfigLike>(
     total_active_requests as f64 / total_dp_workers as f64
 }
 
+fn active_request_isl_penalty(
+    request: &SchedulingRequest,
+    worker: WorkerWithDpRank,
+    mismatch_penalty: f64,
+    penalty_ramp: (f64, f64),
+) -> f64 {
+    let (penalty_start_tokens, penalty_full_tokens) = penalty_ramp;
+    if mismatch_penalty <= 0.0
+        || !mismatch_penalty.is_finite()
+        || penalty_start_tokens < 0.0
+        || !penalty_start_tokens.is_finite()
+        || penalty_full_tokens <= penalty_start_tokens
+        || !penalty_full_tokens.is_finite()
+    {
+        return 0.0;
+    }
+    let Some(stats) = request.active_request_isl_stats.as_ref() else {
+        return 0.0;
+    };
+
+    let penalty_for = |stats: &IslStats| -> f64 {
+        if stats.count == 0 || !stats.mean.is_finite() {
+            return 0.0;
+        }
+
+        let incoming_isl = request.isl_tokens as f64;
+        let center = stats.mean.max(0.0);
+        let distance = (incoming_isl - center).abs();
+        let ramp_width = penalty_full_tokens - penalty_start_tokens;
+        let factor = ((distance - penalty_start_tokens) / ramp_width).clamp(0.0, 1.0);
+
+        mismatch_penalty * factor
+    };
+
+    let mut penalty: f64 = stats
+        .by_worker_id
+        .get(&worker.worker_id)
+        .map(penalty_for)
+        .unwrap_or(0.0);
+
+    if let Some(rank_stats) = stats
+        .by_worker_with_dp_rank
+        .as_ref()
+        .and_then(|stats| stats.get(&worker))
+    {
+        penalty = penalty.max(penalty_for(rank_stats));
+    }
+
+    penalty
+}
+
 #[allow(clippy::too_many_arguments)]
 fn score_worker<C: WorkerConfigLike>(
     workers: &HashMap<WorkerId, C>,
@@ -146,6 +198,8 @@ fn score_worker<C: WorkerConfigLike>(
     active_request_weight: f64,
     active_request_dp_blend: f64,
     residency_eviction_cost_weight: f64,
+    active_request_isl_mismatch_penalty: f64,
+    active_request_isl_penalty_ramp: (f64, f64),
 ) -> B10Score {
     let prefill_token = request.prefill_tokens_for(worker);
     let potential_prefill_block = (prefill_token as f64) / (block_size as f64);
@@ -172,12 +226,19 @@ fn score_worker<C: WorkerConfigLike>(
         + mean_active_requests_for_worker(workers, request, worker) * active_request_dp_blend;
     let residency_eviction_cost =
         residency_eviction_cost_weight * request.eviction_cost_for(worker);
+    let active_request_isl_penalty = active_request_isl_penalty(
+        request,
+        worker,
+        active_request_isl_mismatch_penalty,
+        active_request_isl_penalty_ramp,
+    );
 
     let logit = overlap_weight * potential_prefill_block
         + decode_block
         + active_request_weight * active_requests
         + cache_miss_weight * (cache_miss_absolute_tokens as f64)
-        + residency_eviction_cost;
+        + residency_eviction_cost
+        + active_request_isl_penalty;
 
     B10Score {
         logit,
@@ -187,6 +248,7 @@ fn score_worker<C: WorkerConfigLike>(
         active_request_dp_blend,
         cache_miss_absolute_tokens,
         residency_eviction_cost,
+        active_request_isl_penalty,
     }
 }
 
@@ -243,6 +305,12 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         let active_request_dp_blend = hot_reloadable_config.routing.router_active_request_dp_blend;
         let residency_eviction_cost_weight =
             hot_reloadable_config.routing.router_residency_eviction_cost;
+        let active_request_isl_mismatch_penalty = hot_reloadable_config
+            .routing
+            .router_active_request_isl_mismatch_penalty;
+        let active_request_isl_penalty_ramp = hot_reloadable_config
+            .routing
+            .router_active_request_isl_penalty_ramp;
         let temperature = request
             .router_config_override
             .as_ref()
@@ -261,6 +329,8 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                 active_request_weight,
                 active_request_dp_blend,
                 residency_eviction_cost_weight,
+                active_request_isl_mismatch_penalty,
+                active_request_isl_penalty_ramp,
             )
         };
 
@@ -285,7 +355,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             let cached_tokens = request.effective_cached_tokens_for(worker);
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3}",
+                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
                     worker.worker_id,
                     worker.dp_rank,
                     score.logit,
@@ -297,7 +367,8 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                     score.active_request_dp_blend,
                     cache_miss_weight,
                     score.cache_miss_absolute_tokens,
-                    score.residency_eviction_cost
+                    score.residency_eviction_cost,
+                    score.active_request_isl_penalty
                 );
             }
 
@@ -323,7 +394,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             let score = score_worker(worker);
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3}",
+                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
                     worker.worker_id,
                     worker.dp_rank,
                     score.logit,
@@ -335,7 +406,8 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                     score.active_request_dp_blend,
                     cache_miss_weight,
                     score.cache_miss_absolute_tokens,
-                    score.residency_eviction_cost
+                    score.residency_eviction_cost,
+                    score.active_request_isl_penalty
                 );
             }
             worker_logits.insert(worker, score.logit);
@@ -451,6 +523,8 @@ mod tests {
             0.0,
             2.0 / 3.0,
             0.0,
+            0.0,
+            (2048.0, 32_768.0),
         );
 
         assert_eq!(score.cache_miss_absolute_tokens, 2);
@@ -478,6 +552,8 @@ mod tests {
             1.0,
             2.0 / 3.0,
             0.0,
+            0.0,
+            (2048.0, 32_768.0),
         );
 
         assert!((score.active_requests - (9.0 / 3.0 + 6.0 * 2.0 / 3.0)).abs() < 1e-9);
