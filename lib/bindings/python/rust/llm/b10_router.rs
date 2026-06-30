@@ -33,7 +33,7 @@ use dynamo_llm::b10_health::{register_runtime_cancel_token, set_health};
 use dynamo_llm::kv_router::{
     KvRouter,
     b10_worker_selector::B10WorkerSelector,
-    b10hotreloadablecm::{get_router_active_replicas, validate_config},
+    b10hotreloadablecm::{get_router_active_replicas, set_log_no_changes, validate_config},
     metrics::{RouterRequestMetrics, register_global_metrics_with_component},
     scheduler::DefaultWorkerSelector,
 };
@@ -442,6 +442,7 @@ pub fn start_router(
             algo_selector,
         };
 
+        set_log_no_changes(true);
         if !validate_config() {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "Invalid B10 routing configuration",

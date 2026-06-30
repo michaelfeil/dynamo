@@ -708,9 +708,11 @@ class RouterCoordinatorPotentialLoadsCheck:
     workers (the ``potential_loads`` method) and denies the request when the
     configured load percentile exceeds the thresholds -- so a request is not
     routed onward to an already-overloaded downstream router. A threshold of
-    ``0`` disables that dimension (no limit). Prefill is measured in tokens,
-    decode in BLOCKS, both load dimensions use ``load_percentile`` as a
-    ``0.0`` to ``1.0`` fraction across workers, and ``queue_depth`` is the
+    ``0`` disables that dimension (no limit). Prefill and decode thresholds are
+    measured in tokens. Decode is converted to blocks with the coordinator's
+    ``block_size`` before comparing with router-reported
+    ``potential_decode_blocks``. Both load dimensions use ``load_percentile`` as
+    a ``0.0`` to ``1.0`` fraction across workers, and ``queue_depth`` is the
     router-level ``pending_count``.
 
     The ``client`` is required: it is the downstream router whose loads are
@@ -718,7 +720,7 @@ class RouterCoordinatorPotentialLoadsCheck:
     lives on ``PyRouterRequestNew`` (shared by the route and the preflight), not
     on this check. Defaults:
     ``queue_depth_threshold=0`` (disabled), ``prefill_tokens_threshold=1_000_000``,
-    ``decode_blocks_threshold=16_000_000``, ``load_percentile=0.5`` (p50).
+    ``decode_tokens_threshold=16_000_000``, ``load_percentile=0.5`` (p50).
     """
 
     def __init__(
@@ -726,7 +728,7 @@ class RouterCoordinatorPotentialLoadsCheck:
         client: Client,
         queue_depth_threshold: int = 0,
         prefill_tokens_threshold: int = 1_000_000,
-        decode_blocks_threshold: int = 16_000_000,
+        decode_tokens_threshold: int = 16_000_000,
         load_percentile: float = 0.5,
     ) -> None: ...
 
@@ -749,10 +751,10 @@ class RouterCoordinatorPotentialLoadsCheck:
     def prefill_tokens_threshold(self, value: int) -> None: ...
 
     @property
-    def decode_blocks_threshold(self) -> int: ...
+    def decode_tokens_threshold(self) -> int: ...
 
-    @decode_blocks_threshold.setter
-    def decode_blocks_threshold(self, value: int) -> None: ...
+    @decode_tokens_threshold.setter
+    def decode_tokens_threshold(self, value: int) -> None: ...
 
     @property
     def load_percentile(self) -> float: ...

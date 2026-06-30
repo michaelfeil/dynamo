@@ -55,6 +55,13 @@ const POTENTIAL_LOADS_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(590);
+const DURATION_LOG_MS_PRECISION: f64 = 1_000.0;
+
+fn duration_ms_for_log(duration: Duration) -> f64 {
+    let duration_ms = duration.as_secs_f64() * 1000.0;
+    (duration_ms * DURATION_LOG_MS_PRECISION).round() / DURATION_LOG_MS_PRECISION
+}
+
 fn create_detached_router_request_context(
     request: serde_json::Value,
     parent_ctx: &Option<context::Context>,
@@ -841,15 +848,18 @@ fn potential_loads_outcome(
 /// fails closed rather than treating an unexpected/wrong-protocol shape as a
 /// silent pass.
 ///
-/// A threshold of `0` disables that dimension (no limit). Prefill is summed in
-/// tokens, decode in BLOCKS (no `block_size` conversion), and `queue_depth` is
-/// the router-level `pending_count`.
+/// A threshold of `0` disables that dimension (no limit). Prefill and decode
+/// thresholds are measured in tokens; decode is converted to blocks with the
+/// coordinator block size before comparing with router-reported
+/// `potential_decode_blocks`. `queue_depth` is the router-level `pending_count`.
+#[allow(clippy::too_many_arguments)]
 async fn query_potential_loads(
     tokens: Vec<u32>,
     block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
     context: Option<context::Context>,
     request_id: &str,
     check: &PotentialLoadsCheckData,
+    block_size: u32,
     tracing_enabled: bool,
     allow_cancel_routing: bool,
 ) -> Result<Option<NextRouterBackpressureInfo>, PotentialLoadsError> {
@@ -943,6 +953,7 @@ async fn query_potential_loads(
                         break 'query evaluate_potential_loads(
                             &router_stream_response.response,
                             check,
+                            block_size,
                         );
                     }
                     Err(err) => {
@@ -1002,6 +1013,7 @@ async fn query_potential_loads(
 fn evaluate_potential_loads(
     response: &RsRouterResponse,
     check: &PotentialLoadsCheckData,
+    block_size: u32,
 ) -> Result<Option<NextRouterBackpressureInfo>, PotentialLoadsError> {
     let RsRouterResponse::PotentialLoads {
         loads,
@@ -1023,11 +1035,12 @@ fn evaluate_potential_loads(
     );
     let queue_depth = *pending_count;
     let pending_isl = *pending_isl_tokens;
+    let decode_blocks_threshold =
+        decode_tokens_threshold_to_blocks(check.decode_tokens_threshold, block_size);
 
     let prefill_exceeded =
         check.prefill_tokens_threshold != 0 && prefill_tokens > check.prefill_tokens_threshold;
-    let decode_exceeded =
-        check.decode_blocks_threshold != 0 && decode_blocks > check.decode_blocks_threshold;
+    let decode_exceeded = decode_blocks_threshold != 0 && decode_blocks > decode_blocks_threshold;
     let queue_exceeded =
         check.queue_depth_threshold != 0 && queue_depth > check.queue_depth_threshold;
 
@@ -1041,6 +1054,20 @@ fn evaluate_potential_loads(
     } else {
         Ok(None)
     }
+}
+
+fn decode_tokens_threshold_to_blocks(decode_tokens_threshold: usize, block_size: u32) -> usize {
+    if decode_tokens_threshold == 0 {
+        return 0;
+    }
+
+    let block_size = block_size as usize;
+    debug_assert_ne!(block_size, 0, "block_size must be positive");
+    if block_size == 0 {
+        return decode_tokens_threshold;
+    }
+
+    ((decode_tokens_threshold - 1) / block_size) + 1
 }
 
 fn percentile_load(values: impl Iterator<Item = usize>, percentile: f64) -> usize {
@@ -1126,6 +1153,7 @@ async fn route_once(
     context: Option<context::Context>,
     require: Vec<MinReplicaAvailable>,
     preflight: Option<PreflightInputs>,
+    block_size: u32,
     notify_timeout: Duration,
     tracing_enabled: bool,
     allow_cancel_routing: bool,
@@ -1169,6 +1197,7 @@ async fn route_once(
             context.clone(),
             &request_id,
             &check,
+            block_size,
             tracing_enabled,
             allow_cancel_routing,
         )
@@ -1632,6 +1661,7 @@ pub(super) async fn route_and_connect(
             Some(context.clone()),
             require.clone(),
             preflight,
+            block_size,
             notify_timeout,
             tracing_enabled,
             allow_cancel_routing,
@@ -1702,8 +1732,8 @@ pub(super) async fn route_and_connect(
                     request_id = %request_id,
                     worker_id,
                     stale_reroutes = attempt,
-                    routing_new_duration_ms = timings.routing_new_duration.as_millis() as u64,
-                    worker_connect_duration_ms = timings.worker_connect_duration.as_millis() as u64,
+                    routing_new_duration_ms = duration_ms_for_log(timings.routing_new_duration),
+                    worker_connect_duration_ms = duration_ms_for_log(timings.worker_connect_duration),
                     estimated_overlap_tokens,
                     unified_logs = true,
                     "route_and_connect admitted"

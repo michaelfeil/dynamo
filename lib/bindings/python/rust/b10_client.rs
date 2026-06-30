@@ -287,7 +287,7 @@ impl RouterWorkerCoordinator {
                     router: Arc::new(JsonRouterGuardClient::new(borrowed.client.router.clone())),
                     queue_depth_threshold: borrowed.queue_depth_threshold,
                     prefill_tokens_threshold: borrowed.prefill_tokens_threshold,
-                    decode_blocks_threshold: borrowed.decode_blocks_threshold,
+                    decode_tokens_threshold: borrowed.decode_tokens_threshold,
                     load_percentile: borrowed.load_percentile,
                 })
             }

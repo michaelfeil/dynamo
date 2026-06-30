@@ -10,7 +10,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+    Arc, OnceLock, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use std::collections::HashMap;
@@ -22,6 +25,15 @@ const ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN: f64 = 0.0001;
 const ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX: f64 = 0.9999;
 const DEFAULT_ROUTER_RESIDENCY_EVICTION_COST: f64 = 0.0;
 const DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS: f64 = 120.0;
+static LOG_NO_CHANGES: AtomicBool = AtomicBool::new(false);
+
+pub fn set_log_no_changes(enabled: bool) {
+    LOG_NO_CHANGES.store(enabled, Ordering::Relaxed);
+}
+
+fn log_no_changes() -> bool {
+    LOG_NO_CHANGES.load(Ordering::Relaxed)
+}
 
 fn is_warning_disabled() -> bool {
     static DISABLE_WARNING: OnceLock<bool> = OnceLock::new();
@@ -532,15 +544,17 @@ impl HotReloadableConfig {
                             let config_changed = *config != new_config;
                             *config = new_config;
 
-                            tracing::info!(
-                                "B10RouterConfig hot-reload {}: {:?}",
-                                if config_changed {
-                                    "(HAS CHANGED!)"
-                                } else {
-                                    "(no change)"
-                                },
-                                config
-                            );
+                            if config_changed || log_no_changes() {
+                                tracing::info!(
+                                    "B10RouterConfig hot-reload {}: {:?}",
+                                    if config_changed {
+                                        "(HAS CHANGED!)"
+                                    } else {
+                                        "(no change)"
+                                    },
+                                    config
+                                );
+                            }
                         }
                     }
                     Err(e) => {
