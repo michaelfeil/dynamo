@@ -995,6 +995,8 @@ The `reasoning_effort` field on chat completion requests is normalized through a
 
 The request-side assistant message accepts `reasoning` as a serde alias for `reasoning_content`, so prior-turn reasoning sent under either wire name (OpenRouter/newer-vLLM `reasoning` or DeepSeek/vLLM-legacy `reasoning_content`) deserializes into the canonical field and re-renders into the chat template.
 
+Added `chat_template_args` (alias `chat_template_kwargs`) to `BasetenExt` so it is available on all request paths that flatten `BasetenExt` — including `/v1/chat/completions` and `/v1/responses`. The `TryFrom<NvCreateResponse>` conversion now forwards `baseten_ext.chat_template_args` instead of hard-coding `None`, so callers of `/v1/responses` can pass a custom chat-template context through to the worker.
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,

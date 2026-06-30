@@ -33,6 +33,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 use validator::Validate;
 
+use super::baseten_ext::BasetenExt;
 use super::chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionResponse};
 use super::nvext::{NvExt, NvExtProvider};
 use super::{OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider};
@@ -45,7 +46,7 @@ use super::{OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider};
 /// that walked `serde_json::Value` to inject synthetic defaults for missing
 /// `id` / `status` / `annotations`; that was replaced by typed ownership for
 /// correctness and to avoid the double-deserialize cost.
-#[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone)]
+#[derive(ToSchema, Serialize, Deserialize, Validate, Debug, Clone, Default)]
 pub struct NvCreateResponse {
     /// Flattened CreateResponse fields (model, input, temperature, etc.).
     ///
@@ -59,6 +60,11 @@ pub struct NvCreateResponse {
     #[serde(flatten)]
     #[schema(value_type = Object)]
     pub inner: dynamo_protocols::types::responses::CreateResponse,
+
+    /// Baseten-specific extensions (cache_control, dynamic_temperature,
+    /// thinking, chat_template_args, etc.) forwarded at root level.
+    #[serde(flatten, default, skip_serializing_if = "BasetenExt::is_empty")]
+    pub baseten_ext: BasetenExt,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvext: Option<NvExt>,
@@ -754,7 +760,7 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             common: Default::default(),
             baseten_ext: Default::default(),
             nvext: resp.nvext,
-            chat_template_args: None,
+            chat_template_args: resp.baseten_ext.chat_template_args,
             media_io_kwargs: None,
             return_tokens_as_token_ids: None,
             unsupported_fields: Default::default(),
@@ -1136,6 +1142,7 @@ mod tests {
                 annotations: Some(vec!["debug".into(), "trace".into()]),
                 ..Default::default()
             }),
+            ..Default::default()
         }
     }
 
@@ -1222,6 +1229,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1283,6 +1291,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1324,6 +1333,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1367,6 +1377,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1415,6 +1426,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1454,6 +1466,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1488,6 +1501,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1530,6 +1544,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1591,6 +1606,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1663,6 +1679,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1720,6 +1737,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1775,6 +1793,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1822,6 +1841,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1885,6 +1905,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -1964,6 +1985,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
@@ -2037,6 +2059,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2106,6 +2129,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2172,6 +2196,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2229,6 +2254,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
         let messages = &chat_req.inner.messages;
@@ -2268,6 +2294,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         };
 
         let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();

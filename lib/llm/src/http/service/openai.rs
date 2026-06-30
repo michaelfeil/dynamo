@@ -2885,6 +2885,7 @@ mod tests {
                 ..Default::default()
             },
             nvext: None,
+            ..Default::default()
         }
     }
 

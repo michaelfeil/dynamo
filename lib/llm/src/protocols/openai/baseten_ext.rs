@@ -259,6 +259,16 @@ pub struct BasetenExt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub thinking_token_budget: Option<u32>,
+
+    /// Extra args forwarded verbatim to the chat-template rendering context.
+    /// Also accepts `"chat_template_kwargs"` as an alias (OpenAI-compatible name).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "chat_template_kwargs"
+    )]
+    #[builder(default, setter(strip_option))]
+    pub chat_template_args: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl BasetenExt {
@@ -275,6 +285,7 @@ impl BasetenExt {
             && self.thinking.is_none()
             && self.reasoning.is_none()
             && self.thinking_token_budget.is_none()
+            && self.chat_template_args.is_none()
     }
 
     pub fn validate_request(&self) -> anyhow::Result<()> {
