@@ -470,6 +470,14 @@ new threshold, while `0` or `None` disables queueing. When queueing is disabled
 after requests are already pending, the actor drains them immediately so the
 target queue cannot strand requests behind a now-disabled threshold.
 
+The router queue also has an internal `DYN_ROUTER_QUEUE_BUSY_FRACTIONAL`
+admission knob for large replica counts. By default, queue admission preserves
+the exact all-eligible-workers-busy behavior. When the env var is enabled, the
+queue starts once busy eligible workers reach `floor(0.99 * N)` above 16
+eligible workers, `floor(0.98 * N)` above 64, and `floor(0.97 * N)` above 200.
+This lets large deployments begin queueing before a literal P100 worker-busy
+condition, while keeping pinned-worker and small-deployment behavior exact.
+
 The current v1.2 branch restores arbitrary Python worker selectors after review.
 This intentionally differs from v1.1. The implementation keeps the bridge in a
 separate Python-binding module and connects it to the Rust router through the

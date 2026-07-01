@@ -4,8 +4,8 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -34,6 +34,37 @@ use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRe
 pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 
 const ADMISSION_CHANNEL_CAPACITY: usize = 65_536;
+const ROUTER_QUEUE_BUSY_FRACTIONAL_ENV: &str = "DYN_ROUTER_QUEUE_BUSY_FRACTIONAL";
+
+static ROUTER_QUEUE_BUSY_FRACTIONAL: OnceLock<bool> = OnceLock::new();
+
+fn router_queue_busy_fractional() -> bool {
+    *ROUTER_QUEUE_BUSY_FRACTIONAL.get_or_init(|| {
+        std::env::var(ROUTER_QUEUE_BUSY_FRACTIONAL_ENV)
+            .map(|value| matches!(value.to_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+fn required_busy_workers_for_queueing(eligible_workers: usize, busy_fractional: bool) -> usize {
+    if eligible_workers == 0 {
+        return 0;
+    }
+
+    if !busy_fractional || eligible_workers <= 16 {
+        return eligible_workers;
+    }
+
+    let busy_fraction = if eligible_workers > 200 {
+        0.97
+    } else if eligible_workers > 64 {
+        0.98
+    } else {
+        0.99
+    };
+
+    ((eligible_workers as f64 * busy_fraction).floor() as usize).clamp(1, eligible_workers)
+}
 
 /// Entry in the priority queue, ordered by key (higher key = higher priority).
 struct QueueEntry<K: Ord + Eq> {
@@ -152,6 +183,11 @@ impl<
     ) -> Self {
         if let Some(frac) = threshold_frac {
             tracing::info!("Router queue enabled with threshold fraction {frac}");
+        }
+        if router_queue_busy_fractional() {
+            tracing::info!(
+                "Router queue fractional busy admission enabled: require all eligible workers up to 16, floor(0.99*N) above 16, floor(0.98*N) above 64, floor(0.97*N) above 200"
+            );
         }
         if !queue_depth_tiers.is_unbounded() {
             tracing::info!("Router queue tiered by cache-miss: pending ISL token caps configured");
@@ -843,8 +879,62 @@ impl<
             return (tokens as f64) > threshold * (max_batched as f64);
         }
 
+        if !router_queue_busy_fractional() {
+            return Self::all_eligible_workers_prefill_busy_exact(
+                threshold,
+                eligibility,
+                &active_tokens,
+                &configs,
+            );
+        }
+
+        let mut eligible_workers = 0;
+        eligibility.for_each_eligible_worker_rank(&configs, |_, _| {
+            eligible_workers += 1;
+        });
+
+        if eligible_workers == 0 {
+            return false;
+        }
+
+        let required_busy = required_busy_workers_for_queueing(eligible_workers, true);
+        let allowed_free_workers = eligible_workers.saturating_sub(required_busy);
+        if allowed_free_workers == 0 {
+            return Self::all_eligible_workers_prefill_busy_exact(
+                threshold,
+                eligibility,
+                &active_tokens,
+                &configs,
+            );
+        }
+
+        let mut busy_workers = 0;
+        let mut free_workers = 0;
+
+        eligibility.any_eligible_worker_rank(&configs, |worker, config| {
+            let max_batched = config
+                .max_num_batched_tokens()
+                .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
+            let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
+            if (tokens as f64) > threshold * (max_batched as f64) {
+                busy_workers += 1;
+                return busy_workers >= required_busy;
+            }
+            free_workers += 1;
+            free_workers > allowed_free_workers
+        });
+
+        busy_workers >= required_busy
+    }
+
+    fn all_eligible_workers_prefill_busy_exact(
+        threshold: f64,
+        eligibility: RoutingEligibility<'_>,
+        active_tokens: &HashMap<WorkerWithDpRank, usize>,
+        configs: &HashMap<WorkerId, C>,
+    ) -> bool {
         let mut checked_any = false;
-        let has_available = eligibility.any_eligible_worker_rank(&configs, |worker, config| {
+        let has_available = eligibility.any_eligible_worker_rank(configs, |worker, config| {
             checked_any = true;
             let max_batched = config
                 .max_num_batched_tokens()
@@ -1357,6 +1447,21 @@ mod tests {
             resp_tx: Some(tx),
         };
         (req, rx)
+    }
+
+    #[test]
+    fn test_required_busy_workers_for_queueing_tiers() {
+        assert_eq!(required_busy_workers_for_queueing(0, false), 0);
+        assert_eq!(required_busy_workers_for_queueing(1, false), 1);
+        assert_eq!(required_busy_workers_for_queueing(201, false), 201);
+
+        assert_eq!(required_busy_workers_for_queueing(1, true), 1);
+        assert_eq!(required_busy_workers_for_queueing(16, true), 16);
+        assert_eq!(required_busy_workers_for_queueing(17, true), 16);
+        assert_eq!(required_busy_workers_for_queueing(64, true), 63);
+        assert_eq!(required_busy_workers_for_queueing(65, true), 63);
+        assert_eq!(required_busy_workers_for_queueing(200, true), 196);
+        assert_eq!(required_busy_workers_for_queueing(201, true), 194);
     }
 
     #[tokio::test(flavor = "multi_thread")]
