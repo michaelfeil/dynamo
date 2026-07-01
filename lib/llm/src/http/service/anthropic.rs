@@ -104,6 +104,8 @@ pub fn anthropic_models_router(
 
 /// Converts 422 validation errors to Anthropic error format.
 async fn anthropic_error_middleware(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let response = next.run(request).await;
 
     if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
@@ -112,6 +114,15 @@ async fn anthropic_error_middleware(request: Request<Body>, next: Next) -> Respo
             .await
             .unwrap_or_default();
         let error_message = String::from_utf8_lossy(&body_bytes).to_string();
+        tracing::info!(
+            method = %method,
+            path = %path,
+            status_code = StatusCode::BAD_REQUEST.as_u16(),
+            reason = "request_body_deserialization_failed",
+            message = %error_message,
+            unified_logs = true,
+            "rejecting Anthropic request during JSON deserialization"
+        );
         return anthropic_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",

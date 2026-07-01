@@ -362,6 +362,8 @@ impl From<HttpError> for ErrorMessage {
 // But all the downstream apps that relies on openai based APIs, expects to get 400 for all these cases otherwise they fail badly
 // Solution: Intercept the response from handlers and convert ANY 422 status codes to 400 with the actual error message.
 pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let response = next.run(request).await;
 
     if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
@@ -370,6 +372,15 @@ pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> 
             .await
             .unwrap_or_default();
         let error_message = String::from_utf8_lossy(&body_bytes).to_string();
+        tracing::info!(
+            method = %method,
+            path = %path,
+            status_code = StatusCode::BAD_REQUEST.as_u16(),
+            reason = "request_body_deserialization_failed",
+            message = %error_message,
+            unified_logs = true,
+            "rejecting OpenAI request during JSON deserialization"
+        );
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorMessage {
@@ -3603,6 +3614,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "unsupported OpenAI fields are temporarily allowed by default in v1.2"]
     fn test_chat_completions_unknown_fields_rejected() {
         // Test that known unsupported fields are rejected and all shown in error message
         let json = r#"{
@@ -3638,6 +3650,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "unsupported OpenAI fields are temporarily allowed by default in v1.2"]
     fn test_completions_unsupported_fields_rejected() {
         // Test that known unsupported fields are rejected and all shown in error message
         let json = r#"{

@@ -46,10 +46,6 @@ pub use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs,
     ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestSystemMessageContentPart,
-    ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestToolMessageContent,
-    ChatCompletionRequestToolMessageContentPart,
     ChatCompletionResponseMessageAudio,
     Choice,
     CompletionFinishReason,
@@ -76,6 +72,59 @@ pub use async_openai::types::chat::{
     WebSearchUserLocation,
     WebSearchUserLocationType,
 };
+
+// ---------------------------------------------------------------------------
+// Dynamo-owned override: ChatCompletionRequestToolMessageContent
+// ---------------------------------------------------------------------------
+// Upstream `async-openai` 0.34 restricts tool-message content parts to `Text`
+// only (the OpenAPI spec says "For tool messages, only type `text` is
+// supported"). Some OpenAI-compatible clients send multimodal tool-observation
+// payloads, such as `image_url` parts inside tool-message `content` arrays.
+// Upstream rejects those shapes at deserialization before Dynamo can decide how
+// to handle them.
+//
+// Reuse Dynamo's existing request content-part enum rather than maintaining a
+// second near-identical tool-message enum. This lets the request enter Dynamo's
+// typed protocol world with the image/audio payload preserved; processor support
+// can be added separately.
+//
+// When async-openai upstream supports multimodal tool content, delete this owned
+// content type and re-add upstream tool-message types to the `pub use` block.
+
+pub type ChatCompletionRequestToolMessageContentPart = ChatCompletionRequestUserMessageContentPart;
+
+/// Dynamo-owned `ChatCompletionRequestToolMessageContent` referencing the
+/// existing multimodal-aware request content part enum. Shape mirrors upstream
+/// except that array parts are not restricted to text only.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum ChatCompletionRequestToolMessageContent {
+    /// The text contents of the tool message.
+    Text(String),
+    /// An array of content parts with a defined type. Dynamo extends this to use
+    /// the same content-part set accepted by user messages.
+    Array(Vec<ChatCompletionRequestToolMessageContentPart>),
+}
+
+impl Default for ChatCompletionRequestToolMessageContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+/// Dynamo-owned `ChatCompletionRequestToolMessage` struct that references the
+/// owned `ChatCompletionRequestToolMessageContent` so serde uses the
+/// multimodal-aware content type. Shape mirrors upstream exactly.
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Builder, PartialEq)]
+#[builder(name = "ChatCompletionRequestToolMessageArgs")]
+#[builder(pattern = "mutable")]
+#[builder(setter(into, strip_option), default)]
+#[builder(derive(Debug))]
+#[builder(build_fn(error = "OpenAIError"))]
+pub struct ChatCompletionRequestToolMessage {
+    pub content: ChatCompletionRequestToolMessageContent,
+    pub tool_call_id: String,
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct ChatChoiceLogprobs {
@@ -1252,5 +1301,33 @@ mod tests {
             tool_call["function"]["arguments"],
             "{\"query\":\"weather\"}"
         );
+    }
+
+    // --- tool message multimodal content ---
+
+    #[test]
+    fn tool_message_image_content_deserializes_into_request_message() {
+        let json = serde_json::json!([
+            {"role": "user", "content": "Take a screenshot."},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "screenshot", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": "Captured frame:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+            ]}
+        ]);
+        let msgs: Vec<ChatCompletionRequestMessage> = serde_json::from_value(json).unwrap();
+        assert_eq!(msgs.len(), 3);
+        let ChatCompletionRequestMessage::Tool(tool) = &msgs[2] else {
+            panic!("expected tool message");
+        };
+        let ChatCompletionRequestToolMessageContent::Array(parts) = &tool.content else {
+            panic!("expected tool message content array");
+        };
+        assert!(matches!(
+            parts[1],
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(_)
+        ));
     }
 }

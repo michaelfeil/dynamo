@@ -868,6 +868,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "unsupported OpenAI fields are temporarily allowed by default in v1.2"]
     fn test_truncate_prompt_tokens_rejected_until_supported() {
         let request_json = json!({
             "model": "test-model",

@@ -971,6 +971,20 @@ access they fail before exercising Dynamo behavior.
 Also: carry `ErrorMessage::from_http_error` 5xx pass-through (BIS-165/#272) to each future fork — it allows 529 (site overloaded) to reach clients instead of being squashed to 500.
 Also should include error classsification for metrics, so that we can observe it as site-overloaded etc in metrics.
 
+Current v1.2 OpenAI compatibility gap: the protocol layer now accepts
+multimodal tool-message content so real OpenAI-compatible clients are not
+rejected at JSON deserialization time, but this is only the ingress piece.
+Follow-up work should implement the two remaining pieces explicitly: preserve
+and validate the relevant `tool_choice` behavior through the Dynamo/OpenAI
+pipeline, and add processor/backend handling for image content carried in tool
+messages rather than merely preserving it in the typed request.
+
+The v1.2 HTTP compatibility work also keeps rejected 400 requests observable:
+OpenAI and Anthropic JSON-deserialization failures are converted from Axum 422
+responses into API-compatible 400 responses in middleware, and the middleware
+can emit structured `unified_logs` entries with the rejection reason and serde
+message before returning the 400.
+
 Restored the v1.0 logprobs `token_id` response field on v1.2.0 via #302:
 `ChatCompletionTokenLogprob` and `ChatChoiceLogprobs` are now defined locally in
 `lib/protocols/src/types/chat.rs` (shadowing the `async-openai` re-exports) with

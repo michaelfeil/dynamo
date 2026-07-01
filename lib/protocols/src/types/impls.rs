@@ -11,8 +11,9 @@ use super::{
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
     ChatCompletionRequestMessageContentPartAudio, ChatCompletionRequestMessageContentPartAudioUrl,
     ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestMessageContentPartVideo, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionToolChoiceOption, ChatCompletionToolType, FunctionName, ImageUrl, VideoUrl,
+    ChatCompletionRequestMessageContentPartVideo, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionToolChoiceOption,
+    ChatCompletionToolType, FunctionName, ImageUrl, VideoUrl,
 };
 
 use crate::error::OpenAIError;
@@ -95,19 +96,17 @@ impl From<async_openai::types::chat::ChatCompletionRequestDeveloperMessage>
     }
 }
 
-impl From<async_openai::types::chat::ChatCompletionRequestToolMessage>
-    for ChatCompletionRequestMessage
-{
-    fn from(value: async_openai::types::chat::ChatCompletionRequestToolMessage) -> Self {
-        Self::Tool(value)
-    }
-}
-
 impl From<async_openai::types::chat::ChatCompletionRequestFunctionMessage>
     for ChatCompletionRequestMessage
 {
     fn from(value: async_openai::types::chat::ChatCompletionRequestFunctionMessage) -> Self {
         Self::Function(value)
+    }
+}
+
+impl From<ChatCompletionRequestToolMessage> for ChatCompletionRequestMessage {
+    fn from(value: ChatCompletionRequestToolMessage) -> Self {
+        Self::Tool(value)
     }
 }
 

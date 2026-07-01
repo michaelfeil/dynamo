@@ -114,7 +114,9 @@ fn allow_unsupported_fields() -> bool {
     *ALLOW_UNSUPPORTED_FIELDS.get_or_init(|| {
         read_bool_env(ALLOW_UNSUPPORTED_FIELDS_ENV)
             .or_else(|| read_bool_env(IGNORE_UNSUPPORTED_FIELDS_ENV_ALIAS))
-            .unwrap_or(false)
+            // nit: for intial rollout of dyn1.2, we wanna set this to true, and then
+            // revert is later for compatibility with previous behavior
+            .unwrap_or(true)
     })
 }
 
@@ -145,11 +147,11 @@ pub fn validate_no_unsupported_fields(
     if !unknown.is_empty() {
         let unknown_fields = unknown.join(", ");
         if allow_unsupported_fields() {
-            tracing::info!(
+            tracing::warn!(
                 fields = %unknown_fields,
                 allow_unsupported_fields = true,
                 unified_logs = true,
-                "allowing OpenAI request with unsupported field(s)"
+                "allowing OpenAI request with unsupported field(s). This will be lead to a HTTP(400) response in the future."
             );
         } else {
             tracing::info!(
