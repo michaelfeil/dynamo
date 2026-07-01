@@ -107,14 +107,28 @@ pub const PASSTHROUGH_EXTRA_FIELDS: &[&str] = &[
 ];
 
 static ALLOW_UNSUPPORTED_FIELDS: OnceLock<bool> = OnceLock::new();
+const ALLOW_UNSUPPORTED_FIELDS_ENV: &str = "DYN_ALLOW_UNSUPPORTED_FIELDS";
+const IGNORE_UNSUPPORTED_FIELDS_ENV_ALIAS: &str = "DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS";
 
 fn allow_unsupported_fields() -> bool {
     *ALLOW_UNSUPPORTED_FIELDS.get_or_init(|| {
-        env::var("DYN_ALLOW_UNSUPPORTED_FIELDS")
-            .ok()
-            .and_then(|value| value.parse::<bool>().ok())
+        read_bool_env(ALLOW_UNSUPPORTED_FIELDS_ENV)
+            .or_else(|| read_bool_env(IGNORE_UNSUPPORTED_FIELDS_ENV_ALIAS))
             .unwrap_or(false)
     })
+}
+
+fn read_bool_env(name: &str) -> Option<bool> {
+    let value = env::var(name).ok()?;
+    parse_bool_env_value(&value)
+}
+
+fn parse_bool_env_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" | "" => Some(false),
+        _ => None,
+    }
 }
 
 /// Validates that no unsupported fields are present in the request.
@@ -126,10 +140,18 @@ pub fn validate_no_unsupported_fields(
     let unknown: Vec<_> = unsupported_fields
         .keys()
         .filter(|k| !PASSTHROUGH_EXTRA_FIELDS.contains(&k.as_str()))
-        .map(|s| format!("`{}`", s))
+        .map(String::as_str)
         .collect();
     if !unknown.is_empty() && !allow_unsupported_fields() {
-        anyhow::bail!("Unsupported parameter(s): {}", unknown.join(", "));
+        let unknown_fields = unknown.join(", ");
+        tracing::info!(
+            fields = %unknown_fields,
+            reason = "unsupported_parameter",
+            unified_logs = true,
+            "rejecting OpenAI request due to unsupported field(s)"
+        );
+        let quoted_unknown: Vec<_> = unknown.iter().map(|field| format!("`{field}`")).collect();
+        anyhow::bail!("Unsupported parameter(s): {}", quoted_unknown.join(", "));
     }
     if let Some(value) = unsupported_fields.get("cache_salt")
         && !value.is_string()
