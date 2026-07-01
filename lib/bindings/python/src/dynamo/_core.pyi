@@ -1934,8 +1934,8 @@ class PyWorkerSelectionResult:
     def __init__(self, worker_id: int, dp_rank: int) -> None:
         ...
 
-def set_health(healthy: bool, reason: str = "") -> None:
-    """Set the B10 health-file readiness state."""
+def set_health(healthy: bool, reason: str = "", timeout_secs: float | None = None) -> None:
+    """Set B10 health-file readiness; each healthy call replaces the previous lease for up to 600 seconds."""
     ...
 
 def register_runtime(runtime: DistributedRuntime) -> None:

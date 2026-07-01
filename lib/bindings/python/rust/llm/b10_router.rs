@@ -155,7 +155,7 @@ struct TaskAbortGuard {
 
 impl Drop for TaskAbortGuard {
     fn drop(&mut self) {
-        set_health(false, "router task aborted or dropped");
+        set_health(false, "router task aborted or dropped", None);
         self.task.abort();
     }
 }
@@ -199,7 +199,7 @@ where
             // another caller has explicitly set health.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             loop {
-                set_health(true, "router health heartbeat");
+                set_health(true, "router health heartbeat", None);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
@@ -320,7 +320,7 @@ where
         .start()
         .await?;
 
-    set_health(false, "router shutting down gracefully");
+    set_health(false, "router shutting down gracefully", None);
 
     Ok(())
 }
