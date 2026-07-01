@@ -473,23 +473,29 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         self.track_residency.load(AtomicOrdering::Relaxed)
     }
 
-    pub fn eviction_pressure_for_new_blocks_at(
+    pub fn eviction_pressure_for_request_at(
         &self,
         worker: WorkerWithDpRank,
-        additional_blocks: u64,
+        estimated_cached_blocks: u64,
+        request_blocks: u64,
         half_life: Duration,
         now: Instant,
     ) -> EvictionPressure {
+        let fallback_new_blocks =
+            request_blocks.saturating_sub(estimated_cached_blocks.min(request_blocks));
         let table = self.workers.read();
         let Some(&idx) = table.index.get(&worker) else {
-            return EvictionPressure::empty(additional_blocks);
+            return EvictionPressure::empty(fallback_new_blocks);
         };
         let Some(residency) = &table.slots[idx].residency else {
-            return EvictionPressure::empty(additional_blocks);
+            return EvictionPressure::empty(fallback_new_blocks);
         };
-        residency
-            .read()
-            .eviction_pressure_for_new_blocks_at(additional_blocks, half_life, now)
+        residency.read().eviction_pressure_for_request_at(
+            estimated_cached_blocks,
+            request_blocks,
+            half_life,
+            now,
+        )
     }
 
     fn apply_worker_topology_change(&self, change: super::topology::WorkerTopologyChange) {
@@ -1192,8 +1198,9 @@ mod tests {
         );
         assert_eq!(sequences.active_blocks().get(&worker).copied(), Some(0));
 
-        let pressure = sequences.eviction_pressure_for_new_blocks_at(
+        let pressure = sequences.eviction_pressure_for_request_at(
             worker,
+            0,
             2,
             Duration::from_secs(60),
             decay_now,
@@ -1235,8 +1242,9 @@ mod tests {
         assert_eq!(sequences.residency_test_state(worker).unwrap().1, 3);
         assert_eq!(
             sequences
-                .eviction_pressure_for_new_blocks_at(
+                .eviction_pressure_for_request_at(
                     worker,
+                    0,
                     2,
                     Duration::from_secs(60),
                     Instant::now()

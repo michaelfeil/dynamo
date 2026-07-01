@@ -734,16 +734,14 @@ impl<
         let mut eviction_costs = HashMap::new();
 
         eligibility.for_each_eligible_worker_rank(&workers, |worker, _| {
-            let overlap_blocks = request
-                .tier_overlap_blocks
-                .device
-                .get(&worker)
-                .copied()
-                .unwrap_or(0) as u64;
-            let additional_blocks = request_blocks.saturating_sub(overlap_blocks);
-            let pressure = self.slots.eviction_pressure_for_new_blocks_at(
+            let estimated_cached_blocks = request
+                .effective_overlap_blocks_for(worker)
+                .round()
+                .max(0.0) as u64;
+            let pressure = self.slots.eviction_pressure_for_request_at(
                 worker,
-                additional_blocks,
+                estimated_cached_blocks,
+                request_blocks,
                 half_life,
                 now,
             );

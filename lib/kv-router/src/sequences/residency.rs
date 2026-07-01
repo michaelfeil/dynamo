@@ -80,29 +80,37 @@ impl WorkerResidency {
         self.trim_to_capacity();
     }
 
-    pub(crate) fn eviction_pressure_for_new_blocks_at(
+    pub(crate) fn eviction_pressure_for_request_at(
         &self,
-        additional_blocks: u64,
+        estimated_cached_blocks: u64,
+        request_blocks: u64,
         half_life: Duration,
         now: Instant,
     ) -> EvictionPressure {
-        // nit(michaelfeil): tracking against sequence_hashes instead of additional_blocks
-        // would be the correct thing to do, but requires a comparison/query
-        // assuming 256 workers, 100 requests/s, median blocks per request: 3000
-        // would be 76.8M request-hash lookups/s per router replica.
+        let estimated_new_blocks =
+            request_blocks.saturating_sub(estimated_cached_blocks.min(request_blocks));
+        self.eviction_pressure_for_estimated_new_blocks_at(estimated_new_blocks, half_life, now)
+    }
+
+    fn eviction_pressure_for_estimated_new_blocks_at(
+        &self,
+        estimated_new_blocks: u64,
+        half_life: Duration,
+        now: Instant,
+    ) -> EvictionPressure {
         let resident_blocks = self.blocks.len() as u64;
         let capacity = self.capacity_blocks;
         let capacity_blocks = Some(capacity);
 
         let target_evictions = resident_blocks
-            .saturating_add(additional_blocks)
+            .saturating_add(estimated_new_blocks)
             .saturating_sub(capacity);
         let would_evict_blocks = target_evictions.min(resident_blocks);
         if would_evict_blocks == 0 {
             return EvictionPressure {
                 resident_blocks,
                 capacity_blocks,
-                new_blocks: additional_blocks,
+                new_blocks: estimated_new_blocks,
                 would_evict_blocks,
                 oldest_evicted_age: None,
                 youngest_evicted_age: None,
@@ -126,7 +134,7 @@ impl WorkerResidency {
         EvictionPressure {
             resident_blocks,
             capacity_blocks,
-            new_blocks: additional_blocks,
+            new_blocks: estimated_new_blocks,
             would_evict_blocks,
             oldest_evicted_age,
             youngest_evicted_age,
@@ -186,11 +194,11 @@ impl WorkerResidency {
 }
 
 impl EvictionPressure {
-    pub(crate) fn empty(additional_blocks: u64) -> Self {
+    pub(crate) fn empty(estimated_new_blocks: u64) -> Self {
         Self {
             resident_blocks: 0,
             capacity_blocks: None,
-            new_blocks: additional_blocks,
+            new_blocks: estimated_new_blocks,
             would_evict_blocks: 0,
             oldest_evicted_age: None,
             youngest_evicted_age: None,
@@ -283,7 +291,7 @@ mod tests {
         let now = Instant::now();
         residency.touch_sequence_hashes(&[100], now);
 
-        let pressure = residency.eviction_pressure_for_new_blocks_at(
+        let pressure = residency.eviction_pressure_for_estimated_new_blocks_at(
             1,
             Duration::from_secs(10),
             now + Duration::from_secs(10),
@@ -299,14 +307,15 @@ mod tests {
     }
 
     #[test]
-    fn eviction_pressure_uses_additional_blocks_without_hash_lookup() {
+    fn eviction_pressure_uses_estimated_cached_blocks() {
         let mut residency = WorkerResidency::new(Some(2));
         let now = Instant::now();
         residency.touch_sequence_hashes(&[100], now);
         residency.touch_sequence_hashes(&[200], now + Duration::from_secs(5));
 
-        let pressure = residency.eviction_pressure_for_new_blocks_at(
-            1,
+        let pressure = residency.eviction_pressure_for_request_at(
+            3,
+            4,
             Duration::from_secs(60),
             now + Duration::from_secs(10),
         );
@@ -319,6 +328,34 @@ mod tests {
     }
 
     #[test]
+    fn eviction_pressure_discounts_estimated_resident_request_blocks() {
+        let mut residency = WorkerResidency::new(Some(80));
+        let now = Instant::now();
+        let resident_hashes: Vec<_> = (0..50).collect();
+        residency.touch_sequence_hashes(&resident_hashes, now);
+
+        let pressure =
+            residency.eviction_pressure_for_request_at(50, 100, Duration::from_secs(60), now);
+
+        assert_eq!(pressure.resident_blocks, 50);
+        assert_eq!(pressure.new_blocks, 50);
+        assert_eq!(pressure.would_evict_blocks, 20);
+    }
+
+    #[test]
+    fn eviction_pressure_clamps_estimated_cached_blocks_to_request_blocks() {
+        let mut residency = WorkerResidency::new(Some(8));
+        let now = Instant::now();
+        residency.touch_sequence_hashes(&[100, 200, 300, 400, 500], now);
+
+        let pressure =
+            residency.eviction_pressure_for_request_at(20, 10, Duration::from_secs(60), now);
+
+        assert_eq!(pressure.new_blocks, 0);
+        assert_eq!(pressure.would_evict_blocks, 0);
+    }
+
+    #[test]
     fn eviction_pressure_estimates_cost_from_eviction_endpoints() {
         let mut residency = WorkerResidency::new(Some(100));
         let now = Instant::now();
@@ -326,7 +363,7 @@ mod tests {
             residency.touch_sequence_hashes(&[hash], now + Duration::from_secs(hash));
         }
 
-        let pressure = residency.eviction_pressure_for_new_blocks_at(
+        let pressure = residency.eviction_pressure_for_estimated_new_blocks_at(
             100,
             Duration::from_secs(10),
             now + Duration::from_secs(100),
