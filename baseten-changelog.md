@@ -305,6 +305,11 @@ Validation:
 Exercise startup health, request drain, endpoint unpublication, NATS/ETCD
 lifetime during drain, and forced shutdown timeout behavior.
 
+Backported upstream PR `ai-dynamo/dynamo#10437` (`73903bdc807323c0b14dbb4ddb7c79b7da72d3d8`, `perf(runtime): add request-plane msgpack payload codec`) for v1.2. JSON remains the compatibility default on this
+branch; `DYN_REQUEST_PLANE_CODEC=msgpack` opts into msgpack request/response
+payloads. Moving the default to msgpack later is acceptable after rollout
+validation.
+
 ## PATCH-003: NATS, JetStream, and Discovery Compatibility
 
 Status: `redesign`

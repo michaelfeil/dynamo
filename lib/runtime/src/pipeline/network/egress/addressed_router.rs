@@ -21,6 +21,7 @@ use crate::metrics::request_plane::{
 use crate::pipeline::network::ConnectionInfo;
 use crate::pipeline::network::NetworkStreamWrapper;
 use crate::pipeline::network::PendingConnections;
+use crate::pipeline::network::RequestPlanePayloadCodec;
 use crate::pipeline::network::StreamOptions;
 use crate::pipeline::network::TwoPartCodec;
 use crate::pipeline::network::codec::TwoPartMessage;
@@ -206,6 +207,7 @@ where
         let (request, address, instance_info) = addressed_request.into_parts();
         let engine_ctx = context.context();
         let engine_ctx_ = engine_ctx.clone();
+        let payload_codec = RequestPlanePayloadCodec::configured();
 
         // registration options for the data plane in a singe in / many out configuration
         let options = StreamOptions::builder()
@@ -264,6 +266,7 @@ where
             id: engine_ctx.id().to_string(),
             request_type: RequestType::SingleIn,
             response_type: ResponseType::ManyOut,
+            payload_codec,
             connection_info,
             metadata: context.metadata().clone(),
             frontend_send_ts_ns: None,
@@ -281,13 +284,13 @@ where
                 return Err(e);
             }
         };
-        let data = match serde_json::to_vec(&request) {
+        let data = match payload_codec.encode(&request) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(subject) = &recv_subject {
                     self.resp_transport.cancel_recv_stream(subject).await;
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
 
@@ -417,7 +420,7 @@ where
                     );
                     return Some(U::from_err(err));
                 }
-                match serde_json::from_slice::<NetworkStreamWrapper<U>>(&res_bytes) {
+                match payload_codec.decode::<NetworkStreamWrapper<U>>(&res_bytes) {
                     Ok(item) => {
                         is_complete_final = item.complete_final;
                         if let Some(data) = item.data {
@@ -432,9 +435,13 @@ where
                         }
                     }
                     Err(err) => {
-                        // legacy log print
-                        let json_str = String::from_utf8_lossy(&res_bytes);
-                        tracing::warn!(%err, %json_str, "Failed deserializing JSON to response");
+                        let response_bytes_len = res_bytes.len();
+                        tracing::warn!(
+                            %err,
+                            codec = payload_codec.name(),
+                            response_bytes_len,
+                            "failed deserializing request-plane response"
+                        );
 
                         Some(U::from_err(DynamoError::msg(err.to_string())))
                     }
@@ -468,8 +475,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_MESSAGE_MAX_BYTES, ConnectionInfo, RequestControlMessage, RequestType,
-        ResponseType, serialize_control_message,
+        CONTROL_MESSAGE_MAX_BYTES, ConnectionInfo, RequestControlMessage, RequestPlanePayloadCodec,
+        RequestType, ResponseType, serialize_control_message,
     };
     use std::collections::BTreeMap;
 
@@ -478,6 +485,7 @@ mod tests {
             id: "request-123".to_string(),
             request_type: RequestType::SingleIn,
             response_type: ResponseType::ManyOut,
+            payload_codec: RequestPlanePayloadCodec::Json,
             connection_info: ConnectionInfo {
                 transport: "tcp".to_string(),
                 info: "{}".to_string(),
