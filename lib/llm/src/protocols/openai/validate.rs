@@ -142,16 +142,25 @@ pub fn validate_no_unsupported_fields(
         .filter(|k| !PASSTHROUGH_EXTRA_FIELDS.contains(&k.as_str()))
         .map(String::as_str)
         .collect();
-    if !unknown.is_empty() && !allow_unsupported_fields() {
+    if !unknown.is_empty() {
         let unknown_fields = unknown.join(", ");
-        tracing::info!(
-            fields = %unknown_fields,
-            reason = "unsupported_parameter",
-            unified_logs = true,
-            "rejecting OpenAI request due to unsupported field(s)"
-        );
-        let quoted_unknown: Vec<_> = unknown.iter().map(|field| format!("`{field}`")).collect();
-        anyhow::bail!("Unsupported parameter(s): {}", quoted_unknown.join(", "));
+        if allow_unsupported_fields() {
+            tracing::info!(
+                fields = %unknown_fields,
+                allow_unsupported_fields = true,
+                unified_logs = true,
+                "allowing OpenAI request with unsupported field(s)"
+            );
+        } else {
+            tracing::info!(
+                fields = %unknown_fields,
+                reason = "unsupported_parameter",
+                unified_logs = true,
+                "rejecting OpenAI request due to unsupported field(s)"
+            );
+            let quoted_unknown: Vec<_> = unknown.iter().map(|field| format!("`{field}`")).collect();
+            anyhow::bail!("Unsupported parameter(s): {}", quoted_unknown.join(", "));
+        }
     }
     if let Some(value) = unsupported_fields.get("cache_salt")
         && !value.is_string()
