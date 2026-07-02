@@ -20,7 +20,10 @@
 //! production deployments only use `B10`, and upstream's selector trait
 //! handles DP fan-out internally.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::Result;
 use pyo3::prelude::*;
@@ -187,17 +190,21 @@ where
 
     let endpoint = component_worker.endpoint("generate");
     let client = endpoint.client().await?;
+    let startup_complete = Arc::new(AtomicBool::new(false));
 
-    // Start the health heartbeat before blocking on worker discovery.
-    // KvRouter::new blocks until at least one worker registers, which can take
-    // 10+ minutes for large models. The heartbeat signals that the router process
-    // is alive so the deployment health probe doesn't time out.
+    // Start the health heartbeat task before blocking on worker discovery.
+    // It waits for the router startup path to complete before reporting healthy.
     let _abort_guard = {
-        let task = tokio::spawn(async {
+        let startup_complete = startup_complete.clone();
+        let task = tokio::spawn(async move {
             // Give the router 60s before publishing the first health heartbeat.
             // During that grace period, `/health_file` remains unhealthy unless
             // another caller has explicitly set health.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            while !startup_complete.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
             loop {
                 set_health(true, "router health heartbeat", None);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -311,6 +318,8 @@ where
     if disable_snapshots_in_primary {
         kv_router.disable_snapshots();
     }
+
+    startup_complete.store(true, Ordering::SeqCst);
 
     tracing::info!("Starting router service...");
     component_router

@@ -48,6 +48,15 @@ const RECOVERY_INITIAL_BACKOFF_MS: u64 = 200;
 const RECOVERY_CONCURRENCY_LIMIT: usize = 16;
 const RECOVERY_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_RECOVERY_SETTLE_DELAY: Duration = Duration::from_millis(100);
+const INITIAL_RECOVERY_TARGET_PERCENT: usize = 95;
+const INITIAL_RECOVERY_MAX_WAIT_SECS: u64 = 600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitialRecoveryOutcome {
+    Complete,
+    ThresholdReached,
+    TimedOut,
+}
 
 #[derive(Clone)]
 struct RecoveryProcessLogger {
@@ -86,6 +95,21 @@ struct RecoveryProcessSnapshot {
 impl RecoveryProcessSnapshot {
     fn total_recovered_events(&self) -> usize {
         self.buffered_events + self.tree_dump_events + self.drained_events
+    }
+
+    fn terminal_attempts(&self) -> usize {
+        self.succeeded + self.failed + self.skipped
+    }
+
+    fn target_terminal_attempts(&self) -> usize {
+        self.scheduled
+            .saturating_mul(INITIAL_RECOVERY_TARGET_PERCENT)
+            .saturating_add(99)
+            / 100
+    }
+
+    fn reached_initial_recovery_target(&self) -> bool {
+        self.scheduled > 0 && self.terminal_attempts() >= self.target_terminal_attempts()
     }
 }
 
@@ -156,10 +180,22 @@ impl RecoveryProcessLogger {
     async fn wait_for_initial_recovery(
         &self,
         cancellation_token: &tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        tracing::info!("Waiting for initial worker KV recovery before serving traffic");
+    ) -> Result<InitialRecoveryOutcome> {
+        let wait_started_at = Instant::now();
+        let max_wait = Duration::from_secs(INITIAL_RECOVERY_MAX_WAIT_SECS);
+        tracing::info!(
+            target_percent = INITIAL_RECOVERY_TARGET_PERCENT,
+            max_wait_secs = INITIAL_RECOVERY_MAX_WAIT_SECS,
+            "Waiting for initial worker KV recovery before serving traffic"
+        );
 
         while self.snapshot().scheduled == 0 {
+            let snapshot = self.snapshot();
+            if wait_started_at.elapsed() >= max_wait {
+                self.log_initial_timeout(&snapshot, wait_started_at.elapsed());
+                return Ok(InitialRecoveryOutcome::TimedOut);
+            }
+
             tokio::select! {
                 biased;
 
@@ -177,6 +213,10 @@ impl RecoveryProcessLogger {
 
         loop {
             let snapshot = self.snapshot();
+            if wait_started_at.elapsed() >= max_wait {
+                self.log_initial_timeout(&snapshot, wait_started_at.elapsed());
+                return Ok(InitialRecoveryOutcome::TimedOut);
+            }
             if snapshot.in_flight == 0 {
                 tokio::select! {
                     biased;
@@ -191,9 +231,13 @@ impl RecoveryProcessLogger {
                 let settled = self.snapshot();
                 if settled.in_flight == 0 && settled.scheduled == snapshot.scheduled {
                     self.log_initial_complete(&settled);
-                    return Ok(());
+                    return Ok(InitialRecoveryOutcome::Complete);
                 }
                 continue;
+            }
+            if snapshot.reached_initial_recovery_target() {
+                self.log_initial_threshold_reached(&snapshot, wait_started_at.elapsed());
+                return Ok(InitialRecoveryOutcome::ThresholdReached);
             }
 
             self.log_waiting(&snapshot);
@@ -272,6 +316,8 @@ impl RecoveryProcessLogger {
             succeeded = snapshot.succeeded,
             failed = snapshot.failed,
             skipped = snapshot.skipped,
+            terminal_attempts = snapshot.terminal_attempts(),
+            target_terminal_attempts = snapshot.target_terminal_attempts(),
             total_recovered_events = snapshot.total_recovered_events(),
             elapsed_secs = snapshot.elapsed_secs,
             "Waiting for initial worker KV recovery"
@@ -292,6 +338,45 @@ impl RecoveryProcessLogger {
             total_recovered_events = snapshot.total_recovered_events(),
             elapsed_secs = snapshot.elapsed_secs,
             "Initial worker KV recovery completed before serving traffic"
+        );
+    }
+
+    fn log_initial_threshold_reached(
+        &self,
+        snapshot: &RecoveryProcessSnapshot,
+        wait_elapsed: Duration,
+    ) {
+        tracing::warn!(
+            scheduled = snapshot.scheduled,
+            in_flight = snapshot.in_flight,
+            succeeded = snapshot.succeeded,
+            failed = snapshot.failed,
+            skipped = snapshot.skipped,
+            terminal_attempts = snapshot.terminal_attempts(),
+            target_terminal_attempts = snapshot.target_terminal_attempts(),
+            target_percent = INITIAL_RECOVERY_TARGET_PERCENT,
+            total_recovered_events = snapshot.total_recovered_events(),
+            elapsed_secs = snapshot.elapsed_secs,
+            wait_elapsed_secs = wait_elapsed.as_secs_f64(),
+            "Initial worker KV recovery reached startup threshold; remaining recovery will continue in the background"
+        );
+    }
+
+    fn log_initial_timeout(&self, snapshot: &RecoveryProcessSnapshot, wait_elapsed: Duration) {
+        tracing::warn!(
+            scheduled = snapshot.scheduled,
+            in_flight = snapshot.in_flight,
+            succeeded = snapshot.succeeded,
+            failed = snapshot.failed,
+            skipped = snapshot.skipped,
+            terminal_attempts = snapshot.terminal_attempts(),
+            target_terminal_attempts = snapshot.target_terminal_attempts(),
+            target_percent = INITIAL_RECOVERY_TARGET_PERCENT,
+            max_wait_secs = INITIAL_RECOVERY_MAX_WAIT_SECS,
+            total_recovered_events = snapshot.total_recovered_events(),
+            elapsed_secs = snapshot.elapsed_secs,
+            wait_elapsed_secs = wait_elapsed.as_secs_f64(),
+            "Initial worker KV recovery timed out; remaining recovery will continue in the background"
         );
     }
 }
@@ -432,7 +517,7 @@ impl WorkerQueryClient {
     pub(crate) async fn wait_for_initial_recovery(
         &self,
         cancellation_token: &tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<InitialRecoveryOutcome> {
         self.recovery_process_logger
             .wait_for_initial_recovery(cancellation_token)
             .await
@@ -1240,14 +1325,63 @@ mod tests {
         );
 
         release.notify_waiters();
-        wait_task
+        let outcome = wait_task
             .await
             .expect("wait task should join")
             .expect("initial recovery wait should succeed");
+        assert_eq!(outcome, InitialRecoveryOutcome::Complete);
 
         kv_indexer.flush().await;
         let events = kv_indexer.dump_events().await.unwrap();
         assert_eq!(stored_block_hashes(&events), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_initial_recovery_wait_returns_after_terminal_attempt_threshold() {
+        let (client, transport, _kv_indexer) = make_test_client("initial-recovery-threshold").await;
+        let blocked_started = Arc::new(Notify::new());
+        let blocked_release = Arc::new(Notify::new());
+
+        for worker_id in 0..20 {
+            let key = (worker_id, 0);
+            let (started, release) = if worker_id == 0 {
+                (Some(blocked_started.clone()), Some(blocked_release.clone()))
+            } else {
+                (None, None)
+            };
+            transport.push_action(
+                key,
+                MockQueryAction {
+                    started,
+                    release,
+                    response: Ok(WorkerKvQueryResponse::TreeDump {
+                        events: vec![],
+                        last_event_id: 0,
+                    }),
+                },
+            );
+            client.handle_discovered_worker(worker_id, 0).await;
+        }
+
+        blocked_started.notified().await;
+
+        let cancellation_token = CancellationToken::new();
+        let wait_client = client.clone();
+        let wait_cancellation_token = cancellation_token.clone();
+        let wait_task = tokio::spawn(async move {
+            wait_client
+                .wait_for_initial_recovery(&wait_cancellation_token)
+                .await
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), wait_task)
+            .await
+            .expect("initial recovery wait should return after 95% terminal attempts")
+            .expect("wait task should join")
+            .expect("initial recovery wait should succeed");
+        assert_eq!(outcome, InitialRecoveryOutcome::ThresholdReached);
+
+        blocked_release.notify_waiters();
     }
 
     fn rank_state_matches<F>(client: &Arc<WorkerQueryClient>, key: RecoveryKey, check: F) -> bool

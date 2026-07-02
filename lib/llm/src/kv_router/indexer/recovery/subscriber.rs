@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::worker_query::WorkerQueryClient;
+use super::worker_query::{InitialRecoveryOutcome, WorkerQueryClient};
 use crate::kv_router::Indexer;
 use anyhow::Result;
 use dynamo_kv_router::{
@@ -113,10 +113,24 @@ async fn start_kv_router_background_event_plane(
 
     if wait_for_initial_recovery {
         tracing::info!("Waiting for initial worker KV recovery to complete...");
-        worker_query_client
+        match worker_query_client
             .wait_for_initial_recovery(&cancellation_token)
-            .await?;
-        tracing::info!("Initial worker KV recovery complete");
+            .await?
+        {
+            InitialRecoveryOutcome::Complete => {
+                tracing::info!("Initial worker KV recovery complete");
+            }
+            InitialRecoveryOutcome::ThresholdReached => {
+                tracing::warn!(
+                    "Initial worker KV recovery startup threshold reached; serving while remaining recovery continues"
+                );
+            }
+            InitialRecoveryOutcome::TimedOut => {
+                tracing::warn!(
+                    "Initial worker KV recovery wait timed out; serving while remaining recovery continues"
+                );
+            }
+        }
     } else {
         tracing::info!("Skipping initial worker KV recovery wait");
     }
