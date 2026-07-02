@@ -292,6 +292,12 @@ Phase 3 teardown instead of hanging forever behind a deadlocked in-flight
 request. The cap is controlled by `DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS`;
 Baseten uses a 4 minute default (`240` seconds), not the 15 minute value discussed for the upstream proposal in dyn1.3+.
 
+The primary etcd lease TTL is raised from 10 seconds to 30 seconds on v1.2.
+This gives the lease keep-alive loop more tolerance for transient runtime,
+scheduler, or network stalls before the process lease expires and the runtime
+is cancelled. The keep-alive cadence still derives from the TTL returned by
+etcd, so this only changes the requested lease grant duration.
+
 Replay notes:
 
 Port behavior, not necessarily implementation. Upstream may have refactored

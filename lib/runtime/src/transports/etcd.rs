@@ -37,6 +37,7 @@ use crate::config::environment_names::etcd as env_etcd;
 /// before giving up and surfacing an error. Tolerates etcd and dynamo starting
 /// at the same time.
 const STARTUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const PRIMARY_LEASE_TTL_SECS: u64 = 30;
 
 /// ETCD Client
 #[derive(Clone)]
@@ -98,7 +99,7 @@ impl Client {
                                 })?;
 
                         let lease_id = if config.attach_lease {
-                            create_lease(connector.clone(), 10, token.clone())
+                            create_lease(connector.clone(), PRIMARY_LEASE_TTL_SECS, token.clone())
                                 .await
                                 .with_context(|| {
                                     format!(
