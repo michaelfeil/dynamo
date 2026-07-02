@@ -153,7 +153,7 @@ fn log_route_step(
     if !enabled {
         return;
     }
-    tracing::info!(
+    tracing::debug!(
         request_id = %request_id,
         step,
         trace_context_available = trace_context_available(context),
