@@ -190,23 +190,26 @@ where
 
     let endpoint = component_worker.endpoint("generate");
     let client = endpoint.client().await?;
-    let startup_complete = Arc::new(AtomicBool::new(false));
 
-    // Start the health heartbeat task before blocking on worker discovery.
-    // It waits for the router startup path to complete before reporting healthy.
+    let start_serving_complete: Arc<(AtomicBool, AtomicBool)> =
+        Arc::new((AtomicBool::new(false), AtomicBool::new(false)));
+
+    // Start the health heartbeat before blocking on worker discovery.
+    // KvRouter::new blocks until at least one worker registers, which can take
+    // 10+ minutes for large models. The heartbeat signals that the router process
+    // is alive so the deployment health probe doesn't time out.
     let _abort_guard = {
-        let startup_complete = startup_complete.clone();
+        let start_serving_complete = start_serving_complete.clone();
         let task = tokio::spawn(async move {
-            // Give the router 60s before publishing the first health heartbeat.
-            // During that grace period, `/health_file` remains unhealthy unless
-            // another caller has explicitly set health.
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            while !startup_complete.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-
             loop {
-                set_health(true, "router health heartbeat", None);
+                let started = start_serving_complete.0.load(Ordering::SeqCst);
+                let serving = start_serving_complete.1.load(Ordering::SeqCst);
+                // Signal K8s readiness as soon as startup is complete, regardless of whether
+                // this replica has been elected to serve yet. A replica may remain in standby
+                // for an extended period; withholding readiness would block rolling promotions.
+                if started || serving {
+                    set_health(true, "router health heartbeat", None);
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
@@ -246,6 +249,9 @@ where
         .await?,
     );
     let router = Ingress::for_engine(kv_router.clone())?;
+
+    // now startup is complete, but not yet serving
+    start_serving_complete.0.store(true, Ordering::SeqCst);
 
     // Wait until we have less than router_active_replicas active.
     // This value is hot-reloaded from the router config map, so routers can
@@ -319,9 +325,10 @@ where
         kv_router.disable_snapshots();
     }
 
-    startup_complete.store(true, Ordering::SeqCst);
-
     tracing::info!("Starting router service...");
+    // now serving
+    start_serving_complete.1.store(true, Ordering::SeqCst);
+
     component_router
         .endpoint("generate")
         .endpoint_builder()

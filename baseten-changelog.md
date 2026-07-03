@@ -1425,3 +1425,29 @@ Replay notes:
 Do not replay as-is. If hybrid-attention KV cache group behavior is still
 needed, redesign and validate it against the target upstream router and model
 support code.
+
+## PATCH-013: B10 Router Startup Readiness Gate Fix
+
+Status: `keep`
+
+Source commits:
+
+- Current PR: fix: b10 router startup wrong gates
+
+Purpose:
+
+Fix the health/readiness signaling in the B10 KV router so that Kubernetes
+sees the router as ready as soon as startup completes (`start_serving_complete.0`
+is set), not only when the router is actively serving traffic. A router replica
+may wait indefinitely in standby before being elected; withholding K8s readiness
+during that wait would block rolling promotions (e.g. 2 active / 4 total pods,
+1 max unavailable).
+
+Also fixes a bug where `set_health` was called with 2 arguments instead of the
+required 3 (`healthy`, `reason`, `timeout`).
+
+Replay notes:
+
+Apply to any branch that carries the two-stage `(started, serving)` gate in
+`lib/bindings/python/rust/llm/b10_router.rs`. The heartbeat loop must gate on
+`started || serving`, not on `serving` alone.
