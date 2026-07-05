@@ -109,7 +109,9 @@ jobs:
             echo "sccache: DISABLED (SCCACHE_S3_BUCKET / AWS credentials not available to this run)"
           fi
 
-          ./container/build.sh --framework none --push \
+          # --no-tag-latest: dispatched builds come from arbitrary refs and must
+          # not move the shared latest-none tag; only the post-merge build does.
+          ./container/build.sh --framework none --push --no-tag-latest \
             "${CACHE_ARGS[@]}" "${SCCACHE_ARGS[@]}" 2>&1 | tee build.log
 
       - name: Publish image-tag artifact

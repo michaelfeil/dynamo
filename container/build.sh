@@ -229,6 +229,10 @@ fi
 # ---------------------------------------------------------------------------
 DYNAMO_COMMIT_SHA=${DYNAMO_COMMIT_SHA:-$(git rev-parse HEAD)}
 BUILD_ARGS+=" --build-arg DYNAMO_COMMIT_SHA=$DYNAMO_COMMIT_SHA"
+# OCI provenance labels: readable from the registry config blob without
+# pulling the image (docker buildx imagetools inspect --format ... / skopeo).
+BUILD_ARGS+=" --label org.opencontainers.image.revision=$DYNAMO_COMMIT_SHA"
+BUILD_ARGS+=" --label co.baseten.dynamo-sha=$DYNAMO_COMMIT_SHA"
 
 # ---------------------------------------------------------------------------
 # Baseten version stamp (major.minor from .version-base, patch = commits ahead)

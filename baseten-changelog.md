@@ -216,6 +216,13 @@ The post-merge `framework=none` image workflow now builds native `amd64` and
 unsuffixed tag as a multi-arch manifest. The workflow does not publish a mutable
 `latest` tag.
 
+The dispatchable BIS Dynamo Image Push workflow now passes `--no-tag-latest`,
+so registry-dispatched builds from arbitrary refs no longer move the shared
+`latest-none` tag; only the post-merge build path publishes moving tags.
+`container/build.sh` additionally stamps `org.opencontainers.image.revision`
+and `co.baseten.dynamo-sha` OCI labels so image→SHA provenance is readable
+from the registry config blob without pulling the image.
+
 Replay notes:
 
 Port this first so the new branch has a working CI and image path. Retarget all
