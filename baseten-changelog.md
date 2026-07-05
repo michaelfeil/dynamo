@@ -298,6 +298,13 @@ scheduler, or network stalls before the process lease expires and the runtime
 is cancelled. The keep-alive cadence still derives from the TTL returned by
 etcd, so this only changes the requested lease grant duration.
 
+Mirrored upstream PR `ai-dynamo/dynamo#11146` for v1.2 etcd watch recovery.
+After an etcd watch reconnects, the watcher emits an authoritative full-prefix
+`Resync` snapshot, and stateful consumers (`KvCache`, `TypedPrefixWatcher`,
+storage-backed discovery) rebuild or diff local state from that snapshot. This
+prevents stale lease-bound discovery entries from surviving missed delete
+events during etcd reconnects.
+
 Replay notes:
 
 Port behavior, not necessarily implementation. Upstream may have refactored
