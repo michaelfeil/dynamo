@@ -757,6 +757,11 @@ Upstream sync note:
   selection against `ctx.context().stopped()` / `killed()` and calls
   `self.free(&context_id)` to release scheduler state before returning a
   `Cancelled` error.
+- Queued-request cancellation needs both ai-dynamo/dynamo#10887 (above) and
+  ai-dynamo/dynamo#10331 (the `response_is_closed()` booking guard in
+  `book_and_respond`, which the fork base predates). Preserve the focused
+  scheduler queue regressions for cancelled pending requests and response
+  delivery rollback.
 
 ## PATCH-005: Router Metrics, Tracing, and Observability
 

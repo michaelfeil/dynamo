@@ -64,6 +64,9 @@ pub enum KvSchedulerError {
     #[error("endpoint subscriber shutdown")]
     SubscriberShutdown,
 
+    #[error("failed to book scheduler state: {0}")]
+    BookingFailed(String),
+
     #[error("failed to initialize event publisher: {0}")]
     InitFailed(String),
 }
@@ -297,13 +300,19 @@ impl SchedulingRequest {
         })
     }
 
-    pub fn respond(&mut self, result: Result<SchedulingResponse, KvSchedulerError>) {
+    pub(crate) fn response_is_closed(&self) -> bool {
+        self.resp_tx.as_ref().is_none_or(|tx| tx.is_closed())
+    }
+
+    pub fn respond(&mut self, result: Result<SchedulingResponse, KvSchedulerError>) -> bool {
         let Some(tx) = self.resp_tx.take() else {
             tracing::error!("respond called multiple times on same request");
-            return;
+            return false;
         };
         if tx.send(result).is_err() {
             tracing::error!("failed to send response to requestor");
+            return false;
         }
+        true
     }
 }
