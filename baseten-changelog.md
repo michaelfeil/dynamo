@@ -1346,6 +1346,7 @@ logs already carried the marker on the target branch, and the old
 `Runtime::initiate_shutdown()` hunk no longer applies because that API is not
 present in the target. The broader context reason/log-level churn remains
 unported unless a current false alarm or missing operational signal is proven.
+Low priority: keep/extend startup logging so runtime defaults used are visible (discovery backend, event plane, request plane).
 
 
 Replay notes:

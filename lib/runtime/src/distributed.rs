@@ -119,6 +119,13 @@ impl DistributedRuntime {
         let (discovery_backend, nats_config, request_plane, event_transport_kind) =
             config.dissolve();
 
+        tracing::info!(
+            discovery_backend = discovery_backend_kind(&discovery_backend),
+            event_plane = ?event_transport_kind,
+            request_plane = %request_plane,
+            "Creating distributed runtime"
+        );
+
         let nats_client = match nats_config {
             Some(nc) => Some(nc.connect().await?),
             None => None,
@@ -595,6 +602,15 @@ impl DistributedRuntime {
         });
 
         rx
+    }
+}
+
+fn discovery_backend_kind(discovery_backend: &DiscoveryBackend) -> &'static str {
+    match discovery_backend {
+        DiscoveryBackend::Kubernetes => "kubernetes",
+        DiscoveryBackend::KvStore(kv::Selector::Etcd(_)) => "etcd",
+        DiscoveryBackend::KvStore(kv::Selector::File(_)) => "file",
+        DiscoveryBackend::KvStore(kv::Selector::Memory) => "mem",
     }
 }
 

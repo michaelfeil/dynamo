@@ -349,6 +349,12 @@ async fn app(runtime: Runtime, args: Args) -> Result<()> {
             e
         })?;
 
+    tracing::info!(
+        event_plane = ?runtime.default_event_transport_kind(),
+        request_plane = %runtime.request_plane(),
+        "B10 KV router using runtime transport configuration"
+    );
+
     let component_worker = runtime
         .namespace(&args.namespace)?
         .component(&args.component_to_route)?;
