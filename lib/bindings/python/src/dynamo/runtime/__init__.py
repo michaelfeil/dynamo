@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import signal
+import threading
 import warnings
 from functools import wraps
 from typing import Any, AsyncGenerator, Callable, Optional, Type, Union
@@ -19,6 +20,7 @@ from dynamo._core import DistributedRuntime as DistributedRuntime
 from dynamo._core import Endpoint as Endpoint
 
 logger = logging.getLogger(__name__)
+B10_SHUTDOWN_INITIATED = threading.Event()
 
 
 def _b10_shutdown_handler(runtime: DistributedRuntime):
@@ -26,6 +28,7 @@ def _b10_shutdown_handler(runtime: DistributedRuntime):
         "Shutdown signal received, initiating graceful shutdown...",
         extra={"unified_model_logs": True},
     )
+    B10_SHUTDOWN_INITIATED.set()
     shutdown = getattr(runtime, "initiate_shutdown", runtime.shutdown)
     shutdown()
 

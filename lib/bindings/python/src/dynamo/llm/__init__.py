@@ -54,6 +54,7 @@ from dynamo._core import set_poisoned as set_poisoned
 from dynamo._core import set_rate_limit_level as set_rate_limit_level
 from dynamo._core import start_router as start_router
 from dynamo._core import unregister_model as unregister_model
+from dynamo.runtime import B10_SHUTDOWN_INITIATED as B10_SHUTDOWN_INITIATED
 
 from .exceptions import HttpError
 
