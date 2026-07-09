@@ -62,6 +62,39 @@ fn duration_ms_for_log(duration: Duration) -> f64 {
     (duration_ms * DURATION_LOG_MS_PRECISION).round() / DURATION_LOG_MS_PRECISION
 }
 
+fn denied_request_kind(denied: &DeniedRequest) -> String {
+    match denied {
+        DeniedRequest::RouterBackpressure { reason, .. } => {
+            format!("router_backpressure.{reason}")
+        }
+        DeniedRequest::RequiredComponentsDown { .. } => "required_components_down".to_string(),
+        DeniedRequest::NextRouterBackpressure { .. } => "next_router_backpressure".to_string(),
+        DeniedRequest::NextRouterUnreachable { .. } => "next_router_unreachable".to_string(),
+        DeniedRequest::ProtocolError { .. } => "protocol_error".to_string(),
+        DeniedRequest::Cancelled() => "cancelled".to_string(),
+        DeniedRequest::FirstWorkerEventFailed { .. } => "first_worker_event_failed".to_string(),
+    }
+}
+
+fn log_route_and_connect_denied(
+    request_id: &str,
+    phase: Option<&str>,
+    worker_id: Option<u64>,
+    stale_reroutes: u64,
+    denied: &DeniedRequest,
+) {
+    tracing::info!(
+        request_id = %request_id,
+        phase = phase.unwrap_or("unknown"),
+        worker_id = worker_id,
+        stale_reroutes,
+        denied_kind = %denied_request_kind(denied),
+        denied = ?denied,
+        unified_logs = true,
+        "route_and_connect denied"
+    );
+}
+
 fn create_detached_router_request_context(
     request: serde_json::Value,
     parent_ctx: &Option<context::Context>,
@@ -1729,6 +1762,7 @@ pub(super) async fn route_and_connect(
 
         let (guard, worker_id, route_timings) = match route_outcome {
             RouteOnceOutcome::Denied(denied) => {
+                log_route_and_connect_denied(&request_id, phase.as_deref(), None, attempt, &denied);
                 return Ok(RouteAndConnectOutcome::Denied(denied));
             }
             RouteOnceOutcome::Route {
@@ -1780,6 +1814,13 @@ pub(super) async fn route_and_connect(
                         worker_id,
                         "route_and_connect denied after worker setup because context was cancelled"
                     );
+                    log_route_and_connect_denied(
+                        &request_id,
+                        phase.as_deref(),
+                        Some(worker_id),
+                        attempt,
+                        &denied,
+                    );
                     return Ok(RouteAndConnectOutcome::Denied(denied));
                 }
 
@@ -1826,14 +1867,27 @@ pub(super) async fn route_and_connect(
                 if let Some(denied) = cancellation_denial_for_context(&context, allow_cancel_setup)
                     .or_else(|| cancellation_denial_for_context(&context, allow_cancel_routing))
                 {
+                    log_route_and_connect_denied(
+                        &request_id,
+                        phase.as_deref(),
+                        Some(worker_id),
+                        attempt,
+                        &denied,
+                    );
                     return Ok(RouteAndConnectOutcome::Denied(denied));
                 }
                 if attempt >= max_reroutes {
-                    return Ok(RouteAndConnectOutcome::Denied(
-                        DeniedRequest::NextRouterUnreachable {
-                            error: "stale route loop exhausted".to_string(),
-                        },
-                    ));
+                    let denied = DeniedRequest::NextRouterUnreachable {
+                        error: "stale route loop exhausted".to_string(),
+                    };
+                    log_route_and_connect_denied(
+                        &request_id,
+                        phase.as_deref(),
+                        Some(worker_id),
+                        attempt,
+                        &denied,
+                    );
+                    return Ok(RouteAndConnectOutcome::Denied(denied));
                 }
                 // The guard cleanup wait above observes the mark_free task reaching
                 // terminal state. Keep a short grace period before reusing the
@@ -1847,14 +1901,35 @@ pub(super) async fn route_and_connect(
                 if let Some(cancelled) =
                     cancellation_denial_for_context(&context, allow_cancel_setup)
                 {
+                    log_route_and_connect_denied(
+                        &request_id,
+                        phase.as_deref(),
+                        Some(worker_id),
+                        attempt,
+                        &cancelled,
+                    );
                     return Ok(RouteAndConnectOutcome::Denied(cancelled));
                 }
+                log_route_and_connect_denied(
+                    &request_id,
+                    phase.as_deref(),
+                    Some(worker_id),
+                    attempt,
+                    &denied,
+                );
                 return Ok(RouteAndConnectOutcome::Denied(denied));
             }
             OpenResult::Other(err) => {
                 if let Some(cancelled) =
                     cancellation_denial_for_context(&context, allow_cancel_setup)
                 {
+                    log_route_and_connect_denied(
+                        &request_id,
+                        phase.as_deref(),
+                        Some(worker_id),
+                        attempt,
+                        &cancelled,
+                    );
                     return Ok(RouteAndConnectOutcome::Denied(cancelled));
                 }
                 return Err(err);
