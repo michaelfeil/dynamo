@@ -75,6 +75,7 @@ struct B10Score {
     logit: f64,
     potential_prefill_block: f64,
     decode_block: f64,
+    decode_block_weight: f64,
     active_requests: f64,
     active_request_dp_blend: f64,
     cache_miss_absolute_tokens: usize,
@@ -195,6 +196,7 @@ fn score_worker<C: WorkerConfigLike>(
     worker: WorkerWithDpRank,
     block_size: u32,
     overlap_weight: f64,
+    decode_block_weight: f64,
     cache_miss_weight: f64,
     cache_miss_min_isl: usize,
     active_request_weight: f64,
@@ -236,7 +238,7 @@ fn score_worker<C: WorkerConfigLike>(
     );
 
     let logit = overlap_weight * potential_prefill_block
-        + decode_block
+        + decode_block_weight * decode_block
         + active_request_weight * active_requests
         + cache_miss_weight * (cache_miss_absolute_tokens as f64)
         + residency_eviction_cost
@@ -246,6 +248,7 @@ fn score_worker<C: WorkerConfigLike>(
         logit,
         potential_prefill_block,
         decode_block,
+        decode_block_weight,
         active_requests,
         active_request_dp_blend,
         cache_miss_absolute_tokens,
@@ -301,6 +304,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             .and_then(|cfg| cfg.prefill_load_scale)
             .unwrap_or(hot_reloadable_config.routing.router_overlap_score_weight);
 
+        let decode_block_weight = hot_reloadable_config.routing.router_decode_block_weight;
         let cache_miss_weight = hot_reloadable_config.routing.router_cache_miss_weight;
         let cache_miss_min_isl = hot_reloadable_config.routing.router_cache_miss_min_isl;
         let active_request_weight = hot_reloadable_config.routing.router_active_request_weight;
@@ -326,6 +330,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                 worker,
                 block_size,
                 overlap_weight,
+                decode_block_weight,
                 cache_miss_weight,
                 cache_miss_min_isl,
                 active_request_weight,
@@ -357,12 +362,13 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             let cached_tokens = request.effective_cached_tokens_for(worker);
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
+                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + dbw={:.2}*db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
                     worker.worker_id,
                     worker.dp_rank,
                     score.logit,
                     overlap_weight,
                     score.potential_prefill_block,
+                    score.decode_block_weight,
                     score.decode_block,
                     active_request_weight,
                     score.active_requests,
@@ -396,12 +402,13 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             let score = score_worker(worker);
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
+                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + dbw={:.2}*db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
                     worker.worker_id,
                     worker.dp_rank,
                     score.logit,
                     overlap_weight,
                     score.potential_prefill_block,
+                    score.decode_block_weight,
                     score.decode_block,
                     active_request_weight,
                     score.active_requests,
@@ -521,6 +528,7 @@ mod tests {
             64,
             0.0,
             1.0,
+            1.0,
             0,
             0.0,
             2.0 / 3.0,
@@ -549,6 +557,7 @@ mod tests {
             worker0,
             64,
             0.0,
+            1.0,
             0.0,
             0,
             1.0,
@@ -560,6 +569,84 @@ mod tests {
 
         assert!((score.active_requests - (9.0 / 3.0 + 6.0 * 2.0 / 3.0)).abs() < 1e-9);
         assert!((score.logit - score.active_requests).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_block_weight_scales_decode_term_independently_of_prefill() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let workers = HashMap::from([(worker.worker_id, test_worker_config(0, 1))]);
+        let mut request = base_request(256);
+        // Force a known decode-block count of 4 (256 ISL / 64 block_size, no
+        // cached tokens, no prefill_tokens entry so prefill term is 0).
+        request.decode_blocks.insert(worker, 4);
+        request.prefill_tokens.insert(worker, 0);
+
+        let score_unit = score_worker(
+            &workers,
+            &request,
+            worker,
+            64,
+            0.0,
+            1.0,
+            0.0,
+            0,
+            0.0,
+            2.0 / 3.0,
+            0.0,
+            0.0,
+            (2048.0, 32_768.0),
+        );
+        let score_double = score_worker(
+            &workers,
+            &request,
+            worker,
+            64,
+            0.0,
+            2.0,
+            0.0,
+            0,
+            0.0,
+            2.0 / 3.0,
+            0.0,
+            0.0,
+            (2048.0, 32_768.0),
+        );
+
+        assert_eq!(score_unit.decode_block, 4.0);
+        assert_eq!(score_unit.logit, 4.0);
+        assert_eq!(score_double.decode_block_weight, 2.0);
+        assert_eq!(score_double.logit, 8.0);
+        // Prefill term (overlap_weight * potential_prefill_block) stays 0 in
+        // both, proving the decode weight is applied independently.
+        assert_eq!(score_unit.potential_prefill_block, 0.0);
+    }
+
+    #[test]
+    fn decode_block_weight_zero_suppresses_decode_term() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let workers = HashMap::from([(worker.worker_id, test_worker_config(0, 1))]);
+        let mut request = base_request(256);
+        request.decode_blocks.insert(worker, 4);
+        request.prefill_tokens.insert(worker, 0);
+
+        let score = score_worker(
+            &workers,
+            &request,
+            worker,
+            64,
+            1.0,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            2.0 / 3.0,
+            0.0,
+            0.0,
+            (2048.0, 32_768.0),
+        );
+
+        assert_eq!(score.decode_block, 4.0);
+        assert_eq!(score.logit, 0.0);
     }
 
     #[test]

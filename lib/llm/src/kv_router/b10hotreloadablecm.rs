@@ -49,7 +49,9 @@ fn is_warning_disabled() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct B10RoutingConfigOverride {
     router_temperature: Option<f64>,
+    #[serde(alias = "router_prefill_block_weight")]
     router_overlap_score_weight: Option<f64>,
+    router_decode_block_weight: Option<f64>,
     router_prefill_token_discount: Option<f64>,
     router_decode_token_discount: Option<f64>,
     router_active_request_weight: Option<f64>,
@@ -71,8 +73,19 @@ pub struct B10RoutingConfig {
     #[serde(default = "default_router_temperature")]
     pub router_temperature: f64,
 
-    #[serde(default = "default_router_overlap_score_weight")]
+    #[serde(
+        default = "default_router_overlap_score_weight",
+        alias = "router_prefill_block_weight"
+    )]
     pub router_overlap_score_weight: f64,
+
+    /// Multiplier applied to the decode-block term of the routing logit.
+    /// Mirrors `router_overlap_score_weight` (the prefill-block multiplier) so
+    /// the prefill and decode contributions to the logit can be scaled
+    /// independently. Default 1.0 preserves the prior behavior of adding the
+    /// raw decode-block count.
+    #[serde(default = "default_router_decode_block_weight")]
+    pub router_decode_block_weight: f64,
 
     #[serde(default = "default_router_prefill_token_discount")]
     pub router_prefill_token_discount: f64,
@@ -122,6 +135,9 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_overlap_score_weight {
             self.router_overlap_score_weight = value;
         }
+        if let Some(value) = overrides.router_decode_block_weight {
+            self.router_decode_block_weight = value;
+        }
         if let Some(value) = overrides.router_prefill_token_discount {
             self.router_prefill_token_discount = value;
         }
@@ -166,6 +182,7 @@ impl Default for B10RoutingConfig {
         Self {
             router_temperature: default_router_temperature(),
             router_overlap_score_weight: default_router_overlap_score_weight(),
+            router_decode_block_weight: default_router_decode_block_weight(),
             router_prefill_token_discount: default_router_prefill_token_discount(),
             router_decode_token_discount: default_router_decode_token_discount(),
             router_active_request_weight: default_router_active_request_weight(),
@@ -195,6 +212,13 @@ fn default_router_overlap_score_weight() -> f64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3.5)
+}
+
+fn default_router_decode_block_weight() -> f64 {
+    std::env::var("B10_KV_ROUTER_DECODE_BLOCK_WEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0)
 }
 
 fn default_router_prefill_token_discount() -> f64 {
@@ -627,6 +651,11 @@ pub fn get_router_overlap_score_weight() -> f64 {
     get_config().get().routing.router_overlap_score_weight
 }
 
+/// Convenience function to get router decode block weight
+pub fn get_router_decode_block_weight() -> f64 {
+    get_config().get().routing.router_decode_block_weight
+}
+
 /// Convenience function to get router active request weight
 pub fn get_active_request_weight() -> f64 {
     get_config().get().routing.router_active_request_weight
@@ -694,6 +723,7 @@ mod tests {
 
         assert_eq!(unified_config.routing.router_temperature, 0.01);
         assert_eq!(unified_config.routing.router_overlap_score_weight, 3.5);
+        assert_eq!(unified_config.routing.router_decode_block_weight, 1.0);
         assert_eq!(unified_config.routing.router_prefill_token_discount, 0.35);
         assert_eq!(unified_config.routing.router_decode_token_discount, 0.8);
         assert_eq!(
@@ -762,6 +792,71 @@ override_args:
         assert_eq!(config.runtime.compute_data_parallel_size(), Some(8)); // Because enable_attention_dp=true returns tensor_parallel_size
 
         // Cleanup
+        unsafe {
+            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_prefill_block_weight_alias_populates_overlap_score_weight() {
+        use std::io::Write;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_prefill_block_weight: 5.5
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        unsafe {
+            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
+        }
+
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        // The alias populates the same field as router_overlap_score_weight.
+        assert_eq!(config.routing.router_overlap_score_weight, 5.5);
+    }
+
+    #[test]
+    #[serial]
+    fn test_decode_block_weight_default_and_override() {
+        use std::io::Write;
+
+        // Default is 1.0 (preserves prior behavior).
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_temperature: 0.01
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+        unsafe {
+            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
+        }
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+        assert_eq!(config.routing.router_decode_block_weight, 1.0);
+
+        // Override group applies the decode weight.
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_decode_block_weight: 0.5
+
+override_args:
+  test_group:
+    b10_routing_config:
+      router_decode_block_weight: 2.0
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+        unsafe {
+            std::env::set_var("ENGINE_ARGS_OVERRIDE_GROUP", "test_group");
+        }
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+        assert_eq!(config.routing.router_decode_block_weight, 2.0);
         unsafe {
             std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
         }

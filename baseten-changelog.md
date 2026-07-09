@@ -1360,6 +1360,14 @@ present in the target. The broader context reason/log-level churn remains
 unported unless a current false alarm or missing operational signal is proven.
 Low priority: keep/extend startup logging so runtime defaults used are visible (discovery backend, event plane, request plane).
 
+v1.2 follow-up: the per-request `request received` / `request completed`
+events in `lib/runtime/src/pipeline/network/ingress/push_handler.rs`
+(inline at `handle_payload` admission and the `RequestMetricsGuard::drop`
+impl) were downgraded from `info!` to `debug!`. They fired on every request
+and masked more useful INFO-level signal in production logs. Request
+correlation is preserved through the existing `request_id` field and
+metrics; only the standalone lifecycle events moved to debug.
+
 
 Replay notes:
 
