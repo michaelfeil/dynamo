@@ -608,6 +608,12 @@ already contains the v1.2 scheduler shape and Baseten selector parity work, so
 the replay should preserve that shape and add only the request fields and
 admission behavior described below.
 
+The `KvEventPublisher.local_indexer_endpoint` exposure is only a local replay
+of upstream ai-dynamo/dynamo#11498, which gives Python shutdown hooks access to
+worker-local KV query endpoints so they can deregister before runtime teardown.
+If the target base already contains that upstream PR, or an equivalent endpoint
+exposure, this Baseten-side patch does not need separate consideration.
+
 - `SchedulingRequest` carries an `active_requests` snapshot populated at
   admission before invoking the selector. This intentionally matches the v1.0
   cost model, where active requests were counted by scanning the active
