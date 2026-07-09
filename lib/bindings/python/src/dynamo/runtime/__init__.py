@@ -18,9 +18,13 @@ from dynamo._core import Client as Client
 from dynamo._core import Context as Context
 from dynamo._core import DistributedRuntime as DistributedRuntime
 from dynamo._core import Endpoint as Endpoint
+from dynamo._core import unregister_model as unregister_model
 
 logger = logging.getLogger(__name__)
 B10_SHUTDOWN_INITIATED = threading.Event()
+ENDPOINT_SHUTDOWN_DRAIN_SECS = 5
+_ENDPOINTS_TO_SHUTDOWN: list[Endpoint] = []
+_SHUTDOWN_TASK: Optional[asyncio.Task] = None
 
 
 def _b10_shutdown_handler(runtime: DistributedRuntime):
@@ -28,9 +32,50 @@ def _b10_shutdown_handler(runtime: DistributedRuntime):
         "Shutdown signal received, initiating graceful shutdown...",
         extra={"unified_model_logs": True},
     )
+    if B10_SHUTDOWN_INITIATED.is_set():
+        return
+
     B10_SHUTDOWN_INITIATED.set()
-    shutdown = getattr(runtime, "initiate_shutdown", runtime.shutdown)
-    shutdown()
+
+    if not _ENDPOINTS_TO_SHUTDOWN:
+        runtime.shutdown()
+        return
+
+    global _SHUTDOWN_TASK
+    loop = asyncio.get_running_loop()
+    _SHUTDOWN_TASK = loop.create_task(_shutdown_registered_endpoints(runtime))
+
+
+async def _shutdown_registered_endpoints(runtime: DistributedRuntime):
+    try:
+        endpoints = list(_ENDPOINTS_TO_SHUTDOWN)
+        for endpoint in endpoints:
+            try:
+                await unregister_model(endpoint)
+            except Exception:
+                logger.exception("Failed to unregister model during shutdown")
+
+            try:
+                await endpoint.unregister_endpoint_instance()
+            except Exception:
+                logger.exception("Failed to unregister endpoint during shutdown")
+
+        await asyncio.sleep(ENDPOINT_SHUTDOWN_DRAIN_SECS)
+    finally:
+        runtime.shutdown()
+
+
+def register_endpoint_for_shutdown(endpoint: Endpoint):
+    if not any(registered is endpoint for registered in _ENDPOINTS_TO_SHUTDOWN):
+        _ENDPOINTS_TO_SHUTDOWN.append(endpoint)
+
+
+def unregister_endpoint_for_shutdown(endpoint: Endpoint):
+    _ENDPOINTS_TO_SHUTDOWN[:] = [
+        registered
+        for registered in _ENDPOINTS_TO_SHUTDOWN
+        if registered is not endpoint
+    ]
 
 
 def b10_register_shutdown_signals(runtime: DistributedRuntime):
