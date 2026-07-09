@@ -224,6 +224,11 @@ pub(super) enum RouteSource {
     ProtocolError { received: String },
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct RouteRequestTimings {
+    pub(super) stream_connect_duration: Duration,
+}
+
 pub(super) struct RouterStreamResponse {
     data: serde_json::Value,
     pub(super) response: RsRouterResponse,
@@ -295,7 +300,7 @@ pub(super) async fn route_request(
     notify_timeout: Duration,
     tracing_enabled: bool,
     allow_cancel_routing: bool,
-) -> Result<(RouterRequestGuard, RouteSource)> {
+) -> Result<(RouterRequestGuard, RouteSource, RouteRequestTimings)> {
     if let Some((response, name)) =
         min_replica_available_backpressure(&require_min1_replica_available)?
     {
@@ -314,7 +319,11 @@ pub(super) async fn route_request(
             false,
             notify_timeout,
         );
-        return Ok((guard, RouteSource::RequiredDown { name }));
+        return Ok((
+            guard,
+            RouteSource::RequiredDown { name },
+            RouteRequestTimings::default(),
+        ));
     }
 
     let instance_ids = available_router_instance_ids(router.as_ref());
@@ -335,7 +344,11 @@ pub(super) async fn route_request(
             false,
             notify_timeout,
         );
-        return Ok((guard, RouteSource::RouterBackpressure));
+        return Ok((
+            guard,
+            RouteSource::RouterBackpressure,
+            RouteRequestTimings::default(),
+        ));
     }
 
     let mut last_error = None;
@@ -411,7 +424,7 @@ pub(super) async fn route_request(
                             "route_request router stream opened"
                         );
                     }
-                    stream
+                    (stream, elapsed)
                 }
                 Err(err) => {
                     let elapsed = stream_open_started.elapsed();
@@ -434,6 +447,7 @@ pub(super) async fn route_request(
                     continue;
                 }
             };
+            let (stream, stream_connect_duration) = stream;
 
             // Stage 2: read the first stream item. The router has now
             // admitted the request internally, so an `Err` here (stream
@@ -529,7 +543,13 @@ pub(super) async fn route_request(
                         false,
                         notify_timeout,
                     );
-                    return Ok((guard, RouteSource::RouterBackpressure));
+                    return Ok((
+                        guard,
+                        RouteSource::RouterBackpressure,
+                        RouteRequestTimings {
+                            stream_connect_duration,
+                        },
+                    ));
                 }
             };
             abort_cancellation_forwarder(&mut cancellation_forwarder);
@@ -583,7 +603,13 @@ pub(super) async fn route_request(
                         continue;
                     }
                 };
-                return Ok((placeholder, RouteSource::ProtocolError { received }));
+                return Ok((
+                    placeholder,
+                    RouteSource::ProtocolError { received },
+                    RouteRequestTimings {
+                        stream_connect_duration,
+                    },
+                ));
             }
 
             let RouterStreamResponse { data, response } = router_response;
@@ -613,7 +639,13 @@ pub(super) async fn route_request(
                 None => RouteSource::RouterBackpressure,
             };
             let guard = provisional_guard.commit(data, response, armed);
-            return Ok((guard, source));
+            return Ok((
+                guard,
+                source,
+                RouteRequestTimings {
+                    stream_connect_duration,
+                },
+            ));
         }
     }
 
@@ -1133,6 +1165,7 @@ enum RouteOnceOutcome {
     Route {
         guard: RouterRequestGuard,
         worker_id: u64,
+        timings: RouteRequestTimings,
     },
     Denied(DeniedRequest),
 }
@@ -1276,7 +1309,7 @@ async fn route_once(
     .await;
 
     match route_res {
-        Ok((guard, source)) => {
+        Ok((guard, source, timings)) => {
             if let Some(denied) =
                 cancellation_denial_for_optional_context(&context, allow_cancel_routing)
             {
@@ -1306,7 +1339,11 @@ async fn route_once(
                             name,
                         });
                     }
-                    RouteOnceOutcome::Route { guard, worker_id }
+                    RouteOnceOutcome::Route {
+                        guard,
+                        worker_id,
+                        timings,
+                    }
                 }
                 RouteSource::RouterBackpressure => {
                     let (reason, queued_isl_tokens, max_queued_isl_tokens) = guard
@@ -1366,10 +1403,18 @@ enum OpenResult {
         guard: RouterRequestGuard,
         worker_id: u64,
         stream: EngineStream<RsAnnotated<serde_json::Value>>,
+        timings: WorkerConnectTimings,
     },
     Stale,
     Denied(DeniedRequest),
     Other(anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkerConnectTimings {
+    stream_connect_duration: Duration,
+    first_response_duration: Option<Duration>,
+    sentinel_event_duration: Option<Duration>,
 }
 
 async fn wait_for_first_worker_event(
@@ -1465,13 +1510,20 @@ async fn connect_worker(
     let open_fut = async move {
         let worker_request_ctx =
             create_worker_request_context(worker_request, &open_ctx, allow_cancel_setup);
+        let stream_connect_started = Instant::now();
         let stream_result = wgc
             .direct(worker_request_ctx, worker_id)
             .instrument(span)
             .await;
+        let mut timings = WorkerConnectTimings {
+            stream_connect_duration: stream_connect_started.elapsed(),
+            first_response_duration: None,
+            sentinel_event_duration: None,
+        };
         match stream_result {
             Ok(mut stream) => {
                 if wait_for_first_response {
+                    let first_response_started = Instant::now();
                     let first = match wait_for_first_worker_event(&mut stream, worker_id).await {
                         Ok(first) => first,
                         Err(err) => {
@@ -1486,13 +1538,16 @@ async fn connect_worker(
                             });
                         }
                     };
+                    let first_event_duration = first_response_started.elapsed();
 
                     if should_drop_first_worker_event(&first) {
+                        timings.sentinel_event_duration = Some(first_event_duration);
                         tracing::debug!(
                             worker_id,
                             "connect_worker: swallowed first worker stream sentinel"
                         );
                     } else {
+                        timings.first_response_duration = Some(first_event_duration);
                         stream = prepend_first_worker_event(first, stream);
                     }
                 }
@@ -1500,6 +1555,7 @@ async fn connect_worker(
                     guard,
                     worker_id,
                     stream,
+                    timings,
                 }
             }
             Err(err) => {
@@ -1548,6 +1604,7 @@ async fn connect_worker(
 /// Outcome of the `route_and_connect` loop: either the worker stream opened
 /// (ready to hand back as an `AdmittedRequest`) or a denial. A non-stale open
 /// failure propagates as `Err` from the loop and is raised by the caller.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum RouteAndConnectOutcome {
     Connected {
         guard: RouterRequestGuard,
@@ -1645,6 +1702,7 @@ pub(super) async fn route_and_connect(
     wait_for_first_response: bool,
     notify_timeout: Duration,
     tracing_enabled: bool,
+    phase: Option<String>,
 ) -> Result<RouteAndConnectOutcome> {
     let started = Instant::now();
     let mut attempt: u64 = 0;
@@ -1669,11 +1727,15 @@ pub(super) async fn route_and_connect(
         .await;
         let routing_new_returned_at = Instant::now();
 
-        let (guard, worker_id) = match route_outcome {
+        let (guard, worker_id, route_timings) = match route_outcome {
             RouteOnceOutcome::Denied(denied) => {
                 return Ok(RouteAndConnectOutcome::Denied(denied));
             }
-            RouteOnceOutcome::Route { guard, worker_id } => (guard, worker_id),
+            RouteOnceOutcome::Route {
+                guard,
+                worker_id,
+                timings,
+            } => (guard, worker_id, timings),
         };
 
         // Inject the per-route `RouterResponse::New` into a fresh worker-args
@@ -1706,6 +1768,7 @@ pub(super) async fn route_and_connect(
                 guard,
                 worker_id,
                 stream,
+                timings: connect_timings,
             } => {
                 if let Some(denied) = cancellation_denial_for_context(&context, allow_cancel_setup)
                 {
@@ -1724,6 +1787,10 @@ pub(super) async fn route_and_connect(
                 let estimated_overlap_tokens = guard.estimated_overlap_tokens(block_size);
                 let timings = AdmittedRequestTimings {
                     routing_new_duration: routing_new_returned_at.duration_since(started),
+                    routing_stream_connect_duration: route_timings.stream_connect_duration,
+                    worker_stream_connect_duration: connect_timings.stream_connect_duration,
+                    worker_first_response_duration: connect_timings.first_response_duration,
+                    worker_sentinel_event_duration: connect_timings.sentinel_event_duration,
                     worker_connect_duration: worker_connected_at
                         .duration_since(routing_new_returned_at),
                     stale_reroutes: attempt,
@@ -1731,9 +1798,18 @@ pub(super) async fn route_and_connect(
                 tracing::info!(
                     request_id = %request_id,
                     worker_id,
+                    phase = phase.as_deref().unwrap_or("unknown"),
                     stale_reroutes = attempt,
-                    routing_new_duration_ms = duration_ms_for_log(timings.routing_new_duration),
-                    worker_connect_duration_ms = duration_ms_for_log(timings.worker_connect_duration),
+                    routing_new_ms = duration_ms_for_log(timings.routing_new_duration),
+                    routing_connect_ms = duration_ms_for_log(timings.routing_stream_connect_duration),
+                    worker_connect_ms = duration_ms_for_log(timings.worker_stream_connect_duration),
+                    worker_first_ms = timings
+                        .worker_first_response_duration
+                        .map(duration_ms_for_log),
+                    worker_sentinel_ms = timings
+                        .worker_sentinel_event_duration
+                        .map(duration_ms_for_log),
+                    worker_setup_ms = duration_ms_for_log(timings.worker_connect_duration),
                     estimated_overlap_tokens,
                     unified_logs = true,
                     "route_and_connect admitted"

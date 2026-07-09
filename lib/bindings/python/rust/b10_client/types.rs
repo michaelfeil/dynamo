@@ -265,6 +265,10 @@ pub(super) struct PreflightInputs {
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct AdmittedRequestTimings {
     pub(super) routing_new_duration: Duration,
+    pub(super) routing_stream_connect_duration: Duration,
+    pub(super) worker_stream_connect_duration: Duration,
+    pub(super) worker_first_response_duration: Option<Duration>,
+    pub(super) worker_sentinel_event_duration: Option<Duration>,
     pub(super) worker_connect_duration: Duration,
     pub(super) stale_reroutes: u64,
 }
@@ -457,11 +461,41 @@ impl AdmittedRequest {
         self.timings.routing_new_duration.as_secs_f64()
     }
 
-    /// Seconds from the successful KV-router `new` response to worker stream
-    /// connection. If `wait_for_first_response` was enabled, this includes
-    /// waiting for the first worker stream event.
+    /// Seconds spent opening the KV-router stream, excluding the first router
+    /// response wait.
+    fn routing_stream_connect_duration_seconds(&self) -> f64 {
+        self.timings.routing_stream_connect_duration.as_secs_f64()
+    }
+
+    /// Seconds from the successful KV-router `new` response to completed worker
+    /// setup. If `wait_for_first_response` was enabled, this includes waiting
+    /// for the first worker stream event.
     fn worker_connect_duration_seconds(&self) -> f64 {
         self.timings.worker_connect_duration.as_secs_f64()
+    }
+
+    /// Seconds spent opening the worker stream, excluding any optional first
+    /// worker stream event wait.
+    fn worker_stream_connect_duration_seconds(&self) -> f64 {
+        self.timings.worker_stream_connect_duration.as_secs_f64()
+    }
+
+    /// Seconds spent waiting for a non-sentinel first worker stream event during
+    /// setup. `None` means `wait_for_first_response` was disabled or the first
+    /// event was a drop-message sentinel.
+    fn worker_first_response_duration_seconds(&self) -> Option<f64> {
+        self.timings
+            .worker_first_response_duration
+            .map(|duration| duration.as_secs_f64())
+    }
+
+    /// Seconds spent waiting for a drop-message sentinel as the first worker
+    /// stream event during setup.
+    /// `None` means `wait_for_first_response` was disabled.
+    fn worker_sentinel_event_duration_seconds(&self) -> Option<f64> {
+        self.timings
+            .worker_sentinel_event_duration
+            .map(|duration| duration.as_secs_f64())
     }
 
     /// Number of stale-route reroutes before this request was admitted. `0`

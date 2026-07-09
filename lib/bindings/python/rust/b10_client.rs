@@ -207,7 +207,7 @@ impl RouterWorkerCoordinator {
     /// KV-lifecycle callbacks to the router. A non-stale worker-open failure (or a
     /// non-object `worker_args`) IS raised, not returned as a `DeniedRequest`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, wait_for_first_response=false, mark_prefill_on_response=false))]
+    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, wait_for_first_response=false, mark_prefill_on_response=false, phase=None))]
     fn route_and_worker<'p>(
         &self,
         py: Python<'p>,
@@ -222,6 +222,7 @@ impl RouterWorkerCoordinator {
         tracing_enabled: bool,
         wait_for_first_response: bool,
         mark_prefill_on_response: bool,
+        phase: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let annotated = annotated.unwrap_or(false);
         let allow_cancel_routing = cancellation.allow_cancel_routing();
@@ -383,6 +384,7 @@ impl RouterWorkerCoordinator {
                 wait_for_first_response,
                 ROUTER_GUARD_NOTIFY_TIMEOUT,
                 tracing_enabled,
+                phase,
             );
             let outcome = if allow_cancel_routing {
                 loop_fut.await.map_err(to_pyerr)?

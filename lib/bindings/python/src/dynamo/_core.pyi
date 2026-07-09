@@ -468,6 +468,7 @@ class RouterWorkerCoordinator:
             tracing_enabled: bool = False,
             wait_for_first_response: bool = False,
             mark_prefill_on_response: bool = False,
+            phase: str | None = None,
         ) -> AdmittedRequest | DeniedRequest:
         """
         Route a KV-router ``new`` request, then generate on the routed worker.
@@ -521,6 +522,9 @@ class RouterWorkerCoordinator:
         produces its first non-error, non-sentinel data item. Manual Python
         ``mark_prefill()`` calls remain supported; this just makes that call
         optional without waiting for Python to consume the stream.
+        ``phase`` is an optional caller-provided label included in admitted
+        route/connect logs. It is appended to the signature for backwards
+        compatibility with existing positional callers.
 
         ``cancellation`` (a :class:`CancellationPolicy`, default
         ``CancellationPolicy.Cancellable``) selects which of three phases — the
@@ -560,8 +564,13 @@ class RouterWorkerCoordinator:
         cached-token overlap for the chosen worker, route/connect timing methods
         report seconds for metrics, ``stale_reroutes()`` reports retry count, and
         ``mark_prefill()`` / ``mark_free()`` drive the KV-lifecycle callbacks.
-        When ``mark_prefill_on_response`` is enabled, the prefill mark is also
-        handled automatically on the first real worker-stream item.
+        ``worker_connect_duration_seconds()`` reports total worker setup time;
+        ``worker_stream_connect_duration_seconds()`` excludes the optional
+        first-response wait, which is reported separately by
+        ``worker_first_response_duration_seconds()`` or
+        ``worker_sentinel_event_duration_seconds()``. When
+        ``mark_prefill_on_response`` is enabled, the prefill mark is also handled
+        automatically on the first real worker-stream item.
         """
         ...
 
@@ -590,10 +599,40 @@ class AdmittedRequest:
         """
         ...
 
+    def routing_stream_connect_duration_seconds(self) -> float:
+        """
+        Seconds spent opening the KV-router stream, excluding the first router
+        response wait.
+        """
+        ...
+
     def worker_connect_duration_seconds(self) -> float:
         """
-        Seconds from the successful KV-router ``new`` response to worker stream
-        connection. Includes first-worker-event wait when enabled.
+        Seconds from the successful KV-router ``new`` response to completed
+        worker setup. Includes first-worker-event wait when enabled.
+        """
+        ...
+
+    def worker_stream_connect_duration_seconds(self) -> float:
+        """
+        Seconds spent opening the worker stream, excluding any optional
+        first-worker-event wait.
+        """
+        ...
+
+    def worker_first_response_duration_seconds(self) -> float | None:
+        """
+        Seconds spent waiting for a non-sentinel first worker stream event during
+        setup. ``None`` means ``wait_for_first_response`` was disabled or the
+        first event was a drop-message sentinel.
+        """
+        ...
+
+    def worker_sentinel_event_duration_seconds(self) -> float | None:
+        """
+        Seconds spent waiting for a drop-message sentinel as the first worker
+        stream event during setup. ``None`` means ``wait_for_first_response`` was
+        disabled or the first event was not a sentinel.
         """
         ...
 

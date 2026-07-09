@@ -5,7 +5,8 @@ use super::coordinator::{
 use super::guard::{ROUTER_GUARD_CLEANUP_GRACE_PERIOD, RouterRequestGuard};
 use super::stream_with_optional_prefill_mark;
 use super::types::{
-    DeniedRequest, MinReplicaAvailable, PotentialLoadsCheckData, PreflightInputs, RouterRequestNew,
+    AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, PotentialLoadsCheckData,
+    PreflightInputs, RouterRequestNew,
 };
 use crate::context;
 use anyhow::Result;
@@ -409,6 +410,7 @@ async fn route(
         true,
     )
     .await
+    .map(|(guard, source, _timings)| (guard, source))
     .unwrap()
 }
 
@@ -758,6 +760,7 @@ async fn connect(
         false,
         notify_timeout,
         false,
+        None,
     )
     .await
 }
@@ -827,6 +830,17 @@ async fn take_one_from_stream(
     stream: &mut EngineStream<RsAnnotated<serde_json::Value>>,
 ) -> Option<RsAnnotated<serde_json::Value>> {
     stream.as_mut().next().await
+}
+
+fn assert_connected_timing_splits(timings: &AdmittedRequestTimings) {
+    assert!(
+        timings.routing_stream_connect_duration <= timings.routing_new_duration,
+        "routing stream connect should be a subspan of routing new: {timings:?}"
+    );
+    assert!(
+        timings.worker_stream_connect_duration <= timings.worker_connect_duration,
+        "worker stream connect should be a subspan of worker setup: {timings:?}"
+    );
 }
 
 // ----- end-to-end `route_and_connect` scenarios -----
@@ -903,21 +917,31 @@ async fn route_and_connect_wait_for_first_response_omits_sentinel() {
         true,
         Duration::from_secs(60),
         false,
+        None,
     )
     .await
     .expect("connect");
 
-    let (guard, worker_id, mut stream) = match outcome {
+    let (guard, worker_id, mut stream, timings) = match outcome {
         RouteAndConnectOutcome::Connected {
             guard,
             worker_id,
             stream,
-            ..
-        } => (guard, worker_id, stream),
+            timings,
+        } => (guard, worker_id, stream, timings),
         other => panic!("expected Connected, got {:?}", other),
     };
 
     assert_eq!(worker_id, 1);
+    assert_connected_timing_splits(&timings);
+    assert!(
+        timings.worker_first_response_duration.is_none(),
+        "sentinel first event should not record first-response timing: {timings:?}"
+    );
+    assert!(
+        timings.worker_sentinel_event_duration.is_some(),
+        "sentinel first event should record sentinel timing: {timings:?}"
+    );
     assert_eq!(
         worker.stream_items_polled_count(),
         1,
@@ -966,21 +990,31 @@ async fn route_and_connect_wait_for_first_response_replays_non_sentinel_item() {
         true,
         Duration::from_secs(60),
         false,
+        None,
     )
     .await
     .expect("connect");
 
-    let (guard, worker_id, mut stream) = match outcome {
+    let (guard, worker_id, mut stream, timings) = match outcome {
         RouteAndConnectOutcome::Connected {
             guard,
             worker_id,
             stream,
-            ..
-        } => (guard, worker_id, stream),
+            timings,
+        } => (guard, worker_id, stream, timings),
         other => panic!("expected Connected, got {:?}", other),
     };
 
     assert_eq!(worker_id, 1);
+    assert_connected_timing_splits(&timings);
+    assert!(
+        timings.worker_first_response_duration.is_some(),
+        "non-sentinel first event should record first-response timing: {timings:?}"
+    );
+    assert!(
+        timings.worker_sentinel_event_duration.is_none(),
+        "non-sentinel first event should not record sentinel timing: {timings:?}"
+    );
     assert_eq!(
         worker.stream_items_polled_count(),
         1,
@@ -1086,20 +1120,30 @@ async fn route_and_connect_wait_for_first_response_uses_sentinel_behavior() {
         true,
         Duration::from_secs(60),
         false,
+        None,
     )
     .await
     .expect("connect");
 
-    let (guard, _worker_id, mut stream) = match outcome {
+    let (guard, _worker_id, mut stream, timings) = match outcome {
         RouteAndConnectOutcome::Connected {
             guard,
             worker_id,
             stream,
-            ..
-        } => (guard, worker_id, stream),
+            timings,
+        } => (guard, worker_id, stream, timings),
         other => panic!("expected Connected, got {:?}", other),
     };
 
+    assert_connected_timing_splits(&timings);
+    assert!(
+        timings.worker_first_response_duration.is_none(),
+        "sentinel first event should not record first-response timing: {timings:?}"
+    );
+    assert!(
+        timings.worker_sentinel_event_duration.is_some(),
+        "sentinel first event should record sentinel timing: {timings:?}"
+    );
     assert_eq!(
         worker.stream_items_polled_count(),
         1,
@@ -1139,6 +1183,7 @@ async fn route_and_connect_wait_for_first_response_failure_returns_denied() {
         true,
         Duration::from_secs(60),
         false,
+        None,
     )
     .await
     .expect("first event failure should be a denial, not a raised error");
@@ -1636,7 +1681,7 @@ async fn route_request_parent_kill_kills_detached_route_context_when_cancellable
         .kill_with_reason(Some("test_parent_context_killed"));
     wait_for_context_killed(route_contexts[0].clone(), Duration::from_secs(1)).await;
 
-    let (guard, source) = route_task
+    let (guard, source, _timings) = route_task
         .await
         .expect("route task should not panic")
         .expect("fake route still returns its scripted response");
@@ -1650,7 +1695,7 @@ async fn route_request_success_aborts_parent_cancellation_forwarder() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let context = build_test_context("test-route-forwarder-abort");
 
-    let (guard, source) = route_request(
+    let (guard, source, _timings) = route_request(
         router.clone(),
         make_routing_request(),
         "req-route-forwarder-abort".to_string(),
@@ -2727,6 +2772,7 @@ async fn shield_route_and_connect_no_taker_drains_connected_worker_stream() {
         false,
         Duration::from_secs(60),
         false,
+        None,
     );
     let task = tokio::spawn(async move { shield_route_and_connect(route_fut).await });
 
