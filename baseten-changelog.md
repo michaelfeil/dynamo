@@ -611,8 +611,9 @@ admission behavior described below.
 The `KvEventPublisher.local_indexer_endpoint` exposure is only a local replay
 of upstream ai-dynamo/dynamo#11498, which gives Python shutdown hooks access to
 worker-local KV query endpoints so they can deregister before runtime teardown.
-If the target base already contains that upstream PR, or an equivalent endpoint
-exposure, this Baseten-side patch does not need separate consideration.
+If the target base already contains that upstream PR, register the exposed
+worker-local KV query endpoints with `phase="early"` instead of carrying a
+separate endpoint-exposure patch.
 
 - `SchedulingRequest` carries an `active_requests` snapshot populated at
   admission before invoking the selector. This intentionally matches the v1.0

@@ -19,7 +19,8 @@ pytestmark = [
 
 def test_b10_shutdown_handler_without_endpoint_shutdowns_immediately():
     runtime_mod.B10_SHUTDOWN_INITIATED.clear()
-    runtime_mod._ENDPOINTS_TO_SHUTDOWN.clear()
+    runtime_mod._ENDPOINTS_TO_SHUTDOWN["early"].clear()
+    runtime_mod._ENDPOINTS_TO_SHUTDOWN["default"].clear()
     runtime = MagicMock()
 
     runtime_mod._b10_shutdown_handler(runtime)
@@ -28,19 +29,21 @@ def test_b10_shutdown_handler_without_endpoint_shutdowns_immediately():
 
 
 def test_register_endpoint_for_shutdown_dedupes_by_identity():
-    runtime_mod._ENDPOINTS_TO_SHUTDOWN.clear()
+    runtime_mod._ENDPOINTS_TO_SHUTDOWN["early"].clear()
+    runtime_mod._ENDPOINTS_TO_SHUTDOWN["default"].clear()
     endpoint = MagicMock()
 
     register_endpoint_for_shutdown(endpoint)
     register_endpoint_for_shutdown(endpoint)
 
-    assert runtime_mod._ENDPOINTS_TO_SHUTDOWN == [endpoint]
+    assert runtime_mod._ENDPOINTS_TO_SHUTDOWN["default"] == [endpoint]
 
 
 def test_b10_shutdown_handler_unregisters_endpoint_before_runtime_shutdown(monkeypatch):
     async def run_test():
         runtime_mod.B10_SHUTDOWN_INITIATED.clear()
-        runtime_mod._ENDPOINTS_TO_SHUTDOWN.clear()
+        runtime_mod._ENDPOINTS_TO_SHUTDOWN["early"].clear()
+        runtime_mod._ENDPOINTS_TO_SHUTDOWN["default"].clear()
         monkeypatch.setattr(runtime_mod, "ENDPOINT_SHUTDOWN_DRAIN_SECS", 0)
 
         events = []

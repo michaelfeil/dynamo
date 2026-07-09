@@ -8,7 +8,7 @@ import signal
 import threading
 import warnings
 from functools import wraps
-from typing import Any, AsyncGenerator, Callable, Optional, Type, Union
+from typing import Any, AsyncGenerator, Callable, Literal, Optional, Type, Union
 
 from pydantic import BaseModel, ValidationError
 
@@ -22,9 +22,14 @@ from dynamo._core import unregister_model as unregister_model
 
 logger = logging.getLogger(__name__)
 B10_SHUTDOWN_INITIATED = threading.Event()
+ENDPOINT_PHASE_SHUTDOWN_DRAIN_SECS = 1
 ENDPOINT_SHUTDOWN_DRAIN_SECS = 5
-_ENDPOINTS_TO_SHUTDOWN: list[Endpoint] = []
 _SHUTDOWN_TASK: Optional[asyncio.Task] = None
+ShutdownPhase = Literal["early", "default"]
+_ENDPOINTS_TO_SHUTDOWN: dict[ShutdownPhase, list[Endpoint]] = {
+    "early": [],
+    "default": [],
+}
 
 
 def _b10_shutdown_handler(runtime: DistributedRuntime):
@@ -37,7 +42,7 @@ def _b10_shutdown_handler(runtime: DistributedRuntime):
 
     B10_SHUTDOWN_INITIATED.set()
 
-    if not _ENDPOINTS_TO_SHUTDOWN:
+    if not any(_ENDPOINTS_TO_SHUTDOWN.values()):
         runtime.shutdown()
         return
 
@@ -48,34 +53,50 @@ def _b10_shutdown_handler(runtime: DistributedRuntime):
 
 async def _shutdown_registered_endpoints(runtime: DistributedRuntime):
     try:
-        endpoints = list(_ENDPOINTS_TO_SHUTDOWN)
-        for endpoint in endpoints:
-            try:
-                await unregister_model(endpoint)
-            except Exception:
-                logger.exception("Failed to unregister model during shutdown")
+        early_endpoints = list(_ENDPOINTS_TO_SHUTDOWN["early"])
+        default_endpoints = list(_ENDPOINTS_TO_SHUTDOWN["default"])
 
-            try:
-                await endpoint.unregister_endpoint_instance()
-            except Exception:
-                logger.exception("Failed to unregister endpoint during shutdown")
+        await _shutdown_endpoint_group(early_endpoints)
+        if early_endpoints and default_endpoints:
+            await asyncio.sleep(ENDPOINT_PHASE_SHUTDOWN_DRAIN_SECS)
+        await _shutdown_endpoint_group(default_endpoints)
 
         await asyncio.sleep(ENDPOINT_SHUTDOWN_DRAIN_SECS)
+    except Exception:
+        logger.exception("Failed during endpoint shutdown")
     finally:
-        runtime.shutdown()
+        try:
+            runtime.shutdown()
+        except Exception:
+            logger.exception("Failed to shutdown runtime")
 
 
-def register_endpoint_for_shutdown(endpoint: Endpoint):
-    if not any(registered is endpoint for registered in _ENDPOINTS_TO_SHUTDOWN):
-        _ENDPOINTS_TO_SHUTDOWN.append(endpoint)
+async def _shutdown_endpoint_group(endpoints: list[Endpoint]):
+    for endpoint in endpoints:
+        try:
+            await unregister_model(endpoint)
+        except Exception:
+            logger.exception("Failed to unregister model during shutdown")
+
+        try:
+            await endpoint.unregister_endpoint_instance()
+        except Exception:
+            logger.exception("Failed to unregister endpoint during shutdown")
+
+
+def register_endpoint_for_shutdown(
+    endpoint: Endpoint, phase: ShutdownPhase = "default"
+):
+    registry = _ENDPOINTS_TO_SHUTDOWN[phase]
+    if not any(registered is endpoint for registered in registry):
+        registry.append(endpoint)
 
 
 def unregister_endpoint_for_shutdown(endpoint: Endpoint):
-    _ENDPOINTS_TO_SHUTDOWN[:] = [
-        registered
-        for registered in _ENDPOINTS_TO_SHUTDOWN
-        if registered is not endpoint
-    ]
+    for registry in _ENDPOINTS_TO_SHUTDOWN.values():
+        registry[:] = [
+            registered for registered in registry if registered is not endpoint
+        ]
 
 
 def b10_register_shutdown_signals(runtime: DistributedRuntime):
