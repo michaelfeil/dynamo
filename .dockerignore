@@ -75,3 +75,16 @@ docs/_build/
 # AI
 .cursor/
 .claude/
+
+# Rust test sources/fixtures are not compiled into release wheel builds, so
+# keep them out of the build context: editing a test no longer invalidates the
+# wheel-builder COPY layers (a ~5 min rebuild). Verified safe: no [[test]]
+# targets in any workspace manifest, and the only include_bytes!/include_str!
+# of tests/ paths is inside #[cfg(test)] code. Python tests under components/
+# are NOT excluded (they'd change ai_dynamo wheel contents).
+lib/**/tests
+lib/bench/testdata
+# Example crates not needed by wheel builds. backend-common/examples/mocker
+# (workspace member) and kvbm-kernels examples (explicit [[example]]) stay.
+lib/runtime/examples
+lib/llm/examples

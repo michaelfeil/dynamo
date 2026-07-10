@@ -130,9 +130,18 @@ setup_env() {
     # --mount=type=secret); if they're missing or invalid, we skip sccache
     # entirely so the build continues with normal compilers.
     #
+    # The Dockerfile ENV block sets backend vars unconditionally, so the unused
+    # backend's vars arrive as empty strings — which sccache still treats as
+    # "configured" and then fails to start. Unset whichever backend is blank so
+    # sccache picks the real one (S3 via SCCACHE_BUCKET, WebDAV via
+    # SCCACHE_WEBDAV_ENDPOINT).
+    echo 'if [ -z "${SCCACHE_BUCKET:-}" ]; then unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_KEY_PREFIX; fi;'
+    echo 'if [ -z "${SCCACHE_WEBDAV_ENDPOINT:-}" ]; then unset SCCACHE_WEBDAV_ENDPOINT SCCACHE_WEBDAV_TOKEN; fi;'
+
     # Use a per-step Unix domain socket so concurrent builds on the same
     # buildkit worker don't collide on the default TCP port 4226.
     echo 'export SCCACHE_SERVER_UDS="/tmp/sccache-$(mktemp -u XXXXXX).sock";'
+    echo 'export SCCACHE_ERROR_LOG="/tmp/sccache-server-error.log";'
     echo 'if sccache --start-server; then'
     echo '  export SCCACHE_IDLE_TIMEOUT=0;'
     echo '  export RUSTC_WRAPPER="sccache";'
@@ -153,6 +162,16 @@ setup_env() {
 
     echo 'else'
     echo '  echo "WARNING: sccache server failed to start, building without cache";'
+    # Surface the server's actual failure reason — the client only reports a
+    # generic startup timeout, which is useless for diagnosing bad endpoints
+    # or credentials.
+    echo '  if [ -f "$SCCACHE_ERROR_LOG" ]; then echo "--- sccache server error log:"; tail -5 "$SCCACHE_ERROR_LOG"; fi;'
+    # Take the sccache binary off PATH for this step: Meson auto-detects a
+    # PATH-visible sccache as a compiler launcher ("sccache nvcc") regardless
+    # of the env vars we skip setting, and with no running server every
+    # compile fails its sanity check — turning a degraded cache into a broken
+    # build (seen with NIXL's meson setup).
+    echo '  if [ -L /usr/local/bin/sccache ]; then rm -f /usr/local/bin/sccache; fi;'
     echo 'fi'
 }
 

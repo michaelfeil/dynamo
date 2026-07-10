@@ -1,10 +1,11 @@
 name: BIS Dynamo Image Push
 
 # Dispatchable build+push of the Dynamo runtime image for the bis-deploy
-# service. The caller passes a branch; the workflow checks it out, builds+pushes
-# via the repo's standard `container/build.sh --framework none --push` (cf.
-# post-merge-build.yml) — using build.sh's default version-stamped tag
-# (e.g. baseten/dynamo-test:v1.2.0.dev.<sha>-none) — and publishes that exact
+# service. The caller passes a branch; the workflow checks it out, builds
+# native amd64 + arm64 images via the repo's standard `container/build.sh
+# --framework none --push` (same structure as post-merge-build.yml), stitches
+# them into a multi-arch manifest list under the version-stamped tag
+# (e.g. baseten/dynamo-test:v1.2.0.dev.<sha>-none), and publishes that exact
 # resolved ref as the `image-tag` artifact. The run-name carries `(prefix=…)`
 # so bis-deploy can correlate the dispatched run.
 
@@ -26,7 +27,7 @@ on:
         type: boolean
         default: false
       image-repo:
-        description: "Docker Hub repo to push to and store the registry layer cache under (matches container/build.sh's tag prefix)."
+        description: "Docker Hub repo to push to (matches container/build.sh's tag prefix)."
         type: string
         default: "baseten/dynamo-test"
 
@@ -34,9 +35,46 @@ permissions:
   contents: read
 
 jobs:
-  push:
-    name: Build and push Dynamo image
+  resolve-image-tag:
+    outputs:
+      image_tag: ${{ steps.tags.outputs.image_tag }}
     runs-on: depot-ubuntu-24.04-64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          # Full history so `git rev-parse --short HEAD` picks the same
+          # abbreviation length as build.sh's full checkout in the build jobs.
+          fetch-depth: 0
+          filter: blob:none
+          lfs: 'false'
+      - name: Resolve image tag
+        id: tags
+        run: |
+          # Mirrors build.sh's default version-stamped tag so downstream
+          # consumers see the same scheme as post-merge builds.
+          version_base="$(tr -d '[:space:]' < .version-base)"
+          version_base="${version_base#v}"
+          short_sha="$(git rev-parse --short HEAD)"
+          image_tag="${{ inputs.image-repo }}:v${version_base}.dev.${short_sha}-none"
+          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image tag: ${image_tag}"
+
+  build-and-push:
+    needs: resolve-image-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: depot-ubuntu-24.04-64
+          - arch: arm64
+            platform: linux/arm64
+            runner: depot-ubuntu-24.04-arm-64
+    name: Build and push ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - name: Checkout repository
@@ -53,10 +91,15 @@ jobs:
           # LFS pull removes a large, slow download from every run.
           lfs: 'false'
 
-      - name: Set up Docker Buildx
-        # docker-container driver (vs the default "docker" driver) is required to
-        # export a registry-backed layer cache via --cache-to type=registry.
-        uses: docker/setup-buildx-action@v3
+      - name: Set up Depot builder
+        # Routes docker buildx builds to Depot's remote builders, whose BuildKit
+        # cache (layers AND --mount=type=cache dirs, e.g. cargo target dirs)
+        # persists across runs — replacing the registry-backed layer cache and
+        # its Docker Hub import/export round-trips.
+        uses: depot/use-action@v1
+        with:
+          project: ${{ secrets.DEPOT_DYNAMO_CI_PROJECT_ID }}
+          token: ${{ secrets.DEPOT_DYNAMO_CI_PROJECT_TOKEN }}
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -66,17 +109,12 @@ jobs:
 
       - name: Build and push
         env:
-          # Keep the pushed image a plain single-platform manifest (as the default
-          # "docker" driver produced before we switched to docker-container for cache
-          # export). Without this, buildx adds provenance/SBOM attestations and pushes
-          # an OCI image index — extra work, and a manifest shape the downstream
-          # `COPY --from=<dynamo image>` consumers don't expect.
+          # Keep each per-arch push a plain single-platform manifest so the
+          # imagetools stitch below produces a clean two-entry manifest list
+          # (no provenance/SBOM attestation indexes).
           BUILDX_NO_DEFAULT_ATTESTATIONS: 1
-          # Registry layer cache lives in the same Docker Hub repo we push to (reuses
-          # the DOCKER_* creds above). Override-able via the image-repo input.
-          CACHE_REF: ${{ inputs.image-repo }}:buildcache
-          # sccache (S3) is optional: wired only when these org secrets are visible to
-          # the run, so the workflow still succeeds without them (just slower cold builds).
+          # sccache (S3) fallback: wired only when these org secrets are visible to
+          # the run. The primary path is Depot Cache via the runner-provided token.
           SCCACHE_S3_BUCKET: ${{ secrets.SCCACHE_S3_BUCKET }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -84,21 +122,33 @@ jobs:
         run: |
           set -o pipefail
 
-          # Registry-backed BuildKit cache. mode=max also caches the intermediate
-          # wheel-builder stages (where the Rust + native-lib compiles happen), which
-          # is what lets cold (source-changed) rebuilds reuse every unchanged layer and
-          # warm rebuilds finish near-instantly. image-manifest/oci-mediatypes are
-          # required for Docker Hub to accept the cache manifest.
-          CACHE_ARGS=(
-            --cache-from "type=registry,ref=${CACHE_REF}"
-            --cache-to   "type=registry,ref=${CACHE_REF},mode=max,image-manifest=true,oci-mediatypes=true"
-          )
+          image_tag="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          arch_image_tag="${image_tag}-${{ matrix.arch }}"
 
-          # Rust compilation cache (sccache → S3). Persists compiled objects across
-          # runs and across the runtime/kvbm wheel builds, so changing one core Rust
-          # file no longer forces a full recompile from scratch.
+          # Layer caching is handled by the Depot builder's persistent BuildKit
+          # cache — no --cache-from/--cache-to registry round-trips needed.
+
+          # Rust compilation cache (sccache). Persists compiled objects across runs
+          # and across the runtime/kvbm wheel builds, so changing one core Rust file
+          # no longer forces a full recompile from scratch.
+          #
+          # Preferred backend: Depot Cache via WebDAV. Depot-managed runners inject
+          # SCCACHE_WEBDAV_TOKEN into the environment automatically — no repo
+          # secrets required. S3 remains as a fallback for non-Depot runners with
+          # the org AWS secrets configured.
+          #
+          # Always use the public endpoint, NOT the runner's SCCACHE_WEBDAV_ENDPOINT:
+          # the runner injects a runner-local cache proxy (e.g. http://10.x.x.x:980)
+          # that is unreachable from the remote Depot builders where the build
+          # actually executes. The runner token is valid against the public endpoint.
           SCCACHE_ARGS=()
-          if [ -n "${SCCACHE_S3_BUCKET}" ] && [ -n "${AWS_ACCESS_KEY_ID}" ]; then
+          if [ -n "${SCCACHE_WEBDAV_TOKEN:-}" ]; then
+            echo "sccache: ENABLED (webdav endpoint=https://cache.depot.dev)"
+            SCCACHE_ARGS=(
+              --use-sccache
+              --sccache-webdav-endpoint "https://cache.depot.dev"
+            )
+          elif [ -n "${SCCACHE_S3_BUCKET}" ] && [ -n "${AWS_ACCESS_KEY_ID}" ]; then
             echo "sccache: ENABLED (bucket=${SCCACHE_S3_BUCKET}, region=${AWS_DEFAULT_REGION:-us-east-1})"
             SCCACHE_ARGS=(
               --use-sccache
@@ -106,25 +156,77 @@ jobs:
               --sccache-region "${AWS_DEFAULT_REGION:-us-east-1}"
             )
           else
-            echo "sccache: DISABLED (SCCACHE_S3_BUCKET / AWS credentials not available to this run)"
+            echo "::warning title=sccache disabled::No SCCACHE_WEBDAV_TOKEN (Depot runner) or SCCACHE_S3_BUCKET/AWS credentials available — Rust compiles will run uncached."
           fi
 
           # --no-tag-latest: dispatched builds come from arbitrary refs and must
           # not move the shared latest-none tag; only the post-merge build does.
+          # --target runtime: consumers only need the runtime env + /opt/dynamo
+          # wheelhouse (the monorepo bis image copies the wheels out); the dev
+          # target's tooling stages (~5 min + huge layers) are dead weight here.
           ./container/build.sh --framework none --push --no-tag-latest \
-            "${CACHE_ARGS[@]}" "${SCCACHE_ARGS[@]}" 2>&1 | tee build.log
+            --target runtime \
+            --platform "${{ matrix.platform }}" \
+            --tag "${arch_image_tag}" \
+            "${SCCACHE_ARGS[@]}" 2>&1 | tee build.log
+
+      - name: Verify sccache was active
+        run: |
+          # The build tolerates a broken compile cache (it just builds cold), but
+          # that regression should be loud, not silent: annotate the run when no
+          # sccache stats made it into the build log, and surface hit/miss counts
+          # when they did.
+          if ! grep -q "SCCACHE_JSON_BEGIN" build.log; then
+            echo "::warning title=sccache inactive::No sccache statistics found in build.log — Rust compiles ran uncached. Check the cache backend (Depot token / S3 credentials)."
+            exit 0
+          fi
+          echo "sccache statistics from build.log:"
+          grep -E "^.*(Cache hits|Cache misses)" build.log | head -20 || true
+
+      - name: Notify Slack on failure
+        if: failure() && inputs.notify-on-failure
+        continue-on-error: true
+        uses: basetenlabs/action-slack@v3.0.0
+        with:
+          status: custom
+          fields: workflow,job,commit,repo,ref,author,took
+          custom_payload: |
+            {
+              "attachments": [{
+                "color": "danger",
+                "text": "❌ Dynamo image push (${{ matrix.arch }}) failed on `${{ inputs.ref || github.ref_name }}`.\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run> · triggered by `${{ github.actor }}`"
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.MP_CI_SLACK_WEBHOOK_URL }}
+
+  publish-multi-arch-image:
+    needs:
+      - resolve-image-tag
+      - build-and-push
+    runs-on: depot-ubuntu-24.04-64
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          image_tag="${{ needs.resolve-image-tag.outputs.image_tag }}"
+
+          docker buildx imagetools create \
+            --tag "${image_tag}" \
+            "${image_tag}-amd64" \
+            "${image_tag}-arm64"
 
       - name: Publish image-tag artifact
         run: |
           set -euo pipefail
-          # build.sh prints `Building Dynamo Image: '<TAG>'` — capture that exact
-          # default version-stamped tag so the artifact matches what was pushed.
-          ref="$(sed -n "s/.*Building Dynamo Image: '\(.*\)'.*/\1/p" build.log | head -1)"
-          if [ -z "$ref" ]; then
-            echo "::error::could not resolve the built image tag from build.log"; exit 1
-          fi
-          echo -n "$ref" > image-tag.txt
-          echo "Resolved image ref: $ref"
+          image_tag="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          echo -n "${image_tag}" > image-tag.txt
+          echo "Resolved image ref: ${image_tag}"
 
       - name: Upload tag artifact
         uses: actions/upload-artifact@v4
@@ -144,7 +246,7 @@ jobs:
             {
               "attachments": [{
                 "color": "danger",
-                "text": "❌ Dynamo image push failed on `${{ github.ref_name }}` @ `${{ github.sha }}`.\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run> · triggered by `${{ github.actor }}`"
+                "text": "❌ Dynamo multi-arch manifest publish failed on `${{ inputs.ref || github.ref_name }}`.\n<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run> · triggered by `${{ github.actor }}`"
               }]
             }
         env:

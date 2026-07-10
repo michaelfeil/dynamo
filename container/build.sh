@@ -97,7 +97,8 @@ show_help() {
     echo "  Flags preserved for CLI compatibility (values come from context.yaml):"
     echo "  [--enable-kvbm]  [--enable-gpu-memory-service]  [--enable-media-nixl]"
     echo "  [--enable-media-ffmpeg]  [--use-sccache]  [--sccache-bucket B]"
-    echo "  [--sccache-region R]  [--vllm-max-jobs N]  [--efa-version V]"
+    echo "  [--sccache-region R]  [--sccache-webdav-endpoint URL]"
+    echo "  [--vllm-max-jobs N]  [--efa-version V]"
     echo "  [--nixl-ref REF]  [--base-image IMG]  [--base-image-tag TAG]"
     exit 0
 }
@@ -109,6 +110,7 @@ error() { printf '%s %s\n' "$1" "$2" >&2; exit 1; }
 USE_SCCACHE=""
 SCCACHE_BUCKET=""
 SCCACHE_REGION=""
+SCCACHE_WEBDAV_ENDPOINT=""
 
 while :; do
     case ${1:-} in
@@ -138,6 +140,7 @@ while :; do
     --use-sccache)       USE_SCCACHE=true ;;
     --sccache-bucket)    [ "$2" ] && SCCACHE_BUCKET=$2 && shift || missing_requirement "$1" ;;
     --sccache-region)    [ "$2" ] && SCCACHE_REGION=$2 && shift || missing_requirement "$1" ;;
+    --sccache-webdav-endpoint) [ "$2" ] && SCCACHE_WEBDAV_ENDPOINT=$2 && shift || missing_requirement "$1" ;;
     --vllm-max-jobs)     [ "$2" ] && BUILD_ARGS+=" --build-arg MAX_JOBS=$2" && shift || missing_requirement "$1" ;;
     --efa-version)       [ "$2" ] && BUILD_ARGS+=" --build-arg EFA_VERSION=$2" && shift || missing_requirement "$1" ;;
     --nixl-ref)          [ "$2" ] && BUILD_ARGS+=" --build-arg NIXL_REF=$2" && shift || missing_requirement "$1" ;;
@@ -272,13 +275,26 @@ fi
 # sccache
 # ---------------------------------------------------------------------------
 if [ "$USE_SCCACHE" = true ]; then
-    if [ -z "$SCCACHE_BUCKET" ]; then error "ERROR:" "--sccache-bucket is required when --use-sccache is specified"; fi
-    if [ -z "$SCCACHE_REGION" ]; then error "ERROR:" "--sccache-region is required when --use-sccache is specified"; fi
-    BUILD_ARGS+=" --build-arg USE_SCCACHE=true"
-    BUILD_ARGS+=" --build-arg SCCACHE_BUCKET=${SCCACHE_BUCKET}"
-    BUILD_ARGS+=" --build-arg SCCACHE_REGION=${SCCACHE_REGION}"
-    BUILD_ARGS+=" --secret id=aws-key-id,env=AWS_ACCESS_KEY_ID"
-    BUILD_ARGS+=" --secret id=aws-secret-id,env=AWS_SECRET_ACCESS_KEY"
+    if [ -n "$SCCACHE_WEBDAV_ENDPOINT" ]; then
+        # WebDAV backend (e.g. Depot Cache at https://cache.depot.dev). The token
+        # comes from the SCCACHE_WEBDAV_TOKEN env var — provided automatically on
+        # Depot-managed GitHub runners — and is passed as a build secret so it
+        # never lands in image layers or the layer cache.
+        if [ -z "${SCCACHE_WEBDAV_TOKEN:-}" ]; then
+            error "ERROR:" "SCCACHE_WEBDAV_TOKEN must be set in the environment when --sccache-webdav-endpoint is specified"
+        fi
+        BUILD_ARGS+=" --build-arg USE_SCCACHE=true"
+        BUILD_ARGS+=" --build-arg SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT}"
+        BUILD_ARGS+=" --secret id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN"
+    else
+        if [ -z "$SCCACHE_BUCKET" ]; then error "ERROR:" "--sccache-bucket or --sccache-webdav-endpoint is required when --use-sccache is specified"; fi
+        if [ -z "$SCCACHE_REGION" ]; then error "ERROR:" "--sccache-region is required when --use-sccache is specified with --sccache-bucket"; fi
+        BUILD_ARGS+=" --build-arg USE_SCCACHE=true"
+        BUILD_ARGS+=" --build-arg SCCACHE_BUCKET=${SCCACHE_BUCKET}"
+        BUILD_ARGS+=" --build-arg SCCACHE_REGION=${SCCACHE_REGION}"
+        BUILD_ARGS+=" --secret id=aws-key-id,env=AWS_ACCESS_KEY_ID"
+        BUILD_ARGS+=" --secret id=aws-secret-id,env=AWS_SECRET_ACCESS_KEY"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -300,7 +316,11 @@ echo "   CUDA: '${CUDA_VERSION}'"
 echo "   Build Context: '${BUILD_CONTEXT}'"
 echo "   Build Arguments: '${BUILD_ARGS}'"
 if [ "$USE_SCCACHE" = true ]; then
-    echo "   sccache: Enabled (bucket=${SCCACHE_BUCKET}, region=${SCCACHE_REGION})"
+    if [ -n "$SCCACHE_WEBDAV_ENDPOINT" ]; then
+        echo "   sccache: Enabled (webdav endpoint=${SCCACHE_WEBDAV_ENDPOINT})"
+    else
+        echo "   sccache: Enabled (bucket=${SCCACHE_BUCKET}, region=${SCCACHE_REGION})"
+    fi
 fi
 echo ""
 

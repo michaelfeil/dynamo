@@ -96,6 +96,7 @@ RUN apt-get update -y \
         # Rust build dependencies
         clang \
         libclang-dev \
+        lld \
         protobuf-compiler \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -135,6 +136,7 @@ RUN --mount=type=cache,target=/var/cache/dnf,sharing=locked \
         cmake \
         ninja-build \
         clang-devel \
+        lld \
         # Install GCC toolset 14 (CUDA compatible, max version 14)
         gcc-toolset-14-gcc \
         gcc-toolset-14-gcc-c++ \
@@ -200,6 +202,20 @@ RUN set -eux; \
 # Point build tools explicitly at the modern protoc
 ENV PROTOC=/usr/local/bin/protoc
 
+# Link Rust artifacts with lld: the link phase dominates warm wheel builds
+# (sccache/cargo caches cover compilation but never linking) and GNU ld is
+# single-threaded. Wired via cargo's `linker` key + a wrapper rather than
+# rustflags: a RUSTFLAGS env var or a CARGO_HOME rustflags entry would shadow
+# the project .cargo/config.toml's per-target rustflags (target-cpu etc.).
+RUN printf '#!/bin/sh\nexec cc -fuse-ld=lld "$@"\n' > /usr/local/bin/cc-lld && \
+    chmod +x /usr/local/bin/cc-lld && \
+    printf '[target.x86_64-unknown-linux-gnu]\nlinker = "/usr/local/bin/cc-lld"\n[target.aarch64-unknown-linux-gnu]\nlinker = "/usr/local/bin/cc-lld"\n' \
+        >> ${CARGO_HOME}/config.toml && \
+    echo 'int main(){return 0;}' > /tmp/lld-check.c && \
+    cc -fuse-ld=lld /tmp/lld-check.c -o /tmp/lld-check && \
+    rm -f /tmp/lld-check.c /tmp/lld-check && \
+    ld.lld --version
+
 {% if device == "xpu" or device == "cpu" %}
 # Install uv package manager
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -244,6 +260,7 @@ COPY --from=dynamo_base /usr/local/bin/sccache /opt/sccache/sccache
 ARG USE_SCCACHE
 ARG SCCACHE_BUCKET
 ARG SCCACHE_REGION
+ARG SCCACHE_WEBDAV_ENDPOINT
 COPY container/use-sccache.sh /tmp/use-sccache.sh
 RUN if [ "$USE_SCCACHE" = "true" ]; then \
         ln -s /opt/sccache/sccache /usr/local/bin/sccache && \
@@ -253,7 +270,8 @@ RUN if [ "$USE_SCCACHE" = "true" ]; then \
 # Set SCCACHE environment variables (RUSTC_WRAPPER is set dynamically by
 # setup-env only when the sccache server starts successfully)
 ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET}} \
-    SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION}}
+    SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION}} \
+    SCCACHE_WEBDAV_ENDPOINT=${USE_SCCACHE:+${SCCACHE_WEBDAV_ENDPOINT}}
 
 # Always build FFmpeg so libs are available for Rust checks in CI.
 # We also build the ffmpeg CLI with h264_nvenc + libvpx_vp9 encoders so Python
@@ -267,6 +285,7 @@ ARG NV_CODEC_HEADERS_REF
 ARG LIBVPX_REF
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
     if [ "$USE_SCCACHE" = "true" ]; then \
@@ -327,6 +346,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
 # Build and install UCX
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}}" && \
     if [ "$USE_SCCACHE" = "true" ]; then \
@@ -395,6 +415,7 @@ ARG NIXL_LIBFABRIC_REPO
 ARG NIXL_LIBFABRIC_REF
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}}" && \
     if [ "$USE_SCCACHE" = "true" ]; then \
@@ -430,6 +451,7 @@ ENV PKG_CONFIG_PATH="/usr/local/libfabric/lib/pkgconfig:${PKG_CONFIG_PATH}"
 ARG AWS_SDK_CPP_VERSION
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}}" && \
     if [ "$USE_SCCACHE" = "true" ]; then \
@@ -488,6 +510,7 @@ ARG USE_SCCACHE
 ARG ENABLE_MEDIA_FFMPEG
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
     --mount=type=cache,target=/root/.cargo/git,sharing=shared \
     --mount=type=cache,id=cargo-target-runtime,target=${CARGO_TARGET_DIR} \
@@ -546,6 +569,7 @@ ARG CUDA_MAJOR
 
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}}" && \
     if [ "$USE_SCCACHE" = "true" ]; then \
@@ -605,6 +629,7 @@ RUN echo "$NIXL_LIB_DIR" > /etc/ld.so.conf.d/nixl.conf && \
 ARG PYTHON_VERSION
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN \
     --mount=type=cache,target=/root/.cache/uv,sharing=shared \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export UV_CACHE_DIR=/root/.cache/uv && \
@@ -626,6 +651,7 @@ COPY components/ /opt/dynamo/components/
 ARG ENABLE_KVBM
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=secret,id=sccache-webdav-token,env=SCCACHE_WEBDAV_TOKEN \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
     --mount=type=cache,target=/root/.cargo/git,sharing=shared \
     --mount=type=cache,id=cargo-target-wheelbuilder,target=${CARGO_TARGET_DIR} \

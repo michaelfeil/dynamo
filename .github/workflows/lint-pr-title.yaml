@@ -75,10 +75,18 @@ jobs:
               return;
             }
 
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              labels: [type],
-            });
-            core.info(`Added "${type}" label based on the PR title.`);
+            // Labeling is best-effort: the org caps GITHUB_TOKEN below issues:write,
+            // so addLabels 403s ("Resource not accessible by integration") and was
+            // failing this check on every PR even though the title validated fine.
+            // Title validation above remains enforced.
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: [type],
+              });
+              core.info(`Added "${type}" label based on the PR title.`);
+            } catch (error) {
+              core.warning(`Title is valid; could not add "${type}" label: ${error.message}`);
+            }

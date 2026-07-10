@@ -1486,3 +1486,35 @@ Replay notes:
 Apply to any branch that carries the two-stage `(started, serving)` gate in
 `lib/bindings/python/rust/llm/b10_router.rs`. The heartbeat loop must gate on
 `started || serving`, not on `serving` alone.
+
+## PATCH-014: CI Image Build Overhaul (Depot, sccache, Multi-Arch, Runtime Target)
+
+Status: `keep`
+
+Source commits:
+
+- Current PR: feat: overhaul CI image builds — Depot builders, sccache, multi-arch, runtime target
+
+Purpose:
+
+Cut bis-dynamo-image-push from ~20 min flat to time proportional to the change
+(identical rerun ~3–4 min, test-only ~3.6 min, minor Rust change ~9 min
+multi-arch). Build-infra only; no runtime behavior changes.
+
+- sccache via Depot Cache (WebDAV) using the runner-provided token; S3 fallback
+  retained; loud warnings replace silent degradation.
+- Depot remote builders replace registry cache-from/to; cargo target cache
+  mounts persist across runs.
+- bis-dynamo-image-push builds amd64+arm64 natively and publishes a manifest
+  list; CI images use `--target runtime` (consumers only need the wheelhouse).
+- lld links Rust; Rust test sources excluded from the docker build context.
+- dynamo_runtime template: environment layers ordered before wheel_builder-
+  derived layers; wheel install takes requirements as `--constraint`.
+
+Replay notes:
+
+Entirely Baseten-specific CI/build plumbing across `.github/workflows/`
+(bis-dynamo-image-push, post-merge-build), `container/build.sh`,
+`container/use-sccache.sh`, `container/templates/`, and `.dockerignore`.
+On upstream rebase, replay wholesale; only expect conflicts where upstream
+touches the same templates (wheel_builder, dynamo_runtime, args).

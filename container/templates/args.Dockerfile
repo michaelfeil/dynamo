@@ -71,6 +71,7 @@ ARG USE_SCCACHE
 ARG SCCACHE_VERSION={{ context.dynamo.sccache_version }}
 ARG SCCACHE_BUCKET=""
 ARG SCCACHE_REGION=""
+ARG SCCACHE_WEBDAV_ENDPOINT=""
 
 # NIXL configuration
 ARG NIXL_UCX_REF={{ context.dynamo.nixl_ucx_ref }}

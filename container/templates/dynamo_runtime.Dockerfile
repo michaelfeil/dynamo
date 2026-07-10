@@ -36,32 +36,18 @@ ${NIXL_PLUGIN_DIR}:\
 /usr/local/ucx/lib/ucx:\
 ${LD_LIBRARY_PATH}
 
-# Copy ucx and nixl libs
-COPY --chown=dynamo: --from=wheel_builder /usr/local/ucx/ /usr/local/ucx/
-COPY --chown=dynamo: --from=wheel_builder ${NIXL_PREFIX}/ ${NIXL_PREFIX}/
-COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/nixl/ /opt/dynamo/wheelhouse/nixl/
-COPY --chown=dynamo: --from=wheel_builder /workspace/nixl/build/src/bindings/python/nixl-meta/nixl-*.whl /opt/dynamo/wheelhouse/nixl/
-
-# Always copy FFmpeg so libs are available for Rust checks in CI.
-# libvpx.so* is included because the in-tree ffmpeg is built with --enable-libvpx,
-# so libavcodec.so has a runtime dependency on libvpx.so.9.
-RUN --mount=type=bind,from=wheel_builder,source=/usr/local/,target=/tmp/usr/local/ \
-    mkdir -p /usr/local/lib/pkgconfig && \
-    cp -rnL /tmp/usr/local/include/libav* /tmp/usr/local/include/libsw* /usr/local/include/ && \
-    cp -nL /tmp/usr/local/lib/libav*.so /tmp/usr/local/lib/libsw*.so /usr/local/lib/ && \
-    cp -nL /tmp/usr/local/lib/lib*vpx*.so* /usr/local/lib/ 2>/dev/null || true && \
-    cp -nL /tmp/usr/local/lib/pkgconfig/libav*.pc /tmp/usr/local/lib/pkgconfig/libsw*.pc /usr/local/lib/pkgconfig/ && \
-    cp -r /tmp/usr/local/src/ffmpeg /usr/local/src/ && \
-    ldconfig
-
 # ===========================================================================
 # Source-INDEPENDENT runtime layers
 # ===========================================================================
-# Everything below up to the "Source-DEPENDENT layers" banner depends only on
-# the base image + requirements files, NOT on the dynamo source tree (lib/,
-# components/) or the freshly-built wheels. Keeping these layers ABOVE the wheel
-# and workspace COPYs means a one-file Rust/Python edit no longer invalidates
-# the expensive apt + pip layers, so cold (source-changed) rebuilds reuse them.
+# Everything below up to the "wheel_builder-derived layers" banner depends only
+# on the base image + requirements files — NOT on the dynamo source tree (lib/,
+# components/), the freshly-built wheels, or ANY wheel_builder snapshot content.
+# That last part matters: a COPY --from / bind mount of wheel_builder keys its
+# cache on the mounted content's hash, and wheel_builder re-runs on every
+# source change — one unstable byte anywhere in the mounted tree re-executes
+# the layer and everything after it (observed: the broad /usr/local bind mount
+# broke the chain and dragged the apt + pip installs with it). So: environment
+# setup first, wheel_builder-derived layers strictly after.
 
 # Install Python for framework=none runtime (cuda-dl-base doesn't include Python)
 # This is needed to create venv and install dynamo packages
@@ -104,21 +90,13 @@ ENV VIRTUAL_ENV=/opt/dynamo/venv \
 # Initialize Git LFS (required for git+https dependencies with LFS artifacts)
 RUN git lfs install
 
-{% if target in ("dev", "local-dev") %}
-# Dev/local-dev: skip dynamo wheel install (users build from source via cargo build + maturin develop).
-# Install NIXL wheel only (pre-built C++ binary, not buildable from source). The nixl
-# wheelhouse was copied above from wheel_builder and is independent of dynamo source,
-# so this layer stays cached when only Rust/Python source changes.
-RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
-    export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
-    uv pip install /opt/dynamo/wheelhouse/nixl/nixl*.whl
-
-# Install runtime dependencies (common + planner + frontend).
-# These are driven entirely by the requirements files (not the dynamo wheels), so for
-# dev/local-dev we install them here — above the wheel/source COPYs — to keep this
-# expensive network layer cached across source-only changes. (For runtime targets this
-# install stays below the wheel install so the resolver sees the dynamo wheels' pins in
-# one pass; see the source-dependent section.)
+# Install runtime dependencies (common + planner + frontend) for ALL targets.
+# Driven entirely by the requirements files, so this expensive network layer sits
+# in the source-independent section and stays cached across source-only changes.
+# Frontend deps (tritonclient + grpcio/protobuf pins) resolve here in one pass;
+# the wheel install below re-applies these files as --constraint so installing
+# the dynamo wheels cannot drift the pins (the old wheels-then-requirements
+# ordering existed to prevent exactly that grpcio downgrade).
 RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
     --mount=type=bind,source=./container/deps/requirements.planner.txt,target=/tmp/requirements.planner.txt \
     --mount=type=bind,source=./container/deps/requirements.frontend.txt,target=/tmp/requirements.frontend.txt \
@@ -130,24 +108,76 @@ RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tm
         --requirement /tmp/requirements.common.txt \
         --requirement /tmp/requirements.planner.txt \
         --requirement /tmp/requirements.frontend.txt
+
+# ===========================================================================
+# wheel_builder-derived layers (re-validated whenever wheel_builder re-runs)
+# ===========================================================================
+# ucx / NIXL / ffmpeg content is byte-stable across source changes, so these
+# COPYs normally cache — but keep them BELOW all environment layers so a cache
+# miss here can never re-trigger apt/pip work.
+
+# Copy ucx and nixl libs
+COPY --chown=dynamo: --from=wheel_builder /usr/local/ucx/ /usr/local/ucx/
+COPY --chown=dynamo: --from=wheel_builder ${NIXL_PREFIX}/ ${NIXL_PREFIX}/
+COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/nixl/ /opt/dynamo/wheelhouse/nixl/
+COPY --chown=dynamo: --from=wheel_builder /workspace/nixl/build/src/bindings/python/nixl-meta/nixl-*.whl /opt/dynamo/wheelhouse/nixl/
+
+# Always copy FFmpeg so libs are available for Rust checks in CI.
+# libvpx.so* is included because the in-tree ffmpeg is built with --enable-libvpx,
+# so libavcodec.so has a runtime dependency on libvpx.so.9.
+# Bind-mount the specific subtrees rather than all of /usr/local: the broad
+# mount hashed unstable wheel_builder state (cargo home etc.) into this layer's
+# cache key and re-ran it — and everything after it — on every source change.
+# Needs root (writes /usr/local, runs ldconfig); this stage switched to the
+# dynamo user for the venv layers above.
+USER root
+RUN --mount=type=bind,from=wheel_builder,source=/usr/local/include,target=/tmp/usr/local/include \
+    --mount=type=bind,from=wheel_builder,source=/usr/local/lib,target=/tmp/usr/local/lib \
+    --mount=type=bind,from=wheel_builder,source=/usr/local/src/ffmpeg,target=/tmp/usr/local/src/ffmpeg \
+    mkdir -p /usr/local/lib/pkgconfig && \
+    cp -rnL /tmp/usr/local/include/libav* /tmp/usr/local/include/libsw* /usr/local/include/ && \
+    cp -nL /tmp/usr/local/lib/libav*.so /tmp/usr/local/lib/libsw*.so /usr/local/lib/ && \
+    cp -nL /tmp/usr/local/lib/lib*vpx*.so* /usr/local/lib/ 2>/dev/null || true && \
+    cp -nL /tmp/usr/local/lib/pkgconfig/libav*.pc /tmp/usr/local/lib/pkgconfig/libsw*.pc /usr/local/lib/pkgconfig/ && \
+    cp -r /tmp/usr/local/src/ffmpeg /usr/local/src/ && \
+    ldconfig
+USER dynamo
+
+{% if target in ("dev", "local-dev") %}
+# Dev/local-dev: skip dynamo wheel install (users build from source via cargo build + maturin develop).
+# Install NIXL wheel only (pre-built C++ binary, not buildable from source). The nixl
+# wheelhouse copied above is independent of dynamo source, so this layer stays
+# cached when only Rust/Python source changes.
+RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
+    uv pip install /opt/dynamo/wheelhouse/nixl/nixl*.whl
 {% endif %}
 
 # ===========================================================================
 # Source-DEPENDENT layers (rebuilt when dynamo source / wheels change)
 # ===========================================================================
-{% if target not in ("dev", "local-dev") %}
-# Copy built artifacts (not needed for dev/local-dev; users build from source)
-COPY --chown=dynamo: --from=wheel_builder $CARGO_TARGET_DIR $CARGO_TARGET_DIR
-{% endif %}
+# The cargo target dir is NOT copied here: it lives in a --mount=type=cache in
+# wheel_builder (absent from the stage filesystem), and the runtime image
+# consumes the built wheels below — build intermediates would be dead weight.
 COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
 
 {% if target not in ("dev", "local-dev") %}
-# Install dynamo wheels (runtime packages only, no test dependencies)
+# Install dynamo wheels (runtime packages only, no test dependencies).
+# The requirements files ride along as --constraint so this install cannot
+# up/downgrade anything the requirements layer pinned (grpcio/protobuf etc.).
 # uv handles its own locking for the cache, no need to add sharing=locked
 ARG ENABLE_KVBM
-RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
+    --mount=type=bind,source=./container/deps/requirements.planner.txt,target=/tmp/requirements.planner.txt \
+    --mount=type=bind,source=./container/deps/requirements.frontend.txt,target=/tmp/requirements.frontend.txt \
+    --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
     export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
     uv pip install \
+    --index-strategy unsafe-best-match \
+    --extra-index-url https://download.pytorch.org/whl/cu130 \
+    --constraint /tmp/requirements.common.txt \
+    --constraint /tmp/requirements.planner.txt \
+    --constraint /tmp/requirements.frontend.txt \
     /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
     /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
     /opt/dynamo/wheelhouse/nixl/nixl*.whl && \
@@ -157,24 +187,12 @@ RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sh
             echo "ERROR: ENABLE_KVBM is true but no KVBM wheel found in wheelhouse" >&2; \
             exit 1; \
         fi; \
-        uv pip install "$KVBM_WHEEL"; \
+        uv pip install \
+            --constraint /tmp/requirements.common.txt \
+            --constraint /tmp/requirements.planner.txt \
+            --constraint /tmp/requirements.frontend.txt \
+            "$KVBM_WHEEL"; \
     fi
-
-# Install runtime dependencies (common + planner + frontend).
-# Frontend deps (tritonclient + grpcio/protobuf pins) are installed here so the resolver
-# sees all constraints in one pass, avoiding grpcio downgrades in the test layer.
-# Test and dev dependencies are NOT installed here — they go in the test and dev images.
-RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
-    --mount=type=bind,source=./container/deps/requirements.planner.txt,target=/tmp/requirements.planner.txt \
-    --mount=type=bind,source=./container/deps/requirements.frontend.txt,target=/tmp/requirements.frontend.txt \
-    --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
-    export UV_CACHE_DIR=/home/dynamo/.cache/uv UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
-    uv pip install \
-        --index-strategy unsafe-best-match \
-        --extra-index-url https://download.pytorch.org/whl/cu130 \
-        --requirement /tmp/requirements.common.txt \
-        --requirement /tmp/requirements.planner.txt \
-        --requirement /tmp/requirements.frontend.txt
 {% endif %}
 
 # Install gpu_memory_service wheel if enabled (all targets). Guarded so it is a
