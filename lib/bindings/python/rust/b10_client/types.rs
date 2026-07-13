@@ -20,9 +20,8 @@ use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
 use crate::{AsyncResponseStream, Client};
 use anyhow::Result;
 use dynamo_kv_router::protocols::{BlockExtraInfo, RouterRequest, RoutingConstraints};
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -173,12 +172,12 @@ impl CancellationPolicy {
 /// boundary under the GIL (via pythonize + serde). `routing_constraints` is the
 /// local-model pyclass `RoutingConstraints` (`crate::llm::local_model::
 /// RoutingConstraints`, aliased in this module as `PyRoutingConstraints`);
-/// `None` means the default (empty) constraints. `tokens` accepts a Python
-/// sequence of integers, plus one-dimensional `uint32` buffer inputs such as
-/// NumPy `dtype=uint32` arrays via a bulk memoryview copy.
+/// `None` means the default (empty) constraints. `tokens` defaults to the
+/// empty list.
 #[pyclass]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PyRouterRequestNew {
+    #[pyo3(get, set)]
     pub(super) tokens: Vec<u32>,
     #[pyo3(get, set)]
     pub(super) block_mm_infos: Option<PyObject>,
@@ -190,77 +189,6 @@ pub(crate) struct PyRouterRequestNew {
     pub(super) priority_load_shed_percent: u8,
     #[pyo3(get, set)]
     pub(super) do_not_queue: bool,
-}
-
-fn tokens_from_py(tokens: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
-    if let Some(tokens) = tokens_from_u32_memoryview(tokens)? {
-        return Ok(tokens);
-    }
-
-    tokens.extract::<Vec<u32>>()
-}
-
-fn tokens_from_u32_memoryview(tokens: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u32>>> {
-    let memoryview = tokens.py().import("builtins")?.getattr("memoryview")?;
-    let Ok(view) = memoryview.call1((tokens,)) else {
-        return Ok(None);
-    };
-
-    let dimensions: usize = view.getattr("ndim")?.extract()?;
-    if dimensions != 1 {
-        return Err(PyTypeError::new_err(format!(
-            "tokens buffer must be one-dimensional, got {dimensions} dimensions"
-        )));
-    }
-
-    let item_size: usize = view.getattr("itemsize")?.extract()?;
-    let format: String = view.getattr("format")?.extract()?;
-    let Some(endian) = U32MemoryFormat::from_memoryview_format(&format, item_size) else {
-        return Ok(None);
-    };
-
-    let bytes = view.call_method0("tobytes")?;
-    let bytes = bytes.downcast::<PyBytes>()?.as_bytes();
-    if bytes.len() % std::mem::size_of::<u32>() != 0 {
-        return Err(PyTypeError::new_err(format!(
-            "tokens buffer byte length {} is not divisible by 4",
-            bytes.len()
-        )));
-    }
-
-    let tokens = bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            match endian {
-                U32MemoryFormat::Native => u32::from_ne_bytes(bytes),
-                U32MemoryFormat::Little => u32::from_le_bytes(bytes),
-                U32MemoryFormat::Big => u32::from_be_bytes(bytes),
-            }
-        })
-        .collect();
-    Ok(Some(tokens))
-}
-
-enum U32MemoryFormat {
-    Native,
-    Little,
-    Big,
-}
-
-impl U32MemoryFormat {
-    fn from_memoryview_format(format: &str, item_size: usize) -> Option<Self> {
-        if item_size != std::mem::size_of::<u32>() {
-            return None;
-        }
-
-        match format {
-            "I" | "@I" | "=I" => Some(Self::Native),
-            "<I" => Some(Self::Little),
-            ">I" | "!I" => Some(Self::Big),
-            _ => None,
-        }
-    }
 }
 
 #[pymethods]
@@ -275,32 +203,21 @@ impl PyRouterRequestNew {
         do_not_queue = false,
     ))]
     fn new(
-        tokens: &Bound<'_, PyAny>,
+        tokens: Vec<u32>,
         block_mm_infos: Option<PyObject>,
         routing_constraints: Option<Py<PyRoutingConstraints>>,
         priority_jump: f64,
         priority_load_shed_percent: u8,
         do_not_queue: bool,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            tokens: tokens_from_py(tokens)?,
+    ) -> Self {
+        Self {
+            tokens,
             block_mm_infos,
             routing_constraints,
             priority_jump,
             priority_load_shed_percent,
             do_not_queue,
-        })
-    }
-
-    #[getter]
-    fn tokens(&self) -> Vec<u32> {
-        self.tokens.clone()
-    }
-
-    #[setter]
-    fn set_tokens(&mut self, tokens: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.tokens = tokens_from_py(tokens)?;
-        Ok(())
+        }
     }
 }
 
