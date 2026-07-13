@@ -28,7 +28,7 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     task::Poll,
@@ -59,6 +59,16 @@ fn response_inactivity_timeout() -> Option<std::time::Duration> {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .map(std::time::Duration::from_secs)
+}
+
+/// Whether fault-injection handling should report failed remotes down.
+///
+/// Default is disabled so transient per-request failures do not remove workers
+/// from the routable pool.
+fn fault_injection_enabled() -> bool {
+    use crate::config::environment_names::runtime::DYN_ENABLE_FAULT_INJECTION;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::config::env_is_truthy(DYN_ENABLE_FAULT_INJECTION))
 }
 
 struct OccupancyPermit {
@@ -141,6 +151,11 @@ where
     /// instance list instead of the filtered avail list. Use for recovery/query paths
     /// where transient failures are expected.
     fault_detection_enabled: bool,
+
+    /// When true, inhibited transport/backend errors report remotes down via
+    /// `report_instance_down`. Defaults to false unless
+    /// enabled with `DYN_ENABLE_FAULT_INJECTION`.
+    fault_injection_enabled: bool,
 
     /// Cached response inactivity timeout. Read once at construction from
     /// [`environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS`](crate::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS) to avoid a syscall per request.
@@ -427,6 +442,7 @@ where
             router_mode,
             round_robin_counter: Arc::new(AtomicU64::new(0)),
             fault_detection_enabled: false,
+            fault_injection_enabled: false,
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
             _phantom: PhantomData,
@@ -439,6 +455,8 @@ where
     /// overload detection itself is driven by the monitor via `client.set_overloaded_instances(...)`.
     /// If no thresholds are configured on the monitor (or no monitor is provided),
     /// the routing snapshot reports at least one free instance and the gate never rejects.
+    /// Fault-injection reporting is independently controlled by
+    /// `DYN_ENABLE_FAULT_INJECTION` and defaults to disabled.
     pub async fn from_client_with_monitor(
         client: Client,
         router_mode: RouterMode,
@@ -475,6 +493,7 @@ where
             router_mode,
             round_robin_counter: Arc::new(AtomicU64::new(0)),
             fault_detection_enabled: true,
+            fault_injection_enabled: fault_injection_enabled(),
             response_timeout: response_inactivity_timeout(),
             occupancy_state,
             _phantom: PhantomData,
@@ -910,24 +929,29 @@ where
                     return Ok(stream);
                 }
                 let engine_ctx = stream.context();
-                let client = self.client.clone();
                 let client_for_timeout = self.client.clone();
-                let stream = stream.map(move |res| {
-                    // Check if the error is migratable (indicates worker/connection failure)
-                    if let Some(err) = res.err()
-                        && is_inhibited(&err)
-                    {
-                        tracing::debug!(
-                            "Reporting instance {instance_id} down due to migratable error: {err}"
-                        );
-                        client.report_instance_down(instance_id);
-                    }
-                    res
-                });
+                let fault_injection_enabled = self.fault_injection_enabled;
+                let stream: Pin<Box<dyn Stream<Item = U> + Send>> = if fault_injection_enabled {
+                    let client = self.client.clone();
+                    Box::pin(stream.map(move |res| {
+                        // Check if the error is migratable (indicates worker/connection failure)
+                        if let Some(err) = res.err()
+                            && is_inhibited(&err)
+                        {
+                            tracing::debug!(
+                                "Reporting instance {instance_id} down due to migratable error: {err}"
+                            );
+                            client.report_instance_down(instance_id);
+                        }
+                        res
+                    }))
+                } else {
+                    Box::pin(stream)
+                };
 
                 // Request-plane inactivity timeout: emit a ResponseTimeout error item
-                // when the backend stops producing output. This triggers is_inhibited()
-                // → report_instance_down() to quarantine the worker.
+                // when the backend stops producing output. If fault injection is
+                // enabled, also remove the worker from the routable pool.
                 let stream: Pin<Box<dyn Stream<Item = U> + Send>> = if let Some(timeout) =
                     self.response_timeout
                 {
@@ -946,9 +970,12 @@ where
                                     tracing::warn!(
                                         instance_id,
                                         timeout_secs = timeout.as_secs(),
-                                        "backend response inactivity timeout — quarantining worker"
+                                        fault_injection_enabled,
+                                        "backend response inactivity timeout"
                                     );
-                                    client_for_timeout.report_instance_down(instance_id);
+                                    if fault_injection_enabled {
+                                        client_for_timeout.report_instance_down(instance_id);
+                                    }
                                     yield U::from_err(
                                         crate::error::DynamoError::builder()
                                             .error_type(crate::error::ErrorType::ResponseTimeout)
@@ -967,7 +994,10 @@ where
                 Ok(ResponseStream::new(stream, engine_ctx))
             }
             Err(err) => {
-                if self.fault_detection_enabled && is_inhibited(err.as_ref()) {
+                if self.fault_detection_enabled
+                    && self.fault_injection_enabled
+                    && is_inhibited(err.as_ref())
+                {
                     tracing::debug!("Reporting instance {instance_id} down due to error: {err}");
                     self.client.report_instance_down(instance_id);
                 }

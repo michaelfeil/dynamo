@@ -325,10 +325,15 @@ Validation:
 Exercise startup health, request drain, endpoint unpublication, NATS/ETCD
 lifetime during drain, and forced shutdown timeout behavior.
 
-Backported upstream PR `ai-dynamo/dynamo#10437` (`73903bdc807323c0b14dbb4ddb7c79b7da72d3d8`, `perf(runtime): add request-plane msgpack payload codec`) for v1.2. JSON remains the compatibility default on this
-branch; `DYN_REQUEST_PLANE_CODEC=msgpack` opts into msgpack request/response
-payloads. Moving the default to msgpack later is acceptable after rollout
-validation.
+Backported upstream PR `ai-dynamo/dynamo#10437` (`73903bdc807323c0b14dbb4ddb7c79b7da72d3d8`, `perf(runtime): add request-plane msgpack payload codec`) for v1.2. New request-plane sends default to msgpack when
+`DYN_REQUEST_PLANE_CODEC` is unset. Incoming control messages that omit the
+`payload_codec` field are still decoded as JSON for compatibility with older
+clients; set `DYN_REQUEST_PLANE_CODEC=json` to force JSON sends.
+
+Added `DYN_ENABLE_FAULT_INJECTION` to opt into PushRouter request-path
+fault-injection handling. It defaults off so transient transport/backend
+failures do not quarantine remotes unless explicitly enabled; Baseten avoids
+calling `report_instance_down` by default.
 
 ## PATCH-003: NATS, JetStream, and Discovery Compatibility
 

@@ -71,16 +71,16 @@ impl RequestPlanePayloadCodec {
         )
         .as_deref()
         {
-            Err(_) | Ok("") | Ok("json") => Self::Json,
-            Ok("msgpack") => Self::Msgpack,
+            Ok("json") => Self::Json,
+            Err(_) | Ok("") | Ok("msgpack") => Self::Msgpack,
             Ok(other) => {
                 tracing::warn!(
                     env_var =
                         crate::config::environment_names::request_plane::DYN_REQUEST_PLANE_CODEC,
                     value = other,
-                    "invalid request plane payload codec, defaulting to json"
+                    "invalid request plane payload codec, defaulting to msgpack"
                 );
-                Self::Json
+                Self::Msgpack
             }
         }
     }

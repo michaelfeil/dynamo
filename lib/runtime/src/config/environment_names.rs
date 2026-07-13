@@ -84,6 +84,12 @@ pub mod runtime {
     /// Set to "1", "true", or "yes" to enable. Adds ~2× overhead of Instant::now() per task poll.
     pub const DYN_ENABLE_POLL_HISTOGRAM: &str = "DYN_ENABLE_POLL_HISTOGRAM";
 
+    /// Enable fault-injection handling after transport/backend failures.
+    ///
+    /// Set to "1", "true", "on", or "yes" to enable. Unset by default, which keeps
+    /// transient request failures from removing remotes from the routable pool.
+    pub const DYN_ENABLE_FAULT_INJECTION: &str = "DYN_ENABLE_FAULT_INJECTION";
+
     /// System status server configuration
     pub mod system {
         /// Enable system status server for health and metrics endpoints
@@ -484,7 +490,8 @@ pub mod router {
 /// Request plane transport environment variables
 pub mod request_plane {
     /// Request plane payload codec selection: "json" or "msgpack".
-    /// JSON is the compatibility default.
+    /// Unset defaults new request-plane sends to msgpack. Incoming control messages
+    /// that omit `payload_codec` still decode as JSON for compatibility.
     pub const DYN_REQUEST_PLANE_CODEC: &str = "DYN_REQUEST_PLANE_CODEC";
 }
 
@@ -612,6 +619,7 @@ mod tests {
             runtime::DYN_RUNTIME_NUM_WORKER_THREADS,
             runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS,
             runtime::DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+            runtime::DYN_ENABLE_FAULT_INJECTION,
             runtime::system::DYN_SYSTEM_ENABLED,
             runtime::system::DYN_SYSTEM_HOST,
             runtime::system::DYN_SYSTEM_PORT,
