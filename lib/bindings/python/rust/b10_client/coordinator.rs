@@ -1181,13 +1181,12 @@ fn normalize_load_percentile(percentile: f64) -> f64 {
     percentile
 }
 
-/// Render a [`RouterBackpressureReason`] as its snake_case reason name (the
-/// `serde`-serialised form), falling back to the `Debug` form on error.
-fn reason_to_string(reason: &RouterBackpressureReason) -> String {
-    serde_json::to_value(reason)
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| format!("{reason:?}"))
+/// Render a [`RouterBackpressureReason`] as its snake_case reason name.
+fn reason_to_string(reason: &RouterBackpressureReason) -> &'static str {
+    match reason {
+        RouterBackpressureReason::MaxQueuedIslTokensExceeded => "max_queued_isl_tokens_exceeded",
+        RouterBackpressureReason::DoNotQueue => "do_not_queue",
+    }
 }
 
 /// Outcome of one `route_once` attempt: either ready to connect to the chosen
@@ -1384,7 +1383,7 @@ async fn route_once(
                         .unwrap_or((RouterBackpressureReason::DoNotQueue, 0, None));
                     drop(guard);
                     RouteOnceOutcome::Denied(DeniedRequest::RouterBackpressure {
-                        reason: reason_to_string(&reason),
+                        reason: reason_to_string(&reason).to_string(),
                         queued_isl_tokens,
                         max_queued_isl_tokens,
                     })
