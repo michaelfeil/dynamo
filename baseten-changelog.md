@@ -1523,3 +1523,24 @@ Entirely Baseten-specific CI/build plumbing across `.github/workflows/`
 `container/use-sccache.sh`, `container/templates/`, and `.dockerignore`.
 On upstream rebase, replay wholesale; only expect conflicts where upstream
 touches the same templates (wheel_builder, dynamo_runtime, args).
+
+## PATCH-015: B10 Preferred-Taint Scoring
+
+Status: `keep`
+
+Source commits:
+
+- Current PR: feat: apply preferred taints in B10 selector
+
+Purpose:
+
+Apply request-level `preferred_taints` to the B10 worker selector's cost before
+choosing a worker. Positive weights bias traffic toward matching workers and
+negative weights bias traffic away, while `required_taints` remain the hard
+eligibility filter.
+
+Replay notes:
+
+Preserve this behavior while B10 remains a Baseten-specific selector. If B10 is
+replaced by an upstream selector, verify that the replacement applies
+`RoutingConstraints::preferred_taint_multiplier` during worker scoring.

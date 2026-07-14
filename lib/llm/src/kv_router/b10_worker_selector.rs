@@ -398,14 +398,21 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         }
 
         let mut worker_logits: HashMap<WorkerWithDpRank, f64> = HashMap::default();
-        eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+        eligibility.for_each_eligible_worker_rank(workers, |worker, config| {
             let score = score_worker(worker);
+            let preferred_taint_multiplier = request
+                .routing_constraints
+                .preferred_taint_multiplier(config.taints())
+                .unwrap_or(1.0);
+            let weighted_logit = score.logit * preferred_taint_multiplier;
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} | ow={:.2}*ppf={:.2} + dbw={:.2}*db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
+                    "worker_id={} dp={:?} logit={:.3} (base={:.3} * ptm={:.3}) | ow={:.2}*ppf={:.2} + dbw={:.2}*db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
                     worker.worker_id,
                     worker.dp_rank,
+                    weighted_logit,
                     score.logit,
+                    preferred_taint_multiplier,
                     overlap_weight,
                     score.potential_prefill_block,
                     score.decode_block_weight,
@@ -419,7 +426,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                     score.active_request_isl_penalty
                 );
             }
-            worker_logits.insert(worker, score.logit);
+            worker_logits.insert(worker, weighted_logit);
         });
 
         if worker_logits.is_empty() {
@@ -647,6 +654,59 @@ mod tests {
 
         assert_eq!(score.decode_block, 4.0);
         assert_eq!(score.logit, 0.0);
+    }
+
+    fn tainted_worker_config(taints: &[&str]) -> ModelRuntimeConfig {
+        ModelRuntimeConfig {
+            taints: taints.iter().map(|taint| taint.to_string()).collect(),
+            ..test_worker_config(0, 1)
+        }
+    }
+
+    #[test]
+    fn preferred_taints_bias_b10_toward_matching_worker() {
+        let selector = B10WorkerSelector::new();
+        let workers = HashMap::from([
+            (10, tainted_worker_config(&["b10_worker_pool=default"])),
+            (20, tainted_worker_config(&["b10_worker_pool=fast"])),
+        ]);
+        let mut request = base_request(128);
+        request.router_config_override = Some(RouterConfigOverride {
+            prefill_load_scale: Some(1.0),
+            router_temperature: Some(0.0),
+            ..Default::default()
+        });
+        request.routing_constraints.preferred_taints =
+            HashMap::from([("b10_worker_pool=fast".to_string(), 0.85)]);
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 64)
+            .unwrap();
+
+        assert_eq!(result.worker, WorkerWithDpRank::new(20, 0));
+    }
+
+    #[test]
+    fn negative_preferred_taints_bias_b10_away_from_matching_worker() {
+        let selector = B10WorkerSelector::new();
+        let workers = HashMap::from([
+            (10, tainted_worker_config(&["b10_worker_pool=fast"])),
+            (20, tainted_worker_config(&["b10_worker_pool=default"])),
+        ]);
+        let mut request = base_request(128);
+        request.router_config_override = Some(RouterConfigOverride {
+            prefill_load_scale: Some(1.0),
+            router_temperature: Some(0.0),
+            ..Default::default()
+        });
+        request.routing_constraints.preferred_taints =
+            HashMap::from([("b10_worker_pool=fast".to_string(), -0.85)]);
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 64)
+            .unwrap();
+
+        assert_eq!(result.worker, WorkerWithDpRank::new(20, 0));
     }
 
     #[test]
