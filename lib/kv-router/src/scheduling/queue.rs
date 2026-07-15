@@ -941,9 +941,9 @@ impl<
             .values()
             .map(|blocks| (*blocks as u64) * (self.block_size as u64))
             .collect();
-        per_worker_tokens.sort_unstable();
-        let median = per_worker_tokens[per_worker_tokens.len() / 2];
-        median >= threshold
+        let mid = per_worker_tokens.len() / 2;
+        let (_, median, _) = per_worker_tokens.select_nth_unstable(mid);
+        *median >= threshold
     }
 
     /// Check if all eligible workers are prefill-busy based on threshold.
