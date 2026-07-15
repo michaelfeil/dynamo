@@ -404,7 +404,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                 .routing_constraints
                 .preferred_taint_multiplier(config.taints())
                 .unwrap_or(1.0);
-            let weighted_logit = score.logit * preferred_taint_multiplier;
+            let weighted_logit = (score.logit + 1.0) * preferred_taint_multiplier;
             if verbose {
                 tracing::info!(
                     "worker_id={} dp={:?} logit={:.3} (base={:.3} * ptm={:.3}) | ow={:.2}*ppf={:.2} + dbw={:.2}*db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
