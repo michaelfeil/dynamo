@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -37,6 +37,25 @@ const ADMISSION_CHANNEL_CAPACITY: usize = 65_536;
 const ROUTER_QUEUE_BUSY_FRACTIONAL_ENV: &str = "DYN_ROUTER_QUEUE_BUSY_FRACTIONAL";
 
 static ROUTER_QUEUE_BUSY_FRACTIONAL: OnceLock<bool> = OnceLock::new();
+
+static ROUTER_QUEUE_THRESHOLD_DECODE_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// Set the global decode-tokens-inflight backpressure threshold (median per-worker).
+/// 0 disables the check. Called from the B10 hot-reloadable config loader.
+pub fn set_router_queue_threshold_decode_tokens(tokens: u64) {
+    let prev = ROUTER_QUEUE_THRESHOLD_DECODE_TOKENS.swap(tokens, AtomicOrdering::Relaxed);
+    if prev != tokens {
+        tracing::info!(
+            previous = prev,
+            next = tokens,
+            "router_queue_threshold_decode_tokens changed"
+        );
+    }
+}
+
+fn router_queue_threshold_decode_tokens() -> u64 {
+    ROUTER_QUEUE_THRESHOLD_DECODE_TOKENS.load(AtomicOrdering::Relaxed)
+}
 
 fn router_queue_busy_fractional() -> bool {
     *ROUTER_QUEUE_BUSY_FRACTIONAL.get_or_init(|| {
@@ -494,7 +513,15 @@ impl<
             return;
         }
 
-        if self.all_workers_prefill_busy(threshold, request.eligibility(), decay_now) {
+        let prefill_busy =
+            self.all_workers_prefill_busy(threshold, request.eligibility(), decay_now);
+        let decode_busy = if prefill_busy {
+            None
+        } else {
+            Some(self.decode_tokens_busy())
+        };
+
+        if prefill_busy || decode_busy.unwrap_or(false) {
             if request.do_not_queue {
                 request.respond(Err(KvSchedulerError::Backpressure {
                     reason: RouterBackpressureReason::DoNotQueue,
@@ -519,7 +546,12 @@ impl<
                     return;
                 }
             }
-            tracing::debug!("all workers prefill-busy, queueing request");
+            tracing::info!(
+                request_id = request.maybe_request_id.as_deref().unwrap_or("unknown"),
+                prefill_busy,
+                decode_busy,
+                "backpressure, queueing request"
+            );
             let arrival_offset = self.start_time.elapsed();
             let key = {
                 let workers = self.workers_with_configs.borrow();
@@ -576,7 +608,9 @@ impl<
             // drain overhead bounded to the heap front. A blocked pinned or
             // otherwise constrained request can temporarily stall later
             // schedulable entries until we adopt a cheaper non-HOL strategy.
-            if self.all_workers_prefill_busy(threshold, front.request.eligibility(), decay_now) {
+            if self.all_workers_prefill_busy(threshold, front.request.eligibility(), decay_now)
+                || self.decode_tokens_busy()
+            {
                 break;
             }
             let entry = self.pending.pop().expect("heap front vanished before pop");
@@ -621,7 +655,9 @@ impl<
                 request.effective_cached_tokens = effective_cached_tokens;
             }
             let admit_now = Instant::now();
-            if self.all_workers_prefill_busy(threshold, request.eligibility(), admit_now) {
+            if self.all_workers_prefill_busy(threshold, request.eligibility(), admit_now)
+                || self.decode_tokens_busy()
+            {
                 let isl_tokens = request.isl_tokens;
                 self.pending.push(QueueEntry {
                     key: entry.key,
@@ -887,6 +923,27 @@ impl<
                 let bonus = cap.saturating_mul(request.priority_load_shed_percent as usize) / 100;
                 cap.saturating_add(bonus)
             })
+    }
+
+    /// Check if the median per-worker decode tokens inflight exceeds the
+    /// globally-configured `router_queue_threshold_decode_tokens`. Returns
+    /// false when the threshold is 0 (disabled) or no workers are tracked.
+    fn decode_tokens_busy(&self) -> bool {
+        let threshold = router_queue_threshold_decode_tokens();
+        if threshold == 0 {
+            return false;
+        }
+        let active_blocks = self.slots.active_blocks();
+        if active_blocks.is_empty() {
+            return false;
+        }
+        let mut per_worker_tokens: Vec<u64> = active_blocks
+            .values()
+            .map(|blocks| (*blocks as u64) * (self.block_size as u64))
+            .collect();
+        per_worker_tokens.sort_unstable();
+        let median = per_worker_tokens[per_worker_tokens.len() / 2];
+        median >= threshold
     }
 
     /// Check if all eligible workers are prefill-busy based on threshold.
@@ -2556,5 +2613,93 @@ mod tests {
         assert_eq!(refresher.calls.load(Ordering::Relaxed), 2);
         assert_eq!(resp2.best_worker, WorkerWithDpRank::new(0, 0));
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_decode_tokens_backpressure_queues_request() {
+        let block_size = 16;
+        let isl = 512;
+        // High prefill threshold so prefill-busy never triggers; isolate decode check.
+        let (queue, slots) = make_queue(1, block_size, isl, Some(10000.0));
+
+        // Set decode threshold to exactly 1 block worth of tokens (16).
+        set_router_queue_threshold_decode_tokens(block_size as u64);
+
+        // First request: admitted (no active decode blocks yet).
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _resp1 = rx1.await.unwrap().unwrap();
+        assert_eq!(queue.pending_count(), 0);
+
+        // Add an output block → median = 1 active block × 16 = 16 decode tokens ≥ threshold.
+        slots.add_output_block(&"req-1".to_string(), None).unwrap();
+
+        // Second request: should be queued due to decode backpressure.
+        let (req2, _rx2) = make_request("req-2", isl);
+        queue.enqueue(req2).await;
+        assert_eq!(
+            queue.pending_count(),
+            1,
+            "request should be queued by decode backpressure"
+        );
+
+        // Free req-1 → decode tokens drop to 0.
+        slots.free(&"req-1".to_string(), decay_now()).unwrap();
+        queue.update().await;
+        assert_eq!(
+            queue.pending_count(),
+            0,
+            "queued request should be admitted after decode tokens drop"
+        );
+
+        // Drain any remaining admitted request.
+        let _ = slots.mark_prefill_completed(&"req-2".to_string(), decay_now());
+        let _ = slots.free(&"req-2".to_string(), decay_now());
+
+        // Reset global threshold.
+        set_router_queue_threshold_decode_tokens(0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_decode_tokens_backpressure_do_not_queue_rejects() {
+        let block_size = 16;
+        let isl = 512;
+        let (queue, slots) = make_queue(1, block_size, isl, Some(10000.0));
+
+        set_router_queue_threshold_decode_tokens(block_size as u64);
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _resp1 = rx1.await.unwrap().unwrap();
+
+        slots.add_output_block(&"req-1".to_string(), None).unwrap();
+
+        // Second request with do_not_queue=true should get Backpressure, not queued.
+        let (mut req2, rx2) = make_request("req-2", isl);
+        req2.do_not_queue = true;
+        queue.enqueue(req2).await;
+        assert_eq!(
+            queue.pending_count(),
+            0,
+            "do_not_queue request should not be parked"
+        );
+
+        let resp2 = rx2.await.unwrap();
+        assert!(
+            matches!(
+                resp2,
+                Err(KvSchedulerError::Backpressure {
+                    reason: RouterBackpressureReason::DoNotQueue,
+                    ..
+                })
+            ),
+            "expected DoNotQueue backpressure, got {resp2:?}"
+        );
+
+        // Cleanup.
+        let _ = slots.mark_prefill_completed(&"req-1".to_string(), decay_now());
+        let _ = slots.free(&"req-1".to_string(), decay_now());
+
+        set_router_queue_threshold_decode_tokens(0);
     }
 }

@@ -62,6 +62,7 @@ struct B10RoutingConfigOverride {
     router_residency_eviction_cost: Option<f64>,
     router_residency_half_life: Option<f64>,
     router_queue_threshold: Option<Option<f64>>,
+    router_queue_threshold_decode_tokens: Option<u64>,
     router_active_request_isl_mismatch_penalty: Option<f64>,
     router_active_request_isl_penalty_ramp: Option<(f64, f64)>,
 }
@@ -120,6 +121,13 @@ pub struct B10RoutingConfig {
     #[serde(default)]
     pub router_queue_threshold: Option<f64>,
 
+    /// Absolute threshold for the median per-worker decode tokens inflight.
+    /// When the median of (active decode blocks × block_size) across all workers
+    /// exceeds this value, requests are backpressured (queued or rejected)
+    /// in addition to the prefill-busy check. 0 or None disables the check.
+    #[serde(default)]
+    pub router_queue_threshold_decode_tokens: Option<u64>,
+
     #[serde(default)]
     pub router_active_request_isl_mismatch_penalty: f64,
 
@@ -168,6 +176,9 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_queue_threshold {
             self.router_queue_threshold = value;
         }
+        if let Some(value) = overrides.router_queue_threshold_decode_tokens {
+            self.router_queue_threshold_decode_tokens = Some(value);
+        }
         if let Some(value) = overrides.router_active_request_isl_mismatch_penalty {
             self.router_active_request_isl_mismatch_penalty = value;
         }
@@ -193,6 +204,7 @@ impl Default for B10RoutingConfig {
             router_residency_eviction_cost: default_router_residency_eviction_cost(),
             router_residency_half_life: default_router_residency_half_life(),
             router_queue_threshold: None,
+            router_queue_threshold_decode_tokens: None,
             router_active_request_isl_mismatch_penalty: 0.0,
             router_active_request_isl_penalty_ramp: default_router_active_request_isl_penalty_ramp(
             ),
@@ -554,9 +566,26 @@ impl HotReloadableConfig {
             unified_config.routing.router_decode_token_discount,
         );
 
+        let decode_tokens_threshold = unified_config
+            .routing
+            .router_queue_threshold_decode_tokens
+            .unwrap_or(0);
+
+        if decode_tokens_threshold > 0 && decode_tokens_threshold < 1000 {
+            tracing::warn!(
+                router_queue_threshold_decode_tokens = decode_tokens_threshold,
+                "router_queue_threshold_decode_tokens is set below 1000; typical values are 50k-2000k. \
+                 This may cause excessive backpressure."
+            );
+        }
+
+        dynamo_kv_router::scheduling::queue::set_router_queue_threshold_decode_tokens(
+            decode_tokens_threshold,
+        );
+
         if log_no_changes() {
             tracing::info!(
-                "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}",
+                "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}, router_queue_threshold_decode_tokens={:?}",
                 path,
                 unified_config.routing.router_prefill_token_discount,
                 unified_config.routing.router_decode_token_discount,
@@ -567,7 +596,8 @@ impl HotReloadableConfig {
                 unified_config.router_active_replicas,
                 unified_config.runtime.tensor_parallel_size,
                 unified_config.runtime.enable_attention_dp,
-                data_parallel_size
+                data_parallel_size,
+                unified_config.routing.router_queue_threshold_decode_tokens,
             );
         }
 
@@ -688,6 +718,13 @@ pub fn get_router_residency_half_life() -> f64 {
 
 pub fn get_router_queue_threshold() -> Option<f64> {
     get_config().get().routing.router_queue_threshold
+}
+
+pub fn get_router_queue_threshold_decode_tokens() -> Option<u64> {
+    get_config()
+        .get()
+        .routing
+        .router_queue_threshold_decode_tokens
 }
 
 /// Convenience function to get tensor parallel size
