@@ -1544,3 +1544,30 @@ Replay notes:
 Preserve this behavior while B10 remains a Baseten-specific selector. If B10 is
 replaced by an upstream selector, verify that the replacement applies
 `RoutingConstraints::preferred_taint_multiplier` during worker scoring.
+
+## PATCH-016: Client.instances() Snapshot API Backport
+
+Status: `upstream-sync`
+
+Source commits:
+
+- Current PR: feat(bindings): expose Client.instances() with instance/transport
+  snapshot (#11617)
+
+Purpose:
+
+Backport of upstream `ai-dynamo/dynamo#11617` (merged upstream as
+`c2a0c0fb8`). Exposes `Client.instances()` to Python: a structured snapshot of
+an endpoint's currently-registered instances (`instance_id`, `namespace`,
+`component`, `endpoint`, `device_type`, and `transport {kind, address}`),
+mirroring the runtime `Instance`/`TransportType` model. Lets a worker discover
+peer node addresses (e.g. the startup RDMA connectivity precheck) via a dynamo
+API instead of reading the discovery/etcd registry layout directly.
+
+Replay notes:
+
+Already upstream as of `c2a0c0fb8`; drop this patch when rebasing onto any
+release that contains it. One local deviation: the backported test file omits
+`test_python_request_plane_plain_annotated_error_and_malformed_frames`, which
+covers `_dynamo_annotated` response unwrapping that does not exist in the v1.2
+runtime.
