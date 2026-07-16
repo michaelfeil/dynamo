@@ -1571,3 +1571,70 @@ release that contains it. One local deviation: the backported test file omits
 `test_python_request_plane_plain_annotated_error_and_malformed_frames`, which
 covers `_dynamo_annotated` response unwrapping that does not exist in the v1.2
 runtime.
+
+## PATCH-017: KVBM on_rewind — trim slot state after speculative-decoding rewind
+
+Status: `mixed`
+
+Required when KVBM connector is used. If this branch is deployed with
+`kv_connector_config` enabled, the following patches must be present:
+
+- **Rewind API** (`on_rewind` / `rewind_device_blocks`): trims stale freed
+  block ids and token sequence after speculative-decoding rewind. Without
+  this, `get_finished` hangs when Eagle rejects draft tokens crossing a
+  block boundary.
+
+Source commits:
+
+- `7a4e938f2` feat(kvbm): add on_rewind to trim slot state after specdec rewind
+- `5b549f17c` fix(kvbm): record on_rewind in recorder and add rewind_device_blocks tests
+- `a91abfd63` style: apply cargo fmt formatting
+- `107b81364` fix(kvbm): guard on_rewind against missing slots
+- `139a41ecc` fix(kvbm): truncate token sequence on rewind
+
+Upstream PRs:
+
+- `ai-dynamo/dynamo#11736` — upstream contribution
+- `NVIDIA/TensorRT-LLM#16455` — TRT-LLM counterpart
+- `NVIDIA/TensorRT-LLM#16448` — upstream issue
+
+Purpose:
+
+Fix a hang in the KV cache connector when used with Eagle speculative
+decoding. When rejected draft tokens cause `rewindKVCache` to free blocks
+crossing a block boundary, the connector's per-request `block_ids` list was
+never trimmed, retaining stale freed block ids. This caused `get_finished`'s
+cross-rank `mpi_allgather` + `set.intersection` to never complete.
+
+Changes:
+
+- `ExternallyManagedDeviceSlot` trait: new `rewind_device_blocks` method
+- `VllmConnectorSlot.rewind_device_blocks`: trims `device_blocks` to
+  `live_block_ids`, clamps `current_position` / `evaluated_blocks` /
+  `offload_terminated_at_block`, clears `stored_block_priorities` for freed
+  blocks, and truncates `TokenBlockSequence` to `current_position` to prevent
+  rejected draft tokens from corrupting block hashes
+- `Leader` trait (both `trtllm_leader.rs` and `leader.rs`): new `on_rewind`
+  method with `has_slot` guard (matching `request_finished` pattern)
+- `PyTrtllmKvConnectorLeader` / `PyKvConnectorLeader`: exposed as pymethod
+- `KvConnectorLeaderRecorder`: records `OnRewind` action to the recording
+  channel (matching `UpdateStateAfterAlloc` pattern)
+- Python wrappers: `DynamoKVBMConnectorLeader.on_rewind` (trtllm) and vLLM
+  `KvConnectorLeader.on_rewind` delegate to the Rust leader
+- `_core.pyi`: type stub added
+- Rust unit tests: covers `[0,1,2] -> rewind [0,1] -> append [3]` cycle and
+  no-op-when-growing case
+
+Replay notes:
+
+The TRT-LLM side (`basetenlabs/trt-llm#199`) adds the Python `on_rewind` hook
+in `kv_cache_connector.py`, calls it from `resource_manager.py` after each
+`rewind_kv_cache` (guarded by `not self.is_draft` so only the target KV
+manager notifies the connector), and blocks non-linear-tree specdec +
+connector with `NotImplementedError` in `py_executor_creator.py`. If
+upstream merges the TRT-LLM PR, the `py_executor_creator.py` guard can be
+relaxed once external connectors implement `on_rewind`. The sequence
+truncation in `rewind_device_blocks` is needed because without it, rejected
+draft tokens remain in `self.sequence` and the next
+`apply_scheduler_output` appends new tokens after them, corrupting block
+hashes used for offload/save.
