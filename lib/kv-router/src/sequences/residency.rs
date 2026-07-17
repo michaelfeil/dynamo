@@ -16,6 +16,11 @@ const MAX_RESIDENCY_CAPACITY_BLOCKS: u64 = 200_000;
 const LRU_SAMPLE_PROBE_LIMIT: usize = 64;
 const LARGE_RESIDENCY_TRIM_BLOCKS: u64 = 10_000;
 
+/// Tiny non-zero eviction cost reported for a tracked worker when no eviction
+/// is predicted, so the worker appears in `eviction_costs` (and the routing
+/// log's `rec` term is non-zero) whenever residency scoring is enabled.
+const RESIDENCY_TRACKED_EPSILON: f64 = 0.0001;
+
 type ResidencyCache = LruCache<SequenceHash, Instant, FxBuildHasher>;
 
 #[derive(Debug)]
@@ -115,7 +120,7 @@ impl WorkerResidency {
                 would_evict_blocks,
                 oldest_evicted_age: None,
                 youngest_evicted_age: None,
-                eviction_cost: 0.0,
+                eviction_cost: with_tracked_epsilon(0.0, capacity),
             };
         }
 
@@ -139,7 +144,7 @@ impl WorkerResidency {
             would_evict_blocks,
             oldest_evicted_age,
             youngest_evicted_age,
-            eviction_cost,
+            eviction_cost: with_tracked_epsilon(eviction_cost, capacity),
         }
     }
 
@@ -225,6 +230,14 @@ fn warn_if_capacity_capped(requested_capacity: u64, tracked_capacity: u64) {
             tracked_capacity_blocks = tracked_capacity,
             "router residency capacity exceeds tracker budget; using capped capacity estimate"
         );
+    }
+}
+
+fn with_tracked_epsilon(cost: f64, capacity: u64) -> f64 {
+    if capacity > 0 {
+        cost.max(RESIDENCY_TRACKED_EPSILON)
+    } else {
+        cost
     }
 }
 
