@@ -49,10 +49,10 @@ impl WorkerResidency {
         }
     }
 
-    pub(crate) fn set_capacity(&mut self, capacity_blocks: Option<u64>) {
+    pub(crate) fn set_capacity(&mut self, capacity_blocks: Option<u64>) -> bool {
         let (requested_capacity, tracked_capacity) = tracked_capacity(capacity_blocks);
         if self.capacity_blocks == tracked_capacity {
-            return;
+            return false;
         }
 
         warn_if_capacity_capped(requested_capacity, tracked_capacity);
@@ -66,6 +66,7 @@ impl WorkerResidency {
                 "router residency capacity change trimmed a large number of blocks"
             );
         }
+        true
     }
 
     pub(crate) fn touch_sequence_hashes(&mut self, sequence_hashes: &[SequenceHash], now: Instant) {

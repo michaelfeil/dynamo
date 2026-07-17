@@ -1637,4 +1637,50 @@ relaxed once external connectors implement `on_rewind`. The sequence
 truncation in `rewind_device_blocks` is needed because without it, rejected
 draft tokens remain in `self.sequence` and the next
 `apply_scheduler_output` appends new tokens after them, corrupting block
-hashes used for offload/save.
+  hashes used for offload/save.
+
+## PATCH-018: B10 Residency Capacity Tracking for On-the-Fly Discovery
+
+Status: `keep`
+
+Source commits:
+
+- Current PR: fix B10 residency capacity tracking
+- `056f78ba2` fix(router): initialize residency for externally registered workers
+
+Purpose:
+
+Residency setup previously only configured workers present in the worker
+table at `configure_residency` time. Workers discovered on the fly — lazily
+from a request or replica-sync event, or via the EPP/allowed-worker external
+registration path — got a slot but no residency tracker until a later config
+path happened to run. This was most visible on passive active/passive routers
+at high RPS, where events can surface a worker before the worker-config watch
+has supplied its capacity.
+
+Changes:
+
+- Lazily registered workers (request/replica-sync path) now get a residency
+  tracker immediately when residency tracking is enabled, using default
+  capacity until the worker config is observed.
+- Externally registered workers (`register_external_workers`) get the same
+  default-capacity residency initialization for each newly added slot when
+  residency tracking is enabled, so the EPP path is no longer a gap.
+- The B10 hot-reload tick reconfigures residency capacities from the current
+  worker-config snapshot, so capacity changes and newly observed worker configs
+  apply without waiting for topology churn. Per-worker `set_capacity`
+  short-circuits when the effective capacity is unchanged, so the LRU is only
+  trimmed when a capacity number actually changes.
+- `engine_metrics_total_kv_blocks_override` is parsed from the B10
+  hot-reloadable config as a root-level optional integer and stored in a global
+  atomic override; `ModelRuntimeConfig::total_kv_blocks()` prefers the override
+  before the worker MDC value. `0` is rejected and ignored.
+
+Replay notes:
+
+Discovery now works on the fly for residency: any worker registration path
+(lazy, external, or reconcile) ends up with a residency tracker when
+`router_track_residency` is on, and the periodic hot-reload tick closes the
+gap between default and configured capacity. No per-message LRU work is done
+when capacities are unchanged.
+

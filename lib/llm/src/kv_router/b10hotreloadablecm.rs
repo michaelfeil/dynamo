@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{
     Arc, OnceLock, RwLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -27,6 +27,8 @@ const DEFAULT_ROUTER_RESIDENCY_EVICTION_COST: f64 = 0.0;
 const DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS: f64 = 120.0;
 const DEFAULT_ROUTER_ACTIVE_REQUEST_ISL_PENALTY_RAMP: (f64, f64) = (2048.0, 32_768.0);
 static LOG_NO_CHANGES: AtomicBool = AtomicBool::new(false);
+static ENGINE_METRICS_TOTAL_KV_BLOCKS_OVERRIDE: std::sync::LazyLock<Arc<AtomicU64>> =
+    std::sync::LazyLock::new(|| Arc::new(AtomicU64::new(0)));
 
 pub fn set_log_no_changes(enabled: bool) {
     LOG_NO_CHANGES.store(enabled, Ordering::Relaxed);
@@ -350,6 +352,22 @@ fn sanitize_router_residency_half_life(half_life: f64) -> f64 {
     DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS
 }
 
+fn sanitize_engine_metrics_total_kv_blocks_override(value: Option<u64>) -> Option<u64> {
+    match value {
+        Some(0) => {
+            tracing::error!(
+                "engine_metrics_total_kv_blocks_override must be > 0 when set, ignoring override"
+            );
+            None
+        }
+        other => other,
+    }
+}
+
+fn set_engine_metrics_total_kv_blocks_override(value: Option<u64>) {
+    ENGINE_METRICS_TOTAL_KV_BLOCKS_OVERRIDE.store(value.unwrap_or(0), Ordering::Relaxed);
+}
+
 /// Override configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OverrideConfig {
@@ -361,6 +379,9 @@ struct OverrideConfig {
 
     #[serde(default)]
     enable_attention_dp: Option<bool>,
+
+    #[serde(default)]
+    engine_metrics_total_kv_blocks_override: Option<u64>,
 }
 
 /// Root configuration structure for parsing YAML
@@ -378,6 +399,9 @@ struct LLMConfig {
 
     #[serde(default)]
     enable_attention_dp: Option<bool>,
+
+    #[serde(default)]
+    engine_metrics_total_kv_blocks_override: Option<u64>,
 }
 
 /// Runtime configuration fields from llm_api_config_router.yaml
@@ -405,6 +429,13 @@ impl LLMRuntimeConfig {
 pub fn get_data_parallel_size() -> Option<usize> {
     let runtime = &get_config().get().runtime;
     runtime.compute_data_parallel_size()
+}
+
+pub fn get_engine_metrics_total_kv_blocks_override() -> Option<u64> {
+    match ENGINE_METRICS_TOTAL_KV_BLOCKS_OVERRIDE.load(Ordering::Relaxed) {
+        0 => None,
+        value => Some(value),
+    }
 }
 
 /// Unified config containing both routing and runtime configuration
@@ -537,6 +568,9 @@ impl HotReloadableConfig {
             if let Some(adp) = group_config.enable_attention_dp {
                 root_config.enable_attention_dp = Some(adp);
             }
+            if let Some(total_kv_blocks) = group_config.engine_metrics_total_kv_blocks_override {
+                root_config.engine_metrics_total_kv_blocks_override = Some(total_kv_blocks);
+            }
         }
 
         let routing = &mut root_config.b10_routing_config;
@@ -547,6 +581,12 @@ impl HotReloadableConfig {
         routing.router_residency_half_life =
             sanitize_router_residency_half_life(routing.router_residency_half_life);
         // Build UnifiedConfig with separate routing and runtime configs
+        let engine_metrics_total_kv_blocks_override =
+            sanitize_engine_metrics_total_kv_blocks_override(
+                root_config.engine_metrics_total_kv_blocks_override,
+            );
+        set_engine_metrics_total_kv_blocks_override(engine_metrics_total_kv_blocks_override);
+
         let runtime_config = LLMRuntimeConfig {
             tensor_parallel_size: root_config.tensor_parallel_size,
             enable_attention_dp: root_config.enable_attention_dp,
@@ -585,7 +625,7 @@ impl HotReloadableConfig {
 
         if log_no_changes() {
             tracing::info!(
-                "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}, router_queue_threshold_decode_tokens={:?}",
+                "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}, engine_metrics_total_kv_blocks_override={:?}, router_queue_threshold_decode_tokens={:?}",
                 path,
                 unified_config.routing.router_prefill_token_discount,
                 unified_config.routing.router_decode_token_discount,
@@ -597,6 +637,7 @@ impl HotReloadableConfig {
                 unified_config.runtime.tensor_parallel_size,
                 unified_config.runtime.enable_attention_dp,
                 data_parallel_size,
+                engine_metrics_total_kv_blocks_override,
                 unified_config.routing.router_queue_threshold_decode_tokens,
             );
         }
@@ -796,9 +837,11 @@ b10_routing_config:
   router_active_replicas: 2
 tensor_parallel_size: 8
 enable_attention_dp: true
+engine_metrics_total_kv_blocks_override: 150000
 
 override_args:
   test_group:
+    engine_metrics_total_kv_blocks_override: 250000
     b10_routing_config:
       router_temperature: 0.99
       router_overlap_score_weight: 1.0
@@ -826,6 +869,7 @@ override_args:
         // Check runtime config and computed data_parallel_size
         assert_eq!(config.runtime.tensor_parallel_size, Some(8));
         assert_eq!(config.runtime.enable_attention_dp, Some(true));
+        assert_eq!(get_engine_metrics_total_kv_blocks_override(), Some(250000));
         assert_eq!(config.runtime.compute_data_parallel_size(), Some(8)); // Because enable_attention_dp=true returns tensor_parallel_size
 
         // Cleanup
@@ -1058,6 +1102,24 @@ override_args:
         unsafe {
             std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_engine_metrics_total_kv_blocks_override_sanitization() {
+        use std::io::Write;
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+engine_metrics_total_kv_blocks_override: 0
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        assert_eq!(config.runtime.tensor_parallel_size, None);
+        assert_eq!(get_engine_metrics_total_kv_blocks_override(), None);
     }
 
     #[test]

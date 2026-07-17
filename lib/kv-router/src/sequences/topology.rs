@@ -85,15 +85,27 @@ impl WorkerTable {
     pub(super) fn configure_residency(
         &mut self,
         capacity_by_worker: &HashMap<WorkerWithDpRank, Option<u64>>,
-    ) -> Vec<(Arc<RwLock<WorkerResidency>>, Option<u64>)> {
+    ) -> Vec<(WorkerWithDpRank, Arc<RwLock<WorkerResidency>>, Option<u64>)> {
         let mut updates = Vec::with_capacity(self.slots.len());
         for slot in &mut self.slots {
             updates.push((
+                slot.worker,
                 slot.ensure_residency(),
                 capacity_by_worker.get(&slot.worker).copied().flatten(),
             ));
         }
         updates
+    }
+
+    pub(super) fn configure_worker_residency(
+        &mut self,
+        worker: WorkerWithDpRank,
+        capacity_blocks: Option<u64>,
+    ) -> Option<Arc<RwLock<WorkerResidency>>> {
+        let idx = *self.index.get(&worker)?;
+        let residency = self.slots[idx].ensure_residency();
+        residency.write().set_capacity(capacity_blocks);
+        Some(residency)
     }
 
     pub(super) fn register_external(

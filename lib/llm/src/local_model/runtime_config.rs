@@ -226,7 +226,8 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
     }
 
     fn total_kv_blocks(&self) -> Option<u64> {
-        self.total_kv_blocks
+        crate::kv_router::b10hotreloadablecm::get_engine_metrics_total_kv_blocks_override()
+            .or(self.total_kv_blocks)
     }
 
     fn taints(&self) -> &HashSet<String> {

@@ -12,7 +12,7 @@
 use dynamo_tokens::SequenceHash;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{
     Arc,
@@ -432,9 +432,16 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
     /// Worker removal in External mode will be handled separately via GAIE
     /// lifecycle events (not yet implemented). TODO (atchernych) once we upgrade to GAIE latest.
     pub fn register_external_workers(&self, dp_range: &HashMap<u64, (u32, u32)>) {
+        let track_residency = self.tracks_residency();
         let change = {
             let mut table = self.workers.write();
-            table.register_external(self.block_size, dp_range)
+            let change = table.register_external(self.block_size, dp_range);
+            if track_residency {
+                for worker in &change.added {
+                    table.configure_worker_residency(*worker, None);
+                }
+            }
+            change
         };
 
         for worker in &change.added {
@@ -459,13 +466,38 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         &self,
         worker_kv_blocks: &HashMap<WorkerWithDpRank, Option<u64>>,
     ) {
-        self.track_residency.store(true, AtomicOrdering::Relaxed);
+        let first_configuration = !self.track_residency.swap(true, AtomicOrdering::Relaxed);
         let updates = {
             let mut table = self.workers.write();
             table.configure_residency(worker_kv_blocks)
         };
-        for (residency, capacity_blocks) in updates {
-            residency.write().set_capacity(capacity_blocks);
+
+        let mut changed_workers = 0usize;
+        let mut explicit_capacity_workers = 0usize;
+        let mut explicit_capacities = HashSet::new();
+        let mut example_total_kv_blocks = None;
+
+        for (_, residency, capacity_blocks) in &updates {
+            if let Some(capacity_blocks) = capacity_blocks {
+                explicit_capacity_workers += 1;
+                explicit_capacities.insert(*capacity_blocks);
+                example_total_kv_blocks.get_or_insert(*capacity_blocks);
+            }
+            if residency.write().set_capacity(*capacity_blocks) {
+                changed_workers += 1;
+            }
+        }
+
+        if first_configuration || changed_workers > 0 {
+            tracing::info!(
+                tracked_workers = updates.len(),
+                changed_workers,
+                explicit_capacity_workers,
+                default_capacity_workers = updates.len().saturating_sub(explicit_capacity_workers),
+                distinct_explicit_capacities = explicit_capacities.len(),
+                example_total_kv_blocks,
+                "configured worker residency capacities"
+            );
         }
     }
 
@@ -795,8 +827,20 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             return;
         }
 
-        tracing::debug!(?worker, "Lazily registering worker in slot tracker");
+        let track_residency = self.tracks_residency();
+        if track_residency {
+            tracing::warn!(
+                worker_id = worker.worker_id,
+                dp_rank = worker.dp_rank,
+                "lazily registering worker while residency tracking is enabled; using default residency capacity until worker config is observed"
+            );
+        } else {
+            tracing::debug!(?worker, "Lazily registering worker in slot tracker");
+        }
         let change = table.ensure_worker(self.block_size, worker);
+        if track_residency {
+            table.configure_worker_residency(worker, None);
+        }
         drop(table);
 
         self.prompt_registry.apply_topology_change(change);
@@ -1058,6 +1102,10 @@ mod tests {
         )
     }
 
+    fn make_empty_sequences() -> ActiveSequencesMultiWorker<NoopSequencePublisher> {
+        ActiveSequencesMultiWorker::new(NoopSequencePublisher, 4, HashMap::new(), false, 0, "test")
+    }
+
     fn make_multi_sequences_with_block_size(
         block_size: usize,
     ) -> ActiveSequencesMultiWorker<NoopSequencePublisher> {
@@ -1209,6 +1257,42 @@ mod tests {
         assert_eq!(pressure.capacity_blocks, Some(4));
         assert_eq!(pressure.new_blocks, 2);
         assert_eq!(pressure.would_evict_blocks, 1);
+    }
+
+    #[test]
+    fn lazy_worker_registration_gets_residency_until_capacity_is_observed() {
+        let sequences = make_empty_sequences();
+        let worker = WorkerWithDpRank::new(1, 0);
+        let decay_now = Instant::now();
+
+        sequences.configure_residency(&HashMap::new());
+        sequences
+            .add_request(
+                SequenceRequest {
+                    request_id: "req-1".to_string(),
+                    token_sequence: Some(vec![1, 2, 3]),
+                    track_prefill_tokens: false,
+                    expected_output_tokens: None,
+                    prefill_load_hint: None,
+                    active_request_isl_tokens: None,
+                    worker,
+                    lora_name: None,
+                },
+                decay_now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            sequences.residency_test_state(worker).unwrap(),
+            (Some(50_000), 3)
+        );
+
+        sequences.configure_residency(&HashMap::from([(worker, Some(150_000))]));
+
+        assert_eq!(
+            sequences.residency_test_state(worker).unwrap(),
+            (Some(150_000), 3)
+        );
     }
 
     #[tokio::test]

@@ -453,6 +453,16 @@ where
     pub fn get_active_lora_counts(&self) -> HashMap<String, usize> {
         self.slots.get_active_lora_counts()
     }
+
+    pub fn reconfigure_residency_capacities(&self) {
+        if !self.slots.tracks_residency() {
+            return;
+        }
+
+        let capacities =
+            Self::worker_residency_capacities(&self.queue.workers_with_configs_snapshot());
+        self.slots.configure_residency(&capacities);
+    }
 }
 
 impl<P, C, S, Sel> LocalScheduler<P, C, S, Sel, NoopOverlapScoresRefresh>

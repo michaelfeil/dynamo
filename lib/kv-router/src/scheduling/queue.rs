@@ -441,6 +441,13 @@ impl<
         self.supports_overlap_refresh
     }
 
+    pub(crate) fn workers_with_configs_snapshot(&self) -> HashMap<WorkerId, C>
+    where
+        C: Clone,
+    {
+        self.workers_with_configs.borrow().clone()
+    }
+
     fn prepare_block_hashes_for_refresh(
         &self,
         block_hashes: Option<Vec<LocalBlockHash>>,

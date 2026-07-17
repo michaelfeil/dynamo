@@ -159,6 +159,7 @@ where
                                 metrics_scheduler.pending_isl_tokens(),
                             );
                         }
+                        metrics_scheduler.reconfigure_residency_capacities();
                     }
                 }
             }
