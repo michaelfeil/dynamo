@@ -46,6 +46,7 @@ pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
 pub mod b10_metrics_helper;
+mod b10_potential_loads_cache;
 pub mod b10_worker_selector;
 pub mod b10hotreloadablecm;
 pub mod indexer;
@@ -66,6 +67,7 @@ pub use push_router::{DirectRoutingRouter, KvPushRouter};
 pub use scheduler_inputs::{OverlapScoresResponse, SharedCacheOverlapScore, WorkerOverlapScore};
 pub use sticky::{SessionLifecycleController, StickySessionRouter};
 
+use b10_potential_loads_cache::B10PotentialLoadsCache;
 use route_lookup::{TieredLookupResult, query_tiered_matches, split_retained_block_hashes};
 use scheduler_inputs::{
     CacheHitEstimates, KvRouterOverlapRefresher, WorkerCacheHitEstimate,
@@ -274,6 +276,7 @@ where
     /// Optional external shared KV cache pool. When present, `find_best_match`
     /// queries it in parallel with the indexer and factors shared hits into scoring.
     shared_cache: Option<Box<dyn SharedKvCache>>,
+    b10_potential_loads_cache: B10PotentialLoadsCache,
 }
 
 impl<Sel> KvRouter<Sel>
@@ -395,6 +398,7 @@ where
             _served_indexer_handle: served_indexer_handle,
             dynamic_disable_snapshots,
             shared_cache,
+            b10_potential_loads_cache: B10PotentialLoadsCache::default(),
         })
     }
 
@@ -1165,18 +1169,36 @@ where
             RouterRequest::PotentialLoads {
                 tokens,
                 block_mm_infos,
+                allow_short_caching,
             } => {
+                let cache_key =
+                    B10PotentialLoadsCache::key(&tokens, &block_mm_infos, allow_short_caching);
+                if let Some(cache_key) = cache_key.as_ref()
+                    && let Some(response) = self
+                        .b10_potential_loads_cache
+                        .get(cache_key, Instant::now())
+                {
+                    return Ok(ResponseStream::new(
+                        Box::pin(stream::iter(vec![Annotated::from_data(response)])),
+                        ctx.context(),
+                    ));
+                }
                 // Same overlap-aware pipeline as main-v1.0.0; block_mm_infos
                 // (when provided) is forwarded so MM-conditioned hashes drive
                 // the overlap-aware cache-hit estimates.
                 let loads = self
                     .get_potential_loads(&tokens, None, block_mm_infos.as_deref(), None)
                     .await?;
-                RouterResponse::PotentialLoads {
+                let response = RouterResponse::PotentialLoads {
                     loads,
                     pending_count: self.pending_count(),
                     pending_isl_tokens: self.pending_isl_tokens(),
+                };
+                if let Some(cache_key) = cache_key {
+                    self.b10_potential_loads_cache
+                        .put(cache_key, response.clone(), Instant::now());
                 }
+                response
             }
         };
 

@@ -460,6 +460,8 @@ pub enum RouterRequest {
         tokens: Vec<Token>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_short_caching: bool,
     },
 }
 

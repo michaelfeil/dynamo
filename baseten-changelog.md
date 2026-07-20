@@ -567,6 +567,11 @@ router queue backlog through `pending_count` and `pending_isl_tokens`, so caller
 can inspect both worker load projections and queued-work pressure in one request.
 Each `PotentialLoad` row also carries the worker's `active_requests` count,
 matching the v1.0 bookkeeping surface used by autoscaling consumers.
+`PotentialLoads` requests now also accept `allow_short_caching`, an opt-in
+500 ms router-side cache for repeated probes with fewer than 32 input tokens.
+Callers that set this flag avoid repeatedly recomputing the same load snapshot
+for short capacity probes. The cache is implemented in
+`lib/llm/src/kv_router/b10_potential_loads_cache.rs`.
 
 The B10 selector heuristic must stay compatible with v1.0 for a seamless router
 upgrade. The v1.2 port therefore restores the v1.0 active-request term, DP

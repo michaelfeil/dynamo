@@ -948,6 +948,8 @@ async fn query_potential_loads(
         let request = RouterRequest::PotentialLoads {
             tokens,
             block_mm_infos,
+            // no caching for this query.
+            allow_short_caching: false,
         };
         let request_value =
             match serde_json::to_value(&request).map_err(|e| PotentialLoadsError::Unreachable {
