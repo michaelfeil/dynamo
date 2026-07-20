@@ -443,8 +443,9 @@ fn copy_x_request_id<T: Send + Sync + 'static, U: Send + Sync + 'static>(
 fn b10_rate_limit_request(
     headers: &HeaderMap,
     context_id: &str,
+    is_service_tier_flex: bool,
 ) -> Option<axum::response::Response> {
-    if let Some((rate_limit_msg, _)) = check_rate_limit(headers) {
+    if let Some((rate_limit_msg, _)) = check_rate_limit(headers, is_service_tier_flex) {
         tracing::info!(
             unified_model_logs = true,
             context_id = %context_id,
@@ -485,7 +486,7 @@ async fn handler_completions(
 
     // create the context for the request
     let context_id = get_or_create_context_id(&headers);
-    if let Some(response) = b10_rate_limit_request(&headers, &context_id) {
+    if let Some(response) = b10_rate_limit_request(&headers, &context_id, false) {
         return Ok(response);
     }
     let streaming = request.inner.stream.unwrap_or(false);
@@ -904,7 +905,7 @@ async fn embeddings(
     check_ready(&state)?;
 
     let context_id = get_or_create_context_id(&headers);
-    if let Some(response) = b10_rate_limit_request(&headers, &context_id) {
+    if let Some(response) = b10_rate_limit_request(&headers, &context_id, false) {
         return Ok(response);
     }
     let request = context_from_headers(request, context_id, &headers)?;
@@ -1064,7 +1065,11 @@ async fn handler_chat_completions(
 
     // create the context for the request
     let context_id = get_or_create_context_id(&headers);
-    if let Some(response) = b10_rate_limit_request(&headers, &context_id) {
+    let is_service_tier_flex = matches!(
+        request.inner.service_tier,
+        Some(dynamo_protocols::types::ServiceTier::Flex)
+    );
+    if let Some(response) = b10_rate_limit_request(&headers, &context_id, is_service_tier_flex) {
         return Ok(response);
     }
     let streaming = request.inner.stream.unwrap_or(false);
@@ -1741,6 +1746,13 @@ async fn handler_responses(
 
     // create the context for the request
     let context_id = get_or_create_context_id(&headers);
+    let is_service_tier_flex = matches!(
+        request.inner.service_tier,
+        Some(dynamo_protocols::types::responses::ServiceTier::Flex)
+    );
+    if let Some(response) = b10_rate_limit_request(&headers, &context_id, is_service_tier_flex) {
+        return Ok(response);
+    }
     let streaming = request.inner.stream.unwrap_or(false);
     let raw_model = request.inner.model.as_deref().unwrap_or("");
     let resolved_model = resolve_request_model(raw_model, template.as_ref());

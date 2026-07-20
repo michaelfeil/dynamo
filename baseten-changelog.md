@@ -20,6 +20,16 @@ The entries below are intentionally grouped by replay unit, not by original PR
 or commit. Each group should be treated as one functional area to audit, port,
 test, and either keep or drop during an upgrade.
 
+Document guidelines:
+
+- Prefer updating an existing patch section when a change belongs to an
+  already-covered replay unit.
+- Add a new patch section only for a substantial standalone PR, ideally around
+  500 LOC or larger, or for a change that creates a distinct future rebase
+  decision.
+- If in doubt, keep the changelog entry local to the relevant existing section
+  and reference these document guidelines instead of adding a new section.
+
 Status values:
 
 - `keep`: likely Baseten-specific or still required.
@@ -962,10 +972,13 @@ the standalone B10 health heartbeat/poison state, the `/health_file` route, the
 header-driven B10 rate limiter, and Python functions `set_health`,
 `is_healthy`, `set_poisoned`, and `set_rate_limit_level`. The rate limiter was
 attached to the same endpoint classes v1.1 gated first: completions, chat
-completions, and embeddings. The target already has selective endpoint
-activation through `HttpService.enable_endpoint(...)`, with Python tests using
-it to turn chat on explicitly; do not replay old endpoint activation code unless
-new endpoint-specific tests fail. Broader protocol work remains open only for
+completions, and embeddings, and later extended to Responses and Anthropic
+Messages/count_tokens. `service_tier: flex` gets a B10-specific `+1.0`
+rate-limit surcharge with a kill switch; all other tiers remain on the
+default/non-flex path. The target already has selective endpoint activation
+through `HttpService.enable_endpoint(...)`, with Python tests using it to turn
+chat on explicitly; do not replay old endpoint activation code unless new
+endpoint-specific tests fail. Broader protocol work remains open only for
 response-shape or tolerance decisions not already covered by `baseten_ext` and
 Anthropic conformance slices.
 
@@ -1706,3 +1719,10 @@ Discovery now works on the fly for residency: any worker registration path
 gap between default and configured capacity. No per-message LRU work is done
 when capacities are unchanged.
 
+## Document Guidelines Reminder
+
+Before adding another top-level patch section, check the document guidelines at
+the top of this file. New sections should generally represent a substantial
+standalone PR, ideally around 500 LOC or larger, or a distinct future rebase
+decision; smaller follow-ups should be folded into the existing relevant
+section.

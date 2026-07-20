@@ -31,6 +31,7 @@ use tracing::Instrument;
 
 use super::{
     RouteDoc,
+    b10_rate_limiter::check_rate_limit,
     disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
     metrics::{CancellationLabels, Endpoint, process_response_and_observe_metrics},
     service_v2,
@@ -161,6 +162,19 @@ async fn handler_anthropic_messages(
 
     // Create request context
     let context_id = get_or_create_context_id(&headers);
+    let is_service_tier_flex = request.service_tier.as_deref() == Some("flex");
+    if let Some((rate_limit_msg, _)) = check_rate_limit(&headers, is_service_tier_flex) {
+        tracing::info!(
+            unified_model_logs = true,
+            context_id = %context_id,
+            "Request is rate limited: {rate_limit_msg}"
+        );
+        return Err(anthropic_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            &rate_limit_msg,
+        ));
+    }
     let streaming = request.stream;
     let resolved_model = resolve_request_model(&request.model, template.as_ref());
     let cancellation_labels = CancellationLabels {
@@ -506,8 +520,22 @@ async fn anthropic_messages(
 /// Returns an estimated input token count using a len/3 heuristic.
 async fn handler_count_tokens(
     State((_state, _template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    headers: HeaderMap,
     Json(mut request): Json<AnthropicCountTokensRequest>,
 ) -> Result<Response, Response> {
+    let context_id = get_or_create_context_id(&headers);
+    if let Some((rate_limit_msg, _)) = check_rate_limit(&headers, false) {
+        tracing::info!(
+            unified_model_logs = true,
+            context_id = %context_id,
+            "Request is rate limited: {rate_limit_msg}"
+        );
+        return Err(anthropic_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            &rate_limit_msg,
+        ));
+    }
     if env_is_truthy(env_llm::DYN_STRIP_ANTHROPIC_PREAMBLE) {
         strip_billing_preamble(&mut request.system);
     }
