@@ -106,7 +106,17 @@ impl HttpService {
                 )
             })?;
 
+        // Hold Phase 2 of Runtime::shutdown until axum finishes draining
+        // in-flight requests. Without this the primary token cancels seconds
+        // after SIGTERM, tearing down discovery watches while multi-minute
+        // streams are still draining: the frontend then sees an empty
+        // instance list, mistakes a healthy router for gone, and fails the
+        // drained requests with 529 (Instance not found / next router
+        // unreachable).
+        let guard = runtime.inner().register_graceful_task();
+
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _guard = guard;
             service.run(token).await.map_err(to_pyerr)?;
             Ok(())
         })

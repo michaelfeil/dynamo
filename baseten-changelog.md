@@ -312,6 +312,28 @@ storage-backed discovery) rebuild or diff local state from that snapshot. This
 prevents stale lease-bound discovery entries from surviving missed delete
 events during etcd reconnects.
 
+The frontend HTTP service now registers with the graceful-shutdown tracker for
+the lifetime of its serve+drain future (`HttpService::run` holds a
+`GracefulTaskGuard`, basetenlabs/dynamo#461). Before this, only worker
+orchestrators registered, so on a frontend Phase 2 was empty and Phase 3
+cancelled the primary token milliseconds after SIGTERM — tearing down the
+KV-store discovery watch while axum was still draining multi-minute streams.
+The dying frontend then saw an empty instance list, treated a healthy router as
+unreachable (`Instance not found and no other instances available`), and failed
+in-flight requests with HTTP 529 `model_unavailable`; the router-side request
+guard's `mark_free` failed on the same path, leaking queued-ISL admission until
+the router's 300 s stale-sequence expiry. Observed on every frontend HPA
+scale-down under long-context traffic (fde wdld27k, 2026-07-17). With the
+guard, Phase 2 holds until in-flight HTTP requests finish, bounded by
+`DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS` — deployments must size that
+variable (and `terminationGracePeriodSeconds`) above the longest expected
+stream; the Baseten model-values 90 s pin is too low for long-context serving.
+Validated by killing both frontend pods with four in-flight ~600K-token
+requests: all drained to HTTP 200, shutdown held 83 s/161 s (previously 0.6 ms
+and 529s). Known follow-ups, not yet ported: the discovery `endpoint_watcher`
+still publishes an empty instance list on local cancellation, and the router
+guard leak deserves a liveness lease instead of relying on the 300 s expiry.
+
 Replay notes:
 
 Port behavior, not necessarily implementation. Upstream may have refactored
