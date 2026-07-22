@@ -930,6 +930,9 @@ Source commits:
 - `3e42842b0` feat(async-openai): widen ReasoningEffort for DeepSeek V4 (#220)
 - `d104200bf` fix(anthropic): gate inline tool_use stop on parseable accumulated args (#232)
 - `d637b3f39` Adding reasoning block for openai requests (#243)
+- `de9d4ba04` fix(frontend): correct Anthropic /v1/messages input_tokens accounting
+  (port of upstream #11030 `2a29f6d65f`; Baseten deviation: always emit
+  `cache_creation_input_tokens: 0`)
 
 Purpose:
 
