@@ -86,8 +86,7 @@ mod parsers;
 mod planner;
 mod prometheus_metrics;
 
-type JsonServerStreamingIngress =
-    Ingress<SingleIn<serde_json::Value>, ManyOut<RsAnnotated<serde_json::Value>>>;
+type JsonServerStreamingIngress = Ingress<SingleIn<rmpv::Value>, ManyOut<RsAnnotated<rmpv::Value>>>;
 
 static INIT: OnceCell<()> = OnceCell::new();
 
@@ -120,9 +119,9 @@ fn get_span_for_direct_context(
 
 // Helper to create request context with proper linking and cancellation handling
 fn create_request_context(
-    request: serde_json::Value,
+    request: rmpv::Value,
     parent_ctx: &Option<context::Context>,
-) -> RsContext<serde_json::Value> {
+) -> RsContext<rmpv::Value> {
     match parent_ctx {
         // If there is a parent context, link the request as a child context of it
         Some(parent_ctx) => {
@@ -619,7 +618,7 @@ struct ModelCardInstanceId {
 #[pyclass]
 #[derive(Clone)]
 struct Client {
-    router: rs::pipeline::PushRouter<serde_json::Value, RsAnnotated<serde_json::Value>>,
+    router: rs::pipeline::PushRouter<rmpv::Value, RsAnnotated<rmpv::Value>>,
     endpoint: rs::component::Endpoint,
 }
 
@@ -1157,12 +1156,13 @@ impl Endpoint {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = inner.client().await.map_err(to_pyerr)?;
-            let push_router = rs::pipeline::PushRouter::<
-                serde_json::Value,
-                RsAnnotated<serde_json::Value>,
-            >::from_client(client, router_mode.into())
-            .await
-            .map_err(to_pyerr)?;
+            let push_router =
+                rs::pipeline::PushRouter::<rmpv::Value, RsAnnotated<rmpv::Value>>::from_client(
+                    client,
+                    router_mode.into(),
+                )
+                .await
+                .map_err(to_pyerr)?;
             Ok(Client {
                 router: push_router,
                 endpoint: inner,
@@ -1418,7 +1418,7 @@ impl Client {
         annotated: Option<bool>,
         context: Option<context::Context>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let request: serde_json::Value = pythonize::depythonize(&request.into_bound(py))?;
+        let request: rmpv::Value = pythonize::depythonize(&request.into_bound(py))?;
         let request_ctx = create_request_context(request, &context);
         let annotated = annotated.unwrap_or(false);
 
@@ -1452,7 +1452,7 @@ impl Client {
         annotated: Option<bool>,
         context: Option<context::Context>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let request: serde_json::Value = pythonize::depythonize(&request.into_bound(py))?;
+        let request: rmpv::Value = pythonize::depythonize(&request.into_bound(py))?;
         let request_ctx = create_request_context(request, &context);
         let annotated = annotated.unwrap_or(false);
 
@@ -1490,7 +1490,7 @@ impl Client {
         annotated: Option<bool>,
         context: Option<context::Context>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let request: serde_json::Value = pythonize::depythonize(&request.into_bound(py))?;
+        let request: rmpv::Value = pythonize::depythonize(&request.into_bound(py))?;
         let request_ctx = create_request_context(request, &context);
         let annotated = annotated.unwrap_or(false);
 
@@ -1527,7 +1527,7 @@ impl Client {
         annotated: Option<bool>,
         context: Option<context::Context>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let request: serde_json::Value = pythonize::depythonize(&request.into_bound(py))?;
+        let request: rmpv::Value = pythonize::depythonize(&request.into_bound(py))?;
         let request_ctx = create_request_context(request, &context);
         let annotated = annotated.unwrap_or(false);
 
@@ -1560,13 +1560,13 @@ impl Client {
 }
 
 async fn process_stream(
-    stream: EngineStream<RsAnnotated<serde_json::Value>>,
+    stream: EngineStream<RsAnnotated<rmpv::Value>>,
     tx: tokio::sync::mpsc::Sender<RsAnnotated<PyObject>>,
 ) {
     let mut stream = stream;
     while let Some(response) = stream.next().await {
         // Convert the response to a PyObject using Python's GIL
-        let annotated: RsAnnotated<serde_json::Value> = response;
+        let annotated: RsAnnotated<rmpv::Value> = response;
         let annotated: RsAnnotated<PyObject> = annotated.map_data(|data| {
             Python::with_gil(|py| match pythonize::pythonize(py, &data) {
                 Ok(pyobj) => Ok(pyobj.into()),
@@ -1700,5 +1700,56 @@ impl Annotated {
             self.inner.comment.as_deref().unwrap_or(&[]),
             self.inner.id.as_deref().unwrap_or("None")
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Keep Rust unit tests here free of Python C API calls. This crate uses
+    // PyO3's `extension-module` feature, so standalone `cargo test` binaries
+    // intentionally do not link libpython. Python behavior is covered by
+    // tests/test_request_plane_bytes.py against the built extension.
+
+    /// The Python `Client` router path carries requests/responses through the
+    /// request-plane codec as a dynamic value. It uses `rmpv::Value` (not
+    /// `serde_json::Value`) so that a `bytes` field survives the (default)
+    /// msgpack codec as a `Binary` marker instead of erroring — which is what
+    /// lets workers emit raw bytes instead of base64. This pins that property
+    /// at the wire level; the full Python `Client` round-trip is covered by
+    /// `tests/test_request_plane_bytes.py` against the built extension.
+    #[test]
+    fn rmpv_value_carries_bytes_through_msgpack_request_plane() {
+        use dynamo_runtime::pipeline::network::{NetworkStreamWrapper, RequestPlanePayloadCodec};
+        use dynamo_runtime::protocols::annotated::Annotated;
+
+        let payload = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::String("img".into()),
+                rmpv::Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            ),
+            (rmpv::Value::String("n".into()), rmpv::Value::from(7i64)),
+        ]);
+        let wrapper = NetworkStreamWrapper {
+            data: Some(Annotated::from_data(payload)),
+            complete_final: false,
+        };
+        let wire = RequestPlanePayloadCodec::Msgpack
+            .encode(&wrapper)
+            .expect("encode");
+        let back: NetworkStreamWrapper<Annotated<rmpv::Value>> = RequestPlanePayloadCodec::Msgpack
+            .decode(&wire)
+            .expect("bytes field must not error on decode");
+        let data = back.data.expect("data").data.expect("annotated data");
+        let img = data
+            .as_map()
+            .expect("map")
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("img"))
+            .map(|(_, v)| v)
+            .expect("img field");
+        assert!(
+            matches!(img, rmpv::Value::Binary(b) if b == &[0xDE, 0xAD, 0xBE, 0xEF]),
+            "msgpack must preserve bytes as Binary, got {img:?}"
+        );
     }
 }

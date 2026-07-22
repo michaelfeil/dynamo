@@ -67,8 +67,10 @@ impl RouterRequestNew {
     /// Build the wire body for a `new` routing request from the typed fields.
     /// Every field is set by the caller from the [`PyRouterRequestNew`] pyclass
     /// under the GIL; no serde-deserialized defaults are layered in.
-    pub(super) fn into_routing_request_value(self) -> Result<serde_json::Value> {
-        Ok(serde_json::to_value(RouterRequest::from(self))?)
+    pub(super) fn into_routing_request_value(self) -> Result<rmpv::Value> {
+        Ok(serde_json::from_value(serde_json::to_value(
+            RouterRequest::from(self),
+        )?)?)
     }
 }
 

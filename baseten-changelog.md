@@ -362,6 +362,17 @@ Backported upstream PR `ai-dynamo/dynamo#10437` (`73903bdc807323c0b14dbb4ddb7c79
 `payload_codec` field are still decoded as JSON for compatibility with older
 clients; set `DYN_REQUEST_PLANE_CODEC=json` to force JSON sends.
 
+The Dynamo fork is adjusted to send Python `bytes` natively through the
+request pipeline using msgpack as the default codec, instead of
+base64-encoding binary payloads. This mirrors upstream
+`ai-dynamo/dynamo#12015`, which swaps the Python `Client` request-plane
+intermediate and the server ingress from `serde_json::Value` to
+`rmpv::Value` so that msgpack's native `Binary` type round-trips as
+`PyBytes` end-to-end. Both the fork and upstream are considered aligned
+when the fork contains some version of `ai-dynamo/dynamo#12015` and a
+Python `bytes` field survives the full client→router→worker→client
+round-trip as `bytes` (not base64, not an int array).
+
 Added `DYN_ENABLE_FAULT_INJECTION` to opt into PushRouter request-path
 fault-injection handling. It defaults off so transient transport/backend
 failures do not quarantine remotes unless explicitly enabled; Baseten avoids

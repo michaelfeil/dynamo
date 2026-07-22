@@ -29,6 +29,19 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// Build an `rmpv::Value` from `jv!` syntax. The request plane
+/// carries `rmpv::Value` (not `rmpv::Value`), but `jv!` is
+/// the most ergonomic way to build test fixtures, so this macro bridges the two
+/// via a JSON-level round-trip (both types impl Serialize + Deserialize).
+macro_rules! jv {
+    ($($x:tt)*) => { serde_json::from_value::<rmpv::Value>(serde_json::json!($($x)*)).unwrap() };
+}
+
+/// Convert a `serde_json::Value` to `rmpv::Value` for test fixtures.
+fn jv_value(v: serde_json::Value) -> rmpv::Value {
+    serde_json::from_value::<rmpv::Value>(v).expect("json -> rmpv round-trip")
+}
+
 const TEST_BLOCK_SIZE: u32 = 32;
 
 /// When Yes, the fake's `direct()` short-circuits with
@@ -77,7 +90,7 @@ struct RouterGuardClientForTesting {
     available_instance_ids: Mutex<Vec<u64>>,
     instance_ids: Mutex<Vec<u64>>,
     responses: Mutex<VecDeque<Result<RsRouterResponse, String>>>,
-    stream_chunks_queue: Mutex<Option<VecDeque<Vec<serde_json::Value>>>>,
+    stream_chunks_queue: Mutex<Option<VecDeque<Vec<rmpv::Value>>>>,
     respect_cancel: Mutex<CancelRespect>,
     auto_remove_on_error: AtomicBool,
     stream_items_polled: Arc<AtomicUsize>,
@@ -86,7 +99,7 @@ struct RouterGuardClientForTesting {
     prefill_callback_delay: Mutex<Duration>,
     mark_free_callback_delay: Mutex<Duration>,
     route_contexts: Mutex<Vec<Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>>>,
-    calls: Mutex<Vec<(u64, serde_json::Value)>>,
+    calls: Mutex<Vec<(u64, rmpv::Value)>>,
     detailed_calls: Mutex<Vec<DetailedCall>>,
 }
 
@@ -137,7 +150,7 @@ impl RouterGuardClientForTesting {
     fn set_mark_free_callback_delay(&self, delay: Duration) {
         *self.mark_free_callback_delay.lock().unwrap() = delay;
     }
-    fn set_stream_chunks(&self, chunks: Vec<Vec<serde_json::Value>>) {
+    fn set_stream_chunks(&self, chunks: Vec<Vec<rmpv::Value>>) {
         *self.stream_chunks_queue.lock().unwrap() = Some(chunks.into());
     }
 
@@ -163,7 +176,7 @@ impl RouterGuardClientForTesting {
             .retain(|&x| x != id);
     }
 
-    fn calls(&self) -> Vec<(u64, serde_json::Value)> {
+    fn calls(&self) -> Vec<(u64, rmpv::Value)> {
         self.calls.lock().unwrap().clone()
     }
     fn detailed_calls(&self) -> Vec<DetailedCall> {
@@ -209,16 +222,12 @@ impl RouterGuardClient for RouterGuardClientForTesting {
 
     async fn direct(
         &self,
-        request: RsContext<serde_json::Value>,
+        request: RsContext<rmpv::Value>,
         instance_id: u64,
-    ) -> Result<EngineStream<RsAnnotated<serde_json::Value>>> {
+    ) -> Result<EngineStream<RsAnnotated<rmpv::Value>>> {
         let data = request.content().clone();
         let context = request.context();
-        let method = data
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let method = data["method"].as_str().unwrap_or("").to_string();
         let ctx_stopped_or_killed = context.is_stopped() || context.is_killed();
 
         // Legacy log: every direct() attempt is recorded so tests can
@@ -248,9 +257,9 @@ impl RouterGuardClient for RouterGuardClientForTesting {
             } else {
                 RsRouterResponse::PrefillMarked { success: true }
             };
-            let data = serde_json::to_value(&resp)?;
+            let data = jv_value(serde_json::to_value(&resp)?);
             let stream = stream::iter(vec![RsAnnotated::from_data(data)]);
-            let stream: EngineStream<RsAnnotated<serde_json::Value>> =
+            let stream: EngineStream<RsAnnotated<rmpv::Value>> =
                 ResponseStream::new(Box::pin(stream), context);
             self.detailed_calls.lock().unwrap().push(DetailedCall {
                 instance_id,
@@ -298,7 +307,7 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         if let Some(chunks_queue) = self.stream_chunks_queue.lock().unwrap().as_mut()
             && let Some(chunks) = chunks_queue.pop_front()
         {
-            let annotated: Vec<RsAnnotated<serde_json::Value>> =
+            let annotated: Vec<RsAnnotated<rmpv::Value>> =
                 chunks.into_iter().map(RsAnnotated::from_data).collect();
             let ctx_for_filter = context.clone();
             let stream_items_polled = self.stream_items_polled.clone();
@@ -310,7 +319,7 @@ impl RouterGuardClient for RouterGuardClientForTesting {
                     let stop = ctx_for_filter.is_stopped() || ctx_for_filter.is_killed();
                     std::future::ready(!stop)
                 });
-            let stream: EngineStream<RsAnnotated<serde_json::Value>> =
+            let stream: EngineStream<RsAnnotated<rmpv::Value>> =
                 ResponseStream::new(Box::pin(stream), context);
             self.detailed_calls.lock().unwrap().push(DetailedCall {
                 instance_id,
@@ -331,12 +340,12 @@ impl RouterGuardClient for RouterGuardClientForTesting {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| Err("missing scripted router response".to_string()));
-        let stream_result: Result<EngineStream<RsAnnotated<serde_json::Value>>> = match response {
+        let stream_result: Result<EngineStream<RsAnnotated<rmpv::Value>>> = match response {
             Ok(resp) => {
-                let data = serde_json::to_value(&resp)?;
+                let data = jv_value(serde_json::to_value(&resp)?);
                 let first_response_delay = *self.first_response_delay.lock().unwrap();
                 let stream: std::pin::Pin<
-                    Box<dyn futures::Stream<Item = RsAnnotated<serde_json::Value>> + Send>,
+                    Box<dyn futures::Stream<Item = RsAnnotated<rmpv::Value>> + Send>,
                 > = if first_response_delay > Duration::ZERO {
                     Box::pin(stream::once(async move {
                         tokio::time::sleep(first_response_delay).await;
@@ -394,7 +403,7 @@ async fn wait_for_call_count(client: &RouterGuardClientForTesting, count: usize)
 
 async fn route(
     router: Arc<RouterGuardClientForTesting>,
-    request: serde_json::Value,
+    request: rmpv::Value,
     request_id: &str,
     require: Vec<MinReplicaAvailable>,
     notify_timeout: Duration,
@@ -420,7 +429,7 @@ async fn no_router_instances_returns_router_backpressure() {
 
     let (guard, source) = route(
         router.clone(),
-        serde_json::json!({"method": "new", "tokens": [1]}),
+        jv!({"method": "new", "tokens": [1]}),
         "req-no-router",
         vec![],
         Duration::from_secs(60),
@@ -440,7 +449,7 @@ async fn min_replica_preflight_returns_required_down_without_routing() {
 
     let (guard, source) = route(
         router.clone(),
-        serde_json::json!({"method": "new", "tokens": [1]}),
+        jv!({"method": "new", "tokens": [1]}),
         "req-preflight",
         vec![MinReplicaAvailable {
             name: "prefillworker".to_string(),
@@ -466,7 +475,7 @@ async fn drop_sends_mark_free_without_mark_prefill() {
 
     let (guard, source) = route(
         router.clone(),
-        serde_json::json!({"method": "new", "tokens": [1]}),
+        jv!({"method": "new", "tokens": [1]}),
         "req-drop",
         vec![],
         Duration::from_secs(60),
@@ -481,7 +490,7 @@ async fn drop_sends_mark_free_without_mark_prefill() {
     let calls = router.calls();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].0, 7);
-    assert_eq!(calls[1].1["method"], "mark_free");
+    assert_eq!(calls[1].1["method"].as_str(), Some("mark_free"));
 }
 
 #[tokio::test]
@@ -494,7 +503,7 @@ async fn notify_timeout_sends_mark_free_and_exits() {
 
     let (guard, source) = route(
         router.clone(),
-        serde_json::json!({"method": "new", "tokens": [1]}),
+        jv!({"method": "new", "tokens": [1]}),
         "req-timeout",
         vec![],
         Duration::from_millis(5),
@@ -506,7 +515,7 @@ async fn notify_timeout_sends_mark_free_and_exits() {
     wait_for_call_count(&router, 2).await;
     let calls = router.calls();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[1].1["method"], "mark_free");
+    assert_eq!(calls[1].1["method"].as_str(), Some("mark_free"));
 
     drop(guard);
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -519,16 +528,17 @@ fn router_request_new_defaults_minimal_wire() {
         .into_routing_request_value()
         .expect("build ok");
 
-    assert_eq!(value["method"], "new");
-    assert_eq!(value["tokens"], serde_json::json!([]));
+    assert_eq!(value["method"].as_str(), Some("new"));
+    assert_eq!(value["tokens"], jv!([]));
     // defaults are skipped on the wire
-    assert!(value.get("block_mm_infos").is_none());
-    assert!(value.get("routing_constraints").is_none());
-    assert!(value.get("priority_jump").is_none());
-    assert!(value.get("priority_load_shed_percent").is_none());
-    assert!(value.get("do_not_queue").is_none());
+    assert!(value["block_mm_infos"].is_nil());
+    assert!(value["routing_constraints"].is_nil());
+    assert!(value["priority_jump"].is_nil());
+    assert!(value["priority_load_shed_percent"].is_nil());
+    assert!(value["do_not_queue"].is_nil());
 
-    let parsed: RouterRequest = serde_json::from_value(value).expect("round-trips");
+    let parsed: RouterRequest =
+        serde_json::from_value(serde_json::to_value(&value).unwrap()).expect("round-trips");
     match parsed {
         RouterRequest::New {
             tokens,
@@ -556,13 +566,15 @@ fn router_request_new_priority_fields_round_trip() {
     };
     let value = req.into_routing_request_value().expect("build ok");
 
-    assert_eq!(value["method"], "new");
-    assert_eq!(value["tokens"], serde_json::json!([1, 2, 3]));
-    assert_eq!(value["priority_jump"], 0.5);
-    assert_eq!(value["priority_load_shed_percent"], 10);
-    assert_eq!(value["do_not_queue"], true);
+    assert_eq!(value["method"].as_str(), Some("new"));
+    assert_eq!(value["tokens"], jv!([1, 2, 3]));
+    assert_eq!(value["priority_jump"].as_f64(), Some(0.5));
+    assert_eq!(value["priority_load_shed_percent"].as_i64(), Some(10));
+    assert_eq!(value["do_not_queue"].as_bool(), Some(true));
 
-    match serde_json::from_value::<RouterRequest>(value).expect("round-trips") {
+    match serde_json::from_value::<RouterRequest>(serde_json::to_value(&value).unwrap())
+        .expect("round-trips")
+    {
         RouterRequest::New {
             tokens,
             do_not_queue,
@@ -595,9 +607,11 @@ fn router_request_new_block_mm_infos_carried() {
     };
     let value = req.into_routing_request_value().expect("build ok");
 
-    assert_eq!(value["method"], "new");
+    assert_eq!(value["method"].as_str(), Some("new"));
     // block_mm_infos round-trips through the wire tagged payload.
-    match serde_json::from_value::<RouterRequest>(value).expect("round-trips") {
+    match serde_json::from_value::<RouterRequest>(serde_json::to_value(&value).unwrap())
+        .expect("round-trips")
+    {
         RouterRequest::New { block_mm_infos, .. } => {
             let infos = block_mm_infos.expect("block_mm_infos present");
             assert_eq!(infos.len(), 1);
@@ -625,9 +639,11 @@ fn router_request_new_routing_constraints_non_default_round_trip() {
     };
     let value = req.into_routing_request_value().expect("build ok");
 
-    assert_eq!(value["method"], "new");
-    assert!(value.get("routing_constraints").is_some());
-    match serde_json::from_value::<RouterRequest>(value).expect("round-trips") {
+    assert_eq!(value["method"].as_str(), Some("new"));
+    assert!(!value["routing_constraints"].is_nil());
+    match serde_json::from_value::<RouterRequest>(serde_json::to_value(&value).unwrap())
+        .expect("round-trips")
+    {
         RouterRequest::New {
             routing_constraints,
             ..
@@ -651,14 +667,14 @@ fn build_test_context(id: &str) -> context::Context {
     context::Context::new(inner, None, None, BTreeMap::new())
 }
 
-fn make_routing_request() -> serde_json::Value {
+fn make_routing_request() -> rmpv::Value {
     RouterRequestNew::default()
         .into_routing_request_value()
         .expect("default routing request builds")
 }
 
-fn make_worker_request() -> serde_json::Value {
-    serde_json::json!({"method": "generate", "prompt": "hello"})
+fn make_worker_request() -> rmpv::Value {
+    jv!({"method": "generate", "prompt": "hello"})
 }
 
 fn route_response_new(worker_id: u64) -> Result<RsRouterResponse, String> {
@@ -733,12 +749,12 @@ fn potential_loads_response_for_workers(
 async fn connect(
     router: Arc<RouterGuardClientForTesting>,
     worker: Arc<RouterGuardClientForTesting>,
-    routing_request: serde_json::Value,
+    routing_request: rmpv::Value,
     request_id: &str,
     context: context::Context,
     require: Vec<MinReplicaAvailable>,
     preflight_inputs: Option<PreflightInputs>,
-    worker_request: serde_json::Value,
+    worker_request: rmpv::Value,
     max_reroutes: u64,
     allow_cancel_routing: bool,
     allow_cancel_setup: bool,
@@ -827,8 +843,8 @@ async fn wait_for_stream_items_polled(
 /// The `EngineStream` is a `Pin<Box<dyn Stream + Send>>`; `StreamExt::next`
 /// polls it once. Used by the stream-cancellation test.
 async fn take_one_from_stream(
-    stream: &mut EngineStream<RsAnnotated<serde_json::Value>>,
-) -> Option<RsAnnotated<serde_json::Value>> {
+    stream: &mut EngineStream<RsAnnotated<rmpv::Value>>,
+) -> Option<RsAnnotated<rmpv::Value>> {
     stream.as_mut().next().await
 }
 
@@ -879,7 +895,10 @@ async fn route_and_connect_happy_router_response_inject_and_mark_free_on_drop() 
     assert_eq!(router.method_call_count("new"), 1);
     assert_eq!(worker.method_call_count("generate"), 1);
     let worker_call = &worker.calls()[0];
-    assert_eq!(worker_call.1["router_response"]["worker_id"], 1);
+    assert_eq!(
+        worker_call.1["router_response"]["worker_id"].as_i64(),
+        Some(1)
+    );
 
     // Cleanup on drop fires `mark_free` on the ROUTER fake (the guard's
     // `router` field is the routing router). The worker fake never sees
@@ -895,9 +914,9 @@ async fn route_and_connect_wait_for_first_response_omits_sentinel() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
     worker.set_stream_chunks(vec![vec![
-        serde_json::json!({"drop_this_message": true, "internal_healthy": true}),
-        serde_json::json!({"chunk": 1}),
-        serde_json::json!({"chunk": 2}),
+        jv!({"drop_this_message": true, "internal_healthy": true}),
+        jv!({"chunk": 1}),
+        jv!({"chunk": 2}),
     ]]);
     let context = build_test_context("test-swallow-first-event");
 
@@ -951,12 +970,12 @@ async fn route_and_connect_wait_for_first_response_omits_sentinel() {
     let first_visible = take_one_from_stream(&mut stream)
         .await
         .expect("remaining stream should contain first visible item");
-    assert_eq!(first_visible.data, Some(serde_json::json!({"chunk": 1})));
+    assert_eq!(first_visible.data, Some(jv!({"chunk": 1})));
 
     let second_visible = take_one_from_stream(&mut stream)
         .await
         .expect("remaining stream should contain second visible item");
-    assert_eq!(second_visible.data, Some(serde_json::json!({"chunk": 2})));
+    assert_eq!(second_visible.data, Some(jv!({"chunk": 2})));
 
     assert_eq!(worker.stream_items_polled_count(), 3);
     drop(stream);
@@ -968,10 +987,7 @@ async fn route_and_connect_wait_for_first_response_omits_sentinel() {
 async fn route_and_connect_wait_for_first_response_replays_non_sentinel_item() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
-    worker.set_stream_chunks(vec![vec![
-        serde_json::json!({"chunk": 1}),
-        serde_json::json!({"chunk": 2}),
-    ]]);
+    worker.set_stream_chunks(vec![vec![jv!({"chunk": 1}), jv!({"chunk": 2})]]);
     let context = build_test_context("test-swallow-first-event-non-health");
 
     let outcome = route_and_connect(
@@ -1024,7 +1040,7 @@ async fn route_and_connect_wait_for_first_response_replays_non_sentinel_item() {
     let first_visible = take_one_from_stream(&mut stream)
         .await
         .expect("first non-health item should be replayed");
-    assert_eq!(first_visible.data, Some(serde_json::json!({"chunk": 1})));
+    assert_eq!(first_visible.data, Some(jv!({"chunk": 1})));
     assert_eq!(
         worker.stream_items_polled_count(),
         1,
@@ -1034,7 +1050,7 @@ async fn route_and_connect_wait_for_first_response_replays_non_sentinel_item() {
     let second_visible = take_one_from_stream(&mut stream)
         .await
         .expect("remaining stream should contain second item");
-    assert_eq!(second_visible.data, Some(serde_json::json!({"chunk": 2})));
+    assert_eq!(second_visible.data, Some(jv!({"chunk": 2})));
 
     drop(stream);
     drop(guard);
@@ -1046,8 +1062,8 @@ async fn stream_prefill_mark_skips_internal_event_and_marks_first_real_item() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
     worker.set_stream_chunks(vec![vec![
-        serde_json::json!({"drop_this_message": true, "internal_healthy": true}),
-        serde_json::json!({"chunk": 1}),
+        jv!({"drop_this_message": true, "internal_healthy": true}),
+        jv!({"chunk": 1}),
     ]]);
     let context = build_test_context("test-prefill-mark-first-real-item");
 
@@ -1079,14 +1095,14 @@ async fn stream_prefill_mark_skips_internal_event_and_marks_first_real_item() {
         .expect("internal event should still be forwarded without first-event mutation");
     assert_eq!(
         internal.data,
-        Some(serde_json::json!({"drop_this_message": true, "internal_healthy": true}))
+        Some(jv!({"drop_this_message": true, "internal_healthy": true}))
     );
     assert_eq!(router.method_call_count("mark_prefill"), 0);
 
     let first_real = take_one_from_stream(&mut stream)
         .await
         .expect("real worker item should follow internal event");
-    assert_eq!(first_real.data, Some(serde_json::json!({"chunk": 1})));
+    assert_eq!(first_real.data, Some(jv!({"chunk": 1})));
     wait_for_method_call_count(&router, "mark_prefill", 1, Duration::from_secs(2)).await;
 
     drop(stream);
@@ -1099,8 +1115,8 @@ async fn route_and_connect_wait_for_first_response_uses_sentinel_behavior() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
     worker.set_stream_chunks(vec![vec![
-        serde_json::json!({"drop_this_message": true, "internal_healthy": true}),
-        serde_json::json!({"chunk": 1}),
+        jv!({"drop_this_message": true, "internal_healthy": true}),
+        jv!({"chunk": 1}),
     ]]);
     let context = build_test_context("test-wait-and-return-first-event-sentinel");
 
@@ -1153,7 +1169,7 @@ async fn route_and_connect_wait_for_first_response_uses_sentinel_behavior() {
     let first_visible = take_one_from_stream(&mut stream)
         .await
         .expect("sentinel should be swallowed before first visible item");
-    assert_eq!(first_visible.data, Some(serde_json::json!({"chunk": 1})));
+    assert_eq!(first_visible.data, Some(jv!({"chunk": 1})));
 
     drop(stream);
     drop(guard);
@@ -2437,9 +2453,9 @@ async fn route_and_connect_stream_cancelled_in_band_truncates_stream() {
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
     worker.set_stream_chunks(vec![
-        vec![serde_json::json!({"chunk": 1})],
-        vec![serde_json::json!({"chunk": 2})],
-        vec![serde_json::json!({"chunk": 3})],
+        vec![jv!({"chunk": 1})],
+        vec![jv!({"chunk": 2})],
+        vec![jv!({"chunk": 3})],
     ]);
     let context = build_test_context("test-stream-cancel");
 
@@ -2474,7 +2490,7 @@ async fn route_and_connect_stream_cancelled_in_band_truncates_stream() {
     // returns true so chunk 1 forwards.
     let first = take_one_from_stream(&mut stream).await;
     assert!(first.is_some(), "first chunk should arrive");
-    assert_eq!(first.unwrap().data, Some(serde_json::json!({"chunk": 1})));
+    assert_eq!(first.unwrap().data, Some(jv!({"chunk": 1})));
 
     // Stop the parent now; the linked child's controller propagates
     // stop_generating synchronously, so the next take_while poll
@@ -2653,7 +2669,7 @@ async fn route_and_connect_mark_free_preempts_in_flight_mark_prefill() {
 
     guard.mark_prefill();
     wait_for_call_count(&router, 2).await;
-    assert_eq!(router.calls()[1].1["method"], "mark_prefill");
+    assert_eq!(router.calls()[1].1["method"].as_str(), Some("mark_prefill"));
 
     guard.mark_free();
     wait_for_method_call_count(&router, "mark_free", 1, Duration::from_millis(250)).await;
@@ -2750,9 +2766,9 @@ async fn shield_route_and_connect_no_taker_drains_connected_worker_stream() {
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
     worker.set_open_delay(Duration::from_millis(200));
     worker.set_stream_chunks(vec![vec![
-        serde_json::json!({"chunk": 1}),
-        serde_json::json!({"chunk": 2}),
-        serde_json::json!({"chunk": 3}),
+        jv!({"chunk": 1}),
+        jv!({"chunk": 2}),
+        jv!({"chunk": 3}),
     ]]);
     let context = build_test_context("test-shield-route-no-taker-drain");
 

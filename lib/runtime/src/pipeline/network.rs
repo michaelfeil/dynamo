@@ -54,7 +54,7 @@ pub(crate) fn get_tcp_max_message_size() -> usize {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RequestPlanePayloadCodec {
+pub enum RequestPlanePayloadCodec {
     #[default]
     Json,
     Msgpack,
@@ -92,14 +92,14 @@ impl RequestPlanePayloadCodec {
         }
     }
 
-    pub(crate) fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>> {
+    pub fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>> {
         match self {
             Self::Json => Ok(serde_json::to_vec(value)?),
             Self::Msgpack => Ok(rmp_serde::to_vec_named(value)?),
         }
     }
 
-    pub(crate) fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T> {
+    pub fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T> {
         match self {
             Self::Json => Ok(serde_json::from_slice(bytes)?),
             Self::Msgpack => Ok(rmp_serde::from_slice(bytes)?),

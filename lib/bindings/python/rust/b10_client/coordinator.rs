@@ -30,9 +30,24 @@ use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 use futures::StreamExt;
 use pyo3::PyObject;
 use rand::Rng;
+use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
+
+/// Convert any `Serialize` into an `rmpv::Value` via a JSON round-trip. Used
+/// for routing metadata (`RouterRequest` / `RouterResponse`) that originates
+/// from typed wire structs but must flow through the `rmpv::Value`-typed
+/// request plane alongside the user payload.
+fn to_rmpv_value<T: Serialize>(value: &T) -> Result<rmpv::Value> {
+    Ok(serde_json::from_value(serde_json::to_value(value)?)?)
+}
+
+/// Decode a `Deserialize` type from an `rmpv::Value` via a JSON round-trip.
+/// Used to recover the typed `RouterResponse` from the wire `rmpv::Value`.
+fn from_rmpv_value<T: DeserializeOwned>(value: &rmpv::Value) -> Result<T> {
+    Ok(serde_json::from_value(serde_json::to_value(value)?)?)
+}
 
 use super::DROP_THIS_MESSAGE_KEY;
 use super::guard::{
@@ -46,10 +61,10 @@ use super::types::{
 
 /// JSON-typed push router used to talk to KV router instances.
 ///
-/// On v1.2.0 the Python `Client` pyclass holds a `PushRouter<serde_json::Value,
-/// RsAnnotated<serde_json::Value>>` plus a separate `endpoint` handle; this
+/// On v1.2.0 the Python `Client` pyclass holds a `PushRouter<rmpv::Value,
+/// RsAnnotated<rmpv::Value>>` plus a separate `endpoint` handle; this
 /// alias names that router type used throughout the b10_client coordinator.
-type JsonPushRouter = PushRouter<serde_json::Value, RsAnnotated<serde_json::Value>>;
+type JsonPushRouter = PushRouter<rmpv::Value, RsAnnotated<rmpv::Value>>;
 
 const POTENTIAL_LOADS_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
@@ -96,14 +111,11 @@ fn log_route_and_connect_denied(
 }
 
 fn create_detached_router_request_context(
-    request: serde_json::Value,
+    request: rmpv::Value,
     parent_ctx: &Option<context::Context>,
     request_id: &str,
     follow_parent_cancellation: bool,
-) -> (
-    RsContext<serde_json::Value>,
-    Option<tokio::task::JoinHandle<()>>,
-) {
+) -> (RsContext<rmpv::Value>, Option<tokio::task::JoinHandle<()>>) {
     let request_ctx = RsContext::with_id_and_metadata(
         request,
         request_id.to_string(),
@@ -220,10 +232,10 @@ fn cancellation_denial_for_optional_context(
 }
 
 fn create_worker_request_context(
-    request: serde_json::Value,
+    request: rmpv::Value,
     parent_ctx: &context::Context,
     follow_parent_during_setup: bool,
-) -> RsContext<serde_json::Value> {
+) -> RsContext<rmpv::Value> {
     if follow_parent_during_setup {
         create_request_context(request, &Some(parent_ctx.clone()))
     } else {
@@ -263,7 +275,7 @@ pub(super) struct RouteRequestTimings {
 }
 
 pub(super) struct RouterStreamResponse {
-    data: serde_json::Value,
+    data: rmpv::Value,
     pub(super) response: RsRouterResponse,
 }
 
@@ -277,9 +289,9 @@ pub(super) trait RouterGuardClient: Send + Sync {
 
     async fn direct(
         &self,
-        request: RsContext<serde_json::Value>,
+        request: RsContext<rmpv::Value>,
         instance_id: u64,
-    ) -> Result<EngineStream<RsAnnotated<serde_json::Value>>>;
+    ) -> Result<EngineStream<RsAnnotated<rmpv::Value>>>;
 }
 
 #[derive(Clone)]
@@ -309,9 +321,9 @@ impl RouterGuardClient for JsonRouterGuardClient {
 
     async fn direct(
         &self,
-        request: RsContext<serde_json::Value>,
+        request: RsContext<rmpv::Value>,
         instance_id: u64,
-    ) -> Result<EngineStream<RsAnnotated<serde_json::Value>>> {
+    ) -> Result<EngineStream<RsAnnotated<rmpv::Value>>> {
         self.router.direct(request, instance_id).await
     }
 }
@@ -326,7 +338,7 @@ impl RouterGuardClient for JsonRouterGuardClient {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn route_request(
     router: Arc<dyn RouterGuardClient>,
-    request: serde_json::Value,
+    request: rmpv::Value,
     request_id: String,
     context: Option<context::Context>,
     require_min1_replica_available: Vec<MinReplicaAvailable>,
@@ -746,7 +758,7 @@ fn router_backpressure_response() -> Result<RouterStreamResponse> {
         queued_isl_tokens: 0,
         max_queued_isl_tokens: None,
     };
-    let data = serde_json::to_value(&response)?;
+    let data = to_rmpv_value(&response)?;
     Ok(RouterStreamResponse { data, response })
 }
 
@@ -768,7 +780,7 @@ pub(super) fn callback_router_instance_ids(
 }
 
 pub(super) async fn first_stream_response(
-    mut stream: EngineStream<RsAnnotated<serde_json::Value>>,
+    mut stream: EngineStream<RsAnnotated<rmpv::Value>>,
 ) -> Result<RouterStreamResponse> {
     let response = stream
         .next()
@@ -780,8 +792,8 @@ pub(super) async fn first_stream_response(
     let data = response
         .data
         .ok_or_else(|| anyhow::anyhow!("router response did not contain data"))?;
-    let router_response = serde_json::from_value(data.clone())
-        .map_err(|err| anyhow::anyhow!("failed to decode router response {data}: {err}))"))?;
+    let router_response = from_rmpv_value(&data)
+        .map_err(|err| anyhow::anyhow!("failed to decode router response {data}: {err}"))?;
 
     Ok(RouterStreamResponse {
         data,
@@ -811,7 +823,7 @@ where
 }
 
 async fn drain_worker_stream_to_completion(
-    stream: EngineStream<RsAnnotated<serde_json::Value>>,
+    stream: EngineStream<RsAnnotated<rmpv::Value>>,
     guard: &RouterRequestGuard,
 ) {
     let mut stream = stream;
@@ -843,7 +855,7 @@ async fn drain_worker_stream_to_completion(
 /// cancellation: [`process_stream`] exits on send failure and drops the
 /// upstream worker stream.
 pub(super) async fn shield_stream_to_completion(
-    stream: EngineStream<RsAnnotated<serde_json::Value>>,
+    stream: EngineStream<RsAnnotated<rmpv::Value>>,
     guard: Arc<RouterRequestGuard>,
     source: RouteSource,
 ) -> Result<
@@ -952,7 +964,7 @@ async fn query_potential_loads(
             allow_short_caching: false,
         };
         let request_value =
-            match serde_json::to_value(&request).map_err(|e| PotentialLoadsError::Unreachable {
+            match to_rmpv_value(&request).map_err(|e| PotentialLoadsError::Unreachable {
                 error: format!("failed to encode potential loads request: {e}"),
             }) {
                 Ok(value) => value,
@@ -1215,7 +1227,7 @@ enum RouteOnceOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn route_once(
     router_guard_client: Arc<dyn RouterGuardClient>,
-    routing_request: serde_json::Value,
+    routing_request: rmpv::Value,
     request_id: String,
     context: Option<context::Context>,
     require: Vec<MinReplicaAvailable>,
@@ -1436,7 +1448,7 @@ enum OpenResult {
     Ok {
         guard: RouterRequestGuard,
         worker_id: u64,
-        stream: EngineStream<RsAnnotated<serde_json::Value>>,
+        stream: EngineStream<RsAnnotated<rmpv::Value>>,
         timings: WorkerConnectTimings,
     },
     Stale,
@@ -1452,9 +1464,9 @@ struct WorkerConnectTimings {
 }
 
 async fn wait_for_first_worker_event(
-    stream: &mut EngineStream<RsAnnotated<serde_json::Value>>,
+    stream: &mut EngineStream<RsAnnotated<rmpv::Value>>,
     worker_id: u64,
-) -> Result<RsAnnotated<serde_json::Value>> {
+) -> Result<RsAnnotated<rmpv::Value>> {
     let first = stream
         .next()
         .await
@@ -1471,19 +1483,19 @@ async fn wait_for_first_worker_event(
     Ok(first)
 }
 
-pub(super) fn should_drop_first_worker_event(event: &RsAnnotated<serde_json::Value>) -> bool {
+pub(super) fn should_drop_first_worker_event(event: &RsAnnotated<rmpv::Value>) -> bool {
     event
         .data
         .as_ref()
-        .and_then(|data| data.get(DROP_THIS_MESSAGE_KEY))
-        .and_then(|value| value.as_bool())
+        .map(|data| data[DROP_THIS_MESSAGE_KEY].as_bool())
+        .and_then(|value| value)
         .unwrap_or(false)
 }
 
 fn prepend_first_worker_event(
-    first: RsAnnotated<serde_json::Value>,
-    stream: EngineStream<RsAnnotated<serde_json::Value>>,
-) -> EngineStream<RsAnnotated<serde_json::Value>> {
+    first: RsAnnotated<rmpv::Value>,
+    stream: EngineStream<RsAnnotated<rmpv::Value>>,
+) -> EngineStream<RsAnnotated<rmpv::Value>> {
     let stream_context = stream.context();
     let replay_stream = futures::stream::once(async move { first }).chain(stream);
     ResponseStream::new(Box::pin(replay_stream), stream_context)
@@ -1515,7 +1527,7 @@ async fn connect_worker(
     worker_guard_client: Arc<dyn RouterGuardClient>,
     worker_id: u64,
     guard: RouterRequestGuard,
-    worker_request: serde_json::Value,
+    worker_request: rmpv::Value,
     context: context::Context,
     allow_cancel_setup: bool,
     wait_for_first_response: bool,
@@ -1643,7 +1655,7 @@ pub(super) enum RouteAndConnectOutcome {
     Connected {
         guard: RouterRequestGuard,
         worker_id: u64,
-        stream: EngineStream<RsAnnotated<serde_json::Value>>,
+        stream: EngineStream<RsAnnotated<rmpv::Value>>,
         timings: AdmittedRequestTimings,
     },
     Denied(DeniedRequest),
@@ -1723,12 +1735,12 @@ where
 pub(super) async fn route_and_connect(
     router_guard_client: Arc<dyn RouterGuardClient>,
     worker_guard_client: Arc<dyn RouterGuardClient>,
-    routing_request: serde_json::Value,
+    routing_request: rmpv::Value,
     request_id: String,
     context: context::Context,
     require: Vec<MinReplicaAvailable>,
     mut preflight_inputs: Option<PreflightInputs>,
-    worker_request: serde_json::Value,
+    worker_request: rmpv::Value,
     block_size: u32,
     max_reroutes: u64,
     allow_cancel_routing: bool,
@@ -1777,8 +1789,12 @@ pub(super) async fn route_and_connect(
         // clone so the worker (or a further forwarder) sees the routing decision.
         let mut req = worker_request.clone();
         match &mut req {
-            serde_json::Value::Object(map) => {
-                map.insert("router_response".to_string(), guard.new_response().clone());
+            rmpv::Value::Map(map) => {
+                map.retain(|(k, _)| k.as_str() != Some("router_response"));
+                map.push((
+                    rmpv::Value::from("router_response"),
+                    guard.new_response().clone(),
+                ));
             }
             _ => {
                 drop(guard);

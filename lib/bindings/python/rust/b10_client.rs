@@ -64,10 +64,10 @@ use types::{MinReplicaAvailable, PotentialLoadsCheckData, PreflightInputs, Route
 pub(crate) const DROP_THIS_MESSAGE_KEY: &str = "drop_this_message";
 
 fn stream_with_optional_prefill_mark(
-    stream: EngineStream<RsAnnotated<serde_json::Value>>,
+    stream: EngineStream<RsAnnotated<rmpv::Value>>,
     guard: Arc<RouterRequestGuard>,
     mark_prefill_on_response: bool,
-) -> EngineStream<RsAnnotated<serde_json::Value>> {
+) -> EngineStream<RsAnnotated<rmpv::Value>> {
     if !mark_prefill_on_response {
         return stream;
     }
@@ -89,7 +89,7 @@ fn stream_with_optional_prefill_mark(
 }
 
 fn attach_worker_stream_to_parent_context(
-    stream: &EngineStream<RsAnnotated<serde_json::Value>>,
+    stream: &EngineStream<RsAnnotated<rmpv::Value>>,
     parent: &context::Context,
 ) {
     let parent_inner = parent.inner();
@@ -309,9 +309,9 @@ impl RouterWorkerCoordinator {
         };
         let routing_request = req.into_routing_request_value().map_err(to_pyerr)?;
 
-        let worker_request: serde_json::Value = match worker_args {
+        let worker_request: rmpv::Value = match worker_args {
             Some(wa) => pythonize::depythonize(&wa.into_bound(py))?,
-            None => serde_json::Value::Object(Default::default()),
+            None => rmpv::Value::Map(Vec::new()),
         };
 
         let require: Vec<MinReplicaAvailable> = require_available
@@ -341,7 +341,7 @@ impl RouterWorkerCoordinator {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // `worker_args` must be a JSON object so the per-route
             // `RouterResponse::New` can be injected under `router_response`.
-            if !matches!(worker_request, serde_json::Value::Object(_)) {
+            if !matches!(worker_request, rmpv::Value::Map(_)) {
                 return Err(PyValueError::new_err(
                     "worker_args must be a JSON object so the router response can be added as the `router_response` field",
                 ));

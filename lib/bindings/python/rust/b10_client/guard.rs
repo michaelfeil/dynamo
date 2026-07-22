@@ -137,7 +137,7 @@ pub(super) struct RouterRequestGuard {
     state: Arc<RouterRequestGuardState>,
     /// Raw JSON of the router response. `None` on a provisional guard until
     /// [`Self::commit`] installs it.
-    new_response: Option<serde_json::Value>,
+    new_response: Option<rmpv::Value>,
     /// Decoded router response. `None` on a provisional guard until
     /// [`Self::commit`] installs it.
     response: Option<RsRouterResponse>,
@@ -153,7 +153,7 @@ impl RouterRequestGuard {
         router: Arc<dyn RouterGuardClient>,
         request_id: String,
         preferred_instance_id: u64,
-        new_response: serde_json::Value,
+        new_response: rmpv::Value,
         response: RsRouterResponse,
         armed: bool,
         notify_timeout: Duration,
@@ -207,7 +207,7 @@ impl RouterRequestGuard {
         router: Arc<dyn RouterGuardClient>,
         request_id: String,
         preferred_instance_id: u64,
-        new_response: Option<serde_json::Value>,
+        new_response: Option<rmpv::Value>,
         response: Option<RsRouterResponse>,
         armed: bool,
         notify_timeout: Duration,
@@ -245,7 +245,7 @@ impl RouterRequestGuard {
     /// without sending `mark_free`.
     pub(super) fn commit(
         mut self,
-        new_response: serde_json::Value,
+        new_response: rmpv::Value,
         response: RsRouterResponse,
         armed: bool,
     ) -> Self {
@@ -271,7 +271,7 @@ impl RouterRequestGuard {
     }
 
     /// The raw JSON of the initial router response, for surfacing to Python.
-    pub(super) fn new_response(&self) -> &serde_json::Value {
+    pub(super) fn new_response(&self) -> &rmpv::Value {
         self.new_response
             .as_ref()
             .expect("RouterRequestGuard response accessed before commit")
@@ -422,10 +422,10 @@ async fn send_router_guard_mark(
         callback_router_instance_ids(state.router.as_ref(), state.preferred_instance_id);
     let method = mark.request_method();
     let preemptible = matches!(mark, GuardMark::Prefill);
-    let request = serde_json::json!({
+    let request: rmpv::Value = serde_json::from_value(serde_json::json!({
         "method": method,
         "request_id": state.request_id.clone(),
-    });
+    }))?;
     let mut last_error = None;
 
     for attempt in 0..ROUTER_GUARD_ATTEMPTS {
