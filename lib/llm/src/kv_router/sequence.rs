@@ -9,7 +9,7 @@
 
 pub use dynamo_kv_router::multi_worker_sequence::{
     ActiveSequencesMultiWorker, SequenceError, SequencePublisher, SequenceRequest,
-    SequenceSubscriber,
+    SequenceSubscriber, WorkerLoadObservation,
 };
 use dynamo_kv_router::protocols::{ActiveLoad, ActiveSequenceEvent, WorkerWithDpRank};
 pub use dynamo_kv_router::sequence::{ActiveSequences, RequestId};
@@ -21,7 +21,7 @@ use dynamo_runtime::transports::event_plane::{EventPublisher, EventSubscriber};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::metrics::WORKER_LOAD_METRICS;
+use super::metrics::{ROUTER_SEQUENCE_METRICS, WORKER_LOAD_METRICS};
 use crate::kv_router::{ACTIVE_SEQUENCES_SUBJECT, KV_METRICS_SUBJECT};
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 #[cfg(test)]
@@ -55,16 +55,20 @@ impl SequencePublisher for RuntimeSequencePublisher {
         &self,
         worker: &WorkerWithDpRank,
         worker_type: &str,
-        blocks: usize,
-        tokens: usize,
+        load: WorkerLoadObservation,
     ) {
-        WORKER_LOAD_METRICS.observe(
-            worker.worker_id,
-            worker.dp_rank,
-            worker_type,
-            blocks,
-            tokens,
-        );
+        WORKER_LOAD_METRICS.observe(worker.worker_id, worker.dp_rank, worker_type, load);
+    }
+
+    fn b10_observe_worker_removed(&self, worker: &WorkerWithDpRank, worker_type: &str) {
+        WORKER_LOAD_METRICS.b10_remove_series(worker.worker_id, worker.dp_rank, worker_type);
+    }
+
+    fn b10_observe_force_expired_requests(&self, worker_type: &str, expired_count: usize) {
+        ROUTER_SEQUENCE_METRICS
+            .force_expired_requests_total
+            .with_label_values(&[worker_type])
+            .inc_by(expired_count as u64);
     }
 }
 

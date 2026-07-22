@@ -34,6 +34,10 @@ use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRe
 pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 
 const ADMISSION_CHANNEL_CAPACITY: usize = 65_536;
+
+/// Bounds the tier-cap rejection path's cancelled-entry prune (a full pending-heap
+/// scan) under sustained overload.
+const ENQUEUE_REJECT_PRUNE_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const ROUTER_QUEUE_BUSY_FRACTIONAL_ENV: &str = "DYN_ROUTER_QUEUE_BUSY_FRACTIONAL";
 
 static ROUTER_QUEUE_BUSY_FRACTIONAL: OnceLock<bool> = OnceLock::new();
@@ -53,7 +57,7 @@ pub fn set_router_queue_threshold_decode_tokens(tokens: u64) {
     }
 }
 
-fn router_queue_threshold_decode_tokens() -> u64 {
+pub fn router_queue_threshold_decode_tokens() -> u64 {
     ROUTER_QUEUE_THRESHOLD_DECODE_TOKENS.load(AtomicOrdering::Relaxed)
 }
 
@@ -114,6 +118,32 @@ impl<K: Ord + Eq> PartialOrd for QueueEntry<K> {
 }
 
 #[allow(clippy::large_enum_variant)]
+/// Inputs of the most recent queue-admission evaluations, snapshotted with
+/// Relaxed atomics on the admission path and exported as gauges.
+/// Note: under fractional busy mode (>16 workers) the queue can engage while
+/// the min-visited worker is below threshold; the pair is exact in the
+/// default all-workers-busy mode.
+#[derive(Debug, Default)]
+pub struct B10QueueEvalGauges {
+    /// Min active prefill tokens among workers visited by the last
+    /// prefill-busy evaluation.
+    pub prefill_evaluated_tokens: AtomicU64,
+    /// `threshold_frac * max_num_batched_tokens` of that worker.
+    pub prefill_threshold_tokens: AtomicU64,
+    /// Median per-(worker, dp_rank) decode tokens at the last decode-gate
+    /// evaluation. Compared against the global (hot-reloadable)
+    /// `router_queue_threshold_decode_tokens()`, which the metrics sync task
+    /// exports as this gate's threshold gauge.
+    pub decode_evaluated_tokens: AtomicU64,
+    /// Missing-ISL tier cap (the 429 backpressure rejection threshold on
+    /// queued ISL) applied at the last evaluation; 0 when no cap applied.
+    /// The compared value is the pending-ISL gauge.
+    pub isl_cap_tokens: AtomicU64,
+}
+
+// Enqueue's inline SchedulingRequest dominates; boxing would only add a
+// per-enqueue allocation on the admission hot path.
+#[allow(clippy::large_enum_variant)]
 enum AdmissionCommand {
     Enqueue {
         request: SchedulingRequest,
@@ -139,11 +169,14 @@ struct SchedulerQueueActor<
     pending: BinaryHeap<QueueEntry<S::Key>>,
     pending_count: Arc<AtomicUsize>,
     pending_isl_tokens: Arc<AtomicUsize>,
+    cancelled_requests: Arc<AtomicUsize>,
+    eval_gauges: Arc<B10QueueEvalGauges>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     threshold_frac: Option<f64>,
     queue_depth_tiers: RouterQueueDepthTiers,
     start_time: Instant,
+    last_cancel_prune: Instant,
     block_size: u32,
     selector: Sel,
     policy: S,
@@ -172,6 +205,11 @@ pub struct SchedulerQueue<
     /// Sum of `isl_tokens` for requests currently parked in the pending queue.
     /// Incremented after push, decremented after pop. Lock-free reads via `Relaxed` load.
     pending_isl_tokens: Arc<AtomicUsize>,
+    /// Total bookings skipped because the requester abandoned the response
+    /// channel before admission (lazy cleanup of cancelled queued requests).
+    cancelled_requests: Arc<AtomicUsize>,
+    /// Last-evaluation snapshots for the threshold/eval gauge exports.
+    eval_gauges: Arc<B10QueueEvalGauges>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     supports_overlap_refresh: bool,
@@ -228,16 +266,24 @@ impl<
         };
         let pending_count = Arc::new(AtomicUsize::new(0));
         let pending_isl_tokens = Arc::new(AtomicUsize::new(0));
+        let cancelled_requests = Arc::new(AtomicUsize::new(0));
+        let eval_gauges = Arc::new(B10QueueEvalGauges::default());
         let (admission_tx, admission_rx) = mpsc::channel(ADMISSION_CHANNEL_CAPACITY);
         let actor = SchedulerQueueActor {
             pending: BinaryHeap::new(),
             pending_count: Arc::clone(&pending_count),
             pending_isl_tokens: Arc::clone(&pending_isl_tokens),
+            cancelled_requests: Arc::clone(&cancelled_requests),
+            eval_gauges: Arc::clone(&eval_gauges),
             slots: Arc::clone(&slots),
             workers_with_configs: workers_with_configs.clone(),
             threshold_frac,
             queue_depth_tiers,
             start_time: Instant::now(),
+            // One interval in the past so the first reject-path prune is not gated.
+            last_cancel_prune: Instant::now()
+                .checked_sub(ENQUEUE_REJECT_PRUNE_MIN_INTERVAL)
+                .unwrap_or_else(Instant::now),
             block_size,
             selector,
             policy,
@@ -252,6 +298,8 @@ impl<
             admission_tx,
             pending_count,
             pending_isl_tokens,
+            cancelled_requests,
+            eval_gauges,
             slots,
             workers_with_configs,
             supports_overlap_refresh: overlap_refresh_after.is_some(),
@@ -427,6 +475,11 @@ impl<
         }
     }
 
+    /// Last-evaluation snapshots for the threshold/eval gauges (lock-free).
+    pub fn b10_eval_gauges(&self) -> &B10QueueEvalGauges {
+        &self.eval_gauges
+    }
+
     /// Number of requests currently parked in the pending queue (lock-free).
     pub fn pending_count(&self) -> usize {
         self.pending_count.load(AtomicOrdering::Relaxed)
@@ -435,6 +488,11 @@ impl<
     /// Sum of `isl_tokens` for requests currently parked in the pending queue (lock-free).
     pub fn pending_isl_tokens(&self) -> usize {
         self.pending_isl_tokens.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Total bookings skipped for requests cancelled before admission (lock-free).
+    pub fn b10_cancelled_requests_count(&self) -> usize {
+        self.cancelled_requests.load(AtomicOrdering::Relaxed)
     }
 
     pub fn supports_overlap_refresh(&self) -> bool {
@@ -539,18 +597,34 @@ impl<
             }
 
             if !self.queue_depth_tiers.is_unbounded() {
-                let pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
+                let mut pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
+                let tier_cap = self.tier_cap_for_request(&request);
+                // 0 = no cap applied at the last evaluation, so the gauge
+                // cannot go stale when tiers are unbounded or waived.
+                self.eval_gauges
+                    .isl_cap_tokens
+                    .store(tier_cap.unwrap_or(0) as u64, AtomicOrdering::Relaxed);
                 // This is a rejection threshold on current queued ISL, not a hard
                 // post-admission bound on `pending + incoming`.
-                if let Some(max_isl_tokens) = self.tier_cap_for_request(&request)
+                if let Some(max_isl_tokens) = tier_cap
                     && pending_isl_tokens >= max_isl_tokens
                 {
-                    request.respond(Err(KvSchedulerError::Backpressure {
-                        reason: RouterBackpressureReason::MaxQueuedIslTokensExceeded,
-                        queued_isl_tokens: pending_isl_tokens,
-                        max_queued_isl_tokens: Some(max_isl_tokens),
-                    }));
-                    return;
+                    // Dead entries must not push live traffic over the cap:
+                    // prune and re-check before rejecting. The min-interval
+                    // bounds the O(n) heap scan under sustained overload.
+                    if self.last_cancel_prune.elapsed() >= ENQUEUE_REJECT_PRUNE_MIN_INTERVAL
+                        && self.b10_prune_cancelled_pending() > 0
+                    {
+                        pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
+                    }
+                    if pending_isl_tokens >= max_isl_tokens {
+                        request.respond(Err(KvSchedulerError::Backpressure {
+                            reason: RouterBackpressureReason::MaxQueuedIslTokensExceeded,
+                            queued_isl_tokens: pending_isl_tokens,
+                            max_queued_isl_tokens: Some(max_isl_tokens),
+                        }));
+                        return;
+                    }
                 }
             }
             tracing::info!(
@@ -581,10 +655,57 @@ impl<
         self.admit_one(request, decay_now);
     }
 
+    /// Drop parked entries whose requester has gone away so the pending
+    /// gauges and tier-cap accounting stop counting dead ISL tokens.
+    /// Returns the number of entries removed.
+    fn b10_prune_cancelled_pending(&mut self) -> usize {
+        let mut removed_count = 0usize;
+        let mut removed_isl_tokens = 0usize;
+        self.pending.retain(|entry| {
+            let closed = entry.request.response_is_closed();
+            if closed {
+                removed_count += 1;
+                removed_isl_tokens += entry.request.isl_tokens;
+            }
+            !closed
+        });
+        if removed_count > 0 {
+            let current_pending_count = self.pending_count.load(AtomicOrdering::Relaxed);
+            debug_assert!(
+                current_pending_count >= removed_count,
+                "pending_count underflow on cancel prune: pending={current_pending_count} removed={removed_count}"
+            );
+            self.pending_count
+                .fetch_sub(removed_count, AtomicOrdering::Relaxed);
+            let current_pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
+            debug_assert!(
+                current_pending_isl_tokens >= removed_isl_tokens,
+                "pending_isl_tokens underflow on cancel prune: pending={current_pending_isl_tokens} removed={removed_isl_tokens}"
+            );
+            self.pending_isl_tokens
+                .fetch_sub(removed_isl_tokens, AtomicOrdering::Relaxed);
+            self.cancelled_requests
+                .fetch_add(removed_count, AtomicOrdering::Relaxed);
+            tracing::debug!(
+                removed_count,
+                removed_isl_tokens,
+                "Pruned cancelled requests from router queue"
+            );
+        }
+        self.last_cancel_prune = Instant::now();
+        removed_count
+    }
+
     async fn handle_update(&mut self) {
         let Some(threshold) = self.threshold_frac else {
             return;
         };
+
+        // Bounds prune cost on the update path; enqueue-time cap checks prune
+        // unconditionally when they would otherwise reject.
+        if self.last_cancel_prune.elapsed() >= Duration::from_secs(1) {
+            self.b10_prune_cancelled_pending();
+        }
 
         if self.policy.is_dynamic() {
             let now = self.start_time.elapsed();
@@ -814,6 +935,8 @@ impl<
         response: SchedulingResponse,
     ) {
         if request.response_is_closed() {
+            self.cancelled_requests
+                .fetch_add(1, AtomicOrdering::Relaxed);
             tracing::debug!(
                 request_id = %sequence_request.request_id,
                 "Skipping scheduler booking for cancelled request"
@@ -832,6 +955,10 @@ impl<
             return;
         }
 
+        // respond() can only fail here via receiver drop (resp_tx was Some past
+        // the closed-at-entry check), so this is a cancellation too.
+        self.cancelled_requests
+            .fetch_add(1, AtomicOrdering::Relaxed);
         tracing::debug!(%request_id, "Rolling back undelivered scheduler booking");
         if let Err(error) = self.slots.free(&request_id, Instant::now()) {
             tracing::error!(%request_id, %error, "Failed to roll back scheduler booking");
@@ -942,6 +1069,9 @@ impl<
         }
         let active_blocks = self.slots.active_blocks();
         if active_blocks.is_empty() {
+            self.eval_gauges
+                .decode_evaluated_tokens
+                .store(0, AtomicOrdering::Relaxed);
             return false;
         }
         let mut per_worker_tokens: Vec<u64> = active_blocks
@@ -950,6 +1080,9 @@ impl<
             .collect();
         let mid = per_worker_tokens.len() / 2;
         let (_, median, _) = per_worker_tokens.select_nth_unstable(mid);
+        self.eval_gauges
+            .decode_evaluated_tokens
+            .store(*median, AtomicOrdering::Relaxed);
         *median >= threshold
     }
 
@@ -977,11 +1110,12 @@ impl<
                 .max_num_batched_tokens()
                 .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
             let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
+            self.b10_record_prefill_evaluation(tokens, threshold, max_batched);
             return (tokens as f64) > threshold * (max_batched as f64);
         }
 
         if !router_queue_busy_fractional() {
-            return Self::all_eligible_workers_prefill_busy_exact(
+            return self.all_eligible_workers_prefill_busy_exact(
                 threshold,
                 eligibility,
                 &active_tokens,
@@ -1001,7 +1135,7 @@ impl<
         let required_busy = required_busy_workers_for_queueing(eligible_workers, true);
         let allowed_free_workers = eligible_workers.saturating_sub(required_busy);
         if allowed_free_workers == 0 {
-            return Self::all_eligible_workers_prefill_busy_exact(
+            return self.all_eligible_workers_prefill_busy_exact(
                 threshold,
                 eligibility,
                 &active_tokens,
@@ -1011,12 +1145,16 @@ impl<
 
         let mut busy_workers = 0;
         let mut free_workers = 0;
+        let mut min_visited: Option<(usize, u64)> = None;
 
         eligibility.any_eligible_worker_rank(&configs, |worker, config| {
             let max_batched = config
                 .max_num_batched_tokens()
                 .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
             let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
+            if min_visited.is_none_or(|(min_tokens, _)| tokens < min_tokens) {
+                min_visited = Some((tokens, max_batched));
+            }
             if (tokens as f64) > threshold * (max_batched as f64) {
                 busy_workers += 1;
                 return busy_workers >= required_busy;
@@ -1025,26 +1163,48 @@ impl<
             free_workers > allowed_free_workers
         });
 
+        if let Some((tokens, max_batched)) = min_visited {
+            self.b10_record_prefill_evaluation(tokens, threshold, max_batched);
+        }
         busy_workers >= required_busy
     }
 
     fn all_eligible_workers_prefill_busy_exact(
+        &self,
         threshold: f64,
         eligibility: RoutingEligibility<'_>,
         active_tokens: &HashMap<WorkerWithDpRank, usize>,
         configs: &HashMap<WorkerId, C>,
     ) -> bool {
         let mut checked_any = false;
+        let mut min_visited: Option<(usize, u64)> = None;
         let has_available = eligibility.any_eligible_worker_rank(configs, |worker, config| {
             checked_any = true;
             let max_batched = config
                 .max_num_batched_tokens()
                 .unwrap_or(DEFAULT_MAX_BATCHED_TOKENS);
             let tokens = active_tokens.get(&worker).copied().unwrap_or(0);
+            if min_visited.is_none_or(|(min_tokens, _)| tokens < min_tokens) {
+                min_visited = Some((tokens, max_batched));
+            }
             (tokens as f64) <= threshold * (max_batched as f64)
         });
 
+        if let Some((tokens, max_batched)) = min_visited {
+            self.b10_record_prefill_evaluation(tokens, threshold, max_batched);
+        }
         checked_any && !has_available
+    }
+
+    /// Store the last prefill-busy evaluation for gauge export.
+    fn b10_record_prefill_evaluation(&self, tokens: usize, threshold: f64, max_batched: u64) {
+        self.eval_gauges
+            .prefill_evaluated_tokens
+            .store(tokens as u64, AtomicOrdering::Relaxed);
+        self.eval_gauges.prefill_threshold_tokens.store(
+            (threshold * (max_batched as f64)) as u64,
+            AtomicOrdering::Relaxed,
+        );
     }
 }
 
@@ -1108,7 +1268,13 @@ mod tests {
             self.response_rx.lock().unwrap().take();
         }
 
-        fn observe_load(&self, _: &WorkerWithDpRank, _: &str, _: usize, _: usize) {}
+        fn observe_load(
+            &self,
+            _: &WorkerWithDpRank,
+            _: &str,
+            _: crate::sequences::WorkerLoadObservation,
+        ) {
+        }
     }
 
     #[derive(Default)]
@@ -1600,6 +1766,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_eval_gauges_capture_last_admission_evaluation() {
+        let isl = 512;
+        // threshold_frac 0.5 x max_batched 512 = 256 busy-threshold tokens.
+        let (queue, _slots) = make_queue(1, 16, isl, Some(0.5));
+
+        let (first, first_rx) = make_request("first", isl);
+        queue.enqueue(first).await;
+        first_rx
+            .await
+            .expect("first response sender dropped")
+            .expect("first request should be scheduled");
+
+        // Second request's admission evaluation sees the booked 512 tokens
+        // against the 256-token threshold and parks.
+        let (second, _second_rx) = make_request("second", isl);
+        queue.enqueue(second).await;
+        assert_eq!(queue.pending_count(), 1);
+
+        let gauges = queue.b10_eval_gauges();
+        assert_eq!(
+            gauges
+                .prefill_evaluated_tokens
+                .load(AtomicOrdering::Relaxed),
+            isl as u64
+        );
+        assert_eq!(
+            gauges
+                .prefill_threshold_tokens
+                .load(AtomicOrdering::Relaxed),
+            (isl / 2) as u64
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_failed_response_delivery_rolls_back_booking() {
         let isl = 512;
         let response_rx = Arc::new(StdMutex::new(None));
@@ -1922,6 +2122,40 @@ mod tests {
         );
         assert_eq!(queue.pending_count(), 1);
         assert_eq!(queue.pending_isl_tokens(), isl);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b10_prune_cancelled_pending_frees_tier_cap() {
+        let block_size = 16;
+        let isl = 512;
+
+        let tiers = RouterQueueDepthTiers::try_from(vec![RouterQueueDepthByMissingIslTier {
+            missing_cache_tokens_floor: 0,
+            max_queue_depth: isl,
+        }])
+        .unwrap();
+        let (queue, _slots, _cfg_tx) =
+            make_queue_with_sender_with_tiers(1, block_size, isl, Some(0.0), tiers, None);
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _resp1 = rx1.await.unwrap().unwrap();
+
+        // req-2 parks and fills the 512-token tier cap, then its requester
+        // goes away (receiver dropped).
+        let (req2, rx2) = make_request("req-2", isl);
+        queue.enqueue(req2).await;
+        assert_eq!(queue.pending_isl_tokens(), isl);
+        drop(rx2);
+
+        // req-3 would exceed the cap on stale accounting; the prune removes
+        // the dead entry so it queues instead of being rejected.
+        let (req3, _rx3) = make_request("req-3", isl);
+        queue.enqueue(req3).await;
+
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.pending_isl_tokens(), isl);
+        assert_eq!(queue.b10_cancelled_requests_count(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -33,6 +33,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Publish the growth of the queue's cancelled-booking count since the last sync
+/// as counter increments.
+fn b10_sync_cancelled_requests(worker_type: &str, current: usize, last: &mut usize) {
+    let delta = current.saturating_sub(*last);
+    *last = current;
+    ROUTER_QUEUE_METRICS.b10_inc_cancelled_requests(worker_type, delta as u64);
+}
+
 pub struct KvScheduler<Sel = DefaultWorkerSelector, RF = NoopOverlapScoresRefresh>
 where
     Sel: WorkerSelectorTrait<ModelRuntimeConfig>,
@@ -123,9 +131,41 @@ where
             let mut recheck_interval = tokio::time::interval(Duration::from_secs(60));
             let mut hot_reload_interval = tokio::time::interval(Duration::from_secs(10));
             hot_reload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ROUTER_QUEUE_METRICS.set_pending(worker_type, metrics_scheduler.pending_count());
-            ROUTER_QUEUE_METRICS
-                .set_pending_isl_tokens(worker_type, metrics_scheduler.pending_isl_tokens());
+            // Starting from 0 credits cancellations that happened between
+            // queue start and this task's first sync.
+            let mut last_cancelled_requests = 0;
+            let sync_scheduler = Arc::clone(&metrics_scheduler);
+            let mut sync_queue_metrics = move || {
+                ROUTER_QUEUE_METRICS.set_pending(worker_type, sync_scheduler.pending_count());
+                ROUTER_QUEUE_METRICS
+                    .set_pending_isl_tokens(worker_type, sync_scheduler.pending_isl_tokens());
+                b10_sync_cancelled_requests(
+                    worker_type,
+                    sync_scheduler.b10_cancelled_requests_count(),
+                    &mut last_cancelled_requests,
+                );
+                use std::sync::atomic::Ordering::Relaxed;
+                let eval = sync_scheduler.b10_eval_gauges();
+                ROUTER_QUEUE_METRICS.b10_set_gate_evaluation(
+                    worker_type,
+                    "prefill_busy",
+                    eval.prefill_threshold_tokens.load(Relaxed),
+                    eval.prefill_evaluated_tokens.load(Relaxed),
+                );
+                ROUTER_QUEUE_METRICS.b10_set_gate_evaluation(
+                    worker_type,
+                    "decode_tokens",
+                    dynamo_kv_router::scheduling::queue::router_queue_threshold_decode_tokens(),
+                    eval.decode_evaluated_tokens.load(Relaxed),
+                );
+                // isl_cap's compared value is the pending-ISL gauge itself.
+                ROUTER_QUEUE_METRICS.b10_set_gate_threshold(
+                    worker_type,
+                    "isl_cap",
+                    eval.isl_cap_tokens.load(Relaxed),
+                );
+            };
+            sync_queue_metrics();
 
             loop {
                 tokio::select! {
@@ -134,30 +174,16 @@ where
                         if result.is_err() {
                             break;
                         }
-                        ROUTER_QUEUE_METRICS
-                            .set_pending(worker_type, metrics_scheduler.pending_count());
-                        ROUTER_QUEUE_METRICS.set_pending_isl_tokens(
-                            worker_type,
-                            metrics_scheduler.pending_isl_tokens(),
-                        );
+                        sync_queue_metrics();
                     }
                     _ = recheck_interval.tick() => {
-                        ROUTER_QUEUE_METRICS.set_pending(worker_type, metrics_scheduler.pending_count());
-                        ROUTER_QUEUE_METRICS.set_pending_isl_tokens(
-                            worker_type,
-                            metrics_scheduler.pending_isl_tokens(),
-                        );
+                        sync_queue_metrics();
                     }
                     _ = hot_reload_interval.tick() => {
                         if let Some(v) = b10hotreloadablecm::get_router_queue_threshold() {
                             let threshold = if v > 0.0 { Some(v) } else { None };
                             metrics_scheduler.update_router_queue_threshold(threshold).await;
-                            ROUTER_QUEUE_METRICS
-                                .set_pending(worker_type, metrics_scheduler.pending_count());
-                            ROUTER_QUEUE_METRICS.set_pending_isl_tokens(
-                                worker_type,
-                                metrics_scheduler.pending_isl_tokens(),
-                            );
+                            sync_queue_metrics();
                         }
                         metrics_scheduler.reconfigure_residency_capacities();
                     }

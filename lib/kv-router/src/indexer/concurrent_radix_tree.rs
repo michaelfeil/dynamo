@@ -584,24 +584,28 @@ impl SyncIndexer for ConcurrentRadixTree {
         while let Ok(task) = event_receiver.recv() {
             match task {
                 WorkerTask::Event(event) => {
+                    let start = counters.as_ref().map(|_| std::time::Instant::now());
                     let kind = EventKind::of(&event.event.data);
                     let result = self.apply_event(&mut lookup, event, counters.as_ref());
                     if result.is_err() {
                         tracing::warn!("Failed to apply event: {:?}", result.as_ref().err());
                     }
-                    if let Some(ref c) = counters {
+                    if let (Some(c), Some(start)) = (counters.as_ref(), start) {
                         c.inc(kind, result);
+                        c.observe_event_op(kind, start.elapsed());
                     }
                 }
                 WorkerTask::EventWithAck { event, resp } => {
+                    let start = counters.as_ref().map(|_| std::time::Instant::now());
                     let kind = EventKind::of(&event.event.data);
                     let result = self.apply_event(&mut lookup, event, counters.as_ref());
                     let applied = result.is_ok();
                     if result.is_err() {
                         tracing::warn!("Failed to apply event: {:?}", result.as_ref().err());
                     }
-                    if let Some(ref c) = counters {
+                    if let (Some(c), Some(start)) = (counters.as_ref(), start) {
                         c.inc(kind, result);
+                        c.observe_event_op(kind, start.elapsed());
                     }
                     let _ = resp.send(applied);
                 }
@@ -611,10 +615,18 @@ impl SyncIndexer for ConcurrentRadixTree {
                     }
                 }
                 WorkerTask::RemoveWorker(worker_id) => {
+                    let start = counters.as_ref().map(|_| std::time::Instant::now());
                     self.remove_or_clear_worker_blocks(&mut lookup, worker_id, false);
+                    if let (Some(c), Some(start)) = (counters.as_ref(), start) {
+                        c.observe_remove_worker_op(start.elapsed());
+                    }
                 }
                 WorkerTask::RemoveWorkerDpRank(worker_id, dp_rank) => {
+                    let start = counters.as_ref().map(|_| std::time::Instant::now());
                     self.remove_worker_dp_rank(&mut lookup, worker_id, dp_rank);
+                    if let (Some(c), Some(start)) = (counters.as_ref(), start) {
+                        c.observe_remove_worker_op(start.elapsed());
+                    }
                 }
                 WorkerTask::CleanupStaleChildren => {
                     self.run_cleanup_task();

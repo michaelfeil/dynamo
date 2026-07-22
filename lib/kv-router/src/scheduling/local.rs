@@ -367,6 +367,14 @@ where
         self.queue.pending_isl_tokens()
     }
 
+    pub fn b10_eval_gauges(&self) -> &crate::scheduling::queue::B10QueueEvalGauges {
+        self.queue.b10_eval_gauges()
+    }
+
+    pub fn b10_cancelled_requests_count(&self) -> usize {
+        self.queue.b10_cancelled_requests_count()
+    }
+
     pub fn supports_overlap_refresh(&self) -> bool {
         self.queue.supports_overlap_refresh()
     }

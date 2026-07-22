@@ -29,7 +29,13 @@ impl SequencePublisher for ReplayNoopPublisher {
 
     fn publish_load(&self, _load: ActiveLoad) {}
 
-    fn observe_load(&self, _: &WorkerWithDpRank, _: &str, _: usize, _: usize) {}
+    fn observe_load(
+        &self,
+        _: &WorkerWithDpRank,
+        _: &str,
+        _: dynamo_kv_router::WorkerLoadObservation,
+    ) {
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

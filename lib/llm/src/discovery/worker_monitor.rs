@@ -39,8 +39,7 @@ fn cleanup_worker_metrics(worker_id: u64, dp_ranks: &[u32], worker_type: &str) {
     for dp_rank in dp_ranks {
         let dp_rank_str = dp_rank.to_string();
         let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
-        let _ = m.active_decode_blocks.remove_label_values(labels);
-        let _ = m.active_prefill_tokens.remove_label_values(labels);
+        m.b10_remove_series(worker_id, *dp_rank, worker_type);
         let _ = WORKER_LAST_TIME_TO_FIRST_TOKEN_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INPUT_SEQUENCE_TOKENS_GAUGE.remove_label_values(labels);
         let _ = WORKER_LAST_INTER_TOKEN_LATENCY_GAUGE.remove_label_values(labels);

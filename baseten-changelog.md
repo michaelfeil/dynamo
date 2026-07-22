@@ -1730,6 +1730,85 @@ Discovery now works on the fly for residency: any worker registration path
 gap between default and configured capacity. No per-message LRU work is done
 when capacities are unchanged.
 
+## PATCH-019: Router Observability — Request-State Gauges, Queue-Gate Gauges, Lifecycle Counters, kv_indexer_ops
+
+Status: `keep`
+
+Source commits:
+
+- Current PR: feat: router observability (#453); includes the indexer half of
+  the closed #409 (`a8aadf36f`), itself the v1.2 port of v1.0 #223.
+
+Purpose:
+
+Make the look-aside router's admission behavior observable: per-worker
+request-state, how close each queue admission gate is to engaging, and
+lifecycle counters for force-expiry and pre-admission cancellation. Restores
+the v1.0 `kv_indexer_ops` metrics lost in the v1.0 -> v1.2 upgrade.
+
+Metrics to preserve across fork upgrades (final names; live-verified on the
+2p/2d disagg harness):
+
+- `dynamo_frontend_worker_active_requests{worker_id,dp_rank,worker_type}`
+- `dynamo_frontend_worker_active_prefill_requests{...}` — booked, not yet
+  mark_prefill
+- `dynamo_frontend_worker_active_decode_requests{...}` — derived
+  active - prefill
+- `dynamo_frontend_router_queue_gate_threshold_tokens{worker_type,gate}` —
+  gate in {prefill_busy, decode_tokens, isl_cap}
+- `dynamo_frontend_router_queue_gate_last_evaluated_tokens{worker_type,gate}`
+  — gate in {prefill_busy, decode_tokens}; isl_cap's compared value is the
+  pending-ISL gauge; snapshots of each gate's LAST admission evaluation
+- `dynamo_frontend_router_force_expired_requests_total{worker_type}`
+- `dynamo_frontend_router_queue_cancelled_requests_total{worker_type}`
+- `dynamo_component_kv_indexer_ops_count{operation}` /
+  `dynamo_component_kv_indexer_ops_latency_total{operation}` — operation in
+  {stored, removed, cleared, remove_worker, find_matches}; the
+  `dynamo_component_` prefix is literal (identity is the `dynamo_component`
+  label); only exported by routers that run a KV indexer
+- Upstream companions these join on dashboards (do not rename):
+  `dynamo_frontend_worker_active_decode_blocks`, `_active_prefill_tokens`,
+  `dynamo_frontend_router_queue_pending_requests`, `_pending_isl_tokens`,
+  `_backpressure_total{reason}`, `dynamo_component_kv_cache_events_applied`.
+
+Key types/functions to preserve (fork-added surface):
+
+- `WorkerLoadObservation` struct + `SequencePublisher::observe_load` /
+  `b10_observe_force_expired_requests` / `b10_observe_worker_removed`
+  (default no-ops; the removal hook prunes departed workers' gauge series
+  from the look-aside router, where `KvWorkerMonitor` never runs) —
+  `lib/kv-router/src/sequences/multi_worker.rs`; sunk into Prometheus by
+  `RuntimeSequencePublisher` in `lib/llm/src/kv_router/sequence.rs`
+- `WorkerLoadMetrics::observe` (derives active_decode_requests) +
+  `WorkerLoadMetrics::b10_remove_series`,
+  `RouterSequenceMetrics` + `b10_register_router_sequence_metrics`,
+  `RouterQueueMetrics::{b10_inc_cancelled_requests, b10_set_gate_evaluation,
+  b10_set_gate_threshold}` — `lib/llm/src/kv_router/metrics.rs`
+- `B10QueueEvalGauges` + `SchedulerQueue::b10_eval_gauges` +
+  `b10_record_prefill_evaluation` (min-visited capture in all three
+  prefill-busy paths), `b10_prune_cancelled_pending` + `cancelled_requests`
+  atomic, pub `router_queue_threshold_decode_tokens()` —
+  `lib/kv-router/src/scheduling/queue.rs`
+- Metrics sync task additions (gate gauges + `b10_sync_cancelled_requests`)
+  in `lib/llm/src/kv_router/scheduler.rs`; stale-series cleanup on worker
+  removal in `lib/llm/src/discovery/worker_monitor.rs`
+- `KvIndexerMetrics::{indexer_ops_count, indexer_ops_latency}` + prebound
+  counters in the SyncIndexer worker loops —
+  `lib/kv-router/src/indexer/metrics.rs`, `concurrent_radix_tree*.rs`,
+  `thread_pool.rs`
+
+Replay notes:
+
+Regression tests to keep: `test_worker_load_metrics_pef`,
+`test_router_queue_metrics_pef` (exact-name PEF assertions),
+`test_eval_gauges_capture_last_admission_evaluation`. Known caveats carried
+deliberately: the cancelled counter only fires when a parked entry's response
+channel drops (cross-process cancels do not deliver that signal today; see
+PR #452); gate last-evaluated is exact in the default all-workers-busy mode
+and may understate under fractional busy mode (>16 workers); counters are
+absent until first event (no zero-series materialization — use
+`or vector(0)`).
+
 ## Document Guidelines Reminder
 
 Before adding another top-level patch section, check the document guidelines at

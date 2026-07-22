@@ -21,6 +21,8 @@ use crate::protocols::WorkerWithDpRank;
 pub(super) struct WorkerLoadSnapshot {
     pub(super) active_blocks: usize,
     pub(super) prefill: PrefillLoadSnapshot,
+    pub(super) active_requests: usize,
+    pub(super) active_prefill_requests: usize,
 }
 
 impl WorkerLoadSnapshot {
@@ -239,6 +241,8 @@ mod tests {
         WorkerLoadSnapshot {
             active_blocks,
             prefill: PrefillLoadSnapshot::default(),
+            active_requests: 0,
+            active_prefill_requests: 0,
         }
     }
 
@@ -259,6 +263,8 @@ mod tests {
                     anchored_since,
                 }),
             },
+            active_requests: 0,
+            active_prefill_requests: 0,
         }
     }
 

@@ -61,6 +61,7 @@ use prometheus::{HistogramOpts, IntCounter, IntCounterVec, IntGaugeVec, Opts};
 
 use crate::http::service::metrics::generate_log_buckets;
 use crate::kv_router::b10_metrics_helper::bis_const_labels;
+use dynamo_kv_router::multi_worker_sequence::WorkerLoadObservation;
 
 /// Buckets for CPU-bound compute phases (block hashing, sequence hashing).
 fn compute_overhead_buckets() -> Vec<f64> {
@@ -197,6 +198,10 @@ pub(crate) fn kv_publisher_metrics() -> Option<Arc<KvPublisherMetrics>> {
 pub struct WorkerLoadMetrics {
     pub active_decode_blocks: IntGaugeVec,
     pub active_prefill_tokens: IntGaugeVec,
+    pub active_requests: IntGaugeVec,
+    pub active_prefill_requests: IntGaugeVec,
+    /// Derived: `active_requests - active_prefill_requests`.
+    pub active_decode_requests: IntGaugeVec,
 }
 
 impl WorkerLoadMetrics {
@@ -205,18 +210,42 @@ impl WorkerLoadMetrics {
         worker_id: u64,
         dp_rank: u32,
         worker_type: &str,
-        active_blocks: usize,
-        active_tokens: usize,
+        load: WorkerLoadObservation,
     ) {
         let worker_id_str = worker_id.to_string();
         let dp_rank_str = dp_rank.to_string();
         let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
         self.active_decode_blocks
             .with_label_values(labels)
-            .set(active_blocks as i64);
+            .set(load.active_decode_blocks as i64);
         self.active_prefill_tokens
             .with_label_values(labels)
-            .set(active_tokens as i64);
+            .set(load.active_prefill_tokens as i64);
+        self.active_requests
+            .with_label_values(labels)
+            .set(load.active_requests as i64);
+        self.active_prefill_requests
+            .with_label_values(labels)
+            .set(load.active_prefill_requests as i64);
+        self.active_decode_requests.with_label_values(labels).set(
+            load.active_requests
+                .saturating_sub(load.active_prefill_requests) as i64,
+        );
+    }
+}
+
+impl WorkerLoadMetrics {
+    /// Remove one (worker, dp_rank, worker_type)'s series from all worker
+    /// gauges so departed workers do not linger at their last values.
+    pub fn b10_remove_series(&self, worker_id: u64, dp_rank: u32, worker_type: &str) {
+        let worker_id_str = worker_id.to_string();
+        let dp_rank_str = dp_rank.to_string();
+        let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
+        let _ = self.active_decode_blocks.remove_label_values(labels);
+        let _ = self.active_prefill_tokens.remove_label_values(labels);
+        let _ = self.active_requests.remove_label_values(labels);
+        let _ = self.active_prefill_requests.remove_label_values(labels);
+        let _ = self.active_decode_requests.remove_label_values(labels);
     }
 }
 
@@ -229,7 +258,8 @@ pub static WORKER_LOAD_METRICS: LazyLock<WorkerLoadMetrics> = LazyLock::new(|| W
                 frontend_service::WORKER_ACTIVE_DECODE_BLOCKS
             ),
             "Active KV cache decode blocks per worker",
-        ),
+        )
+        .const_labels(bis_const_labels()),
         &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
     )
     .expect("Failed to create worker_active_decode_blocks gauge"),
@@ -241,10 +271,38 @@ pub static WORKER_LOAD_METRICS: LazyLock<WorkerLoadMetrics> = LazyLock::new(|| W
                 frontend_service::WORKER_ACTIVE_PREFILL_TOKENS
             ),
             "Active prefill tokens queued per worker",
-        ),
+        )
+        .const_labels(bis_const_labels()),
         &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
     )
     .expect("Failed to create worker_active_prefill_tokens gauge"),
+    active_requests: IntGaugeVec::new(
+        Opts::new(
+            format!("{}_worker_active_requests", name_prefix::FRONTEND),
+            "Requests tracked by the router per worker, from routing until freed",
+        )
+        .const_labels(bis_const_labels()),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_active_requests gauge"),
+    active_prefill_requests: IntGaugeVec::new(
+        Opts::new(
+            format!("{}_worker_active_prefill_requests", name_prefix::FRONTEND),
+            "Tracked requests per worker not yet marked prefill-complete",
+        )
+        .const_labels(bis_const_labels()),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_active_prefill_requests gauge"),
+    active_decode_requests: IntGaugeVec::new(
+        Opts::new(
+            format!("{}_worker_active_decode_requests", name_prefix::FRONTEND),
+            "Tracked requests per worker past prefill (active - prefill)",
+        )
+        .const_labels(bis_const_labels()),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_active_decode_requests gauge"),
 });
 
 /// Register the worker load gauges with the given Prometheus registry.
@@ -255,6 +313,20 @@ pub fn register_worker_load_metrics(
     let m = &*WORKER_LOAD_METRICS;
     registry.register(Box::new(m.active_decode_blocks.clone()))?;
     registry.register(Box::new(m.active_prefill_tokens.clone()))?;
+    registry.register(Box::new(m.active_requests.clone()))?;
+    registry.register(Box::new(m.active_prefill_requests.clone()))?;
+    registry.register(Box::new(m.active_decode_requests.clone()))?;
+    Ok(())
+}
+
+/// Register the router active-sequence lifecycle counters with the given
+/// Prometheus registry. Called during frontend HTTP service setup
+/// (`service_v2.rs`) alongside the worker-load and queue registrations.
+pub fn b10_register_router_sequence_metrics(
+    registry: &prometheus::Registry,
+) -> Result<(), prometheus::Error> {
+    let s = &*ROUTER_SEQUENCE_METRICS;
+    registry.register(Box::new(s.force_expired_requests_total.clone()))?;
     Ok(())
 }
 
@@ -269,10 +341,15 @@ pub struct RouterQueueMetrics {
     pub pending_requests: IntGaugeVec,
     pub pending_isl_tokens: IntGaugeVec,
     pub backpressure_total: IntCounterVec,
+    pub cancelled_requests_total: IntCounterVec,
+    /// Threshold/last-evaluation pairs for each queue admission gate; values
+    /// snapshot the most recent admission evaluation (not continuous).
+    pub threshold_tokens: IntGaugeVec,
+    pub evaluated_tokens: IntGaugeVec,
 }
 
-pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> =
-    LazyLock::new(|| RouterQueueMetrics {
+pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> = LazyLock::new(|| {
+    RouterQueueMetrics {
         pending_requests: IntGaugeVec::new(
             Opts::new(
                 format!(
@@ -304,7 +381,62 @@ pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> =
             &[labels::WORKER_TYPE, "reason"],
         )
         .expect("Failed to create router_queue_backpressure_total counter"),
-    });
+        cancelled_requests_total: IntCounterVec::new(
+            Opts::new(
+                format!(
+                    "{}_router_queue_cancelled_requests_total",
+                    name_prefix::FRONTEND
+                ),
+                "Total requests cancelled before admission: pruned from the pending queue or abandoned at booking",
+            )
+            .const_labels(bis_const_labels()),
+            &[labels::WORKER_TYPE],
+        )
+        .expect("Failed to create router_queue_cancelled_requests_total counter"),
+        threshold_tokens: IntGaugeVec::new(
+            Opts::new(
+                format!("{}_router_queue_gate_threshold_tokens", name_prefix::FRONTEND),
+                "Admission threshold in tokens for each router queue gate, as applied \
+                 at that gate's last evaluation",
+            )
+            .const_labels(bis_const_labels()),
+            &[labels::WORKER_TYPE, "gate"],
+        )
+        .expect("Failed to create router_queue_threshold_tokens gauge"),
+        evaluated_tokens: IntGaugeVec::new(
+            Opts::new(
+                format!("{}_router_queue_gate_last_evaluated_tokens", name_prefix::FRONTEND),
+                "Load compared against the gate threshold at its last evaluation \
+                 (prefill_busy: min visited worker prefill tokens; decode_tokens: \
+                 median worker decode tokens)",
+            )
+            .const_labels(bis_const_labels()),
+            &[labels::WORKER_TYPE, "gate"],
+        )
+        .expect("Failed to create router_queue_evaluated_tokens gauge"),
+    }
+});
+
+/// Router active-sequence lifecycle counters (stale-request expiry).
+pub struct RouterSequenceMetrics {
+    pub force_expired_requests_total: IntCounterVec,
+}
+
+pub static ROUTER_SEQUENCE_METRICS: LazyLock<RouterSequenceMetrics> = LazyLock::new(|| {
+    RouterSequenceMetrics {
+        force_expired_requests_total: IntCounterVec::new(
+            Opts::new(
+                format!("{}_router_force_expired_requests_total", name_prefix::FRONTEND),
+                "Requests force-expired from router tracking by the stale-request sweep (each replica counts its own copy)",
+            )
+            .const_labels(bis_const_labels()),
+            &[labels::WORKER_TYPE],
+        )
+        .expect("Failed to create router_force_expired_requests_total counter"),
+    }
+});
+
+impl RouterSequenceMetrics {}
 
 impl RouterQueueMetrics {
     pub fn set_pending(&self, worker_type: &str, count: usize) {
@@ -324,6 +456,35 @@ impl RouterQueueMetrics {
             .with_label_values(&[worker_type, reason])
             .inc();
     }
+
+    pub fn b10_inc_cancelled_requests(&self, worker_type: &str, count: u64) {
+        if count > 0 {
+            self.cancelled_requests_total
+                .with_label_values(&[worker_type])
+                .inc_by(count);
+        }
+    }
+
+    pub fn b10_set_gate_evaluation(
+        &self,
+        worker_type: &str,
+        gate: &str,
+        threshold: u64,
+        evaluated: u64,
+    ) {
+        self.threshold_tokens
+            .with_label_values(&[worker_type, gate])
+            .set(threshold as i64);
+        self.evaluated_tokens
+            .with_label_values(&[worker_type, gate])
+            .set(evaluated as i64);
+    }
+
+    pub fn b10_set_gate_threshold(&self, worker_type: &str, gate: &str, threshold: u64) {
+        self.threshold_tokens
+            .with_label_values(&[worker_type, gate])
+            .set(threshold as i64);
+    }
 }
 
 /// Register the router queue gauge with the given Prometheus registry.
@@ -335,6 +496,9 @@ pub fn register_router_queue_metrics(
     registry.register(Box::new(m.pending_requests.clone()))?;
     registry.register(Box::new(m.pending_isl_tokens.clone()))?;
     registry.register(Box::new(m.backpressure_total.clone()))?;
+    registry.register(Box::new(m.cancelled_requests_total.clone()))?;
+    registry.register(Box::new(m.threshold_tokens.clone()))?;
+    registry.register(Box::new(m.evaluated_tokens.clone()))?;
     Ok(())
 }
 
@@ -352,6 +516,23 @@ pub fn register_global_metrics_with_component(component: &Component) {
         Box::new(m.active_prefill_tokens.clone()),
         "worker_active_prefill_tokens",
     );
+    registry.add_metric_or_warn(
+        Box::new(m.active_requests.clone()),
+        "worker_active_requests",
+    );
+    registry.add_metric_or_warn(
+        Box::new(m.active_prefill_requests.clone()),
+        "worker_active_prefill_requests",
+    );
+    registry.add_metric_or_warn(
+        Box::new(m.active_decode_requests.clone()),
+        "worker_active_decode_requests",
+    );
+    let s = &*ROUTER_SEQUENCE_METRICS;
+    registry.add_metric_or_warn(
+        Box::new(s.force_expired_requests_total.clone()),
+        "router_force_expired_requests_total",
+    );
     let q = &*ROUTER_QUEUE_METRICS;
     registry.add_metric_or_warn(
         Box::new(q.pending_requests.clone()),
@@ -364,6 +545,18 @@ pub fn register_global_metrics_with_component(component: &Component) {
     registry.add_metric_or_warn(
         Box::new(q.backpressure_total.clone()),
         "router_queue_backpressure_total",
+    );
+    registry.add_metric_or_warn(
+        Box::new(q.cancelled_requests_total.clone()),
+        "router_queue_cancelled_requests_total",
+    );
+    registry.add_metric_or_warn(
+        Box::new(q.threshold_tokens.clone()),
+        "router_queue_gate_threshold_tokens",
+    );
+    registry.add_metric_or_warn(
+        Box::new(q.evaluated_tokens.clone()),
+        "router_queue_gate_last_evaluated_tokens",
     );
 }
 
@@ -760,6 +953,30 @@ mod tests {
                 &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
             )
             .unwrap(),
+            active_requests: IntGaugeVec::new(
+                Opts::new(
+                    format!("{}_worker_active_requests", name_prefix::FRONTEND),
+                    "Requests tracked by the router per worker, from routing until freed",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
+            active_prefill_requests: IntGaugeVec::new(
+                Opts::new(
+                    format!("{}_worker_active_prefill_requests", name_prefix::FRONTEND),
+                    "Tracked requests per worker not yet marked prefill-complete",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
+            active_decode_requests: IntGaugeVec::new(
+                Opts::new(
+                    format!("{}_worker_active_decode_requests", name_prefix::FRONTEND),
+                    "Tracked requests per worker past prefill (active - prefill)",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.active_decode_blocks.clone()))
@@ -767,17 +984,45 @@ mod tests {
         registry
             .register(Box::new(metrics.active_prefill_tokens.clone()))
             .unwrap();
+        registry
+            .register(Box::new(metrics.active_requests.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.active_prefill_requests.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.active_decode_requests.clone()))
+            .unwrap();
 
-        metrics.observe(123, 0, "decode", 42, 100);
+        metrics.observe(
+            123,
+            0,
+            "decode",
+            WorkerLoadObservation {
+                active_decode_blocks: 42,
+                active_prefill_tokens: 100,
+                active_requests: 7,
+                active_prefill_requests: 3,
+            },
+        );
 
         let output = gather_pef(&registry);
         let expected = "\
 # HELP dynamo_frontend_worker_active_decode_blocks Active KV cache decode blocks per worker
 # TYPE dynamo_frontend_worker_active_decode_blocks gauge
 dynamo_frontend_worker_active_decode_blocks{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 42
+# HELP dynamo_frontend_worker_active_decode_requests Tracked requests per worker past prefill (active - prefill)
+# TYPE dynamo_frontend_worker_active_decode_requests gauge
+dynamo_frontend_worker_active_decode_requests{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 4
+# HELP dynamo_frontend_worker_active_prefill_requests Tracked requests per worker not yet marked prefill-complete
+# TYPE dynamo_frontend_worker_active_prefill_requests gauge
+dynamo_frontend_worker_active_prefill_requests{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 3
 # HELP dynamo_frontend_worker_active_prefill_tokens Active prefill tokens queued per worker
 # TYPE dynamo_frontend_worker_active_prefill_tokens gauge
 dynamo_frontend_worker_active_prefill_tokens{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 100
+# HELP dynamo_frontend_worker_active_requests Requests tracked by the router per worker, from routing until freed
+# TYPE dynamo_frontend_worker_active_requests gauge
+dynamo_frontend_worker_active_requests{dp_rank=\"0\",worker_id=\"123\",worker_type=\"decode\"} 7
 ";
         assert_eq!(
             output, expected,
@@ -817,6 +1062,33 @@ dynamo_frontend_worker_active_prefill_tokens{dp_rank=\"0\",worker_id=\"123\",wor
                 &[labels::WORKER_TYPE, "reason"],
             )
             .unwrap(),
+            cancelled_requests_total: IntCounterVec::new(
+                Opts::new(
+                    format!(
+                        "{}_router_queue_cancelled_requests_total",
+                        name_prefix::FRONTEND
+                    ),
+                    "Total requests cancelled before admission: pruned from the pending queue or abandoned at booking",
+                ),
+                &[labels::WORKER_TYPE],
+            )
+            .unwrap(),
+            threshold_tokens: IntGaugeVec::new(
+                Opts::new(
+                    format!("{}_router_queue_gate_threshold_tokens", name_prefix::FRONTEND),
+                    "Admission threshold in tokens for each router queue gate",
+                ),
+                &[labels::WORKER_TYPE, "gate"],
+            )
+            .unwrap(),
+            evaluated_tokens: IntGaugeVec::new(
+                Opts::new(
+                    format!("{}_router_queue_gate_last_evaluated_tokens", name_prefix::FRONTEND),
+                    "Load compared against the gate threshold at its last evaluation",
+                ),
+                &[labels::WORKER_TYPE, "gate"],
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.pending_requests.clone()))
@@ -827,16 +1099,42 @@ dynamo_frontend_worker_active_prefill_tokens{dp_rank=\"0\",worker_id=\"123\",wor
         registry
             .register(Box::new(metrics.backpressure_total.clone()))
             .unwrap();
+        registry
+            .register(Box::new(metrics.cancelled_requests_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.threshold_tokens.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.evaluated_tokens.clone()))
+            .unwrap();
 
         metrics.set_pending("decode", 5);
         metrics.set_pending_isl_tokens("decode", 1024);
         metrics.inc_backpressure("decode", "max_queued_isl_tokens_exceeded");
+        metrics.b10_inc_cancelled_requests("decode", 2);
+        metrics.b10_inc_cancelled_requests("decode", 0);
+        metrics.b10_set_gate_evaluation("decode", "prefill_busy", 24576, 18000);
+        metrics.b10_set_gate_evaluation("decode", "decode_tokens", 140000, 96000);
+        metrics.b10_set_gate_threshold("decode", "isl_cap", 262144);
 
         let output = gather_pef(&registry);
         let expected = "\
 # HELP dynamo_frontend_router_queue_backpressure_total Total number of router scheduler queue backpressure rejections
 # TYPE dynamo_frontend_router_queue_backpressure_total counter
 dynamo_frontend_router_queue_backpressure_total{reason=\"max_queued_isl_tokens_exceeded\",worker_type=\"decode\"} 1
+# HELP dynamo_frontend_router_queue_cancelled_requests_total Total requests cancelled before admission: pruned from the pending queue or abandoned at booking
+# TYPE dynamo_frontend_router_queue_cancelled_requests_total counter
+dynamo_frontend_router_queue_cancelled_requests_total{worker_type=\"decode\"} 2
+# HELP dynamo_frontend_router_queue_gate_last_evaluated_tokens Load compared against the gate threshold at its last evaluation
+# TYPE dynamo_frontend_router_queue_gate_last_evaluated_tokens gauge
+dynamo_frontend_router_queue_gate_last_evaluated_tokens{gate=\"decode_tokens\",worker_type=\"decode\"} 96000
+dynamo_frontend_router_queue_gate_last_evaluated_tokens{gate=\"prefill_busy\",worker_type=\"decode\"} 18000
+# HELP dynamo_frontend_router_queue_gate_threshold_tokens Admission threshold in tokens for each router queue gate
+# TYPE dynamo_frontend_router_queue_gate_threshold_tokens gauge
+dynamo_frontend_router_queue_gate_threshold_tokens{gate=\"decode_tokens\",worker_type=\"decode\"} 140000
+dynamo_frontend_router_queue_gate_threshold_tokens{gate=\"isl_cap\",worker_type=\"decode\"} 262144
+dynamo_frontend_router_queue_gate_threshold_tokens{gate=\"prefill_busy\",worker_type=\"decode\"} 24576
 # HELP dynamo_frontend_router_queue_pending_isl_tokens Sum of isl_tokens for requests pending in the router scheduler queue
 # TYPE dynamo_frontend_router_queue_pending_isl_tokens gauge
 dynamo_frontend_router_queue_pending_isl_tokens{worker_type=\"decode\"} 1024

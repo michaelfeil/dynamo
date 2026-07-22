@@ -12,7 +12,7 @@ use crate::protocols::{
     KvCacheRemoveData, KvCacheStoreData, KvCacheStoredBlockData, LocalBlockHash, OverlapScores,
     RouterEvent, WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_seq_hash_for_block,
 };
-use crate::sequences::SequencePublisher;
+use crate::sequences::{SequencePublisher, WorkerLoadObservation};
 
 pub fn router_event(
     worker_id: WorkerId,
@@ -361,7 +361,7 @@ impl SequencePublisher for NoopSequencePublisher {
 
     fn publish_load(&self, _load: ActiveLoad) {}
 
-    fn observe_load(&self, _: &WorkerWithDpRank, _: &str, _: usize, _: usize) {}
+    fn observe_load(&self, _: &WorkerWithDpRank, _: &str, _: WorkerLoadObservation) {}
 }
 
 /// Minimal [`WorkerConfigLike`] for scheduler/queue tests and benchmarks.

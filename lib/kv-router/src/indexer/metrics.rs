@@ -13,7 +13,7 @@ use dynamo_runtime::component::Component;
 #[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
 use dynamo_runtime::metrics::MetricsHierarchy;
 #[cfg(feature = "metrics")]
-use prometheus::{IntCounter, IntCounterVec, Opts};
+use prometheus::{Counter, CounterVec, IntCounter, IntCounterVec, Opts};
 
 use crate::protocols::{KvCacheEventData, KvCacheEventError};
 
@@ -133,6 +133,14 @@ pub struct KvIndexerMetrics {
     /// Counter of suspicious-but-valid KV events.
     #[cfg(feature = "metrics")]
     pub kv_cache_event_warnings: IntCounterVec,
+    /// Count of indexer operations by type (event applies, remove_worker,
+    /// find_matches).
+    #[cfg(feature = "metrics")]
+    pub indexer_ops_count: IntCounterVec,
+    /// Total seconds spent in indexer operations by type; divide by
+    /// `kv_indexer_ops_count` for mean latency.
+    #[cfg(feature = "metrics")]
+    pub indexer_ops_latency: CounterVec,
 }
 
 /// Metric status labels.
@@ -149,6 +157,11 @@ pub const METRIC_EVENT_CLEARED: &str = "cleared";
 /// Metric warning labels.
 pub const METRIC_WARNING_DUPLICATE_STORE: &str = "duplicate_store";
 
+/// Metric operation labels for indexer operation tracking. Event applies use
+/// the [`EventKind`] labels (`stored`/`removed`/`cleared`).
+pub const METRIC_OP_REMOVE_WORKER: &str = "remove_worker";
+pub const METRIC_OP_FIND_MATCHES: &str = "find_matches";
+
 /// Metric name for KV cache events applied counter.
 #[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
 const KV_CACHE_EVENTS_APPLIED_SUFFIX: &str = "kv_cache_events_applied";
@@ -158,16 +171,33 @@ const KV_CACHE_EVENTS_APPLIED_NAME: &str = "dynamo_kvrouter_kv_cache_events_appl
 const KV_CACHE_EVENT_WARNINGS_SUFFIX: &str = "kv_cache_event_warnings";
 #[cfg(feature = "metrics")]
 const KV_CACHE_EVENT_WARNINGS_NAME: &str = "dynamo_kvrouter_kv_cache_event_warnings";
+/// Metric name for KV indexer operations count.
+#[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
+const KV_INDEXER_OPS_COUNT_SUFFIX: &str = "kv_indexer_ops_count";
+#[cfg(feature = "metrics")]
+const KV_INDEXER_OPS_COUNT_NAME: &str = "dynamo_kvrouter_kv_indexer_ops_count";
+/// Metric name for KV indexer operations latency.
+#[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
+const KV_INDEXER_OPS_LATENCY_SUFFIX: &str = "kv_indexer_ops_latency_total";
+#[cfg(feature = "metrics")]
+const KV_INDEXER_OPS_LATENCY_NAME: &str = "dynamo_kvrouter_kv_indexer_ops_latency_total";
 
 #[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
 static KV_INDEXER_METRICS: OnceLock<Arc<KvIndexerMetrics>> = OnceLock::new();
 
 impl KvIndexerMetrics {
     #[cfg(all(feature = "metrics", feature = "runtime-protocols"))]
-    fn new(kv_cache_events_applied: IntCounterVec, kv_cache_event_warnings: IntCounterVec) -> Self {
+    fn new(
+        kv_cache_events_applied: IntCounterVec,
+        kv_cache_event_warnings: IntCounterVec,
+        indexer_ops_count: IntCounterVec,
+        indexer_ops_latency: CounterVec,
+    ) -> Self {
         Self {
             kv_cache_events_applied,
             kv_cache_event_warnings,
+            indexer_ops_count,
+            indexer_ops_latency,
         }
     }
 
@@ -179,24 +209,42 @@ impl KvIndexerMetrics {
         {
             KV_INDEXER_METRICS
                 .get_or_init(|| {
-                    match (
-                        component.metrics().create_intcountervec(
+                    let try_create = || -> anyhow::Result<Self> {
+                        let kv_cache_events_applied = component.metrics().create_intcountervec(
                             KV_CACHE_EVENTS_APPLIED_SUFFIX,
                             "Total number of KV cache events applied to index",
                             &["event_type", "status"],
                             &[],
-                        ),
-                        component.metrics().create_intcountervec(
+                        )?;
+                        let kv_cache_event_warnings = component.metrics().create_intcountervec(
                             KV_CACHE_EVENT_WARNINGS_SUFFIX,
                             "Total number of suspicious KV cache events seen by the router indexer",
                             &["warning_kind"],
                             &[],
-                        ),
-                    ) {
-                        (Ok(kv_cache_events_applied), Ok(kv_cache_event_warnings)) => Arc::new(
-                            Self::new(kv_cache_events_applied, kv_cache_event_warnings),
-                        ),
-                        (Err(e), _) | (_, Err(e)) => {
+                        )?;
+                        let indexer_ops_count = component.metrics().create_intcountervec(
+                            KV_INDEXER_OPS_COUNT_SUFFIX,
+                            "Total count of KV indexer operations by type",
+                            &["operation"],
+                            &[],
+                        )?;
+                        let indexer_ops_latency = component.metrics().create_countervec(
+                            KV_INDEXER_OPS_LATENCY_SUFFIX,
+                            "Total duration of KV indexer operations in seconds",
+                            &["operation"],
+                            &[],
+                        )?;
+                        Ok(Self::new(
+                            kv_cache_events_applied,
+                            kv_cache_event_warnings,
+                            indexer_ops_count,
+                            indexer_ops_latency,
+                        ))
+                    };
+
+                    match try_create() {
+                        Ok(metrics) => Arc::new(metrics),
+                        Err(e) => {
                             tracing::warn!("Failed to create kv indexer metrics from component: {}. Using unregistered metrics as fallback.", e);
                             Arc::new(Self::new_unregistered())
                         }
@@ -231,6 +279,22 @@ impl KvIndexerMetrics {
                     "Total number of suspicious KV cache events seen by the router indexer",
                 ),
                 &["warning_kind"],
+            )
+            .unwrap(),
+            indexer_ops_count: IntCounterVec::new(
+                Opts::new(
+                    KV_INDEXER_OPS_COUNT_NAME,
+                    "Total count of KV indexer operations by type",
+                ),
+                &["operation"],
+            )
+            .unwrap(),
+            indexer_ops_latency: CounterVec::new(
+                Opts::new(
+                    KV_INDEXER_OPS_LATENCY_NAME,
+                    "Total duration of KV indexer operations in seconds",
+                ),
+                &["operation"],
             )
             .unwrap(),
         }
@@ -271,6 +335,25 @@ impl KvIndexerMetrics {
         let _ = (self, event_type, result);
     }
 
+    /// Record one indexer operation (count + total seconds) under `operation`.
+    ///
+    /// For hot worker-loop recording prefer the prebound
+    /// [`PreBoundEventCounters::observe_event_op`] /
+    /// [`PreBoundEventCounters::observe_remove_worker_op`]; this method does a
+    /// `with_label_values` lookup and is intended for per-request paths such as
+    /// `find_matches`.
+    pub fn increment_indexer_op(&self, operation: &str, duration: std::time::Duration) {
+        #[cfg(feature = "metrics")]
+        {
+            self.indexer_ops_count.with_label_values(&[operation]).inc();
+            self.indexer_ops_latency
+                .with_label_values(&[operation])
+                .inc_by(duration.as_secs_f64());
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, operation, duration);
+    }
+
     pub fn increment_event_warning(&self, warning_kind: &'static str) {
         #[cfg(feature = "metrics")]
         {
@@ -307,6 +390,33 @@ struct PreBoundMetricCounters {
     removed: ResultCounters,
     cleared: ResultCounters,
     duplicate_store_warning: IntCounter,
+    stored_op: PreBoundOpCounters,
+    removed_op: PreBoundOpCounters,
+    cleared_op: PreBoundOpCounters,
+    remove_worker_op: PreBoundOpCounters,
+}
+
+/// Pre-resolved count + latency handles for one `operation` label value of the
+/// `kv_indexer_ops_*` pair.
+#[cfg(feature = "metrics")]
+struct PreBoundOpCounters {
+    count: IntCounter,
+    latency_seconds: Counter,
+}
+
+#[cfg(feature = "metrics")]
+impl PreBoundOpCounters {
+    fn new(counts: &IntCounterVec, latencies: &CounterVec, operation: &'static str) -> Self {
+        Self {
+            count: counts.with_label_values(&[operation]),
+            latency_seconds: latencies.with_label_values(&[operation]),
+        }
+    }
+
+    fn observe(&self, elapsed: std::time::Duration) {
+        self.count.inc();
+        self.latency_seconds.inc_by(elapsed.as_secs_f64());
+    }
 }
 
 #[cfg(feature = "metrics")]
@@ -346,6 +456,8 @@ impl PreBoundEventCounters {
         {
             let cv = &metrics.kv_cache_events_applied;
             let warnings = &metrics.kv_cache_event_warnings;
+            let ops = &metrics.indexer_ops_count;
+            let latencies = &metrics.indexer_ops_latency;
             Self {
                 inner: PreBoundMetricCounters {
                     stored: ResultCounters::new(cv, METRIC_EVENT_STORED),
@@ -353,6 +465,14 @@ impl PreBoundEventCounters {
                     cleared: ResultCounters::new(cv, METRIC_EVENT_CLEARED),
                     duplicate_store_warning: warnings
                         .with_label_values(&[METRIC_WARNING_DUPLICATE_STORE]),
+                    stored_op: PreBoundOpCounters::new(ops, latencies, METRIC_EVENT_STORED),
+                    removed_op: PreBoundOpCounters::new(ops, latencies, METRIC_EVENT_REMOVED),
+                    cleared_op: PreBoundOpCounters::new(ops, latencies, METRIC_EVENT_CLEARED),
+                    remove_worker_op: PreBoundOpCounters::new(
+                        ops,
+                        latencies,
+                        METRIC_OP_REMOVE_WORKER,
+                    ),
                 },
             }
         }
@@ -392,5 +512,30 @@ impl PreBoundEventCounters {
         }
         #[cfg(not(feature = "metrics"))]
         let _ = (self, kind);
+    }
+
+    /// Record one `kv_indexer_ops_*` observation for an event apply, using the
+    /// pre-resolved handles for the event kind's `operation` label.
+    pub fn observe_event_op(&self, kind: EventKind, elapsed: std::time::Duration) {
+        #[cfg(feature = "metrics")]
+        {
+            let op = match kind {
+                EventKind::Stored => &self.inner.stored_op,
+                EventKind::Removed => &self.inner.removed_op,
+                EventKind::Cleared => &self.inner.cleared_op,
+            };
+            op.observe(elapsed);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, kind, elapsed);
+    }
+
+    /// Record one `kv_indexer_ops_*` observation for a worker removal
+    /// (covers both whole-worker and per-DP-rank removals).
+    pub fn observe_remove_worker_op(&self, elapsed: std::time::Duration) {
+        #[cfg(feature = "metrics")]
+        self.inner.remove_worker_op.observe(elapsed);
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, elapsed);
     }
 }

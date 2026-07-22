@@ -16,8 +16,8 @@ use rustc_hash::FxBuildHasher;
 use tokio::sync::oneshot;
 
 use super::{
-    KvIndexerInterface, KvIndexerMetrics, KvRouterError, ShardSizeSnapshot, SyncIndexer,
-    WorkerLookupStats, WorkerTask, panic_payload_message,
+    KvIndexerInterface, KvIndexerMetrics, KvRouterError, METRIC_OP_FIND_MATCHES, ShardSizeSnapshot,
+    SyncIndexer, WorkerLookupStats, WorkerTask, panic_payload_message,
 };
 use crate::indexer::pruning::{BlockEntry, PruneConfig, WorkerPruneManager};
 use crate::protocols::*;
@@ -72,6 +72,10 @@ pub struct ThreadPoolIndexer<T: SyncIndexer> {
 
     /// Synthetic event IDs for approximate store/remove events.
     synthetic_event_id: Arc<AtomicU64>,
+
+    /// Optional metrics for timing inline `find_matches` calls on the caller's
+    /// thread. Event-apply metrics are recorded inside `SyncIndexer::worker`.
+    metrics: Option<Arc<KvIndexerMetrics>>,
 }
 
 impl<T: SyncIndexer> ThreadPoolIndexer<T> {
@@ -209,6 +213,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             prune_manager,
             prune_pump_cancel,
             synthetic_event_id,
+            metrics,
         }
     }
 
@@ -560,8 +565,14 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
         &self,
         sequence: Vec<LocalBlockHash>,
     ) -> Result<OverlapScores, KvRouterError> {
-        // Execute inline on caller's thread - no channel dispatch
-        Ok(self.backend.find_matches(&sequence, false))
+        // Execute inline on caller's thread - no channel dispatch.
+        // Timing here matches where the work actually happens.
+        let start = std::time::Instant::now();
+        let scores = self.backend.find_matches(&sequence, false);
+        if let Some(ref m) = self.metrics {
+            m.increment_indexer_op(METRIC_OP_FIND_MATCHES, start.elapsed());
+        }
+        Ok(scores)
     }
 
     async fn find_matches_for_request(
@@ -579,7 +590,12 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
                 ..Default::default()
             },
         );
-        Ok(self.backend.find_matches(&sequence, false))
+        let start = std::time::Instant::now();
+        let scores = self.backend.find_matches(&sequence, false);
+        if let Some(ref m) = self.metrics {
+            m.increment_indexer_op(METRIC_OP_FIND_MATCHES, start.elapsed());
+        }
+        Ok(scores)
     }
 
     async fn apply_event(&self, event: RouterEvent) {

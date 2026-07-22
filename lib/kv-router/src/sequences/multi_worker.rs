@@ -43,6 +43,19 @@ const FORCE_EXPIRE_REQUESTS_ACROSS_ALL_WORKERS_INTERVAL: Duration = Duration::fr
 // Traits
 // ---------------------------------------------------------------------------
 
+/// Per-worker load values observed into metrics gauges.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerLoadObservation {
+    pub active_decode_blocks: usize,
+    /// Uncached (effective) prefill tokens of booked requests, not raw ISL:
+    /// each request contributes ISL minus cached tokens, with the oldest
+    /// request decayed toward its expected prefill completion.
+    pub active_prefill_tokens: usize,
+    pub active_requests: usize,
+    /// Booked requests that have not completed prefill (`mark_prefill`).
+    pub active_prefill_requests: usize,
+}
+
 /// Abstraction over event publishing and metrics observation.
 ///
 /// Implementations provide the runtime-specific transport (e.g., NATS EventPublisher,
@@ -63,9 +76,17 @@ pub trait SequencePublisher: Send + Sync {
         &self,
         worker: &WorkerWithDpRank,
         worker_type: &str,
-        blocks: usize,
-        tokens: usize,
+        load: WorkerLoadObservation,
     );
+
+    /// Record requests removed by the stale-request force-expiry sweep.
+    /// Default no-op so only metrics-sinking publishers need to implement it.
+    fn b10_observe_force_expired_requests(&self, _worker_type: &str, _expired_count: usize) {}
+
+    /// Remove a departed worker's exported gauge series. Without this the
+    /// per-worker series freeze at their last published values (frees after
+    /// removal are idempotent no-ops that publish nothing).
+    fn b10_observe_worker_removed(&self, _worker: &WorkerWithDpRank, _worker_type: &str) {}
 }
 
 /// Abstraction over event subscription for replica sync.
@@ -221,8 +242,16 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         let active_blocks = load.active_blocks;
         let active_tokens = load.active_tokens(decay_now);
 
-        self.publisher
-            .observe_load(&worker, self.worker_type, active_blocks, active_tokens);
+        self.publisher.observe_load(
+            &worker,
+            self.worker_type,
+            WorkerLoadObservation {
+                active_decode_blocks: active_blocks,
+                active_prefill_tokens: active_tokens,
+                active_requests: load.active_requests,
+                active_prefill_requests: load.active_prefill_requests,
+            },
+        );
 
         let active_load = ActiveLoad {
             worker_id: worker.worker_id,
@@ -233,6 +262,13 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         };
 
         self.publisher.publish_load(active_load);
+    }
+
+    fn b10_record_force_expired_requests(&self, expired_count: usize) {
+        if expired_count > 0 {
+            self.publisher
+                .b10_observe_force_expired_requests(self.worker_type, expired_count);
+        }
     }
 
     fn spawn_publish_event(&self, event: ActiveSequenceEvent) {
@@ -357,6 +393,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                                 };
                                 drop(table);
                                 self.request_index.remove_requests(expired_request_ids.iter());
+                                self.b10_record_force_expired_requests(expired_request_ids.len());
                                 self.publish_worker_load_snapshot(event.worker, load, decay_now);
                                 continue;
                             } else {
@@ -534,6 +571,8 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         for removed in &change.removed {
             tracing::warn!("Removing worker {:?}", removed.worker);
             self.request_index.remove_worker_requests(removed.worker);
+            self.publisher
+                .b10_observe_worker_removed(&removed.worker, self.worker_type);
         }
         for worker in &change.added {
             tracing::warn!("Adding worker {:?}", worker);
@@ -777,6 +816,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 removed_request_count += outcome.expired_request_ids.len();
                 self.request_index
                     .remove_requests(outcome.expired_request_ids.iter());
+                self.b10_record_force_expired_requests(outcome.expired_request_ids.len());
                 self.publish_worker_load_snapshot(slot.worker, load, now);
             }
         }
@@ -912,6 +952,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
 
         self.request_index
             .remove_requests(expired_request_ids.iter());
+        self.b10_record_force_expired_requests(expired_request_ids.len());
 
         self.publish_worker_load_snapshot(worker, load, decay_now);
 
@@ -1079,6 +1120,59 @@ mod tests {
         compute_block_hash_for_seq, compute_seq_hash_for_block,
     };
     use crate::test_utils::NoopSequencePublisher;
+
+    #[derive(Clone, Default)]
+    struct RemovalRecordingPublisher {
+        removed: std::sync::Arc<std::sync::Mutex<Vec<(WorkerWithDpRank, String)>>>,
+    }
+
+    impl SequencePublisher for RemovalRecordingPublisher {
+        fn publish_event(
+            &self,
+            _event: &ActiveSequenceEvent,
+        ) -> impl Future<Output = anyhow::Result<()>> + Send {
+            future::ready(Ok(()))
+        }
+
+        fn publish_load(&self, _load: ActiveLoad) {}
+
+        fn observe_load(&self, _: &WorkerWithDpRank, _: &str, _: WorkerLoadObservation) {}
+
+        fn b10_observe_worker_removed(&self, worker: &WorkerWithDpRank, worker_type: &str) {
+            self.removed
+                .lock()
+                .unwrap()
+                .push((*worker, worker_type.to_string()));
+        }
+    }
+
+    #[test]
+    fn b10_update_workers_notifies_publisher_of_removed_workers() {
+        let publisher = RemovalRecordingPublisher::default();
+        let seqs = ActiveSequencesMultiWorker::new(
+            publisher.clone(),
+            4,
+            HashMap::from([(1_u64, (0_u32, 1_u32)), (2_u64, (0_u32, 2_u32))]),
+            false,
+            0,
+            "test",
+        );
+
+        seqs.update_workers(&HashMap::from([(1_u64, (0_u32, 1_u32))]));
+
+        let mut removed = publisher.removed.lock().unwrap().clone();
+        removed.sort_by_key(|(w, _)| (w.worker_id, w.dp_rank));
+        assert_eq!(
+            removed,
+            vec![
+                (WorkerWithDpRank::new(2, 0), "test".to_string()),
+                (WorkerWithDpRank::new(2, 1), "test".to_string()),
+            ]
+        );
+
+        // Surviving worker is untouched.
+        assert!(removed.iter().all(|(w, _)| w.worker_id != 1));
+    }
 
     fn make_sequences() -> ActiveSequencesMultiWorker<NoopSequencePublisher> {
         ActiveSequencesMultiWorker::new(

@@ -19,7 +19,8 @@ use super::metrics::register_worker_timing_metrics;
 use crate::discovery::ModelManager;
 use crate::endpoint_type::EndpointType;
 use crate::kv_router::metrics::{
-    RoutingOverheadMetrics, register_router_queue_metrics, register_worker_load_metrics,
+    RoutingOverheadMetrics, b10_register_router_sequence_metrics, register_router_queue_metrics,
+    register_worker_load_metrics,
 };
 use crate::request_template::RequestTemplate;
 use anyhow::Result;
@@ -541,6 +542,11 @@ impl HttpServiceConfigBuilder {
         // These are updated by KvScheduler on enqueue/update/free
         if let Err(e) = register_router_queue_metrics(&registry) {
             tracing::warn!("Failed to register router queue metrics: {}", e);
+        }
+
+        // Register router sequence lifecycle counters (stale-request expiry)
+        if let Err(e) = b10_register_router_sequence_metrics(&registry) {
+            tracing::warn!("Failed to register router sequence metrics: {}", e);
         }
 
         if let Some(ref discovery) = config.drt_discovery {

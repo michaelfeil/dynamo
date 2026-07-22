@@ -41,7 +41,7 @@ pub mod test_utils;
 // Re-export key types for convenience
 pub use self::multi_worker_sequence::{
     ActiveSequencesMultiWorker, SequenceError, SequencePublisher, SequenceRequest,
-    SequenceSubscriber,
+    SequenceSubscriber, WorkerLoadObservation,
 };
 pub use self::sequence::{ActiveSequences, RequestId};
 pub use self::sequences::PrefillTokenDeltas;

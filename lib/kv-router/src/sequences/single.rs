@@ -106,6 +106,11 @@ pub(super) struct SequenceMutationOutcome {
 pub struct ActiveSequences {
     requests: HashMap<RequestId, RequestState>,
     prefill: PrefillLoadTracker,
+    /// Requests that have not completed prefill. Tracked independently of
+    /// `prefill`, which only holds requests with token-load accounting
+    /// (skipped when tracking is disabled, the load hint is absent, or the
+    /// request is fully cached) and would undercount the prefill phase.
+    b10_prefill_phase: HashSet<RequestId>,
     blocks: BlockTracker,
     last_expiry_check_time: Instant,
 }
@@ -118,6 +123,7 @@ impl ActiveSequences {
         Self {
             requests: HashMap::new(),
             prefill: PrefillLoadTracker::default(),
+            b10_prefill_phase: HashSet::new(),
             blocks: BlockTracker::default(),
             last_expiry_check_time: Instant::now(),
         }
@@ -131,6 +137,14 @@ impl ActiveSequences {
         assert!(
             active_prefills.is_subset(&active_requests),
             "prefill tracker cannot reference missing request state",
+        );
+        assert!(
+            self.b10_prefill_phase.is_subset(&active_requests),
+            "prefill phase set cannot reference missing request state",
+        );
+        assert!(
+            active_prefills.is_subset(&self.b10_prefill_phase),
+            "token-tracked prefills must be a subset of the prefill phase set",
         );
         assert!(
             self.blocks
@@ -231,6 +245,7 @@ impl ActiveSequences {
                 expected_output_tokens,
             },
         );
+        self.b10_prefill_phase.insert(request_id.clone());
 
         if let Some(prefill) = prefill {
             self.prefill.insert(&request_id, prefill, decay_now);
@@ -242,6 +257,7 @@ impl ActiveSequences {
 
     /// Mark prefill as completed for a request, removing it from prompt-load tracking.
     pub(super) fn mark_prefill_completed(&mut self, request_id: &RequestId, decay_now: Instant) {
+        self.b10_prefill_phase.remove(request_id);
         let _ = self.prefill.remove(request_id, decay_now);
         self.validate_state();
     }
@@ -255,6 +271,7 @@ impl ActiveSequences {
         request_id: &RequestId,
         decay_now: Instant,
     ) -> PromptMembershipDelta {
+        self.b10_prefill_phase.remove(request_id);
         let _ = self.prefill.remove(request_id, decay_now);
 
         let Some(request_state) = self.requests.remove(request_id) else {
@@ -376,6 +393,8 @@ impl ActiveSequences {
         WorkerLoadSnapshot {
             active_blocks: self.active_blocks(),
             prefill: self.prefill.snapshot(),
+            active_requests: self.requests.len(),
+            active_prefill_requests: self.b10_prefill_phase.len(),
         }
     }
 
@@ -410,6 +429,54 @@ mod tests {
             initial_effective_prefill_tokens: tokens,
             expected_prefill_duration: None,
         })
+    }
+
+    #[test]
+    fn b10_prefill_phase_counts_requests_without_token_tracking() {
+        let mut seq_manager = ActiveSequences::new(4);
+        let decay_now = Instant::now();
+
+        // Token tracking disabled: request must still count as prefill-phase.
+        seq_manager.add_request_with_prefill_tracking(
+            "untracked".to_string(),
+            Some(vec![1, 2]),
+            None,
+            false,
+            None,
+            decay_now,
+        );
+        // Tracking enabled but no load hint (e.g. fully cached): same.
+        seq_manager.add_request_with_prefill_tracking(
+            "no-hint".to_string(),
+            Some(vec![3, 4]),
+            None,
+            true,
+            None,
+            decay_now,
+        );
+        assert_eq!(
+            seq_manager.worker_load_snapshot().active_prefill_requests,
+            2
+        );
+
+        // mark_prefill moves a request out of the prefill phase...
+        seq_manager.mark_prefill_completed(&"untracked".to_string(), decay_now);
+        assert_eq!(
+            seq_manager.worker_load_snapshot().active_prefill_requests,
+            1
+        );
+        // ...idempotently...
+        seq_manager.mark_prefill_completed(&"untracked".to_string(), decay_now);
+        assert_eq!(
+            seq_manager.worker_load_snapshot().active_prefill_requests,
+            1
+        );
+        // ...and free-without-mark also clears it.
+        seq_manager.free(&"no-hint".to_string(), decay_now);
+        assert_eq!(
+            seq_manager.worker_load_snapshot().active_prefill_requests,
+            0
+        );
     }
 
     #[test]
