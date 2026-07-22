@@ -33,7 +33,7 @@ pub fn set_health(healthy: bool, reason: &str, timeout: Option<Duration>) {
             tracing::info!("Health state changed to HEALTHY: {}", reason);
         } else {
             tracing::warn!(
-                unified_logs = true,
+                unified_model_logs = true,
                 "Health state changed to UNHEALTHY: {}",
                 reason
             );

@@ -150,14 +150,14 @@ pub fn validate_no_unsupported_fields(
             tracing::warn!(
                 fields = %unknown_fields,
                 allow_unsupported_fields = true,
-                unified_logs = true,
+                unified_model_logs = true,
                 "allowing OpenAI request with unsupported field(s). This will be lead to a HTTP(400) response in the future."
             );
         } else {
             tracing::info!(
                 fields = %unknown_fields,
                 reason = "unsupported_parameter",
-                unified_logs = true,
+                unified_model_logs = true,
                 "rejecting OpenAI request due to unsupported field(s)"
             );
             let quoted_unknown: Vec<_> = unknown.iter().map(|field| format!("`{field}`")).collect();

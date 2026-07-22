@@ -1413,6 +1413,12 @@ and masked more useful INFO-level signal in production logs. Request
 correlation is preserved through the existing `request_id` field and
 metrics; only the standalone lifecycle events moved to debug.
 
+v1.2 marker-name fix: several Rust log sites carried a misspelled
+`unified_logs = true` marker that the log pipeline never matched; they were
+renamed to `unified_model_logs = true`. When rebasing or editing log sites,
+preserve the `unified_model_logs` / `skip_unified_model_logs` field settings
+exactly as spelled — the pipeline matches only these names, so a renamed or
+dropped marker silently changes customer-facing log visibility.
 
 Replay notes:
 

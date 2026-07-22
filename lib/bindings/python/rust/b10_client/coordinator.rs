@@ -90,7 +90,7 @@ fn log_route_and_connect_denied(
         stale_reroutes,
         denied_kind = %denied_request_kind(denied),
         denied = ?denied,
-        unified_logs = true,
+        unified_model_logs = true,
         "route_and_connect denied"
     );
 }
@@ -1853,7 +1853,6 @@ pub(super) async fn route_and_connect(
                         .map(duration_ms_for_log),
                     worker_setup_ms = duration_ms_for_log(timings.worker_connect_duration),
                     estimated_overlap_tokens,
-                    unified_logs = true,
                     "route_and_connect admitted"
                 );
                 return Ok(RouteAndConnectOutcome::Connected {

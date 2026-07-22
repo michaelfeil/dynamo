@@ -378,7 +378,7 @@ pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> 
             status_code = StatusCode::BAD_REQUEST.as_u16(),
             reason = "request_body_deserialization_failed",
             message = %error_message,
-            unified_logs = true,
+            unified_model_logs = true,
             "rejecting OpenAI request during JSON deserialization"
         );
         (
