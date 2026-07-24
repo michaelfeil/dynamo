@@ -35,8 +35,6 @@ pub struct AnthropicStreamConverter {
     text_block_started: bool,
     text_block_closed: bool,
     text_block_index: u32,
-    // Starts with a frontend estimate and is replaced atomically when the
-    // engine reports authoritative usage.
     usage: AnthropicUsage,
     // Tool call tracking
     tool_call_states: Vec<ToolCallState>,
@@ -59,7 +57,7 @@ struct ToolCallState {
 }
 
 impl AnthropicStreamConverter {
-    pub fn new(model: String, estimated_input_tokens: u32) -> Self {
+    pub fn new(model: String) -> Self {
         Self {
             model,
             message_id: format!("msg_{}", Uuid::new_v4().simple()),
@@ -71,7 +69,6 @@ impl AnthropicStreamConverter {
             text_block_closed: false,
             text_block_index: 0,
             usage: AnthropicUsage {
-                input_tokens: estimated_input_tokens,
                 cache_creation_input_tokens: Some(0),
                 ..Default::default()
             },
@@ -85,12 +82,8 @@ impl AnthropicStreamConverter {
     /// Create a converter seeded with the original Anthropic request context.
     /// This allows the response stream to carry forward metadata that was lost
     /// during the Anthropic-to-OpenAI request conversion.
-    pub fn with_context(
-        model: String,
-        estimated_input_tokens: u32,
-        context: AnthropicContext,
-    ) -> Self {
-        let mut converter = Self::new(model, estimated_input_tokens);
+    pub fn with_context(model: String, context: AnthropicContext) -> Self {
+        let mut converter = Self::new(model);
         converter.api_context = Some(context);
         converter
     }
@@ -125,9 +118,9 @@ impl AnthropicStreamConverter {
     ) -> Vec<Result<Event, anyhow::Error>> {
         let mut events = Vec::new();
 
-        // Replace the initial estimate when the engine reports authoritative
-        // usage (typically on the final chunk). This also applies Anthropic's
-        // non-overlapping cached-token accounting.
+        // Record authoritative usage when the engine reports it, typically on
+        // the final chunk. This also applies Anthropic's non-overlapping
+        // cached-token accounting.
         if let Some(usage) = &chunk.inner.usage {
             self.record_usage(usage);
         }
@@ -867,14 +860,13 @@ mod tests {
         }
     }
 
-    /// Streaming usage starts with the frontend estimate, then reconciles to
-    /// the engine's total prompt tokens minus its cached-token count.
+    /// Streaming usage starts at zero, then updates to the engine's total
+    /// prompt tokens minus its cached-token count.
     #[test]
     fn test_streaming_input_tokens_reconciled_from_engine_usage() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 19);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
 
-        // `message_start` is emitted before backend usage is available.
-        assert_eq!(conv.usage.input_tokens, 19);
+        assert_eq!(conv.usage.input_tokens, 0);
 
         // Exercise the production chunk path rather than its tagged test mirror.
         let events = conv.process_chunk(&usage_chunk(12, Some(11), 5));
@@ -911,7 +903,7 @@ mod tests {
     /// events and fail to execute tool calls ("Error editing file").
     #[test]
     fn test_text_block_stops_before_tool_block_starts() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
 
         // Stream some text
         let text_events = conv.process_chunk_tagged(&text_chunk("I'll edit the file."));
@@ -973,7 +965,7 @@ mod tests {
 
     #[test]
     fn test_streaming_tool_use_id_is_rewritten_to_toolu_prefix() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
         let events = conv.process_chunk_tagged(&tool_call_chunk(
             0,
             Some("chatcmpl-tool-DEADBEEF"),
@@ -1004,7 +996,7 @@ mod tests {
     /// Tool-only response (no preceding text): no spurious stop events.
     #[test]
     fn test_tool_only_response_no_text_block() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
 
         let tool_events = conv.process_chunk_tagged(&tool_call_chunk(
             0,
@@ -1033,7 +1025,7 @@ mod tests {
     /// Text-only response: stop emitted in end events (no early close).
     #[test]
     fn test_text_only_response_stop_in_end_events() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
 
         conv.process_chunk_tagged(&text_chunk("Hello world"));
 
@@ -1082,7 +1074,7 @@ mod tests {
     /// block is properly closed before the next one starts.
     #[test]
     fn test_thinking_text_then_tool_call() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
 
         // 1. Reasoning tokens → thinking block starts
         let ev = conv.process_chunk_tagged(&reasoning_chunk("Let me think..."));
@@ -1149,7 +1141,7 @@ mod tests {
     /// Thinking-only response (no text/tool follows): thinking block closed in end events.
     #[test]
     fn test_thinking_only_closed_in_end_events() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
         conv.process_chunk_tagged(&reasoning_chunk("Deep thought..."));
 
         let ev = conv.emit_end_events_tagged();
@@ -1167,7 +1159,7 @@ mod tests {
     /// Multiple tool calls: each gets inline content_block_stop.
     #[test]
     fn test_multiple_tool_calls_each_stopped_inline() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
 
         let events1 = conv.process_chunk_tagged(&tool_call_chunk(
             0,
@@ -1220,7 +1212,7 @@ mod tests {
             service_tier: Some("priority".to_string()),
             ..Default::default()
         };
-        let mut conv = AnthropicStreamConverter::with_context("test-model".into(), 0, ctx);
+        let mut conv = AnthropicStreamConverter::with_context("test-model".into(), ctx);
         assert!(conv.api_context.is_some());
         assert_eq!(
             conv.api_context.as_ref().unwrap().service_tier.as_deref(),
@@ -1260,7 +1252,7 @@ mod tests {
     /// loop on every Claude Code Write/Bash/Edit invocation.
     #[test]
     fn test_streamed_tool_args_close_only_when_json_complete() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
 
         // Chunk 1: id + name + empty args prefix. Block opens, empty delta
         // emitted, but block must NOT close (args don't parse yet).
@@ -1320,7 +1312,7 @@ mod tests {
     /// `max_tokens`) must close in `emit_end_events`, not be left dangling.
     #[test]
     fn test_streamed_tool_args_unclosed_finalized_in_end_events() {
-        let mut conv = AnthropicStreamConverter::new("test-model".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("test-model".into());
 
         let ev1 =
             conv.process_chunk_tagged(&tool_call_chunk(0, Some("call-1"), Some("Write"), Some("")));
@@ -1385,7 +1377,7 @@ mod tests {
     /// `content_block_stop` for index 2.
     #[test]
     fn test_minimax_m2_claude_code_session_replay() {
-        let mut conv = AnthropicStreamConverter::new("MiniMaxAI/MiniMax-M2.5".into(), 0);
+        let mut conv = AnthropicStreamConverter::new("MiniMaxAI/MiniMax-M2.5".into());
 
         // 1. Thinking block: a few reasoning tokens, then text starts which
         //    forces the thinking block closed (signature_delta + stop).
