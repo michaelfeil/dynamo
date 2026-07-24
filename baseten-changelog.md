@@ -1769,10 +1769,17 @@ Metrics to preserve across fork upgrades (final names; live-verified on the
 - `dynamo_frontend_worker_active_decode_requests{...}` — derived
   active - prefill
 - `dynamo_frontend_router_queue_gate_threshold_tokens{worker_type,gate}` —
-  gate in {prefill_busy, decode_tokens, isl_cap}
+  gate in {prefill_busy, decode_tokens} (gate=isl_cap removed, superseded by
+  the per-tier isl_tokens pair below)
+- `dynamo_frontend_router_queue_isl_tokens_threshold{worker_type,missing_isl_floor}`
+  / `dynamo_frontend_router_queue_isl_tokens_last_evaluated{...}` — per
+  missing-ISL tier (keyed by the tier's floor), PER-WORKER so values never
+  move with fleet size: configured max_queue_depth, and pending-ISL / live
+  workers at that tier's last cap evaluation (enforcement scales by worker
+  count; priority bonus excluded); replaces the former gate=isl_cap series
 - `dynamo_frontend_router_queue_gate_last_evaluated_tokens{worker_type,gate}`
-  — gate in {prefill_busy, decode_tokens}; isl_cap's compared value is the
-  pending-ISL gauge; snapshots of each gate's LAST admission evaluation
+  — gate in {prefill_busy, decode_tokens}; snapshots of each gate's LAST
+  admission evaluation
 - `dynamo_frontend_router_force_expired_requests_total{worker_type}`
 - `dynamo_frontend_router_queue_cancelled_requests_total{worker_type}`
 - `dynamo_component_kv_indexer_ops_count{operation}` /

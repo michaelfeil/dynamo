@@ -371,6 +371,10 @@ where
         self.queue.b10_eval_gauges()
     }
 
+    pub fn b10_isl_tier_caps(&self) -> Vec<(usize, usize)> {
+        self.queue.b10_isl_tier_caps()
+    }
+
     pub fn b10_cancelled_requests_count(&self) -> usize {
         self.queue.b10_cancelled_requests_count()
     }

@@ -189,6 +189,30 @@ impl RouterQueueDepthTiers {
     }
 
     /// Get effective cap for a request's cache-miss tokens, scaled by worker count.
+    /// Per-worker cap per tier: `(missing_isl_floor, max_queue_depth)`.
+    /// Order matches the configured tiers. Enforcement scales by live worker
+    /// count; the exported gauges stay per-worker so they do not move as the
+    /// fleet scales.
+    pub fn b10_tier_caps(&self) -> Vec<(usize, usize)> {
+        self.0
+            .iter()
+            .map(|tier| (tier.missing_cache_tokens_floor, tier.max_queue_depth))
+            .collect()
+    }
+
+    /// Number of configured tiers.
+    pub fn b10_tier_count(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Index of the tier that applies to `cache_miss_tokens` (aligned with
+    /// `b10_tier_caps` order); `None` when tiers are unbounded.
+    pub fn b10_tier_index_for(&self, cache_miss_tokens: usize) -> Option<usize> {
+        self.0
+            .iter()
+            .rposition(|tier| cache_miss_tokens >= tier.missing_cache_tokens_floor)
+    }
+
     pub fn cap_for(&self, cache_miss_tokens: usize, worker_count: usize) -> Option<usize> {
         if self.0.is_empty() {
             return None;

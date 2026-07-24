@@ -123,7 +123,7 @@ impl<K: Ord + Eq> PartialOrd for QueueEntry<K> {
 /// Note: under fractional busy mode (>16 workers) the queue can engage while
 /// the min-visited worker is below threshold; the pair is exact in the
 /// default all-workers-busy mode.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct B10QueueEvalGauges {
     /// Min active prefill tokens among workers visited by the last
     /// prefill-busy evaluation.
@@ -135,10 +135,22 @@ pub struct B10QueueEvalGauges {
     /// `router_queue_threshold_decode_tokens()`, which the metrics sync task
     /// exports as this gate's threshold gauge.
     pub decode_evaluated_tokens: AtomicU64,
-    /// Missing-ISL tier cap (the 429 backpressure rejection threshold on
-    /// queued ISL) applied at the last evaluation; 0 when no cap applied.
-    /// The compared value is the pending-ISL gauge.
-    pub isl_cap_tokens: AtomicU64,
+    /// Per-worker share of pending-ISL tokens (pending / live workers)
+    /// compared at the last cap evaluation of each missing-ISL tier,
+    /// index-aligned with the configured tiers. Per-worker so the pair with
+    /// the per-worker tier cap is scale-invariant.
+    pub isl_evaluated_tokens_per_tier: Vec<AtomicU64>,
+}
+
+impl B10QueueEvalGauges {
+    fn new(tier_count: usize) -> Self {
+        Self {
+            prefill_evaluated_tokens: AtomicU64::new(0),
+            prefill_threshold_tokens: AtomicU64::new(0),
+            decode_evaluated_tokens: AtomicU64::new(0),
+            isl_evaluated_tokens_per_tier: (0..tier_count).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
 }
 
 // Enqueue's inline SchedulingRequest dominates; boxing would only add a
@@ -210,6 +222,9 @@ pub struct SchedulerQueue<
     cancelled_requests: Arc<AtomicUsize>,
     /// Last-evaluation snapshots for the threshold/eval gauge exports.
     eval_gauges: Arc<B10QueueEvalGauges>,
+    /// Copy of the missing-ISL tiers (immutable after construction) so the
+    /// metrics task can export per-rung effective caps without the actor.
+    queue_depth_tiers: RouterQueueDepthTiers,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     supports_overlap_refresh: bool,
@@ -267,8 +282,9 @@ impl<
         let pending_count = Arc::new(AtomicUsize::new(0));
         let pending_isl_tokens = Arc::new(AtomicUsize::new(0));
         let cancelled_requests = Arc::new(AtomicUsize::new(0));
-        let eval_gauges = Arc::new(B10QueueEvalGauges::default());
+        let eval_gauges = Arc::new(B10QueueEvalGauges::new(queue_depth_tiers.b10_tier_count()));
         let (admission_tx, admission_rx) = mpsc::channel(ADMISSION_CHANNEL_CAPACITY);
+        let handle_queue_depth_tiers = queue_depth_tiers.clone();
         let actor = SchedulerQueueActor {
             pending: BinaryHeap::new(),
             pending_count: Arc::clone(&pending_count),
@@ -300,6 +316,7 @@ impl<
             pending_isl_tokens,
             cancelled_requests,
             eval_gauges,
+            queue_depth_tiers: handle_queue_depth_tiers,
             slots,
             workers_with_configs,
             supports_overlap_refresh: overlap_refresh_after.is_some(),
@@ -480,6 +497,13 @@ impl<
         &self.eval_gauges
     }
 
+    /// Per-worker missing-ISL caps: `(missing_isl_floor, max_queue_depth)`
+    /// per tier, straight from config so the exported thresholds never move
+    /// with fleet size.
+    pub fn b10_isl_tier_caps(&self) -> Vec<(usize, usize)> {
+        self.queue_depth_tiers.b10_tier_caps()
+    }
+
     /// Number of requests currently parked in the pending queue (lock-free).
     pub fn pending_count(&self) -> usize {
         self.pending_count.load(AtomicOrdering::Relaxed)
@@ -599,11 +623,23 @@ impl<
             if !self.queue_depth_tiers.is_unbounded() {
                 let mut pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
                 let tier_cap = self.tier_cap_for_request(&request);
-                // 0 = no cap applied at the last evaluation, so the gauge
-                // cannot go stale when tiers are unbounded or waived.
-                self.eval_gauges
-                    .isl_cap_tokens
-                    .store(tier_cap.unwrap_or(0) as u64, AtomicOrdering::Relaxed);
+                if let Some((tier_idx, _)) = tier_cap
+                    && let Some(slot) = self.eval_gauges.isl_evaluated_tokens_per_tier.get(tier_idx)
+                {
+                    // Per-worker share, mirroring the enforcement ratio
+                    // (pending >= depth x N  <=>  pending / N >= depth).
+                    // A zero-worker fleet cannot reach this branch (no
+                    // eligible workers means never busy); skip rather than
+                    // fabricate a divisor if that ever changes.
+                    let worker_count = self.workers_with_configs.borrow().len();
+                    if worker_count > 0 {
+                        slot.store(
+                            (pending_isl_tokens / worker_count) as u64,
+                            AtomicOrdering::Relaxed,
+                        );
+                    }
+                }
+                let tier_cap = tier_cap.map(|(_, cap)| cap);
                 // This is a rejection threshold on current queued ISL, not a hard
                 // post-admission bound on `pending + incoming`.
                 if let Some(max_isl_tokens) = tier_cap
@@ -1036,7 +1072,9 @@ impl<
     /// Resolve the admission cap for `request` from the cache-miss tier table.
     ///
     /// Returns `None` when capping is disabled.
-    fn tier_cap_for_request(&self, request: &SchedulingRequest) -> Option<usize> {
+    /// The applicable missing-ISL tier (index aligned with the configured
+    /// tiers) and its effective cap for this request.
+    fn tier_cap_for_request(&self, request: &SchedulingRequest) -> Option<(usize, usize)> {
         let workers = self.workers_with_configs.borrow();
         let ctx = SchedulingContext::new(request, &workers);
         let cache_miss_tokens = ctx.best_effective_prefill_tokens();
@@ -1047,15 +1085,18 @@ impl<
         // look like it must all be drained by that subset, which overstates the
         // backlog pressure on those workers.
         let worker_count = workers.len();
+        let tier_idx = self
+            .queue_depth_tiers
+            .b10_tier_index_for(cache_miss_tokens)?;
         self.queue_depth_tiers
             .cap_for(cache_miss_tokens, worker_count)
             .map(|cap| {
                 if request.priority_jump <= 0.0 || request.priority_load_shed_percent == 0 {
-                    return cap;
+                    return (tier_idx, cap);
                 }
 
                 let bonus = cap.saturating_mul(request.priority_load_shed_percent as usize) / 100;
-                cap.saturating_add(bonus)
+                (tier_idx, cap.saturating_add(bonus))
             })
     }
 
@@ -1766,6 +1807,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn b10_isl_tier_caps_are_per_worker_config_values() {
+        let isl = 512;
+        let tiers =
+            RouterQueueDepthTiers::from_tuples(vec![(0, 1000), (256, 400)]).expect("valid tiers");
+        let (queue, _slots, _tx) =
+            make_queue_with_sender_with_tiers(3, 16, isl, Some(0.5), tiers, None);
+        // Per-worker config values: independent of the 3-worker fleet size.
+        assert_eq!(queue.b10_isl_tier_caps(), vec![(0, 1000), (256, 400)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_gauges_capture_last_admission_evaluation() {
         let isl = 512;
         // threshold_frac 0.5 x max_batched 512 = 256 busy-threshold tokens.
@@ -2122,6 +2174,13 @@ mod tests {
         );
         assert_eq!(queue.pending_count(), 1);
         assert_eq!(queue.pending_isl_tokens(), isl);
+
+        // The rejected request's tier recorded the pending-ISL it was
+        // compared against (single tier -> index 0).
+        assert_eq!(
+            queue.b10_eval_gauges().isl_evaluated_tokens_per_tier[0].load(AtomicOrdering::Relaxed),
+            isl as u64
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

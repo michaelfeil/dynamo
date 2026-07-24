@@ -346,6 +346,11 @@ pub struct RouterQueueMetrics {
     /// snapshot the most recent admission evaluation (not continuous).
     pub threshold_tokens: IntGaugeVec,
     pub evaluated_tokens: IntGaugeVec,
+    /// Per missing-ISL tier (keyed by the tier's floor): the effective
+    /// queued-ISL cap and the pending-ISL compared at that tier's last cap
+    /// evaluation. Same dimensions on both.
+    pub isl_tokens_threshold: IntGaugeVec,
+    pub isl_tokens_last_evaluated: IntGaugeVec,
 }
 
 pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> = LazyLock::new(|| {
@@ -414,6 +419,31 @@ pub static ROUTER_QUEUE_METRICS: LazyLock<RouterQueueMetrics> = LazyLock::new(||
             &[labels::WORKER_TYPE, "gate"],
         )
         .expect("Failed to create router_queue_evaluated_tokens gauge"),
+        isl_tokens_threshold: IntGaugeVec::new(
+            Opts::new(
+                format!("{}_router_queue_isl_tokens_threshold", name_prefix::FRONTEND),
+                "Per-worker queued-ISL cap per missing-ISL tier, keyed by the tier's \
+                 floor (configured max_queue_depth; enforcement scales by live worker \
+                 count, priority bonus excluded)",
+            )
+            .const_labels(bis_const_labels()),
+            &[labels::WORKER_TYPE, "missing_isl_floor"],
+        )
+        .expect("Failed to create router_queue_isl_tokens_threshold gauge"),
+        isl_tokens_last_evaluated: IntGaugeVec::new(
+            Opts::new(
+                format!(
+                    "{}_router_queue_isl_tokens_last_evaluated",
+                    name_prefix::FRONTEND
+                ),
+                "Per-worker share of pending-ISL tokens (pending / live workers) \
+                 compared against the tier's per-worker cap at that tier's last \
+                 evaluation",
+            )
+            .const_labels(bis_const_labels()),
+            &[labels::WORKER_TYPE, "missing_isl_floor"],
+        )
+        .expect("Failed to create router_queue_isl_tokens_last_evaluated gauge"),
     }
 });
 
@@ -480,10 +510,23 @@ impl RouterQueueMetrics {
             .set(evaluated as i64);
     }
 
-    pub fn b10_set_gate_threshold(&self, worker_type: &str, gate: &str, threshold: u64) {
-        self.threshold_tokens
-            .with_label_values(&[worker_type, gate])
-            .set(threshold as i64);
+    pub fn b10_set_isl_tokens_tiers(
+        &self,
+        worker_type: &str,
+        caps: &[(usize, usize)],
+        evaluated: &[u64],
+    ) {
+        for (idx, (floor, cap)) in caps.iter().enumerate() {
+            let floor = floor.to_string();
+            self.isl_tokens_threshold
+                .with_label_values(&[worker_type, &floor])
+                .set(*cap as i64);
+            if let Some(value) = evaluated.get(idx) {
+                self.isl_tokens_last_evaluated
+                    .with_label_values(&[worker_type, &floor])
+                    .set(*value as i64);
+            }
+        }
     }
 }
 
@@ -499,6 +542,8 @@ pub fn register_router_queue_metrics(
     registry.register(Box::new(m.cancelled_requests_total.clone()))?;
     registry.register(Box::new(m.threshold_tokens.clone()))?;
     registry.register(Box::new(m.evaluated_tokens.clone()))?;
+    registry.register(Box::new(m.isl_tokens_threshold.clone()))?;
+    registry.register(Box::new(m.isl_tokens_last_evaluated.clone()))?;
     Ok(())
 }
 
@@ -557,6 +602,14 @@ pub fn register_global_metrics_with_component(component: &Component) {
     registry.add_metric_or_warn(
         Box::new(q.evaluated_tokens.clone()),
         "router_queue_gate_last_evaluated_tokens",
+    );
+    registry.add_metric_or_warn(
+        Box::new(q.isl_tokens_threshold.clone()),
+        "router_queue_isl_tokens_threshold",
+    );
+    registry.add_metric_or_warn(
+        Box::new(q.isl_tokens_last_evaluated.clone()),
+        "router_queue_isl_tokens_last_evaluated",
     );
 }
 
@@ -1089,6 +1142,25 @@ dynamo_frontend_worker_active_requests{dp_rank=\"0\",worker_id=\"123\",worker_ty
                 &[labels::WORKER_TYPE, "gate"],
             )
             .unwrap(),
+            isl_tokens_threshold: IntGaugeVec::new(
+                Opts::new(
+                    format!("{}_router_queue_isl_tokens_threshold", name_prefix::FRONTEND),
+                    "Per-worker queued-ISL cap per missing-ISL tier",
+                ),
+                &[labels::WORKER_TYPE, "missing_isl_floor"],
+            )
+            .unwrap(),
+            isl_tokens_last_evaluated: IntGaugeVec::new(
+                Opts::new(
+                    format!(
+                        "{}_router_queue_isl_tokens_last_evaluated",
+                        name_prefix::FRONTEND
+                    ),
+                    "Per-worker pending-ISL share compared at the tier's last cap evaluation",
+                ),
+                &[labels::WORKER_TYPE, "missing_isl_floor"],
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.pending_requests.clone()))
@@ -1108,6 +1180,12 @@ dynamo_frontend_worker_active_requests{dp_rank=\"0\",worker_id=\"123\",worker_ty
         registry
             .register(Box::new(metrics.evaluated_tokens.clone()))
             .unwrap();
+        registry
+            .register(Box::new(metrics.isl_tokens_threshold.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.isl_tokens_last_evaluated.clone()))
+            .unwrap();
 
         metrics.set_pending("decode", 5);
         metrics.set_pending_isl_tokens("decode", 1024);
@@ -1116,7 +1194,7 @@ dynamo_frontend_worker_active_requests{dp_rank=\"0\",worker_id=\"123\",worker_ty
         metrics.b10_inc_cancelled_requests("decode", 0);
         metrics.b10_set_gate_evaluation("decode", "prefill_busy", 24576, 18000);
         metrics.b10_set_gate_evaluation("decode", "decode_tokens", 140000, 96000);
-        metrics.b10_set_gate_threshold("decode", "isl_cap", 262144);
+        metrics.b10_set_isl_tokens_tiers("decode", &[(0, 1000), (256, 400)], &[300, 366]);
 
         let output = gather_pef(&registry);
         let expected = "\
@@ -1133,8 +1211,15 @@ dynamo_frontend_router_queue_gate_last_evaluated_tokens{gate=\"prefill_busy\",wo
 # HELP dynamo_frontend_router_queue_gate_threshold_tokens Admission threshold in tokens for each router queue gate
 # TYPE dynamo_frontend_router_queue_gate_threshold_tokens gauge
 dynamo_frontend_router_queue_gate_threshold_tokens{gate=\"decode_tokens\",worker_type=\"decode\"} 140000
-dynamo_frontend_router_queue_gate_threshold_tokens{gate=\"isl_cap\",worker_type=\"decode\"} 262144
 dynamo_frontend_router_queue_gate_threshold_tokens{gate=\"prefill_busy\",worker_type=\"decode\"} 24576
+# HELP dynamo_frontend_router_queue_isl_tokens_last_evaluated Per-worker pending-ISL share compared at the tier's last cap evaluation
+# TYPE dynamo_frontend_router_queue_isl_tokens_last_evaluated gauge
+dynamo_frontend_router_queue_isl_tokens_last_evaluated{missing_isl_floor=\"0\",worker_type=\"decode\"} 300
+dynamo_frontend_router_queue_isl_tokens_last_evaluated{missing_isl_floor=\"256\",worker_type=\"decode\"} 366
+# HELP dynamo_frontend_router_queue_isl_tokens_threshold Per-worker queued-ISL cap per missing-ISL tier
+# TYPE dynamo_frontend_router_queue_isl_tokens_threshold gauge
+dynamo_frontend_router_queue_isl_tokens_threshold{missing_isl_floor=\"0\",worker_type=\"decode\"} 1000
+dynamo_frontend_router_queue_isl_tokens_threshold{missing_isl_floor=\"256\",worker_type=\"decode\"} 400
 # HELP dynamo_frontend_router_queue_pending_isl_tokens Sum of isl_tokens for requests pending in the router scheduler queue
 # TYPE dynamo_frontend_router_queue_pending_isl_tokens gauge
 dynamo_frontend_router_queue_pending_isl_tokens{worker_type=\"decode\"} 1024

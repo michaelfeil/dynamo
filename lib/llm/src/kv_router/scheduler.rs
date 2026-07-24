@@ -158,11 +158,15 @@ where
                     dynamo_kv_router::scheduling::queue::router_queue_threshold_decode_tokens(),
                     eval.decode_evaluated_tokens.load(Relaxed),
                 );
-                // isl_cap's compared value is the pending-ISL gauge itself.
-                ROUTER_QUEUE_METRICS.b10_set_gate_threshold(
+                let tier_evaluated: Vec<u64> = eval
+                    .isl_evaluated_tokens_per_tier
+                    .iter()
+                    .map(|slot| slot.load(Relaxed))
+                    .collect();
+                ROUTER_QUEUE_METRICS.b10_set_isl_tokens_tiers(
                     worker_type,
-                    "isl_cap",
-                    eval.isl_cap_tokens.load(Relaxed),
+                    &sync_scheduler.b10_isl_tier_caps(),
+                    &tier_evaluated,
                 );
             };
             sync_queue_metrics();
