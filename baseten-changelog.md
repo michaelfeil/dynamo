@@ -1115,6 +1115,8 @@ The request-side assistant message accepts `reasoning` as a serde alias for `rea
 
 Added `chat_template_args` (alias `chat_template_kwargs`) to `BasetenExt` so it is available on all request paths that flatten `BasetenExt` — including `/v1/chat/completions` and `/v1/responses`. The `TryFrom<NvCreateResponse>` conversion now forwards `baseten_ext.chat_template_args` instead of hard-coding `None`, so callers of `/v1/responses` can pass a custom chat-template context through to the worker.
 
+Owned `ChatCompletionRequestSystemMessage` (content optional, opaque `tools` passthrough) and added `partial: Option<bool>` on the owned assistant message so Moonshot Kimi K3 conformance traffic deserializes: K3 sends system messages carrying only a dynamic `tools` list (no `content`, which upstream rejects with 400 "missing field `content`") and assistant prefill turns marked `partial: true` (#496). Implemented in `lib/protocols/src/types/chat.rs` (owned struct + `partial` field) with `From` bridges in `impls.rs` and call-site updates in `lib/llm` (anthropic, responses) + tests; both fields forward opaquely to the worker. Drop once upstream `async-openai` relaxes `content` and accepts the `tools`/`partial` keys.
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,

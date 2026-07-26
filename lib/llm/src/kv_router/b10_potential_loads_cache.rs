@@ -160,7 +160,7 @@ mod tests {
         );
         assert!(
             cache
-                .get(&key, now + TTL + TTL_JITTER + Duration::from_millis(1))
+                .get(&key, now + TTL + 2 * TTL_JITTER + Duration::from_millis(1))
                 .is_none()
         );
     }

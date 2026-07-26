@@ -426,6 +426,7 @@ impl PendingAssistant {
                 } else {
                     Some(self.tool_calls)
                 },
+                partial: None,
                 #[allow(deprecated)]
                 function_call: None,
             },
@@ -451,10 +452,11 @@ fn convert_input_items_to_messages(
                                 let text = convert_input_content_to_text(&msg.content);
                                 ChatCompletionRequestMessage::System(
                                     ChatCompletionRequestSystemMessage {
-                                        content: ChatCompletionRequestSystemMessageContent::Text(
-                                            text,
+                                        content: Some(
+                                            ChatCompletionRequestSystemMessageContent::Text(text),
                                         ),
                                         name: None,
+                                        tools: None,
                                     },
                                 )
                             }
@@ -555,8 +557,11 @@ fn convert_input_items_to_messages(
                         std::mem::take(&mut pending).flush_into(&mut messages);
                         messages.push(ChatCompletionRequestMessage::System(
                             ChatCompletionRequestSystemMessage {
-                                content: ChatCompletionRequestSystemMessageContent::Text(text),
+                                content: Some(ChatCompletionRequestSystemMessageContent::Text(
+                                    text,
+                                )),
                                 name: None,
+                                tools: None,
                             },
                         ));
                     }
@@ -688,8 +693,11 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
         if let Some(instructions) = &resp.inner.instructions {
             messages.push(ChatCompletionRequestMessage::System(
                 ChatCompletionRequestSystemMessage {
-                    content: ChatCompletionRequestSystemMessageContent::Text(instructions.clone()),
+                    content: Some(ChatCompletionRequestSystemMessageContent::Text(
+                        instructions.clone(),
+                    )),
                     name: None,
+                    tools: None,
                 },
             ));
         }
@@ -1238,7 +1246,7 @@ mod tests {
 
         match &messages[0] {
             ChatCompletionRequestMessage::System(sys) => match &sys.content {
-                ChatCompletionRequestSystemMessageContent::Text(t) => {
+                Some(ChatCompletionRequestSystemMessageContent::Text(t)) => {
                     assert_eq!(t, "You are a helpful assistant.");
                 }
                 _ => panic!("expected text content"),

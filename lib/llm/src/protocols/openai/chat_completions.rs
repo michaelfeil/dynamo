@@ -456,6 +456,46 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn test_system_message_without_content_carries_dynamic_tools() {
+        // Kimi K3 official protocol: a system message may carry only a
+        // `tools` list (dynamic tool declarations) and no `content`.
+        let json_str = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "compute 1+1"},
+                {"role": "system", "tools": [{"type": "function", "function": {
+                    "name": "Calculator", "parameters": {"type": "object"}}}]}
+            ]
+        });
+
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            wire["messages"][1]["tools"][0]["function"]["name"],
+            "Calculator"
+        );
+        assert!(wire["messages"][1].get("content").is_none());
+    }
+
+    #[test]
+    fn test_assistant_partial_prefill_roundtrip() {
+        // Kimi-style assistant prefill marker must reach the worker.
+        let json_str = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "incomplete", "partial": true}
+            ]
+        });
+
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["messages"][1]["partial"], true);
+    }
+
+    #[test]
     fn test_skip_special_tokens_none() {
         let json_str = json!({
             "model": "test-model",
