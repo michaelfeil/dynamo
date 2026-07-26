@@ -24,14 +24,17 @@ use anyhow::{Result, bail};
 
 use dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionRequestMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionToolChoiceOption, EncodingFormat,
 };
 use dynamo_renderer::OAIPromptFormatter;
 use dynamo_runtime::config::is_truthy;
 use dynamo_runtime::error::{DynamoError, ErrorType};
+use either::Either;
 use futures::Stream;
 use futures::stream::{self, StreamExt};
+use std::borrow::Cow;
 use std::time::Instant;
 
 use dynamo_runtime::dynamo_nvtx_range;
@@ -104,6 +107,55 @@ fn invalid_argument_error(message: impl Into<String>) -> anyhow::Error {
         .message(message.into())
         .build()
         .into()
+}
+
+fn tool_content_part_as_user(
+    part: &ChatCompletionRequestToolMessageContentPart,
+) -> Cow<'_, ChatCompletionRequestUserMessageContentPart> {
+    Cow::Owned(match part {
+        ChatCompletionRequestToolMessageContentPart::Text(part) => {
+            ChatCompletionRequestUserMessageContentPart::Text(part.clone())
+        }
+        ChatCompletionRequestToolMessageContentPart::ImageUrl(part) => {
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(part.clone())
+        }
+        ChatCompletionRequestToolMessageContentPart::VideoUrl(part) => {
+            ChatCompletionRequestUserMessageContentPart::VideoUrl(part.clone())
+        }
+        ChatCompletionRequestToolMessageContentPart::AudioUrl(part) => {
+            ChatCompletionRequestUserMessageContentPart::AudioUrl(part.clone())
+        }
+    })
+}
+
+fn multimodal_content_parts(
+    message: &ChatCompletionRequestMessage,
+) -> Option<impl Iterator<Item = Cow<'_, ChatCompletionRequestUserMessageContentPart>>> {
+    match message {
+        ChatCompletionRequestMessage::User(user) => match &user.content {
+            ChatCompletionRequestUserMessageContent::Array(parts) => {
+                Some(Either::Left(parts.iter().map(Cow::Borrowed)))
+            }
+            ChatCompletionRequestUserMessageContent::Text(_) => None,
+        },
+        ChatCompletionRequestMessage::Tool(tool) => match &tool.content {
+            ChatCompletionRequestToolMessageContent::Array(parts) => {
+                Some(Either::Right(parts.iter().map(tool_content_part_as_user)))
+            }
+            ChatCompletionRequestToolMessageContent::Text(_) => None,
+        },
+        _ => None,
+    }
+}
+
+#[cfg(feature = "mm-routing")]
+fn image_content_part_url(
+    content_part: &ChatCompletionRequestUserMessageContentPart,
+) -> Option<&str> {
+    let ChatCompletionRequestUserMessageContentPart::ImageUrl(part) = content_part else {
+        return None;
+    };
+    part.image_url.as_ref().map(|image| image.url.as_str())
 }
 
 /// Encode a slice of `f32` values as a base64 string per the OpenAI
@@ -198,9 +250,7 @@ pub struct MmImageEntry {
 struct MediaFetchTask<'a> {
     modality: &'static str,
     slot_idx: usize,
-    #[cfg(feature = "mm-routing")]
-    source_url: &'a str,
-    content_part: &'a ChatCompletionRequestUserMessageContentPart,
+    content_part: Cow<'a, ChatCompletionRequestUserMessageContentPart>,
 }
 
 /// Per-request media content-part counts, carried to the metrics annotation.
@@ -1399,7 +1449,7 @@ impl OpenAIPreprocessor {
         // URLs here and resolve dims via header-only HTTP after the loop so we
         // can issue all fetches in parallel.
         #[cfg(feature = "mm-routing")]
-        let mut url_passthrough_images: Vec<(u64, &str)> = Vec::new();
+        let mut url_passthrough_images: Vec<(u64, String)> = Vec::new();
 
         let Some(messages) = request.typed_messages() else {
             return Ok((Vec::new(), None));
@@ -1407,19 +1457,15 @@ impl OpenAIPreprocessor {
         let has_media_loader = self.media_loader.is_some();
 
         for message in messages.iter() {
-            let content_parts = match message {
-                ChatCompletionRequestMessage::User(u) => match &u.content {
-                    ChatCompletionRequestUserMessageContent::Array(parts) => parts,
-                    _ => continue,
-                },
-                _ => continue,
+            let Some(content_parts) = multimodal_content_parts(message) else {
+                continue;
             };
-            for content_part in content_parts.iter() {
-                let (type_str, url, uuid): (&'static str, Option<&url::Url>, Option<String>) =
-                    match content_part {
+            for content_part in content_parts {
+                let (type_str, url, uuid): (&'static str, Option<url::Url>, Option<String>) =
+                    match content_part.as_ref() {
                         ChatCompletionRequestUserMessageContentPart::ImageUrl(part) => (
                             "image_url",
-                            part.image_url.as_ref().map(|media| &media.url),
+                            part.image_url.as_ref().map(|media| media.url.clone()),
                             part.uuid.clone(),
                         ),
                         ChatCompletionRequestUserMessageContentPart::VideoUrl(part) => {
@@ -1430,7 +1476,7 @@ impl OpenAIPreprocessor {
                             }
                             (
                                 "video_url",
-                                part.video_url.as_ref().map(|media| &media.url),
+                                part.video_url.as_ref().map(|media| media.url.clone()),
                                 None,
                             )
                         }
@@ -1442,7 +1488,7 @@ impl OpenAIPreprocessor {
                             }
                             (
                                 "audio_url",
-                                part.audio_url.as_ref().map(|media| &media.url),
+                                part.audio_url.as_ref().map(|media| media.url.clone()),
                                 None,
                             )
                         }
@@ -1476,18 +1522,16 @@ impl OpenAIPreprocessor {
                             fetch_tasks.push(MediaFetchTask {
                                 modality: type_str,
                                 slot_idx,
-                                #[cfg(feature = "mm-routing")]
-                                source_url: url.as_str(),
                                 content_part,
                             });
                         } else {
                             #[cfg(feature = "mm-routing")]
                             if type_str == "image_url" {
                                 let mm_hash = Self::hash_image_url(url.as_str());
-                                url_passthrough_images.push((mm_hash, url.as_str()));
+                                url_passthrough_images.push((mm_hash, url.as_str().to_string()));
                             }
                         }
-                        slots.push(MultimodalData::Url(url.clone()));
+                        slots.push(MultimodalData::Url(url));
                     }
                     (None, Some(uuid)) => {
                         slots.push(MultimodalData::UuidOnly(uuid));
@@ -1506,7 +1550,7 @@ impl OpenAIPreprocessor {
             let loader = self.media_loader.as_ref().unwrap();
             let media_io_kwargs = request.media_io_kwargs();
             let results = futures::future::join_all(fetch_tasks.iter().map(|task| {
-                loader.fetch_and_decode_media_part(task.content_part, media_io_kwargs)
+                loader.fetch_and_decode_media_part(task.content_part.as_ref(), media_io_kwargs)
             }))
             .await;
 
@@ -1531,7 +1575,15 @@ impl OpenAIPreprocessor {
                         // shouldn't happen on the frontend.
                         let (mm_hash, hash_source) = match rdma_descriptor.content_hash() {
                             Some(h) => (h, "decoded_bytes"),
-                            None => (Self::hash_image_url(task.source_url), "url_fallback"),
+                            None => {
+                                let source_url = image_content_part_url(task.content_part.as_ref())
+                                    .ok_or_else(|| {
+                                        invalid_argument_error(
+                                            "image_url task must contain an image URL",
+                                        )
+                                    })?;
+                                (Self::hash_image_url(source_url), "url_fallback")
+                            }
                         };
                         if let Some(counter) = self.image_token_counter.as_ref() {
                             let n = counter.count_tokens(w, h);
@@ -3979,6 +4031,49 @@ mod tests {
         assert_eq!(counts.image, 0);
         assert_eq!(counts.video, 0);
         assert_eq!(counts.audio, 0);
+    }
+
+    #[test]
+    fn tool_message_exposes_multimodal_content_parts() {
+        let message: ChatCompletionRequestMessage = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_media",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,aGVsbG8="
+                    }
+                },
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "https://example.com/clip.mp4"
+                    }
+                },
+                {
+                    "type": "audio_url",
+                    "audio_url": {
+                        "url": "https://example.com/audio.wav"
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+
+        let parts: Vec<_> = multimodal_content_parts(&message).unwrap().collect();
+        assert!(matches!(
+            parts[0].as_ref(),
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(_)
+        ));
+        assert!(matches!(
+            parts[1].as_ref(),
+            ChatCompletionRequestUserMessageContentPart::VideoUrl(_)
+        ));
+        assert!(matches!(
+            parts[2].as_ref(),
+            ChatCompletionRequestUserMessageContentPart::AudioUrl(_)
+        ));
     }
 
     #[cfg(feature = "mm-routing")]
