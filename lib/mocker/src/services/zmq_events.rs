@@ -386,6 +386,7 @@ mod tests {
 
     fn stored_event() -> KvCacheEvent {
         KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,

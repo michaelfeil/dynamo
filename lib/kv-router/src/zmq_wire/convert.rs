@@ -63,6 +63,7 @@ pub fn convert_event(
                     return Some(PlacementEvent::new(
                         Placement::local_worker(worker.worker_id, worker.dp_rank, storage_tier),
                         KvCacheEvent {
+                            cache_group: None,
                             event_id,
                             data: KvCacheEventData::Removed(KvCacheRemoveData {
                                 block_hashes: vec![],
@@ -79,6 +80,7 @@ pub fn convert_event(
                 .map(BlockHashValue::into_u64)
                 .collect();
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: parent_block_hash
@@ -108,6 +110,7 @@ pub fn convert_event(
                 .map(ExternalSequenceBlockHash::from)
                 .collect();
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: hashes,
@@ -116,6 +119,7 @@ pub fn convert_event(
             }
         }
         RawKvEvent::AllBlocksCleared => KvCacheEvent {
+            cache_group: None,
             event_id,
             data: KvCacheEventData::Cleared,
             dp_rank,

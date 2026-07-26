@@ -124,9 +124,15 @@ impl RawKvEvent {
                 group_idx,
                 kv_cache_spec_kind,
                 kv_cache_spec_sliding_window,
+                block_size,
                 ..
-            }
-            | Self::BlockRemoved {
+            } => KvCacheEventMetadata {
+                group_idx: *group_idx,
+                kv_cache_spec_kind: *kv_cache_spec_kind,
+                kv_cache_spec_sliding_window: *kv_cache_spec_sliding_window,
+                block_size: u32::try_from(*block_size).ok(),
+            },
+            Self::BlockRemoved {
                 group_idx,
                 kv_cache_spec_kind,
                 kv_cache_spec_sliding_window,
@@ -135,6 +141,7 @@ impl RawKvEvent {
                 group_idx: *group_idx,
                 kv_cache_spec_kind: *kv_cache_spec_kind,
                 kv_cache_spec_sliding_window: *kv_cache_spec_sliding_window,
+                block_size: None,
             },
             Self::AllBlocksCleared | Self::Ignored => KvCacheEventMetadata::default(),
         }

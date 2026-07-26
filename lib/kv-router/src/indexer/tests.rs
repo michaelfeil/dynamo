@@ -2459,6 +2459,7 @@ mod local_indexer_tests {
         RouterEvent::new(
             0,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: None,
@@ -2478,6 +2479,7 @@ mod local_indexer_tests {
         RouterEvent::new(
             0,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: block_hashes
@@ -2495,6 +2497,7 @@ mod local_indexer_tests {
         RouterEvent::new(
             0,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Cleared,
                 dp_rank: 0,
@@ -2517,6 +2520,7 @@ mod local_indexer_tests {
             RouterEvent::new(
                 0,
                 KvCacheEvent {
+                    cache_group: None,
                     event_id: id,
                     data: KvCacheEventData::Stored(KvCacheStoreData {
                         parent_hash: None,
@@ -2711,6 +2715,7 @@ mod local_indexer_tests {
         let test_event = RouterEvent::new(
             worker_id,
             KvCacheEvent {
+                cache_group: None,
                 event_id: 1,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: None,
@@ -2768,6 +2773,7 @@ mod local_indexer_tests {
         let test_event = RouterEvent::new(
             7,
             KvCacheEvent {
+                cache_group: None,
                 event_id: 1,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: None,

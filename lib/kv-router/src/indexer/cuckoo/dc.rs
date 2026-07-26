@@ -869,6 +869,7 @@ mod tests {
         RouterEvent::new(
             worker.worker_id,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: None,
@@ -892,6 +893,7 @@ mod tests {
         RouterEvent::new(
             worker.worker_id,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: hashes
@@ -909,6 +911,7 @@ mod tests {
         RouterEvent::new(
             worker_id,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Cleared,
                 dp_rank,

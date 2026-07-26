@@ -565,6 +565,7 @@ impl<S: AsyncShardHandle> BranchShardedIndexer<S> {
                 events.push(RouterEvent::new(
                     worker.worker_id,
                     KvCacheEvent {
+                        cache_group: None,
                         event_id,
                         data: KvCacheEventData::Stored(KvCacheStoreData {
                             parent_hash,
@@ -681,6 +682,7 @@ impl<S: AsyncShardHandle> BranchShardedIndexer<S> {
                 worker_id: event.worker_id,
                 storage_tier: event.storage_tier,
                 event: KvCacheEvent {
+                    cache_group: None,
                     event_id: event.event.event_id,
                     dp_rank: event.event.dp_rank,
                     data: KvCacheEventData::Removed(KvCacheRemoveData {
@@ -700,6 +702,7 @@ impl<S: AsyncShardHandle> BranchShardedIndexer<S> {
                     worker_id: event.worker_id,
                     storage_tier: event.storage_tier,
                     event: KvCacheEvent {
+                        cache_group: None,
                         event_id: event.event.event_id,
                         dp_rank: event.event.dp_rank,
                         data: KvCacheEventData::Removed(KvCacheRemoveData {

@@ -1092,6 +1092,7 @@ impl KvEventPublisher {
     ) -> KvCacheEvent {
         let block_hashes_u64: Vec<u64> = block_hashes.iter().map(|&hash| hash as u64).collect();
         KvCacheEvent {
+            cache_group: None,
             event_id,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: parent_hash.map(ExternalSequenceBlockHash::from),
@@ -1115,6 +1116,7 @@ impl KvEventPublisher {
 
     fn removed_event(&self, event_id: u64, block_hashes: Vec<i64>) -> KvCacheEvent {
         KvCacheEvent {
+            cache_group: None,
             event_id,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: block_hashes

@@ -769,6 +769,23 @@ pub struct KvCacheEvents {
     pub shutdown: bool,
 }
 
+/// Classifies which kind of KV-cache group produced an event, so consumers
+/// can route recurrent-state (SSM / linear-attention) events separately from
+/// paged-attention events.
+///
+/// `None` on [`KvCacheEvent::cache_group`] means attention: every event
+/// predating this tag, and every producer that only indexes attention groups,
+/// omits it, and absence must preserve that behavior.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheGroupClass {
+    /// Paged attention KV blocks (full / MLA / sink attention groups).
+    Attention,
+    /// Recurrent-state checkpoints (Mamba / Gated DeltaNet / KDA groups).
+    /// No producer emits this yet; reserved for hybrid-model indexing.
+    Recurrent,
+}
+
 /// Represents a single cache event with an ID and associated data.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct KvCacheEvent {
@@ -779,6 +796,10 @@ pub struct KvCacheEvent {
     /// The data parallel rank of the worker emitting this event (0 if DP not enabled).
     #[serde(default)]
     pub dp_rank: DpRank,
+    /// Which cache-group class produced this event. `None` means attention
+    /// (the pre-tag legacy default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_group: Option<CacheGroupClass>,
 }
 
 /// Represents the data associated with a cache event.
@@ -1331,6 +1352,7 @@ mod tests {
     fn test_router_event_new() {
         let worker_id = 0;
         let kv_cache_event = KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
@@ -1357,6 +1379,61 @@ mod tests {
         } else {
             panic!("Expected KvCacheEventData::Stored");
         }
+    }
+
+    /// `cache_group: None` must leave the field-named msgpack wire bytes
+    /// byte-identical to the pre-tag encoding, so a fleet can mix producers
+    /// and consumers across this change.
+    #[test]
+    fn kv_cache_event_none_cache_group_keeps_legacy_wire_bytes() {
+        #[derive(Serialize)]
+        struct LegacyKvCacheEvent {
+            event_id: u64,
+            data: KvCacheEventData,
+            dp_rank: DpRank,
+        }
+
+        let data = KvCacheEventData::Removed(KvCacheRemoveData {
+            block_hashes: vec![ExternalSequenceBlockHash(42)],
+        });
+        let legacy = LegacyKvCacheEvent {
+            event_id: 7,
+            data: data.clone(),
+            dp_rank: 1,
+        };
+        let tagged = KvCacheEvent {
+            event_id: 7,
+            data,
+            dp_rank: 1,
+            cache_group: None,
+        };
+
+        let legacy_bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let tagged_bytes = rmp_serde::to_vec_named(&tagged).unwrap();
+        assert_eq!(legacy_bytes, tagged_bytes);
+
+        // Old payloads (no `cache_group` key) decode with the legacy default.
+        let decoded: KvCacheEvent = rmp_serde::from_slice(&legacy_bytes).unwrap();
+        assert_eq!(decoded.cache_group, None);
+        assert_eq!(decoded, tagged);
+    }
+
+    #[test]
+    fn kv_cache_event_cache_group_round_trips() {
+        let event = KvCacheEvent {
+            event_id: 9,
+            data: KvCacheEventData::Cleared,
+            dp_rank: 0,
+            cache_group: Some(CacheGroupClass::Recurrent),
+        };
+
+        let named: KvCacheEvent =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&event).unwrap()).unwrap();
+        assert_eq!(named, event);
+
+        let json: KvCacheEvent =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(json, event);
     }
 
     #[rstest]

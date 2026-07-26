@@ -1709,6 +1709,7 @@ mod tests {
             payload: DispatchPayload::Event(RouterEvent::new(
                 u64::from(id),
                 dynamo_kv_router::protocols::KvCacheEvent {
+                    cache_group: None,
                     event_id: u64::from(id),
                     data: KvCacheEventData::Cleared,
                     dp_rank: 0,

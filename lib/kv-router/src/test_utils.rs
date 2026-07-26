@@ -22,6 +22,7 @@ pub fn router_event(
     RouterEvent::new(
         worker_id,
         KvCacheEvent {
+            cache_group: None,
             event_id,
             data,
             dp_rank,

@@ -25,6 +25,7 @@ impl FakeCore {
         self.publishers
             .publish(
                 KvCacheEvent {
+                    cache_group: None,
                     event_id,
                     data: KvCacheEventData::Cleared,
                     dp_rank: 0,

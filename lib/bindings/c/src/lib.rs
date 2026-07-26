@@ -308,6 +308,7 @@ fn kv_event_create_stored_from_parts(
     }
 
     KvCacheEvent {
+        cache_group: None,
         data: KvCacheEventData::Stored(KvCacheStoreData {
             blocks,
             parent_hash: kv_params.parent_hash.map(ExternalSequenceBlockHash),
@@ -330,6 +331,7 @@ fn kv_event_create_removed_from_parts(
             .map(|&v| ExternalSequenceBlockHash(v))
             .collect();
     KvCacheEvent {
+        cache_group: None,
         event_id,
         data: KvCacheEventData::Removed(KvCacheRemoveData { block_hashes }),
         dp_rank: 0,

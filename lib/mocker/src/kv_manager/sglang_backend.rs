@@ -839,6 +839,7 @@ impl SglangKvManager {
             .collect();
 
         let event = KvCacheEvent {
+            cache_group: None,
             event_id: self.next_event_id,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash,
@@ -891,6 +892,7 @@ impl SglangKvManager {
         }
 
         let event = KvCacheEvent {
+            cache_group: None,
             event_id: self.next_event_id,
             data: KvCacheEventData::Removed(KvCacheRemoveData { block_hashes }),
             dp_rank: self.dp_rank,

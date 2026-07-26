@@ -88,12 +88,15 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                         batching_state.has_pending() && event.dp_rank != batching_state.last_dp_rank;
                     let storage_tier_changed = batching_state.has_pending()
                         && storage_tier != batching_state.last_storage_tier;
+                    let cache_group_changed = batching_state.has_pending()
+                        && event.cache_group != batching_state.last_cache_group;
 
                     match event.data {
                         KvCacheEventData::Removed(data) => {
                             if batching_state.pending_stored.is_some()
                                 || dp_rank_changed
                                 || storage_tier_changed
+                                || cache_group_changed
                             {
                                 batching_state.flush(&local_indexer, worker_id, &mut dedup, &mut output).await;
                             }
@@ -107,6 +110,7 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                         KvCacheEventData::Stored(data) => {
                             let should_flush = dp_rank_changed
                                 || storage_tier_changed
+                                || cache_group_changed
                                 || batching_state.pending_removed.is_some()
                                 || batching_state.pending_stored.as_ref().is_some_and(|p| {
                                     data.parent_hash != p.blocks.last().map(|b| b.block_hash)
@@ -129,6 +133,7 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
                                 worker_id,
                                 storage_tier,
                                 KvCacheEvent {
+                                    cache_group: event.cache_group,
                                     event_id: batching_state.next_publish_id,
                                     data: KvCacheEventData::Cleared,
                                     dp_rank: event.dp_rank,
@@ -142,6 +147,7 @@ pub(super) async fn run_event_processor_loop<P: RouterEventBatchSink + 'static>(
 
                     batching_state.last_dp_rank = event.dp_rank;
                     batching_state.last_storage_tier = storage_tier;
+                    batching_state.last_cache_group = event.cache_group;
 
                     // Bound coalesced output without splitting an individual source
                     // event or returning to `select!` midway through the native list.

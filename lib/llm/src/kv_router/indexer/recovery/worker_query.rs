@@ -1416,6 +1416,7 @@ mod tests {
         RouterEvent::new(
             42,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: None,
@@ -1435,6 +1436,7 @@ mod tests {
         RouterEvent::new(
             worker.worker_id,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Cleared,
                 dp_rank: worker.dp_rank,

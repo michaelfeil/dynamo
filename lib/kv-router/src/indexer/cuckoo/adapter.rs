@@ -472,6 +472,7 @@ mod tests {
         RouterEvent::new(
             1,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: None,
@@ -491,6 +492,7 @@ mod tests {
         RouterEvent::new(
             1,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: vec![ExternalSequenceBlockHash(hash)],

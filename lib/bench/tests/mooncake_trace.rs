@@ -998,6 +998,7 @@ fn open_loop_preparation_preserves_query_first_ties_and_removed_blocks() -> anyh
         kv_events: vec![
             ReplayTimedKvEvent {
                 event: KvCacheEvent {
+                    cache_group: None,
                     event_id: 7,
                     data: KvCacheEventData::Removed(KvCacheRemoveData {
                         block_hashes: vec![
@@ -1013,6 +1014,7 @@ fn open_loop_preparation_preserves_query_first_ties_and_removed_blocks() -> anyh
             },
             ReplayTimedKvEvent {
                 event: KvCacheEvent {
+                    cache_group: None,
                     event_id: 8,
                     data: KvCacheEventData::Stored(KvCacheStoreData {
                         parent_hash: None,

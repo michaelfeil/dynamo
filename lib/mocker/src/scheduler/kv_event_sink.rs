@@ -311,6 +311,7 @@ mod tests {
                 .into_iter()
                 .map(|event_id| DeferredKvPublish {
                     event: KvCacheEvent {
+                        cache_group: None,
                         event_id,
                         data: stored_data.clone(),
                         dp_rank: 0,

@@ -528,6 +528,7 @@ impl PositionalIndexer {
                     worker_id: worker.worker_id,
                     storage_tier: crate::protocols::StorageTier::Device,
                     event: KvCacheEvent {
+                        cache_group: None,
                         event_id,
                         data: KvCacheEventData::Stored(KvCacheStoreData {
                             parent_hash: None,

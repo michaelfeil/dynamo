@@ -874,3 +874,129 @@ fn cpu_event_with_full_payload_is_indexable() {
     }
     assert_eq!(warning_count.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn test_registry_default_matches_legacy_main_attention_filter() {
+    let registry = IndexStrategyRegistry::default();
+    for (kind, expected) in [
+        (KvCacheSpecKind::FullAttention, IndexStrategy::Attention),
+        (KvCacheSpecKind::MlaAttention, IndexStrategy::Attention),
+        (KvCacheSpecKind::SinkFullAttention, IndexStrategy::Attention),
+        (KvCacheSpecKind::SlidingWindow, IndexStrategy::Drop),
+        (KvCacheSpecKind::SlidingWindowMla, IndexStrategy::Drop),
+        (KvCacheSpecKind::Mamba, IndexStrategy::Drop),
+        (KvCacheSpecKind::ChunkedLocalAttention, IndexStrategy::Drop),
+        (KvCacheSpecKind::EncoderOnlyAttention, IndexStrategy::Drop),
+        (KvCacheSpecKind::CrossAttention, IndexStrategy::Drop),
+        (KvCacheSpecKind::Unknown, IndexStrategy::Drop),
+    ] {
+        assert_eq!(registry.strategy(kind), expected, "kind {kind:?}");
+    }
+}
+
+#[test]
+fn test_normalizer_drops_recurrent_and_unknown_kinds_by_default() {
+    let mut normalizer = ZmqEventNormalizer::new(2);
+    let worker = WorkerWithDpRank::new(3, 0);
+
+    let mamba: RawKvEvent = from_slice(&sequence_with_cache_spec_kind(
+        TestEventKind::BlockStored,
+        Some(1),
+        "mamba",
+    ))
+    .expect("valid mamba event");
+    assert_eq!(
+        normalizer
+            .preprocess_with_reason(mamba, worker)
+            .unwrap_err(),
+        ZmqEventFilterReason::NonMainAttentionKind
+    );
+
+    // A future recurrent kind the wire enum does not know yet.
+    let kda: RawKvEvent = from_slice(&sequence_with_cache_spec_kind(
+        TestEventKind::BlockStored,
+        Some(1),
+        "kda",
+    ))
+    .expect("valid kda event");
+    assert_eq!(
+        normalizer.preprocess_with_reason(kda, worker).unwrap_err(),
+        ZmqEventFilterReason::UnknownKind
+    );
+}
+
+#[test]
+fn test_registered_recurrent_kind_passes_and_stamps_cache_group() {
+    let registry = IndexStrategyRegistry::default()
+        .with_strategy(KvCacheSpecKind::Mamba, IndexStrategy::Recurrent);
+    let mut normalizer = ZmqEventNormalizer::new(2).with_index_strategies(registry);
+    let worker = WorkerWithDpRank::new(3, 0);
+
+    let mamba: RawKvEvent = from_slice(&sequence_with_cache_spec_kind(
+        TestEventKind::BlockStored,
+        Some(1),
+        "mamba",
+    ))
+    .expect("valid mamba event");
+    let placement = normalizer
+        .normalize(mamba, 7, worker)
+        .expect("registered kind must pass the filter");
+
+    assert_eq!(
+        placement.event.cache_group,
+        Some(crate::protocols::CacheGroupClass::Recurrent)
+    );
+    assert!(matches!(placement.event.data, KvCacheEventData::Stored(_)));
+}
+
+#[test]
+fn test_normalizer_stamps_attention_cache_group_and_leaves_kindless_untagged() {
+    let mut normalizer = ZmqEventNormalizer::new(2);
+    let worker = WorkerWithDpRank::new(3, 0);
+
+    let attention: RawKvEvent = from_slice(&sequence_with_cache_spec_kind(
+        TestEventKind::BlockStored,
+        Some(0),
+        "full_attention",
+    ))
+    .expect("valid attention event");
+    let placement = normalizer
+        .normalize(attention, 7, worker)
+        .expect("attention event must pass");
+    assert_eq!(
+        placement.event.cache_group,
+        Some(crate::protocols::CacheGroupClass::Attention)
+    );
+
+    // Kindless events (legacy / non-vLLM producers) stay untagged.
+    let kindless: RawKvEvent =
+        from_slice(&block_stored_sequence(None, None)).expect("valid kindless event");
+    let placement = normalizer
+        .normalize(kindless, 8, worker)
+        .expect("kindless event must pass");
+    assert_eq!(placement.event.cache_group, None);
+}
+
+#[test]
+fn test_normalizer_learns_group_block_size() {
+    let mut normalizer = ZmqEventNormalizer::new(16);
+    let worker = WorkerWithDpRank::new(3, 0);
+
+    // The shared fixture declares block_size = 2, which differs from the
+    // configured 16: the metadata must still be learned (and the mismatch
+    // warned about) so the misconfiguration is observable.
+    let store: RawKvEvent = from_slice(&sequence_with_cache_spec_kind(
+        TestEventKind::BlockStored,
+        Some(3),
+        "full_attention",
+    ))
+    .expect("valid store event");
+    assert!(normalizer.preprocess(store, worker).is_some());
+
+    let learned = normalizer
+        .group_metadata
+        .get(&(0, 3))
+        .expect("group metadata must be learned from BlockStored");
+    assert_eq!(learned.kind, KvCacheSpecKind::FullAttention);
+    assert_eq!(learned.block_size, Some(2));
+}

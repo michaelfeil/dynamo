@@ -1522,6 +1522,7 @@ mod tests {
                 (1..=3)
                     .map(|event_id| RawKvEvent {
                         event: KvCacheEvent {
+                            cache_group: None,
                             event_id,
                             data: dynamo_kv_router::protocols::KvCacheEventData::Cleared,
                             dp_rank: 0,

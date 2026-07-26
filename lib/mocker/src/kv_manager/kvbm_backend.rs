@@ -858,6 +858,7 @@ impl KvManager {
         self.next_event_id += 1;
 
         let event = KvCacheEvent {
+            cache_group: None,
             event_id,
             data: event_data,
             dp_rank: self.dp_rank,

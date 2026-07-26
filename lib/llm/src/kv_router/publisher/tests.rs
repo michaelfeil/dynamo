@@ -41,11 +41,13 @@ mod test_event_processing {
         publisher
             .publish_batch(vec![
                 KvCacheEvent {
+                    cache_group: None,
                     event_id: 8,
                     data: KvCacheEventData::Cleared,
                     dp_rank: 1,
                 },
                 KvCacheEvent {
+                    cache_group: None,
                     event_id: 9,
                     data: KvCacheEventData::Cleared,
                     dp_rank: 2,
@@ -76,11 +78,13 @@ mod test_event_processing {
         let error = publisher
             .publish_batch(vec![
                 KvCacheEvent {
+                    cache_group: None,
                     event_id: 8,
                     data: KvCacheEventData::Cleared,
                     dp_rank: 1,
                 },
                 KvCacheEvent {
+                    cache_group: None,
                     event_id: 9,
                     data: KvCacheEventData::Cleared,
                     dp_rank: 2,
@@ -109,6 +113,7 @@ mod test_event_processing {
 
         publisher
             .publish(KvCacheEvent {
+                cache_group: None,
                 event_id: 10,
                 data: KvCacheEventData::Cleared,
                 dp_rank: 2,
@@ -123,6 +128,7 @@ mod test_event_processing {
             .publish_batch_with_storage_tiers(vec![
                 (
                     KvCacheEvent {
+                        cache_group: None,
                         event_id: 10,
                         data: KvCacheEventData::Cleared,
                         dp_rank: 2,
@@ -131,6 +137,7 @@ mod test_event_processing {
                 ),
                 (
                     KvCacheEvent {
+                        cache_group: None,
                         event_id: 11,
                         data: KvCacheEventData::Cleared,
                         dp_rank: 3,
@@ -881,6 +888,7 @@ mod tests_startup_helpers {
         let (component, published) = MockComponent::new();
 
         let event = KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(1), ExternalSequenceBlockHash(2)],
@@ -927,6 +935,7 @@ mod tests_startup_helpers {
 
         // Create BlockStored event
         let event = KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
@@ -1020,6 +1029,7 @@ mod tests_startup_helpers {
 
         // First, store a block
         let store_event = KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
@@ -1048,6 +1058,7 @@ mod tests_startup_helpers {
 
         // Then remove same event
         let remove_event = KvCacheEvent {
+            cache_group: None,
             event_id: 2,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(100)],
@@ -1103,6 +1114,7 @@ mod tests_startup_helpers {
 
         // Store a block
         let store_event = KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
@@ -1121,6 +1133,7 @@ mod tests_startup_helpers {
 
         // Clear all blocks
         let clear_event = KvCacheEvent {
+            cache_group: None,
             event_id: 2,
             data: KvCacheEventData::Cleared,
             dp_rank: 0,
@@ -1186,6 +1199,7 @@ mod tests_startup_helpers {
         token.cancel();
 
         let event = KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(1)],
@@ -1576,6 +1590,7 @@ mod tests_startup_helpers {
 
         // === STEP 1: Normal Operation ===
         let event_1 = KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
@@ -1649,6 +1664,7 @@ mod tests_startup_helpers {
 
         // === STEP 2 & 3: Simulate Outage - Stop forwarding to router ===
         let event_2 = KvCacheEvent {
+            cache_group: None,
             event_id: 2,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
@@ -2238,6 +2254,7 @@ mod event_processor_tests {
         dp_rank: u32,
     ) -> KvCacheEvent {
         KvCacheEvent {
+            cache_group: None,
             event_id,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: parent_hash.map(ExternalSequenceBlockHash),
@@ -2254,6 +2271,7 @@ mod event_processor_tests {
 
     fn removed_event(event_id: u64, block_hash: u64, dp_rank: u32) -> KvCacheEvent {
         KvCacheEvent {
+            cache_group: None,
             event_id,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(block_hash)],
@@ -2291,6 +2309,60 @@ mod event_processor_tests {
             panic!("expected stored event");
         };
         assert_eq!(data.blocks.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_cache_group_survives_batching_and_splits_on_change() {
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<PlacementEvent>>();
+        let publisher = MockPublisher::new();
+        let handle = tokio::spawn(run_event_processor_loop(
+            publisher.clone(),
+            1,
+            CancellationToken::new(),
+            rx,
+            None,
+            None,
+            DEFAULT_MAX_BATCH_BLOCKS,
+        ));
+
+        let tagged = |mut event: KvCacheEvent, group| {
+            event.cache_group = group;
+            event
+        };
+        // The third store chains off the second, so without the tag change it
+        // would coalesce into the same batch.
+        tx.send(local_gpu_batch(vec![
+            tagged(
+                stored_event(0, None, 10, 0),
+                Some(CacheGroupClass::Attention),
+            ),
+            tagged(
+                stored_event(1, Some(10), 11, 0),
+                Some(CacheGroupClass::Attention),
+            ),
+            tagged(
+                stored_event(2, Some(11), 12, 0),
+                Some(CacheGroupClass::Recurrent),
+            ),
+        ]))
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        let events = publisher.get_events();
+        assert_eq!(events.len(), 2, "tag change must split the batch");
+        assert_eq!(
+            events[0].event.cache_group,
+            Some(CacheGroupClass::Attention)
+        );
+        let KvCacheEventData::Stored(first) = &events[0].event.data else {
+            panic!("expected stored event");
+        };
+        assert_eq!(first.blocks.len(), 2);
+        assert_eq!(
+            events[1].event.cache_group,
+            Some(CacheGroupClass::Recurrent)
+        );
     }
 
     #[tokio::test]
@@ -2343,6 +2415,7 @@ mod event_processor_tests {
 
         let host_removed = removed_event(5, 51, 1);
         let clear = KvCacheEvent {
+            cache_group: None,
             event_id: 6,
             data: KvCacheEventData::Cleared,
             dp_rank: 1,
@@ -2537,6 +2610,7 @@ mod event_processor_tests {
 
         let block_count = DEFAULT_MAX_BATCH_BLOCKS + 1;
         let event = KvCacheEvent {
+            cache_group: None,
             event_id: 0,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
@@ -2607,6 +2681,7 @@ mod event_processor_tests {
 
         for i in 0..event_count {
             let event = KvCacheEvent {
+                cache_group: None,
                 event_id: i as u64,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: vec![ExternalSequenceBlockHash(i as u64)],
@@ -2711,6 +2786,7 @@ mod event_processor_tests {
             };
 
             let event = KvCacheEvent {
+                cache_group: None,
                 event_id: i as u64,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash,
@@ -2804,6 +2880,7 @@ mod event_processor_tests {
 
         for i in 0..3 {
             let event = KvCacheEvent {
+                cache_group: None,
                 event_id: i as u64,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: Some(ExternalSequenceBlockHash((i + 1) as u64 * 100)),
@@ -2871,6 +2948,7 @@ mod event_processor_tests {
         });
 
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 0,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None,
@@ -2887,6 +2965,7 @@ mod event_processor_tests {
         tokio::task::yield_now().await;
 
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: Some(ExternalSequenceBlockHash(1)),
@@ -2903,6 +2982,7 @@ mod event_processor_tests {
         tokio::task::yield_now().await;
 
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 2,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: Some(ExternalSequenceBlockHash(1)),
@@ -3012,6 +3092,7 @@ mod event_processor_tests {
         // Since timeout is <= 0.2ms, each event should timeout and be sent individually
         for i in 0..5 {
             let event = KvCacheEvent {
+                cache_group: None,
                 event_id: i as u64,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: vec![ExternalSequenceBlockHash(i as u64)],
@@ -3083,6 +3164,7 @@ mod event_processor_tests {
 
         // Send a Removed event
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 0,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(0)],
@@ -3096,6 +3178,7 @@ mod event_processor_tests {
 
         // Send a Stored event (should cause flush of the Removed event)
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: Some(ExternalSequenceBlockHash(0)),
@@ -3147,6 +3230,7 @@ mod event_processor_tests {
         });
 
         tx.send(local_host_event(KvCacheEvent {
+            cache_group: None,
             event_id: 0,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(42)],
@@ -3195,6 +3279,7 @@ mod event_processor_tests {
         });
 
         tx.send(local_host_event(KvCacheEvent {
+            cache_group: None,
             event_id: 0,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(1)],
@@ -3205,6 +3290,7 @@ mod event_processor_tests {
         tokio::task::yield_now().await;
 
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Removed(KvCacheRemoveData {
                 block_hashes: vec![ExternalSequenceBlockHash(2)],
@@ -3252,6 +3338,7 @@ mod event_processor_tests {
         // Send events with dp_rank=0
         for i in 0..3 {
             tx.send(local_gpu_event(KvCacheEvent {
+                cache_group: None,
                 event_id: i as u64,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: vec![ExternalSequenceBlockHash(i as u64)],
@@ -3265,6 +3352,7 @@ mod event_processor_tests {
         // Send events with dp_rank=1 (should cause flush of previous batch)
         for i in 3..6 {
             tx.send(local_gpu_event(KvCacheEvent {
+                cache_group: None,
                 event_id: i as u64,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: vec![ExternalSequenceBlockHash(i as u64)],
@@ -3344,6 +3432,7 @@ mod event_processor_tests {
         // Send first batch: 3 events with dp_rank=0, event_ids 10-12
         for i in 0..3 {
             tx.send(local_gpu_event(KvCacheEvent {
+                cache_group: None,
                 event_id: 10 + i as u64,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: vec![ExternalSequenceBlockHash(i as u64)],
@@ -3358,6 +3447,7 @@ mod event_processor_tests {
         // This should flush the first batch with dp_rank=0
         for i in 0..2 {
             tx.send(local_gpu_event(KvCacheEvent {
+                cache_group: None,
                 event_id: 20 + i as u64,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: vec![ExternalSequenceBlockHash((i + 3) as u64)],
@@ -3434,6 +3524,7 @@ mod event_processor_tests {
         // remaining 2 should batch together
         for i in 0..3 {
             tx.send(local_gpu_event(KvCacheEvent {
+                cache_group: None,
                 event_id: i as u64,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: vec![ExternalSequenceBlockHash(i as u64)],
@@ -3499,6 +3590,7 @@ mod event_processor_tests {
 
         // Send first batch: 2 sequential stored events with dp_rank=0, event_ids 100-101
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 100,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: Some(ExternalSequenceBlockHash(0)),
@@ -3515,6 +3607,7 @@ mod event_processor_tests {
         tokio::task::yield_now().await;
 
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 101,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: Some(ExternalSequenceBlockHash(1)),
@@ -3533,6 +3626,7 @@ mod event_processor_tests {
         // Send second batch: 1 event with dp_rank=1, event_id=200
         // This should flush the first batch with dp_rank=0, event_id=101
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 200,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: Some(ExternalSequenceBlockHash(0)),
@@ -3619,6 +3713,7 @@ mod event_processor_tests {
 
         // First event: parent_hash=None, block_hash=1
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 0,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: None, // Root block with no parent
@@ -3636,6 +3731,7 @@ mod event_processor_tests {
 
         // Second event: parent_hash=Some(1), block_hash=2 (sequential)
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 1,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: Some(ExternalSequenceBlockHash(1)), // Points to previous block
@@ -3653,6 +3749,7 @@ mod event_processor_tests {
 
         // Third event: parent_hash=Some(2), block_hash=3 (sequential)
         tx.send(local_gpu_event(KvCacheEvent {
+            cache_group: None,
             event_id: 2,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash: Some(ExternalSequenceBlockHash(2)),
@@ -3726,6 +3823,7 @@ mod event_plane_batch_tests {
         RouterEvent::new(
             7,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: (0..block_count)
@@ -3749,6 +3847,7 @@ mod event_plane_batch_tests {
         RouterEvent::new(
             7,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: None,
@@ -3798,6 +3897,7 @@ mod event_plane_batch_tests {
         RouterEvent::new(
             7,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Cleared,
                 dp_rank: (event_id % 2) as u32,

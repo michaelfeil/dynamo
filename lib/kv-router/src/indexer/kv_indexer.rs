@@ -69,6 +69,7 @@ fn apply_routing_decision_with_prune_tracking(
     let event = RouterEvent::new(
         routing_req.worker.worker_id,
         KvCacheEvent {
+            cache_group: None,
             event_id: *event_id_counter,
             data: stored_event,
             dp_rank: routing_req.worker.dp_rank,
@@ -107,6 +108,7 @@ fn apply_prune_removes(trie: &mut RadixTree, entries: Vec<BlockEntry>, event_id_
         let event = RouterEvent::new(
             worker.worker_id,
             KvCacheEvent {
+                cache_group: None,
                 event_id: *event_id_counter,
                 data: KvCacheEventData::Removed(KvCacheRemoveData {
                     block_hashes: entries.into_iter().map(|entry| entry.key).collect(),

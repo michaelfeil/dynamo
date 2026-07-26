@@ -393,6 +393,7 @@ pub(super) mod test_util {
         RouterEvent::with_storage_tier(
             worker_id,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash,

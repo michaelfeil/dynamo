@@ -823,6 +823,7 @@ mod tests {
         RouterEvent::with_storage_tier(
             worker_id,
             KvCacheEvent {
+                cache_group: None,
                 event_id,
                 data: KvCacheEventData::Stored(KvCacheStoreData {
                     parent_hash: Some(ExternalSequenceBlockHash(parent_hash)),
@@ -997,6 +998,7 @@ mod tests {
             .apply_event_with_buffer(RouterEvent::with_storage_tier(
                 11,
                 KvCacheEvent {
+                    cache_group: None,
                     event_id: 3,
                     data: KvCacheEventData::Cleared,
                     dp_rank: 0,

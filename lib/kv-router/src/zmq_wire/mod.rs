@@ -29,9 +29,10 @@ pub use convert::{
 pub use extra_keys::{
     extra_keys_to_block_mm_infos, extra_keys_to_cache_namespace, parse_mm_hash_from_extra_key,
 };
-pub use filter::KvCacheSpecKind;
+pub use filter::{IndexStrategy, IndexStrategyRegistry, KvCacheSpecKind};
 pub use types::{BlockHashValue, ExtraKeyItem, KvEventBatch, KvTokenIds, RawKvEvent};
 
+use crate::protocols::CacheGroupClass;
 use filter::KvCacheEventMetadata;
 
 pub fn decode_event_batch(payload: &[u8]) -> Result<KvEventBatch, rmps::decode::Error> {
@@ -46,6 +47,7 @@ pub struct ZmqEventNormalizer {
     /// pad_value scheme. `None` for text-only models / non-MM deployments.
     image_token_id: Option<u32>,
     warning_count: Arc<AtomicU32>,
+    strategies: IndexStrategyRegistry,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
 }
@@ -56,10 +58,12 @@ enum CacheNamespaceState {
     Ambiguous,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KvCacheGroupMetadata {
     kind: KvCacheSpecKind,
     sliding_window: Option<u32>,
+    /// Block size in tokens declared by this group's `BlockStored` events.
+    block_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +95,7 @@ impl ZmqEventNormalizer {
             kv_block_size,
             image_token_id: None,
             warning_count: Arc::new(AtomicU32::new(0)),
+            strategies: IndexStrategyRegistry::default(),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
         }
@@ -101,9 +106,23 @@ impl ZmqEventNormalizer {
             kv_block_size,
             image_token_id: None,
             warning_count,
+            strategies: IndexStrategyRegistry::default(),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
         }
+    }
+
+    /// Override the kind → index-strategy registry. The default reproduces
+    /// the historical main-attention allow-list; composition roots use this
+    /// to admit additional kinds.
+    ///
+    /// Admitted kinds still convert with the attention `kv_block_size`:
+    /// blocks of a different size are rejected at conversion, so registering
+    /// a `Recurrent` kind only tags its events — dedicated recurrent-state
+    /// indexing does not exist yet.
+    pub fn with_index_strategies(mut self, strategies: IndexStrategyRegistry) -> Self {
+        self.strategies = strategies;
+        self
     }
 
     /// Set the model's image placeholder token id so vLLM BlockStored events
@@ -144,14 +163,17 @@ impl ZmqEventNormalizer {
         event_id: u64,
         worker: WorkerWithDpRank,
     ) -> Option<PlacementEvent> {
-        convert_event(
+        let cache_group = self.cache_group_for(raw.metadata(), worker.dp_rank);
+        let mut placement_event = convert_event(
             raw,
             event_id,
             self.kv_block_size,
             worker,
             &self.warning_count,
             self.image_token_id,
-        )
+        )?;
+        placement_event.event.cache_group = cache_group;
+        Some(placement_event)
     }
 
     pub fn normalize(
@@ -170,13 +192,31 @@ impl ZmqEventNormalizer {
             return;
         };
 
-        self.group_metadata.insert(
-            (dp_rank, group_idx),
-            KvCacheGroupMetadata {
-                kind,
-                sliding_window: metadata.kv_cache_spec_sliding_window,
-            },
-        );
+        let learned = KvCacheGroupMetadata {
+            kind,
+            sliding_window: metadata.kv_cache_spec_sliding_window,
+            block_size: metadata.block_size,
+        };
+        let previous = self.group_metadata.insert((dp_rank, group_idx), learned);
+
+        // An attention group whose event block size disagrees with the
+        // configured router block size will have every stored block rejected
+        // at conversion. Surface that once per (group, size) instead of
+        // letting the per-block conversion warning cap hide it.
+        if previous != Some(learned)
+            && self.strategies.strategy(kind) == IndexStrategy::Attention
+            && let Some(block_size) = learned.block_size
+            && block_size != self.kv_block_size
+        {
+            tracing::warn!(
+                dp_rank,
+                group_idx,
+                kind = kind.as_wire(),
+                event_block_size = block_size,
+                configured_block_size = self.kv_block_size,
+                "KV event block size for this cache group differs from the configured block size; its stored blocks will not be indexed"
+            );
+        }
     }
 
     fn propagate_cache_namespace(
@@ -285,26 +325,15 @@ impl ZmqEventNormalizer {
         dp_rank: DpRank,
     ) -> Option<ZmqEventFilterReason> {
         if let Some(kind) = metadata.kv_cache_spec_kind {
-            if kind.is_main_attention() {
-                return None;
-            }
-            if kind == KvCacheSpecKind::Unknown {
-                return Some(ZmqEventFilterReason::UnknownKind);
-            }
-            return Some(ZmqEventFilterReason::NonMainAttentionKind);
+            return self.kind_filter_reason(kind, ZmqEventFilterReason::NonMainAttentionKind);
         }
 
         let group_idx = metadata.group_idx?;
 
         if let Some(metadata) = self.group_metadata.get(&(dp_rank, group_idx)) {
             let _sliding_window = metadata.sliding_window;
-            if metadata.kind.is_main_attention() {
-                return None;
-            }
-            if metadata.kind == KvCacheSpecKind::Unknown {
-                return Some(ZmqEventFilterReason::UnknownKind);
-            }
-            return Some(ZmqEventFilterReason::NonMainAttentionGroup);
+            return self
+                .kind_filter_reason(metadata.kind, ZmqEventFilterReason::NonMainAttentionGroup);
         }
 
         if group_idx == 0 {
@@ -312,5 +341,36 @@ impl ZmqEventNormalizer {
         } else {
             Some(ZmqEventFilterReason::UnlearnedGroupIdx)
         }
+    }
+
+    fn kind_filter_reason(
+        &self,
+        kind: KvCacheSpecKind,
+        drop_reason: ZmqEventFilterReason,
+    ) -> Option<ZmqEventFilterReason> {
+        match self.strategies.strategy(kind) {
+            IndexStrategy::Attention | IndexStrategy::Recurrent => None,
+            IndexStrategy::Drop if kind == KvCacheSpecKind::Unknown => {
+                Some(ZmqEventFilterReason::UnknownKind)
+            }
+            IndexStrategy::Drop => Some(drop_reason),
+        }
+    }
+
+    /// The cache-group class for an event, resolved from its inline kind or
+    /// the learned group metadata. `None` for kindless events (legacy /
+    /// non-vLLM producers), which consumers treat as attention.
+    fn cache_group_for(
+        &self,
+        metadata: KvCacheEventMetadata,
+        dp_rank: DpRank,
+    ) -> Option<CacheGroupClass> {
+        let kind = metadata.kv_cache_spec_kind.or_else(|| {
+            let group_idx = metadata.group_idx?;
+            self.group_metadata
+                .get(&(dp_rank, group_idx))
+                .map(|metadata| metadata.kind)
+        })?;
+        self.strategies.cache_group(kind)
     }
 }

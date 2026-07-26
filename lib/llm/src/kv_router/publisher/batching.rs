@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use dynamo_kv_router::indexer::LocalKvIndexer;
 use dynamo_kv_router::protocols::{
-    KvCacheEvent, KvCacheEventData, KvCacheRemoveData, KvCacheStoreData, RouterEvent, StorageTier,
+    CacheGroupClass, KvCacheEvent, KvCacheEventData, KvCacheRemoveData, KvCacheStoreData,
+    RouterEvent, StorageTier,
 };
 
 use super::dedup::EventDedupFilter;
@@ -21,6 +22,7 @@ pub(super) struct BatchingState {
     pub(super) next_publish_id: u64,
     pub(super) last_dp_rank: u32,
     pub(super) last_storage_tier: StorageTier,
+    pub(super) last_cache_group: Option<CacheGroupClass>,
     pub(super) last_flush_time: Instant,
 }
 
@@ -32,6 +34,7 @@ impl BatchingState {
             next_publish_id: 1,
             last_dp_rank: 0,
             last_storage_tier: StorageTier::Device,
+            last_cache_group: None,
             last_flush_time: Instant::now(),
         }
     }
@@ -90,6 +93,7 @@ impl BatchingState {
                 worker_id,
                 self.last_storage_tier,
                 KvCacheEvent {
+                    cache_group: self.last_cache_group,
                     event_id: self.next_publish_id,
                     data: KvCacheEventData::Removed(filtered),
                     dp_rank,
@@ -106,6 +110,7 @@ impl BatchingState {
                 worker_id,
                 self.last_storage_tier,
                 KvCacheEvent {
+                    cache_group: self.last_cache_group,
                     event_id: self.next_publish_id,
                     data: KvCacheEventData::Stored(data),
                     dp_rank,

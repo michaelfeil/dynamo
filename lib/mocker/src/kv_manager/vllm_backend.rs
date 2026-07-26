@@ -838,6 +838,7 @@ impl VllmKvManager {
             })
         };
         let event = KvCacheEvent {
+            cache_group: None,
             event_id: self.next_event_id,
             data,
             dp_rank: self.dp_rank,

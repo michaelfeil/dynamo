@@ -46,6 +46,7 @@ fn dump_event(
     RouterEvent::new(
         worker.worker_id,
         KvCacheEvent {
+            cache_group: None,
             event_id,
             data: KvCacheEventData::Stored(KvCacheStoreData {
                 parent_hash,
