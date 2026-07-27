@@ -12,6 +12,7 @@ use tokio_stream::StreamExt;
 use super::local_model::RoutingConstraints;
 use super::*;
 use crate::Endpoint;
+use crate::tokens::extract_list_or_numpy_u32;
 #[cfg(feature = "kv-indexer")]
 use clap::Parser;
 use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
@@ -121,7 +122,7 @@ fn init_standalone_logging() {
 #[pyo3(name = "compute_block_hash_for_seq", signature = (tokens, kv_block_size, block_mm_infos=None, lora_name=None, is_eagle=None))]
 pub fn compute_block_hash_for_seq_py(
     _py: Python,
-    tokens: Vec<u32>,
+    tokens: &Bound<'_, PyAny>,
     kv_block_size: usize,
     block_mm_infos: Option<Bound<PyAny>>,
     lora_name: Option<String>,
@@ -132,6 +133,8 @@ pub fn compute_block_hash_for_seq_py(
             "kv_block_size cannot be 0",
         ));
     }
+
+    let tokens = extract_list_or_numpy_u32(tokens)?;
 
     let mm_infos = block_mm_infos
         .as_ref()
@@ -985,7 +988,7 @@ impl KvRouter {
     fn generate<'p>(
         &self,
         py: Python<'p>,
-        token_ids: Vec<u32>,
+        token_ids: &Bound<'p, PyAny>,
         model: String,
         stop_conditions: Option<PyObject>,
         sampling_options: Option<PyObject>,
@@ -999,6 +1002,8 @@ impl KvRouter {
         mm_routing_info: Option<PyObject>,
         routing_constraints: Option<RoutingConstraints>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let token_ids = extract_list_or_numpy_u32(token_ids)?;
+
         // Depythonize the options with defaults
         let stop_conditions: StopConditions = if let Some(obj) = stop_conditions {
             depythonize(obj.bind(py)).map_err(to_pyerr)?
@@ -1117,7 +1122,7 @@ impl KvRouter {
     fn best_worker<'p>(
         &self,
         py: Python<'p>,
-        token_ids: Vec<u32>,
+        token_ids: &Bound<'p, PyAny>,
         router_config_override: Option<PyObject>,
         request_id: Option<String>,
         update_indexer: bool,
@@ -1125,6 +1130,8 @@ impl KvRouter {
         lora_name: Option<String>,
         routing_constraints: Option<RoutingConstraints>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let token_ids = extract_list_or_numpy_u32(token_ids)?;
+
         let router_config_override = if let Some(obj) = router_config_override {
             let override_config: RouterConfigOverride =
                 depythonize(obj.bind(py)).map_err(to_pyerr)?;
@@ -1247,10 +1254,11 @@ impl KvRouter {
     fn get_potential_loads<'p>(
         &self,
         py: Python<'p>,
-        token_ids: Vec<u32>,
+        token_ids: &Bound<'p, PyAny>,
         block_mm_infos: Option<PyObject>,
         lora_name: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let token_ids = extract_list_or_numpy_u32(token_ids)?;
         let block_mm_infos = block_mm_infos
             .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
             .transpose()?;
@@ -1281,12 +1289,14 @@ impl KvRouter {
     fn get_overlap_scores<'p>(
         &self,
         py: Python<'p>,
-        token_ids: Vec<u32>,
+        token_ids: &Bound<'p, PyAny>,
         router_config_override: Option<PyObject>,
         block_mm_infos: Option<PyObject>,
         lora_name: Option<String>,
         include_shared: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let token_ids = extract_list_or_numpy_u32(token_ids)?;
+
         let router_config_override = if let Some(obj) = router_config_override {
             let override_config: RouterConfigOverride =
                 depythonize(obj.bind(py)).map_err(to_pyerr)?;

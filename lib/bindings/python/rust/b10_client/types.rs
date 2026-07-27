@@ -17,6 +17,7 @@
 //! can register them as `crate::b10_client::Foo`.
 
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
+use crate::tokens::extract_list_or_numpy_u32;
 use crate::{AsyncResponseStream, Client};
 use anyhow::Result;
 use dynamo_kv_router::protocols::{BlockExtraInfo, RouterRequest, RoutingConstraints};
@@ -176,10 +177,17 @@ impl CancellationPolicy {
 /// RoutingConstraints`, aliased in this module as `PyRoutingConstraints`);
 /// `None` means the default (empty) constraints. `tokens` defaults to the
 /// empty list.
+///
+/// `tokens` accepts either a Python sequence of ints or a NumPy `uint32` /
+/// `int64` array (see [`crate::tokens::extract_list_or_numpy_u32`]) -- the
+/// frontend keeps prompt tokens in a `uint32` buffer, and materializing that
+/// buffer into a `list[int]` just to cross this boundary costs one Python
+/// `int` object per token. The stored field stays a `Vec<u32>`, so the getter
+/// still hands back a `list[int]`.
 #[pyclass]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PyRouterRequestNew {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub(super) tokens: Vec<u32>,
     #[pyo3(get, set)]
     pub(super) block_mm_infos: Option<PyObject>,
@@ -205,21 +213,29 @@ impl PyRouterRequestNew {
         do_not_queue = false,
     ))]
     fn new(
-        tokens: Vec<u32>,
+        tokens: &Bound<'_, PyAny>,
         block_mm_infos: Option<PyObject>,
         routing_constraints: Option<Py<PyRoutingConstraints>>,
         priority_jump: f64,
         priority_load_shed_percent: u8,
         do_not_queue: bool,
-    ) -> Self {
-        Self {
-            tokens,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            tokens: extract_list_or_numpy_u32(tokens)?,
             block_mm_infos,
             routing_constraints,
             priority_jump,
             priority_load_shed_percent,
             do_not_queue,
-        }
+        })
+    }
+
+    /// Accepts the same inputs as the constructor's `tokens`: a Python
+    /// sequence of ints or a NumPy `uint32`/`int64` array.
+    #[setter]
+    fn set_tokens(&mut self, tokens: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.tokens = extract_list_or_numpy_u32(tokens)?;
+        Ok(())
     }
 }
 

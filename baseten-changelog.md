@@ -1248,6 +1248,24 @@ upstream client already exposes (e.g. the `Router` trait, `GuardMark`, or the
 `route_once` -> `DeniedRequest` mapping) rather than inside the
 admission/cleanup state machine itself.
 
+v1.2 NumPy token-id inputs:
+
+The token-id arguments on the routing entry points (`PyRouterRequestNew`'s
+constructor and `tokens` setter, `KvRouter.generate` / `best_worker` /
+`get_potential_loads` / `get_overlap_scores`, and the free function
+`compute_block_hash_for_seq`) take `&Bound<'_, PyAny>` and go through
+`crate::tokens::extract_list_or_numpy_u32` instead of extracting a `Vec<u32>`
+directly. That accepts a NumPy `uint32`/`int64` array in addition to the
+previous `list[int]`, so the Baseten frontend can keep prompt tokens in the
+`uint32` buffer the tokenizer produced rather than materializing one Python
+`int` object per token (~29 ms for a 1M-token prompt) just to cross the
+binding. `list[int]` behavior is unchanged -- it is the last branch of the
+same helper. The extraction order and error strings mirror
+`extract_list_or_numpy_u32` in the `llm-runtime-metrics` bindings
+(`bindings/python/rust/lib.rs`) so both extensions accept the same inputs.
+This adds a `numpy` crate dependency to `lib/bindings/python/Cargo.toml`,
+which must be kept in lockstep with the pyo3 minor version.
+
 Validation:
 
 Compile Python bindings, import `dynamo.runtime`, validate type stubs, and run

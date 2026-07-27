@@ -15,10 +15,24 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Union,
 )
+
+import numpy as np
+import numpy.typing as npt
 
 # Import from specialized modules
 from .prometheus_metrics import RuntimeMetrics as PyRuntimeMetrics
+
+TokenIds = Union[Sequence[int], npt.NDArray[np.uint32], npt.NDArray[np.int64]]
+"""
+Token-id input accepted by the routing entry points.
+
+Either a Python sequence of ints or a 1-D NumPy ``uint32``/``int64`` array.
+The array form is read straight out of its buffer, so callers holding tokens
+as a ``uint32`` array (e.g. straight off the tokenizer) do not have to
+materialize one Python ``int`` object per token to cross the binding.
+"""
 
 B10_DROP_THIS_MESSAGE_KEY: str
 
@@ -464,19 +478,25 @@ class PyRouterRequestNew:
     GIL. ``routing_constraints`` is the local-model pyclass
     :class:`RoutingConstraints`; ``None`` means the default (empty) constraints.
     ``tokens`` is REQUIRED (no default); pass ``[]`` (or any ``Sequence[int]``)
-    for decode-only requests.
+    for decode-only requests. It also accepts a 1-D NumPy ``uint32``/``int64``
+    array, which avoids materializing one Python ``int`` per token; reading the
+    attribute back always yields a ``List[int]``.
     """
 
-    tokens: List[int]
     block_mm_infos: Optional[Any]
     routing_constraints: Optional[RoutingConstraints]
     priority_jump: float
     priority_load_shed_percent: int
     do_not_queue: bool
 
+    @property
+    def tokens(self) -> List[int]: ...
+    @tokens.setter
+    def tokens(self, value: TokenIds) -> None: ...
+
     def __init__(
         self,
-        tokens: Sequence[int],
+        tokens: TokenIds,
         block_mm_infos: Optional[Any] = None,
         routing_constraints: Optional[RoutingConstraints] = None,
         priority_jump: float = 0.0,
@@ -871,7 +891,7 @@ class ModelCardInstanceId:
 
 
 def compute_block_hash_for_seq(
-    tokens: List[int],
+    tokens: TokenIds,
     kv_block_size: int,
     block_mm_infos: Optional[List[Optional[Dict[str, Any]]]] = None,
     lora_name: Optional[str] = None,
@@ -885,7 +905,7 @@ def compute_block_hash_for_seq(
     different hashes.
 
     Args:
-        tokens: List of token IDs
+        tokens: Token IDs, as a sequence of ints or a NumPy uint32/int64 array
         kv_block_size: Size of each block in tokens
         block_mm_infos: Optional per-block multimodal metadata. Each element corresponds to a block
                        and should be None or a dict with structure:
@@ -3049,7 +3069,7 @@ class KvRouter:
 
     async def generate(
         self,
-        token_ids: List[int],
+        token_ids: TokenIds,
         model: str,
         stop_conditions: Optional[JsonLike] = None,
         sampling_options: Optional[JsonLike] = None,
@@ -3067,7 +3087,8 @@ class KvRouter:
         Generate text using the KV-aware router.
 
         Args:
-            token_ids: Input token IDs
+            token_ids: Input token IDs, as a sequence of ints or a NumPy
+                      uint32/int64 array
             model: Model name to use for generation
             stop_conditions: Optional stop conditions for generation
             sampling_options: Optional sampling configuration
@@ -3118,7 +3139,7 @@ class KvRouter:
 
     async def best_worker(
         self,
-        token_ids: List[int],
+        token_ids: TokenIds,
         router_config_override: Optional[JsonLike] = None,
         request_id: Optional[str] = None,
         update_indexer: bool = False,
@@ -3130,7 +3151,8 @@ class KvRouter:
         Find the best matching worker for the given tokens.
 
         Args:
-            token_ids: List of token IDs to find matches for
+            token_ids: Token IDs to find matches for, as a sequence of ints
+                      or a NumPy uint32/int64 array
             router_config_override: Optional router configuration override
             request_id: Optional request ID. If provided, router states will be updated
                        to track this request (active blocks, lifecycle events). If not
@@ -3153,7 +3175,7 @@ class KvRouter:
 
     async def get_potential_loads(
         self,
-        token_ids: List[int],
+        token_ids: TokenIds,
         block_mm_infos: Optional[List[Optional[Dict[str, Any]]]] = None,
         lora_name: Optional[str] = None,
     ) -> List[Dict[str, int]]:
@@ -3161,7 +3183,8 @@ class KvRouter:
         Get potential prefill and decode loads for all workers.
 
         Args:
-            token_ids: List of token IDs to evaluate
+            token_ids: Token IDs to evaluate, as a sequence of ints or a
+                      NumPy uint32/int64 array
             block_mm_infos: Optional block-level multimodal metadata aligned to request
                            blocks. When provided, this is used in hash computation
                            for MM-aware potential-load estimation.
@@ -3182,7 +3205,7 @@ class KvRouter:
 
     async def get_overlap_scores(
         self,
-        token_ids: List[int],
+        token_ids: TokenIds,
         router_config_override: Optional[JsonLike] = None,
         block_mm_infos: Optional[List[Optional[Dict[str, Any]]]] = None,
         lora_name: Optional[str] = None,
@@ -3192,7 +3215,8 @@ class KvRouter:
         Get per-worker KV overlap by storage tier.
 
         Args:
-            token_ids: List of token IDs to evaluate.
+            token_ids: Token IDs to evaluate, as a sequence of ints or a
+                      NumPy uint32/int64 array.
             router_config_override: Optional router configuration override for
                                    score-credit fields.
             block_mm_infos: Optional block-level multimodal metadata aligned to

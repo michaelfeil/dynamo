@@ -194,3 +194,83 @@ def test_radix_tree_thread_safety(
     assert (
         len(blocks_after_removal) == expected_blocks_after_removal
     ), f"Expected {expected_blocks_after_removal} block events after removal, got {len(blocks_after_removal)}"
+
+
+# ----- token-id inputs: list[int] vs numpy array -----
+#
+# The routing entry points accept a NumPy uint32/int64 array in addition to a
+# Python sequence of ints, so callers holding tokens in a uint32 buffer do not
+# have to materialize one Python int per token to cross the binding. Both
+# forms must produce identical results.
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("dtype", ["uint32", "int64"])
+def test_compute_block_hash_for_seq_accepts_numpy(dtype):
+    """compute_block_hash_for_seq: numpy array matches the list[int] result."""
+    import numpy as np
+
+    from dynamo.llm import compute_block_hash_for_seq
+
+    tokens = list(range(64))
+
+    from_list = compute_block_hash_for_seq(tokens, 16)
+    from_array = compute_block_hash_for_seq(np.array(tokens, dtype=dtype), 16)
+
+    assert from_list == from_array
+    assert len(from_list) == 4
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("dtype", ["uint32", "int64"])
+def test_compute_block_hash_for_seq_accepts_strided_numpy(dtype):
+    """A non-contiguous NumPy view matches the list[int] result."""
+    import numpy as np
+
+    from dynamo.llm import compute_block_hash_for_seq
+
+    tokens = np.arange(128, dtype=dtype)[::2]
+
+    assert compute_block_hash_for_seq(tokens, 16) == compute_block_hash_for_seq(
+        tokens.tolist(), 16
+    )
+
+
+@pytest.mark.timeout(5)
+def test_compute_block_hash_for_seq_rejects_bad_token_input():
+    """A non-sequence token input raises ValueError, not a panic."""
+    from dynamo.llm import compute_block_hash_for_seq
+
+    with pytest.raises(ValueError):
+        compute_block_hash_for_seq(object(), 16)
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("dtype", ["uint32", "int64"])
+def test_router_request_new_accepts_numpy_tokens(dtype):
+    """PyRouterRequestNew: numpy tokens land as the same list[int]."""
+    import numpy as np
+
+    from dynamo._core import PyRouterRequestNew
+
+    tokens = [1, 2, 3, 4_000_000_000 if dtype == "uint32" else 4]
+
+    from_list = PyRouterRequestNew(tokens=tokens)
+    from_array = PyRouterRequestNew(tokens=np.array(tokens, dtype=dtype))
+
+    assert from_array.tokens == from_list.tokens == tokens
+
+    # The setter accepts the same inputs and always reads back a list[int].
+    from_list.tokens = np.array(tokens, dtype=dtype)
+    assert from_list.tokens == tokens
+
+
+@pytest.mark.timeout(5)
+def test_router_request_new_rejects_out_of_range_int64_tokens():
+    """int64 token ids outside u32 are rejected rather than silently wrapped."""
+    import numpy as np
+
+    from dynamo._core import PyRouterRequestNew
+
+    with pytest.raises(ValueError):
+        PyRouterRequestNew(tokens=np.array([-1, 2, 3], dtype="int64"))

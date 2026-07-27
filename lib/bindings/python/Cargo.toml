@@ -96,6 +96,11 @@ pyo3-async-runtimes = { version = "0.23.0", default-features = false, features =
 
 pythonize = "0.23"
 
+# Zero-copy access to NumPy token-id buffers on the routing entry points, so
+# callers can pass a uint32 array instead of materializing a `list[int]`.
+# Keep the minor version in lockstep with pyo3 above.
+numpy = "0.23"
+
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dynamo-llm = { path = "../../llm" }
