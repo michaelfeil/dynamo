@@ -260,6 +260,15 @@ fn convert_tool_result_content(
         ToolResultContent::Blocks(blocks) => blocks,
     };
 
+    if blocks
+        .iter()
+        .any(|block| matches!(block, ToolResultContentBlock::Other(_)))
+    {
+        anyhow::bail!(
+            "unsupported Anthropic tool_result content block; only text and image are supported"
+        );
+    }
+
     if !blocks
         .iter()
         .any(|block| matches!(block, ToolResultContentBlock::Image { .. }))
@@ -282,7 +291,7 @@ fn convert_tool_result_content(
                     convert_image(source)?,
                 ));
             }
-            ToolResultContentBlock::Other(_) => {}
+            ToolResultContentBlock::Other(_) => unreachable!("validated above"),
         }
     }
     Ok(ChatCompletionRequestToolMessageContent::Array(parts))
@@ -1448,6 +1457,20 @@ mod tests {
         assert_eq!(
             image.image_url.as_ref().unwrap().url.as_str(),
             "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn test_tool_result_other_block_is_rejected() {
+        let content = ToolResultContent::Blocks(vec![ToolResultContentBlock::Other(
+            serde_json::json!({"type": "document"}),
+        )]);
+
+        let error = convert_tool_result_content(&content).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only text and image are supported")
         );
     }
 
