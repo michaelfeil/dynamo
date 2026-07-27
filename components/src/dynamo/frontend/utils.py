@@ -56,9 +56,9 @@ def extract_mm_urls(
 ) -> dict[str, list[dict[str, str]]] | None:
     """Extract multimodal URLs from OpenAI chat completion messages.
 
-    Walks user message content arrays and collects ``image_url``, ``audio_url``,
-    and ``video_url`` entries.  Returns them in the format expected by the
-    backend handler's ``_extract_multimodal_data()``::
+    Walks user and tool message content arrays and collects ``image_url``,
+    ``audio_url``, and ``video_url`` entries. Returns them in the format
+    expected by the backend handler's ``_extract_multimodal_data()``::
 
         {
             "image_url": [{"Url": "https://..."}, ...],
@@ -70,7 +70,7 @@ def extract_mm_urls(
     mm_data: dict[str, list[dict[str, str]]] = {}
 
     for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") != "user":
+        if not isinstance(msg, dict) or msg.get("role") not in {"user", "tool"}:
             continue
         content = msg.get("content")
         if not isinstance(content, list):

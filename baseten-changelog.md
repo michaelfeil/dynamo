@@ -1091,6 +1091,9 @@ Also should include error classsification for metrics, so that we can observe it
 Current v1.2 OpenAI compatibility gap: the protocol layer now accepts
 multimodal tool-message content so real OpenAI-compatible clients are not
 rejected at JSON deserialization time, but this is only the ingress piece.
+The corresponding upstream protocol support was merged in
+[`ai-dynamo/frontend-crates#143`](https://github.com/ai-dynamo/frontend-crates/pull/143)
+and released in `dynamo-protocols` 5.0.0.
 Follow-up work should implement the two remaining pieces explicitly: preserve
 and validate the relevant `tool_choice` behavior through the Dynamo/OpenAI
 pipeline, and add processor/backend handling for image content carried in tool

@@ -17,10 +17,11 @@ use dynamo_protocols::types::{
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
     ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage,
-    FunctionName, FunctionObject, FunctionType, ImageUrl, ReasoningContent,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionToolType, CompletionUsage, FunctionName,
+    FunctionObject, FunctionType, ImageUrl, ReasoningContent,
 };
 use uuid::Uuid;
 
@@ -188,24 +189,9 @@ fn convert_user_blocks(
                 ));
             }
             AnthropicContentBlock::Image { source } => {
-                if source.source_type != "base64" {
-                    anyhow::bail!(
-                        "unsupported image source type {:?}; only base64 is supported",
-                        source.source_type
-                    );
-                }
                 has_image = true;
-                let data_uri = format!("data:{};base64,{}", source.media_type, source.data);
-                let url = url::Url::parse(&data_uri)
-                    .map_err(|e| anyhow::anyhow!("invalid image data URI: {e}"))?;
                 content_parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
-                    ChatCompletionRequestMessageContentPartImage {
-                        image_url: ImageUrl {
-                            url,
-                            detail: None,
-                            uuid: None,
-                        },
-                    },
+                    image_url_part(source)?,
                 ));
             }
             AnthropicContentBlock::ToolResult {
@@ -217,10 +203,14 @@ fn convert_user_blocks(
                 flush_user_content_parts(&mut content_parts, has_image, messages);
                 has_image = false;
 
-                let text = content.clone().map(|c| c.into_text()).unwrap_or_default();
+                let content = content
+                    .as_ref()
+                    .map(convert_tool_result_content)
+                    .transpose()?
+                    .unwrap_or_default();
                 messages.push(ChatCompletionRequestMessage::Tool(
                     ChatCompletionRequestToolMessage {
-                        content: ChatCompletionRequestToolMessageContent::Text(text),
+                        content,
                         tool_call_id: tool_use_id.clone(),
                     },
                 ));
@@ -240,6 +230,77 @@ fn convert_user_blocks(
     flush_user_content_parts(&mut content_parts, has_image, messages);
 
     Ok(())
+}
+
+/// Convert an Anthropic base64 image source into an OpenAI-style `image_url`
+/// content part (data URI).
+fn image_url_part(
+    source: &AnthropicImageSource,
+) -> Result<ChatCompletionRequestMessageContentPartImage, anyhow::Error> {
+    if source.source_type != "base64" {
+        anyhow::bail!(
+            "unsupported image source type {:?}; only base64 is supported",
+            source.source_type
+        );
+    }
+    let data_uri = format!("data:{};base64,{}", source.media_type, source.data);
+    let url =
+        url::Url::parse(&data_uri).map_err(|e| anyhow::anyhow!("invalid image data URI: {e}"))?;
+    Ok(ChatCompletionRequestMessageContentPartImage {
+        image_url: ImageUrl {
+            url,
+            detail: None,
+            uuid: None,
+        },
+    })
+}
+
+/// Convert `tool_result` content into tool-message content.
+///
+/// Text-only results stay `Text` (backwards-compatible with non-multimodal
+/// backends). Results carrying image blocks become `Array` with the images
+/// converted to `ImageUrl` data-URI parts — the same conversion applied to
+/// direct image blocks in user messages — so the image survives the
+/// conversion. Agent clients (e.g. Claude Code's Read/screenshot tools)
+/// deliver images to the model via `tool_result` on `/v1/messages`.
+fn convert_tool_result_content(
+    content: &ToolResultContent,
+) -> Result<ChatCompletionRequestToolMessageContent, anyhow::Error> {
+    let blocks = match content {
+        ToolResultContent::Text(text) => {
+            return Ok(ChatCompletionRequestToolMessageContent::Text(text.clone()));
+        }
+        ToolResultContent::Blocks(blocks) => blocks,
+    };
+
+    if !blocks
+        .iter()
+        .any(|b| matches!(b, ToolResultContentBlock::Image { .. }))
+    {
+        // No images: join text blocks into a single string (previous behavior).
+        return Ok(ChatCompletionRequestToolMessageContent::Text(
+            content.clone().into_text(),
+        ));
+    }
+
+    let mut parts: Vec<ChatCompletionRequestToolMessageContentPart> = Vec::new();
+    for block in blocks {
+        match block {
+            ToolResultContentBlock::Text { text } => {
+                parts.push(ChatCompletionRequestToolMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText { text: text.clone() },
+                ));
+            }
+            ToolResultContentBlock::Image { source } => {
+                parts.push(ChatCompletionRequestToolMessageContentPart::ImageUrl(
+                    image_url_part(source)?,
+                ));
+            }
+            // Unknown non-text blocks are skipped, as before.
+            ToolResultContentBlock::Other(_) => {}
+        }
+    }
+    Ok(ChatCompletionRequestToolMessageContent::Array(parts))
 }
 
 /// Flush accumulated user content parts into a user message.
@@ -1322,6 +1383,93 @@ mod tests {
                 other => panic!("expected ToolResult, got {other:?}"),
             },
             _ => panic!("expected blocks"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_text_only_converts_to_text_content() {
+        // Text-only tool results must keep the flat `Text` content shape
+        // (backwards-compatible with non-multimodal backends).
+        let json = r#"{
+            "model": "test",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "text", "text": "line 1"},
+                        {"type": "text", "text": "line 2"}
+                    ]}
+                ]
+            }]
+        }"#;
+        let req: AnthropicCreateMessageRequest = serde_json::from_str(json).unwrap();
+        let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        match &chat_req.inner.messages[0] {
+            ChatCompletionRequestMessage::Tool(tool) => {
+                assert_eq!(tool.tool_call_id, "t1");
+                match &tool.content {
+                    ChatCompletionRequestToolMessageContent::Text(text) => {
+                        assert_eq!(text, "line 1line 2");
+                    }
+                    other => panic!("expected Text content, got {other:?}"),
+                }
+            }
+            other => panic!("expected tool message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_image_preserved() {
+        // Regression: images inside tool_result content arrays were silently
+        // dropped (flattened to text-only), so the model never saw images
+        // delivered via tool_result (e.g. Claude Code Read/screenshot tools).
+        let json = r#"{
+            "model": "test",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "text", "text": "screenshot taken"},
+                        {"type": "image", "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aGVsbG8="
+                        }}
+                    ]}
+                ]
+            }]
+        }"#;
+        let req: AnthropicCreateMessageRequest = serde_json::from_str(json).unwrap();
+        let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        assert_eq!(chat_req.inner.messages.len(), 1);
+        match &chat_req.inner.messages[0] {
+            ChatCompletionRequestMessage::Tool(tool) => {
+                assert_eq!(tool.tool_call_id, "t1");
+                match &tool.content {
+                    ChatCompletionRequestToolMessageContent::Array(parts) => {
+                        assert_eq!(parts.len(), 2);
+                        match &parts[0] {
+                            ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                                assert_eq!(t.text, "screenshot taken");
+                            }
+                            other => panic!("expected text part, got {other:?}"),
+                        }
+                        match &parts[1] {
+                            ChatCompletionRequestUserMessageContentPart::ImageUrl(img) => {
+                                assert_eq!(
+                                    img.image_url.url.as_str(),
+                                    "data:image/png;base64,aGVsbG8="
+                                );
+                            }
+                            other => panic!("expected image_url part, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Array content, got {other:?}"),
+                }
+            }
+            other => panic!("expected tool message, got {other:?}"),
         }
     }
 
