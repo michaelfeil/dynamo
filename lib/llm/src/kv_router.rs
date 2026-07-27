@@ -90,6 +90,8 @@ pub enum FindBestMatchOutcome {
     Routed {
         worker: WorkerWithDpRank,
         overlap_blocks: u32,
+        /// Max device-tier overlap across all candidate workers.
+        best_overlap_blocks: u32,
         effective_overlap_blocks: f64,
         cached_tokens: usize,
         dp_strict_rank: bool,
@@ -548,6 +550,12 @@ where
             .unwrap_or((None, None));
 
         let tier_overlap_blocks = tier_overlap_blocks_from_tiered_matches(&tiered_matches);
+        let best_overlap_blocks = tier_overlap_blocks
+            .device
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0) as u32;
         let cache_hit_estimates = self.cache_hit_estimates_from_tiered_matches(&tiered_matches);
         let find_matches_elapsed = start.elapsed();
 
@@ -636,6 +644,7 @@ where
         Ok(FindBestMatchOutcome::Routed {
             worker: response.best_worker,
             overlap_blocks: response.effective_overlap_blocks.round() as u32,
+            best_overlap_blocks,
             effective_overlap_blocks: response.effective_overlap_blocks,
             cached_tokens: response.cached_tokens,
             dp_strict_rank: response.dp_strict_rank,
@@ -1128,12 +1137,14 @@ where
                     Ok(FindBestMatchOutcome::Routed {
                         worker,
                         overlap_blocks,
+                        best_overlap_blocks,
                         dp_strict_rank,
                         ..
                     }) => RouterResponse::New {
                         worker_id: worker.worker_id,
                         dp_rank: worker.dp_rank,
                         overlap_blocks,
+                        best_overlap_blocks,
                         dp_strict_rank,
                     },
                     Ok(FindBestMatchOutcome::Backpressure {

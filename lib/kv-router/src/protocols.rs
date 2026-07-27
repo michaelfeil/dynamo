@@ -495,6 +495,9 @@ pub enum RouterResponse {
         #[serde(default)]
         dp_rank: DpRank,
         overlap_blocks: u32,
+        /// Max device-tier overlap across all candidate workers.
+        #[serde(default)]
+        best_overlap_blocks: u32,
         #[serde(default)]
         dp_strict_rank: bool,
     },

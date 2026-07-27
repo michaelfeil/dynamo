@@ -886,6 +886,19 @@ Worker-based KV recovery now has a lightweight `RecoveryProcessLogger` that
 reports aggregate restore progress, recovered event counts, and the final
 initial-recovery completion summary used by router startup gating.
 
+`best_overlap_blocks` was restored to `RouterResponse::New` (originally added
+by `4f8c728ef` / PR #180 on the v1.0 branch; dropped in the v1.2 rebase). It is
+the maximum device-tier overlap across all candidate workers, computed in
+`find_best_match_details` as a max over the per-request
+`tier_overlap_blocks.device` map the routing path already builds — no extra
+indexer queries or allocation. The field is `#[serde(default)]`, so mixed
+router/frontend versions stay wire-compatible, and it also carries
+`FindBestMatchOutcome::Routed::best_overlap_blocks`. The b10_client
+`AdmittedRequest` exposes it to Python as `b10_best_overlap_blocks()`. Consumed
+by the frontend's `llm_kv_cache_best_prefix_hit_rate` and
+`llm_kv_cache_hit_rate_efficiency` metrics; dropping it during a rebase kills
+those dashboards.
+
 Editorial notes:
 
 All metrics that Baseten added should be preserved across versions.

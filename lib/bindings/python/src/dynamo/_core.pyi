@@ -641,6 +641,13 @@ class AdmittedRequest:
         """
         ...
 
+    def b10_best_overlap_blocks(self) -> int:
+        """
+        Max device-tier overlap across all candidate workers, in blocks.
+        ``0`` on routers that predate the field.
+        """
+        ...
+
     def routing_new_duration_seconds(self) -> float:
         """
         Seconds from route/connect start to the successful KV-router ``new``

@@ -380,6 +380,7 @@ fn new_response() -> Result<RsRouterResponse, String> {
         worker_id: 1,
         dp_rank: 0,
         overlap_blocks: 0,
+        best_overlap_blocks: 0,
         dp_strict_rank: false,
     })
 }
@@ -682,6 +683,7 @@ fn route_response_new(worker_id: u64) -> Result<RsRouterResponse, String> {
         worker_id,
         dp_rank: 0,
         overlap_blocks: 0,
+        best_overlap_blocks: 0,
         dp_strict_rank: false,
     })
 }

@@ -327,6 +327,20 @@ impl RouterRequestGuard {
         }
     }
 
+    /// Max device-tier overlap across all candidate workers, in blocks.
+    /// `0` when the route did not arm the guard (the response is not `New`).
+    pub(super) fn b10_best_overlap_blocks(&self) -> u64 {
+        if let Some(RsRouterResponse::New {
+            best_overlap_blocks,
+            ..
+        }) = self.response.as_ref()
+        {
+            u64::from(*best_overlap_blocks)
+        } else {
+            0
+        }
+    }
+
     /// Request that the cleanup task marks prefill complete.
     pub(super) fn mark_prefill(&self) {
         if !self.armed {

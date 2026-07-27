@@ -456,6 +456,12 @@ impl AdmittedRequest {
         self.guard.estimated_overlap_tokens(self.block_size)
     }
 
+    /// Max device-tier overlap across all candidate workers, in blocks.
+    /// `0` on routers that predate the field.
+    fn b10_best_overlap_blocks(&self) -> u64 {
+        self.guard.b10_best_overlap_blocks()
+    }
+
     /// Seconds from entering route/connect setup to the successful KV-router
     /// `new` response used for this admitted worker. Includes preflight and any
     /// stale-route reroute work before the final accepted route.
