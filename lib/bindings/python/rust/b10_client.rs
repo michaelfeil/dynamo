@@ -28,6 +28,7 @@
 //! loop with a per-phase shield selected by the caller's `CancellationPolicy`.
 mod coordinator;
 mod guard;
+mod payload_copy;
 mod types;
 
 #[cfg(test)]

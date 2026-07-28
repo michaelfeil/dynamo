@@ -1241,6 +1241,20 @@ and
 `route_and_connect_unexpected_response_variant_fires_mark_free_then_denies_protocol_error`
 guard the invariant.
 
+v1.2 worker payload copy staging (PRs #511/#512/#513): the reroute loop no
+longer deep-copies the worker payload per attempt. `#511` builds the routing
+wire via msgpack instead of a `serde_json` round-trip, `#512` passes the
+routing request as `Arc<rmpv::Value>`, and `#513` adds
+`b10_client/payload_copy.rs`: each attempt's payload copy is a plain
+`rmpv::Value::clone` on the blocking pool, staged before the routing RPC for
+small payloads (hidden behind the round-trip) and after admission for large
+ones (rejected large-multimodal requests do no copy work), resolved inside
+`connect_worker`'s setup shield so `DetachSetupOnly` gains no new
+cancellation point, handed back unresolved on a proactive stale for the
+retry to reuse, and logged (`unhidden_ms` / `copy_ms` / `payload_mb`) when
+it keeps the critical path waiting beyond 40ms. Replay as part of the 1:1
+module copy; the eager cutoff lives in `EAGER_COPY_MAX_BYTES`.
+
 Guidance for future versions: prefer copying this module forward 1:1 from
 the prior fork release (or from a future upstream equivalent, when one exists)
 and avoid introducing bespoke Baseten-only changes inside `b10_client/`. The

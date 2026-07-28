@@ -1274,6 +1274,23 @@ async fn route_and_connect_proactive_stale_reroutes_then_connects() {
     // Connected outcome, firing another mark_free.
     assert_eq!(router.method_call_count("new"), 2);
     assert_eq!(worker.method_call_count("generate"), 1);
+    // The payload is moved into each attempt and handed back on the stale
+    // pre-check, not cloned: the retry must deliver the original fields
+    // intact with exactly one `router_response` entry (attempt 2's).
+    let worker_call = &worker.calls()[0];
+    assert_eq!(worker_call.1["prompt"].as_str(), Some("hello"));
+    assert_eq!(
+        worker_call.1["router_response"]["worker_id"].as_i64(),
+        Some(2)
+    );
+    let router_response_entries = match &worker_call.1 {
+        rmpv::Value::Map(map) => map
+            .iter()
+            .filter(|(k, _)| k.as_str() == Some("router_response"))
+            .count(),
+        _ => panic!("worker request should be a map"),
+    };
+    assert_eq!(router_response_entries, 1);
     drop(outcome);
     wait_for_method_call_count(&router, "mark_free", 2, Duration::from_secs(2)).await;
     assert_eq!(router.method_call_count("mark_free"), 2);
@@ -1332,8 +1349,10 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
     // {1, 2} so the proactive check passes; but the worker's first direct
     // returns Err and auto-removes worker 1 -- so the reactive stale
     // check inside connect_worker fires (worker now absent) and the loop
-    // reroutes. Second route returns worker 2 and (since worker 2 is
-    // still in the instance set) connect succeeds.
+    // reroutes. The first attempt's payload copy was consumed by the
+    // failed open, so the retry copies the base payload again. Second
+    // route returns worker 2 and (since worker 2 is still in the
+    // instance set) connect succeeds.
     let router = RouterGuardClientForTesting::new(
         vec![7],
         vec![7],
@@ -1381,6 +1400,22 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
     assert_eq!(router.method_call_count("new"), 2);
     // First worker direct errored (incomplete); second succeeded.
     assert_eq!(worker.completed_direct_count(), 1);
+    // The retry's payload is a fresh copy of the untouched base: original
+    // fields intact, exactly one `router_response` entry, attempt 2's id.
+    let retry_call = &worker.calls()[1];
+    assert_eq!(retry_call.1["prompt"].as_str(), Some("hello"));
+    assert_eq!(
+        retry_call.1["router_response"]["worker_id"].as_i64(),
+        Some(2)
+    );
+    let router_response_entries = match &retry_call.1 {
+        rmpv::Value::Map(map) => map
+            .iter()
+            .filter(|(k, _)| k.as_str() == Some("router_response"))
+            .count(),
+        _ => panic!("worker request should be a map"),
+    };
+    assert_eq!(router_response_entries, 1);
     drop(outcome);
     wait_for_method_call_count(&router, "mark_free", 2, Duration::from_secs(2)).await;
     assert_eq!(router.method_call_count("mark_free"), 2);
