@@ -54,7 +54,7 @@ pub(super) struct RouterRequestNew {
 impl From<RouterRequestNew> for RouterRequest {
     fn from(req: RouterRequestNew) -> Self {
         RouterRequest::New {
-            tokens: req.tokens,
+            tokens: req.tokens.into(),
             block_mm_infos: req.block_mm_infos,
             routing_constraints: req.routing_constraints,
             priority_jump: req.priority_jump,

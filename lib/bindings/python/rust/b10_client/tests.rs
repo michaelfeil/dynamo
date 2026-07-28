@@ -583,7 +583,7 @@ fn router_request_new_priority_fields_round_trip() {
             priority_load_shed_percent,
             ..
         } => {
-            assert_eq!(tokens, vec![1, 2, 3]);
+            assert_eq!(*tokens, vec![1, 2, 3]);
             assert!(do_not_queue);
             assert_eq!(priority_jump, 0.5);
             assert_eq!(priority_load_shed_percent, 10);

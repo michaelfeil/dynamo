@@ -970,7 +970,7 @@ async fn query_potential_loads(
             });
         }
         let request = RouterRequest::PotentialLoads {
-            tokens,
+            tokens: tokens.into(),
             block_mm_infos,
             // no caching for this query.
             allow_short_caching: false,

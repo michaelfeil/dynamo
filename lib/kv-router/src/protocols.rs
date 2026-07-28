@@ -427,12 +427,108 @@ impl PlacementEvent {
     }
 }
 
+/// Prompt tokens on the routing wire. Deserializes from either a packed
+/// little-endian u32 byte blob or a plain integer sequence, so routers accept
+/// both formats. Serializes as the integer sequence unless
+/// `DYN_ROUTER_SEND_PACKED_TOKENS` is set and the request plane is msgpack: the blob
+/// is one memcpy per side where the 100k-element msgpack array costs ~3ms of
+/// per-element encode/decode. Flip the flag only once all routers dual-read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenBlob(pub Vec<Token>);
+
+impl std::ops::Deref for TokenBlob {
+    type Target = Vec<Token>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Vec<Token>> for TokenBlob {
+    fn from(tokens: Vec<Token>) -> Self {
+        Self(tokens)
+    }
+}
+
+/// Packed sending requires BOTH the opt-in flag and a MessagePack request
+/// plane. Clients materialize the request as an `rmpv::Value` through an
+/// intermediate msgpack step, so `Serializer::is_human_readable` describes that
+/// step rather than the transport: a JSON request plane would emit
+/// `Value::Binary` as an array of individual bytes and a router would read each
+/// byte as a token (token 300000 -> [224, 147, 4, 0]). Only an explicit msgpack
+/// plane (unset/empty defaults to msgpack, see the runtime's
+/// `RequestPlanePayloadCodec::from_env`) enables packing; any other codec value
+/// falls back to the legacy integer array, which is always correct.
+fn packed_send_enabled(opt_in: Option<&str>, request_plane_codec: Option<&str>) -> bool {
+    let opted_in = matches!(opt_in, Some("1") | Some("true") | Some("on"));
+    let msgpack_plane = matches!(request_plane_codec, None | Some("") | Some("msgpack"));
+    opted_in && msgpack_plane
+}
+
+fn send_packed_tokens() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        packed_send_enabled(
+            std::env::var("DYN_ROUTER_SEND_PACKED_TOKENS")
+                .ok()
+                .as_deref(),
+            std::env::var("DYN_REQUEST_PLANE_CODEC").ok().as_deref(),
+        )
+    })
+}
+
+impl Serialize for TokenBlob {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() || !send_packed_tokens() {
+            serializer.collect_seq(self.0.iter())
+        } else {
+            let mut packed = Vec::with_capacity(self.0.len() * 4);
+            for token in &self.0 {
+                packed.extend_from_slice(&token.to_le_bytes());
+            }
+            serializer.serialize_bytes(&packed)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TokenBlob {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TokenBlobVisitor;
+        impl<'de> serde::de::Visitor<'de> for TokenBlobVisitor {
+            type Value = TokenBlob;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a packed little-endian u32 byte blob or a sequence of u32 tokens")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                if !v.len().is_multiple_of(4) {
+                    return Err(E::custom("packed token blob length is not a multiple of 4"));
+                }
+                Ok(TokenBlob(
+                    v.chunks_exact(4)
+                        .map(|c| Token::from_le_bytes(c.try_into().unwrap()))
+                        .collect(),
+                ))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(token) = seq.next_element::<Token>()? {
+                    out.push(token);
+                }
+                Ok(TokenBlob(out))
+            }
+        }
+        deserializer.deserialize_any(TokenBlobVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum RouterRequest {
     #[serde(rename = "new")]
     New {
-        tokens: Vec<Token>,
+        tokens: TokenBlob,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
         #[serde(default, skip_serializing_if = "RoutingConstraints::is_empty")]
@@ -457,7 +553,7 @@ pub enum RouterRequest {
         request_id: Option<String>,
     },
     PotentialLoads {
-        tokens: Vec<Token>,
+        tokens: TokenBlob,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
         #[serde(default, skip_serializing_if = "is_false")]
@@ -468,7 +564,7 @@ pub enum RouterRequest {
 impl Default for RouterRequest {
     fn default() -> Self {
         RouterRequest::New {
-            tokens: vec![],
+            tokens: TokenBlob::default(),
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
             priority_jump: 0.0,
@@ -1166,6 +1262,68 @@ impl TokensWithHashes {
 // Tests
 // ------
 #[cfg(test)]
+mod token_blob_tests {
+    use super::*;
+
+    fn new_request(tokens: Vec<Token>) -> RouterRequest {
+        RouterRequest::New {
+            tokens: tokens.into(),
+            block_mm_infos: None,
+            routing_constraints: RoutingConstraints::default(),
+            priority_jump: 0.0,
+            priority_load_shed_percent: 0,
+            do_not_queue: false,
+        }
+    }
+
+    #[test]
+    fn packed_send_requires_opt_in_and_msgpack_plane() {
+        // Opted in, msgpack plane (explicit, defaulted, or empty) -> packed.
+        assert!(packed_send_enabled(Some("1"), Some("msgpack")));
+        assert!(packed_send_enabled(Some("true"), None));
+        assert!(packed_send_enabled(Some("on"), Some("")));
+        // A JSON request plane would serialize the packed blob as an array of
+        // individual bytes, which a router would read as tokens: never pack.
+        assert!(!packed_send_enabled(Some("1"), Some("json")));
+        // Unknown codecs are treated as unsafe for packing.
+        assert!(!packed_send_enabled(Some("1"), Some("yaml")));
+        // Not opted in -> legacy array regardless of codec.
+        assert!(!packed_send_enabled(None, Some("msgpack")));
+        assert!(!packed_send_enabled(Some("0"), Some("msgpack")));
+    }
+
+    #[test]
+    fn router_request_tokens_dual_read() {
+        // Default send format is the legacy integer array and round-trips.
+        let wire = rmp_serde::to_vec_named(&new_request(vec![1, 2, 300_000])).unwrap();
+        let RouterRequest::New { tokens, .. } = rmp_serde::from_slice(&wire).unwrap() else {
+            panic!("expected New");
+        };
+        assert_eq!(*tokens, vec![1, 2, 300_000]);
+
+        // A packed little-endian blob decodes to the same tokens:
+        // {"method": "new", "tokens": bin8([1, 2, 300_000] as <u4)}.
+        let mut packed = vec![
+            0x82, // fixmap(2)
+            0xa6, b'm', b'e', b't', b'h', b'o', b'd', 0xa3, b'n', b'e', b'w', 0xa6, b't', b'o',
+            b'k', b'e', b'n', b's', 0xc4, 12, // bin8, 12 bytes
+        ];
+        for token in [1u32, 2, 300_000] {
+            packed.extend_from_slice(&token.to_le_bytes());
+        }
+        let RouterRequest::New { tokens, .. } = rmp_serde::from_slice(&packed).unwrap() else {
+            panic!("expected New");
+        };
+        assert_eq!(*tokens, vec![1, 2, 300_000]);
+
+        // A blob whose length is not a multiple of 4 is rejected.
+        packed[19] = 11;
+        packed.pop();
+        assert!(rmp_serde::from_slice::<RouterRequest>(&packed).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rstest::rstest;
@@ -1469,7 +1627,7 @@ mod tests {
     #[test]
     fn test_router_request_new_serialization_with_priority_jump() {
         let request = RouterRequest::New {
-            tokens: vec![1, 2, 3],
+            tokens: vec![1, 2, 3].into(),
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
             priority_jump: 5.0,
@@ -1490,14 +1648,14 @@ mod tests {
                 tokens,
                 priority_jump,
                 ..
-            } if tokens == vec![1, 2, 3] && priority_jump == 5.0
+            } if *tokens == vec![1, 2, 3] && priority_jump == 5.0
         ));
     }
 
     #[test]
     fn test_router_request_new_serialization_with_priority_load_shed_percent() {
         let request = RouterRequest::New {
-            tokens: vec![1, 2, 3],
+            tokens: vec![1, 2, 3].into(),
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
             priority_jump: 5.0,
@@ -1519,7 +1677,7 @@ mod tests {
                 priority_jump,
                 priority_load_shed_percent,
                 ..
-            } if tokens == vec![1, 2, 3]
+            } if *tokens == vec![1, 2, 3]
                 && priority_jump == 5.0
                 && priority_load_shed_percent == 10
         ));
@@ -1536,7 +1694,7 @@ mod tests {
                 tokens,
                 do_not_queue: false,
                 ..
-            } if tokens == vec![1, 2, 3]
+            } if *tokens == vec![1, 2, 3]
         ));
     }
 

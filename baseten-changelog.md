@@ -1255,6 +1255,15 @@ retry to reuse, and logged (`unhidden_ms` / `copy_ms` / `payload_mb`) when
 it keeps the critical path waiting beyond 40ms. Replay as part of the 1:1
 module copy; the eager cutoff lives in `EAGER_COPY_MAX_BYTES`.
 
+v1.2 packed routing tokens (`DYN_ROUTER_SEND_PACKED_TOKENS`): the `tokens`
+field of `RouterRequest::New` / `PotentialLoads` (kv-router `protocols.rs`,
+`TokenBlob`) deserializes from either a packed little-endian u32 byte blob or
+the legacy integer array — routers accept both, always. Clients send the
+legacy array unless `DYN_ROUTER_SEND_PACKED_TOKENS=1`, which replaces ~3ms of
+per-element msgpack encode/decode per 100k-token route with a memcpy (wire
+size unchanged). Flip the flag only after all routers dual-read; JSON codecs
+always use the integer array (`is_human_readable`).
+
 Guidance for future versions: prefer copying this module forward 1:1 from
 the prior fork release (or from a future upstream equivalent, when one exists)
 and avoid introducing bespoke Baseten-only changes inside `b10_client/`. The
