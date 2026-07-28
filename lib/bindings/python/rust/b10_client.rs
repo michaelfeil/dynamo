@@ -307,7 +307,7 @@ impl RouterWorkerCoordinator {
             priority_load_shed_percent,
             do_not_queue,
         };
-        let routing_request = req.into_routing_request_value().map_err(to_pyerr)?;
+        let routing_request = Arc::new(req.into_routing_request_value().map_err(to_pyerr)?);
 
         let worker_request: rmpv::Value = match worker_args {
             Some(wa) => pythonize::depythonize(&wa.into_bound(py))?,

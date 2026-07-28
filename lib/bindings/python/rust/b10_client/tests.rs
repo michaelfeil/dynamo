@@ -411,7 +411,7 @@ async fn route(
 ) -> (RouterRequestGuard, RouteSource) {
     route_request(
         router,
-        request,
+        Arc::new(request),
         request_id.to_string(),
         None,
         require,
@@ -668,10 +668,12 @@ fn build_test_context(id: &str) -> context::Context {
     context::Context::new(inner, None, None, BTreeMap::new())
 }
 
-fn make_routing_request() -> rmpv::Value {
-    RouterRequestNew::default()
-        .into_routing_request_value()
-        .expect("default routing request builds")
+fn make_routing_request() -> Arc<rmpv::Value> {
+    Arc::new(
+        RouterRequestNew::default()
+            .into_routing_request_value()
+            .expect("default routing request builds"),
+    )
 }
 
 fn make_worker_request() -> rmpv::Value {
@@ -751,7 +753,7 @@ fn potential_loads_response_for_workers(
 async fn connect(
     router: Arc<RouterGuardClientForTesting>,
     worker: Arc<RouterGuardClientForTesting>,
-    routing_request: rmpv::Value,
+    routing_request: Arc<rmpv::Value>,
     request_id: &str,
     context: context::Context,
     require: Vec<MinReplicaAvailable>,

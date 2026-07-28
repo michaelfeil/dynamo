@@ -346,7 +346,7 @@ impl RouterGuardClient for JsonRouterGuardClient {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn route_request(
     router: Arc<dyn RouterGuardClient>,
-    request: rmpv::Value,
+    request: Arc<rmpv::Value>,
     request_id: String,
     context: Option<context::Context>,
     require_min1_replica_available: Vec<MinReplicaAvailable>,
@@ -409,8 +409,11 @@ pub(super) async fn route_request(
         for (instance_index, &instance_id) in instance_ids.iter().enumerate() {
             let has_more_route_attempts =
                 attempt + 1 < ROUTER_GUARD_ATTEMPTS || instance_index + 1 < instance_ids.len();
+            // RouterGuardClient::direct takes RsContext<rmpv::Value> by value,
+            // so the payload is materialized here and only here. Everything
+            // above this point passes the Arc.
             let (request_ctx, mut cancellation_forwarder) = create_detached_router_request_context(
-                request.clone(),
+                (*request).clone(),
                 &context,
                 &request_id,
                 allow_cancel_routing,
@@ -1235,7 +1238,7 @@ enum RouteOnceOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn route_once(
     router_guard_client: Arc<dyn RouterGuardClient>,
-    routing_request: rmpv::Value,
+    routing_request: Arc<rmpv::Value>,
     request_id: String,
     context: Option<context::Context>,
     require: Vec<MinReplicaAvailable>,
@@ -1743,7 +1746,7 @@ where
 pub(super) async fn route_and_connect(
     router_guard_client: Arc<dyn RouterGuardClient>,
     worker_guard_client: Arc<dyn RouterGuardClient>,
-    routing_request: rmpv::Value,
+    routing_request: Arc<rmpv::Value>,
     request_id: String,
     context: context::Context,
     require: Vec<MinReplicaAvailable>,
