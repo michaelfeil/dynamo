@@ -187,9 +187,13 @@ where
                         if let Some(v) = b10hotreloadablecm::get_router_queue_threshold() {
                             let threshold = if v > 0.0 { Some(v) } else { None };
                             metrics_scheduler.update_router_queue_threshold(threshold).await;
-                            sync_queue_metrics();
                         }
                         metrics_scheduler.reconfigure_residency_capacities();
+                        // Sync every tick, not only on threshold changes: the
+                        // gate/eval gauges are exported only by this closure,
+                        // and the 60s recheck alone leaves them a minute
+                        // stale on dashboards.
+                        sync_queue_metrics();
                     }
                 }
             }
