@@ -221,6 +221,21 @@ PRs that legitimately do not need a changelog entry can bypass the check by
 applying the `skip-changelog` label. This makes the patch ledger an enforced
 artifact of the fork rather than a documentation convention.
 
+A required `Upstream Frontend Crates Check` GitHub Actions workflow now runs on
+PRs targeting `main-v1.2.0`. If the PR changes frontend, OpenAI protocol,
+tool-call parsing, reasoning parsing, renderer, or related parity-test files,
+the PR description must link an upstream `ai-dynamo/frontend-crates` issue/PR,
+link an upstream `ai-dynamo/dynamo` issue/PR, or explicitly explain why the
+change is Baseten-only and cannot be useful to any other Dynamo user. The check
+also instructs authors to make upstream issues implementation-ready with a
+minimal sanitized JSON payload. Dynamo agents working from proprietary or
+customer-derived data are strongly encouraged to open an upstream issue with a
+slightly anonymized but still reproducible case that preserves the relevant
+format, fields, parser markers, and failure shape while replacing real content
+with dummy equivalents. The guidance also warns authors to avoid customer
+prompts, model outputs, tenant/model IDs, API keys, request IDs, URLs, headers,
+logs, and other customer or internal data.
+
 The post-merge `framework=none` image workflow now builds native `amd64` and
 `arm64` images on Depot runners, pushes arch-specific tags, and publishes the
 unsuffixed tag as a multi-arch manifest. The workflow does not publish a mutable

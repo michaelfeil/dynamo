@@ -1,0 +1,69 @@
+name: Upstream Frontend Crates Check
+
+on:
+  pull_request:
+    branches:
+      - main-v1.2.0
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+jobs:
+  upstream-frontend-crates:
+    name: upstream frontend-crates link documented
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Collect changed files
+        id: files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            core.setOutput('changed_files', JSON.stringify(files.map((file) => file.filename)));
+
+      - name: Verify upstream frontend-crates tracking
+        env:
+          CHANGED_FILES_JSON: ${{ steps.files.outputs.changed_files }}
+        run: node .github/scripts/check-upstream-frontend-crates-link.js
+
+      - name: Explain failure on ready PR
+        if: ${{ failure() && !github.event.pull_request.draft }}
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- upstream-frontend-crates-check -->';
+            const body = `${marker}
+            The upstream frontend-crates check failed for this ready PR.
+
+            Please update the PR description with either:
+            - an issue or PR link in [ai-dynamo/frontend-crates](https://github.com/ai-dynamo/frontend-crates),
+            - an existing tracking link in [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo), or
+            - a clear explanation of why this change is Baseten-only.
+
+            This automated reminder is best-effort; the check remains the source of truth.`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number, per_page: 100,
+              });
+              if (!comments.some((comment) => comment.body?.includes(marker))) {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              }
+            } catch (error) {
+              core.warning(`Could not post the reminder comment: ${error.message}`);
+            }
