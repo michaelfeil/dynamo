@@ -35,18 +35,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 
-/// Convert any `Serialize` into an `rmpv::Value` via a JSON round-trip. Used
-/// for routing metadata (`RouterRequest` / `RouterResponse`) that originates
-/// from typed wire structs but must flow through the `rmpv::Value`-typed
-/// request plane alongside the user payload.
+/// Convert any `Serialize` into an `rmpv::Value`. Used for routing metadata
+/// (`RouterRequest` / `RouterResponse`) that originates from typed wire structs
+/// but must flow through the `rmpv::Value`-typed request plane alongside the
+/// user payload. Goes through msgpack rather than `serde_json`: a `new`
+/// request carries the whole prompt, and the JSON hop rebuilt every token as a
+/// `serde_json::Value` before rebuilding it again as an `rmpv::Value`.
+/// `to_vec_named` is required -- `rmpv::ext::to_value` emits the compact
+/// representation (structs as arrays, enums as `[index, payload]`), which is
+/// not what the request plane sends.
 fn to_rmpv_value<T: Serialize>(value: &T) -> Result<rmpv::Value> {
-    Ok(serde_json::from_value(serde_json::to_value(value)?)?)
+    let bytes = rmp_serde::to_vec_named(value)?;
+    Ok(rmpv::decode::read_value(&mut bytes.as_slice())?)
 }
 
-/// Decode a `Deserialize` type from an `rmpv::Value` via a JSON round-trip.
+/// Decode a `Deserialize` type from an `rmpv::Value`.
 /// Used to recover the typed `RouterResponse` from the wire `rmpv::Value`.
 fn from_rmpv_value<T: DeserializeOwned>(value: &rmpv::Value) -> Result<T> {
-    Ok(serde_json::from_value(serde_json::to_value(value)?)?)
+    let mut bytes = Vec::new();
+    rmpv::encode::write_value(&mut bytes, value)?;
+    Ok(rmp_serde::from_slice(&bytes)?)
 }
 
 use super::DROP_THIS_MESSAGE_KEY;

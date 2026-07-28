@@ -69,9 +69,12 @@ impl RouterRequestNew {
     /// Every field is set by the caller from the [`PyRouterRequestNew`] pyclass
     /// under the GIL; no serde-deserialized defaults are layered in.
     pub(super) fn into_routing_request_value(self) -> Result<rmpv::Value> {
-        Ok(serde_json::from_value(serde_json::to_value(
-            RouterRequest::from(self),
-        )?)?)
+        // Through msgpack rather than `serde_json`: a `new` request carries
+        // the whole prompt, so the JSON hop rebuilt every token as a
+        // `serde_json::Value` before rebuilding it again as an `rmpv::Value`.
+        // `to_vec_named` matches what the request plane actually sends.
+        let bytes = rmp_serde::to_vec_named(&RouterRequest::from(self))?;
+        Ok(rmpv::decode::read_value(&mut bytes.as_slice())?)
     }
 }
 

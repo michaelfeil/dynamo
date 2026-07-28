@@ -2864,3 +2864,32 @@ async fn route_and_connect_cancellable_setup_drops_on_outer_abort() {
     wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
     assert_eq!(router.method_call_count("mark_free"), 1);
 }
+
+/// The routing wire used to be built by round-tripping through `serde_json`.
+/// It now serializes straight into `rmpv`, so pin the two against each other:
+/// the request plane is shared with older peers and the bytes must not move.
+#[test]
+fn router_request_new_matches_legacy_json_roundtrip() {
+    let cases = vec![
+        RouterRequestNew::default(),
+        RouterRequestNew {
+            tokens: vec![0, 1, 127, 128, 255, 256, 65_535, 65_536, 151_643],
+            priority_jump: 1.5,
+            priority_load_shed_percent: 42,
+            do_not_queue: true,
+            ..Default::default()
+        },
+    ];
+
+    for req in cases {
+        let legacy: rmpv::Value = serde_json::from_value(
+            serde_json::to_value(RouterRequest::from(req.clone())).expect("to_value"),
+        )
+        .expect("from_value");
+        let direct = req
+            .into_routing_request_value()
+            .expect("direct rmpv conversion");
+
+        assert_eq!(direct, legacy, "rmpv wire value changed");
+    }
+}

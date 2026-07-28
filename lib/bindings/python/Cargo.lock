@@ -2330,6 +2330,7 @@ dependencies = [
  "pythonize",
  "rand 0.9.4",
  "rmp",
+ "rmp-serde",
  "rmpv",
  "serde",
  "serde_json",
