@@ -273,6 +273,15 @@ fn convert_tool_result_content(
         ToolResultContent::Blocks(blocks) => blocks,
     };
 
+    if blocks
+        .iter()
+        .any(|block| matches!(block, ToolResultContentBlock::Other(_)))
+    {
+        anyhow::bail!(
+            "unsupported Anthropic tool_result content block; only text and image are supported"
+        );
+    }
+
     if !blocks
         .iter()
         .any(|b| matches!(b, ToolResultContentBlock::Image { .. }))
@@ -296,8 +305,7 @@ fn convert_tool_result_content(
                     image_url_part(source)?,
                 ));
             }
-            // Unknown non-text blocks are skipped, as before.
-            ToolResultContentBlock::Other(_) => {}
+            ToolResultContentBlock::Other(_) => unreachable!("validated above"),
         }
     }
     Ok(ChatCompletionRequestToolMessageContent::Array(parts))
@@ -1471,6 +1479,20 @@ mod tests {
             }
             other => panic!("expected tool message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_tool_result_other_block_is_rejected() {
+        let content = ToolResultContent::Blocks(vec![ToolResultContentBlock::Other(
+            serde_json::json!({"type": "document"}),
+        )]);
+
+        let error = convert_tool_result_content(&content).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only text and image are supported")
+        );
     }
 
     #[test]
