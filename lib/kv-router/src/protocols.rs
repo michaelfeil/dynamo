@@ -429,10 +429,9 @@ impl PlacementEvent {
 
 /// Prompt tokens on the routing wire. Deserializes from either a packed
 /// little-endian u32 byte blob or a plain integer sequence, so routers accept
-/// both formats. Serializes as the integer sequence unless
-/// `DYN_ROUTER_SEND_PACKED_TOKENS` is set and the request plane is msgpack: the blob
-/// is one memcpy per side where the 100k-element msgpack array costs ~3ms of
-/// per-element encode/decode. Flip the flag only once all routers dual-read.
+/// both formats. Serializes as the packed blob whenever the request plane is
+/// msgpack -- one memcpy per side where the 100k-element msgpack array costs
+/// ~3ms of per-element encode/decode -- and as the integer sequence otherwise.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenBlob(pub Vec<Token>);
 
@@ -449,8 +448,12 @@ impl From<Vec<Token>> for TokenBlob {
     }
 }
 
-/// Packed sending requires BOTH the opt-in flag and a MessagePack request
-/// plane. Clients materialize the request as an `rmpv::Value` through an
+/// Packing is the default, kept behind a MessagePack request plane.
+/// `DYN_ROUTER_SEND_PACKED_TOKENS` is an opt-out kill switch: anything but a
+/// recognized truthy value reverts the sender to the legacy integer array,
+/// which recovers a fleet whose routers cannot dual-read without a redeploy.
+/// Both env vars are read once per process, so flipping either needs a restart.
+/// Clients materialize the request as an `rmpv::Value` through an
 /// intermediate msgpack step, so `Serializer::is_human_readable` describes that
 /// step rather than the transport: a JSON request plane would emit
 /// `Value::Binary` as an array of individual bytes and a router would read each
@@ -458,8 +461,8 @@ impl From<Vec<Token>> for TokenBlob {
 /// plane (unset/empty defaults to msgpack, see the runtime's
 /// `RequestPlanePayloadCodec::from_env`) enables packing; any other codec value
 /// falls back to the legacy integer array, which is always correct.
-fn packed_send_enabled(opt_in: Option<&str>, request_plane_codec: Option<&str>) -> bool {
-    let opted_in = matches!(opt_in, Some("1") | Some("true") | Some("on"));
+fn packed_send_enabled(opt_out: Option<&str>, request_plane_codec: Option<&str>) -> bool {
+    let opted_in = matches!(opt_out, None | Some("" | "1" | "true" | "on"));
     let msgpack_plane = matches!(request_plane_codec, None | Some("") | Some("msgpack"));
     opted_in && msgpack_plane
 }
@@ -478,6 +481,9 @@ fn send_packed_tokens() -> bool {
 
 impl Serialize for TokenBlob {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The `is_human_readable` arm is load-bearing now that packing is the
+        // default: JSON dumps outside the request plane would otherwise read
+        // each packed byte back as its own token.
         if serializer.is_human_readable() || !send_packed_tokens() {
             serializer.collect_seq(self.0.iter())
         } else {
@@ -1277,19 +1283,21 @@ mod token_blob_tests {
     }
 
     #[test]
-    fn packed_send_requires_opt_in_and_msgpack_plane() {
-        // Opted in, msgpack plane (explicit, defaulted, or empty) -> packed.
-        assert!(packed_send_enabled(Some("1"), Some("msgpack")));
-        assert!(packed_send_enabled(Some("true"), None));
-        assert!(packed_send_enabled(Some("on"), Some("")));
+    fn packed_send_defaults_on_and_honors_the_opt_out() {
+        // Unset opt-in, msgpack plane (explicit, defaulted, or empty) -> packed.
+        assert!(packed_send_enabled(None, Some("msgpack")));
+        assert!(packed_send_enabled(None, None));
+        assert!(packed_send_enabled(Some("1"), Some("")));
+        // Opting out forces the legacy array; so does an unrecognized value,
+        // which must never resolve towards the encoding that corrupts silently.
+        assert!(!packed_send_enabled(Some("0"), Some("msgpack")));
+        assert!(!packed_send_enabled(Some("off"), None));
+        assert!(!packed_send_enabled(Some("no"), Some("msgpack")));
         // A JSON request plane would serialize the packed blob as an array of
         // individual bytes, which a router would read as tokens: never pack.
-        assert!(!packed_send_enabled(Some("1"), Some("json")));
+        assert!(!packed_send_enabled(None, Some("json")));
         // Unknown codecs are treated as unsafe for packing.
-        assert!(!packed_send_enabled(Some("1"), Some("yaml")));
-        // Not opted in -> legacy array regardless of codec.
-        assert!(!packed_send_enabled(None, Some("msgpack")));
-        assert!(!packed_send_enabled(Some("0"), Some("msgpack")));
+        assert!(!packed_send_enabled(None, Some("yaml")));
     }
 
     #[test]

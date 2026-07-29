@@ -523,6 +523,23 @@ async fn notify_timeout_sends_mark_free_and_exits() {
     assert_eq!(router.calls().len(), 2);
 }
 
+/// Decode the way the request plane does: msgpack, not JSON. A JSON hop would
+/// read each byte of the packed `tokens` blob back as its own token.
+fn round_trip_wire(value: &rmpv::Value) -> RouterRequest {
+    let mut wire = Vec::new();
+    rmpv::encode::write_value(&mut wire, value).expect("encode");
+    rmp_serde::from_slice(&wire).expect("round-trips")
+}
+
+/// The map minus `tokens`, whose encoding is pinned by dedicated tests.
+fn without_tokens(value: &rmpv::Value) -> rmpv::Value {
+    let rmpv::Value::Map(entries) = value else {
+        return value.clone();
+    };
+    let kept = entries.iter().filter(|(k, _)| k.as_str() != Some("tokens"));
+    rmpv::Value::Map(kept.cloned().collect())
+}
+
 #[test]
 fn router_request_new_defaults_minimal_wire() {
     let value = RouterRequestNew::default()
@@ -530,7 +547,8 @@ fn router_request_new_defaults_minimal_wire() {
         .expect("build ok");
 
     assert_eq!(value["method"].as_str(), Some("new"));
-    assert_eq!(value["tokens"], jv!([]));
+    // Tokens ride the wire packed (msgpack request plane is the default).
+    assert_eq!(value["tokens"], rmpv::Value::Binary(Vec::new()));
     // defaults are skipped on the wire
     assert!(value["block_mm_infos"].is_nil());
     assert!(value["routing_constraints"].is_nil());
@@ -568,14 +586,15 @@ fn router_request_new_priority_fields_round_trip() {
     let value = req.into_routing_request_value().expect("build ok");
 
     assert_eq!(value["method"].as_str(), Some("new"));
-    assert_eq!(value["tokens"], jv!([1, 2, 3]));
+    assert_eq!(
+        value["tokens"],
+        rmpv::Value::Binary(vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
+    );
     assert_eq!(value["priority_jump"].as_f64(), Some(0.5));
     assert_eq!(value["priority_load_shed_percent"].as_i64(), Some(10));
     assert_eq!(value["do_not_queue"].as_bool(), Some(true));
 
-    match serde_json::from_value::<RouterRequest>(serde_json::to_value(&value).unwrap())
-        .expect("round-trips")
-    {
+    match round_trip_wire(&value) {
         RouterRequest::New {
             tokens,
             do_not_queue,
@@ -610,9 +629,7 @@ fn router_request_new_block_mm_infos_carried() {
 
     assert_eq!(value["method"].as_str(), Some("new"));
     // block_mm_infos round-trips through the wire tagged payload.
-    match serde_json::from_value::<RouterRequest>(serde_json::to_value(&value).unwrap())
-        .expect("round-trips")
-    {
+    match round_trip_wire(&value) {
         RouterRequest::New { block_mm_infos, .. } => {
             let infos = block_mm_infos.expect("block_mm_infos present");
             assert_eq!(infos.len(), 1);
@@ -642,9 +659,7 @@ fn router_request_new_routing_constraints_non_default_round_trip() {
 
     assert_eq!(value["method"].as_str(), Some("new"));
     assert!(!value["routing_constraints"].is_nil());
-    match serde_json::from_value::<RouterRequest>(serde_json::to_value(&value).unwrap())
-        .expect("round-trips")
-    {
+    match round_trip_wire(&value) {
         RouterRequest::New {
             routing_constraints,
             ..
@@ -2905,6 +2920,9 @@ async fn route_and_connect_cancellable_setup_drops_on_outer_abort() {
 /// The routing wire used to be built by round-tripping through `serde_json`.
 /// It now serializes straight into `rmpv`, so pin the two against each other:
 /// the request plane is shared with older peers and the bytes must not move.
+/// `tokens` is excluded: it ships packed by default, and its encoding is
+/// pinned by `router_request_tokens_dual_read` and the byte assertion in
+/// `router_request_new_priority_fields_round_trip`.
 #[test]
 fn router_request_new_matches_legacy_json_roundtrip() {
     let cases = vec![
@@ -2927,6 +2945,10 @@ fn router_request_new_matches_legacy_json_roundtrip() {
             .into_routing_request_value()
             .expect("direct rmpv conversion");
 
-        assert_eq!(direct, legacy, "rmpv wire value changed");
+        assert_eq!(
+            without_tokens(&direct),
+            without_tokens(&legacy),
+            "rmpv wire value changed"
+        );
     }
 }

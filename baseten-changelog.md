@@ -1274,10 +1274,11 @@ v1.2 packed routing tokens (`DYN_ROUTER_SEND_PACKED_TOKENS`): the `tokens`
 field of `RouterRequest::New` / `PotentialLoads` (kv-router `protocols.rs`,
 `TokenBlob`) deserializes from either a packed little-endian u32 byte blob or
 the legacy integer array — routers accept both, always. Clients send the
-legacy array unless `DYN_ROUTER_SEND_PACKED_TOKENS=1`, which replaces ~3ms of
-per-element msgpack encode/decode per 100k-token route with a memcpy (wire
-size unchanged). Flip the flag only after all routers dual-read; JSON codecs
-always use the integer array (`is_human_readable`).
+packed blob by default, replacing ~3ms of per-element msgpack encode/decode
+per 100k-token route with a memcpy (wire size unchanged). JSON codecs and a
+non-msgpack `DYN_REQUEST_PLANE_CODEC` always use the integer array
+(`is_human_readable`); `DYN_ROUTER_SEND_PACKED_TOKENS` is an opt-out kill
+switch, where any non-truthy value reverts the sender without a redeploy.
 
 Guidance for future versions: prefer copying this module forward 1:1 from
 the prior fork release (or from a future upstream equivalent, when one exists)
