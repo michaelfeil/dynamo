@@ -283,6 +283,17 @@ impl RouterRequestGuard {
         matches!(self.response.as_ref(), Some(RsRouterResponse::New { .. }))
     }
 
+    /// Worker and data-parallel rank selected by the router for an admitted
+    /// request. Returns `None` for backpressure and provisional guards.
+    pub(super) fn routed_worker_info(&self) -> Option<(u64, u32)> {
+        match self.response.as_ref() {
+            Some(RsRouterResponse::New {
+                worker_id, dp_rank, ..
+            }) => Some((*worker_id, *dp_rank)),
+            _ => None,
+        }
+    }
+
     /// Serialised router backpressure reason, or an empty string when routed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn backpressure_reason(&self) -> String {

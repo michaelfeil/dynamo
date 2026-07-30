@@ -1029,6 +1029,12 @@ endpoint-specific tests fail. Broader protocol work remains open only for
 response-shape or tolerance decisions not already covered by `baseten_ext` and
 Anthropic conformance slices.
 
+The Python HTTP frontend now returns B10 route attribution in four
+`x-baseten-dyn-*` OpenAI and Anthropic response headers. The selected worker ID
+and DP rank are recorded in request-scoped `Context.metadata` according to the
+`RouterWorkerPhase` enum (or its backward-compatible exact string values);
+unknown phases fail at the binding boundary.
+
 The v1.2 health replay also ties readiness to runtime lifetime. The B10 router
 registers the `DistributedRuntime` primary cancellation token with B10 health,
 and `/health_file` returns unhealthy once that token is cancelled even if the

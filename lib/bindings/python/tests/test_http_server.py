@@ -28,6 +28,10 @@ from dynamo.runtime import DistributedRuntime
 
 MSG_CONTAINS_ERROR = "This message contains an 400error."
 MSG_CONTAINS_INTERNAL_ERROR = "This message contains an internal server error."
+PREFILL_WORKER_ID = 101
+PREFILL_DP_RANK = 1
+DECODE_WORKER_ID = 202
+DECODE_DP_RANK = 2
 
 pytestmark = [
     pytest.mark.gpu_0,
@@ -46,6 +50,11 @@ class MockHttpEngine:
         """
         Raises HttpError if message contains 'error', otherwise streams a mock response.
         """
+        context.metadata["dynamo.routing.prefill_worker_id"] = str(PREFILL_WORKER_ID)
+        context.metadata["dynamo.routing.prefill_dp_rank"] = str(PREFILL_DP_RANK)
+        context.metadata["dynamo.routing.decode_worker_id"] = str(DECODE_WORKER_ID)
+        context.metadata["dynamo.routing.decode_dp_rank"] = str(DECODE_DP_RANK)
+
         user_message = ""
         for message in request.get("messages", []):
             if message.get("role") == "user":
@@ -83,9 +92,9 @@ class MockHttpEngine:
 
 
 @pytest.fixture(scope="function", autouse=False)
-async def http_server(runtime: DistributedRuntime):
+async def http_server(runtime: DistributedRuntime, unused_tcp_port: int):
     """Fixture to start a mock HTTP server using HttpService, contributed by Baseten."""
-    port = 8008
+    port = unused_tcp_port
     model_name = "test_model"
     start_done = asyncio.Event()
     checksum = "abc123"  # Checksum of ModelDeplomentCard for that model
@@ -143,6 +152,16 @@ async def test_chat_completion_success(http_server):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
         async with session.post(url, json=data) as response:
             response.raise_for_status()
+            assert response.headers["x-baseten-dyn-worker-id"] == str(DECODE_WORKER_ID)
+            assert response.headers["x-baseten-dyn-prefill-worker-id"] == str(
+                PREFILL_WORKER_ID
+            )
+            assert response.headers["x-baseten-dyn-prefill-dp-rank"] == str(
+                PREFILL_DP_RANK
+            )
+            assert response.headers["x-baseten-dyn-decode-dp-rank"] == str(
+                DECODE_DP_RANK
+            )
 
             content = ""
             async for line in response.content:

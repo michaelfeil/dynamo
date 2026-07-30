@@ -6,7 +6,8 @@
 //!
 //! This submodule holds:
 //!  * the Python-facing pyclasses ([`PyRouterRequestNew`], [`CancellationPolicy`],
-//!    [`DeniedRequest`], [`RouterCoordinatorPotentialLoadsCheck`], [`AdmittedRequest`]);
+//!    [`PyRouterWorkerPhase`], [`DeniedRequest`], [`RouterCoordinatorPotentialLoadsCheck`],
+//!    [`AdmittedRequest`]);
 //!  * the wire-mirror [`RouterRequestNew`] + its conversion to the wire
 //!    [`RouterRequest::New`];
 //!  * the plain `Send` data carriers the binding shim (root `b10_client.rs`)
@@ -21,7 +22,7 @@ use crate::tokens::extract_list_or_numpy_u32;
 use crate::{AsyncResponseStream, Client};
 use anyhow::Result;
 use dynamo_kv_router::protocols::{BlockExtraInfo, RouterRequest, RoutingConstraints};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -163,6 +164,98 @@ impl CancellationPolicy {
             Self::CancellableUntilWorkerThenDetach => false,
             Self::DetachSetupOnly => true,
         }
+    }
+}
+
+/// Logical routing phase for worker attribution.
+///
+/// This is intentionally a closed Python enum rather than a free-form string:
+/// an unknown phase is rejected by PyO3 at the protocol boundary instead of
+/// silently attributing a worker to the wrong half of a disaggregated request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[pyclass(name = "RouterWorkerPhase", eq, eq_int)]
+pub(crate) enum PyRouterWorkerPhase {
+    Agg,
+    DecodeFirst,
+    PrefillFirst,
+    DecodeSecond,
+    PrefillSecond,
+}
+
+impl PyRouterWorkerPhase {
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "agg" => Some(Self::Agg),
+            "decode_first" => Some(Self::DecodeFirst),
+            "prefill_first" => Some(Self::PrefillFirst),
+            "decode_second" => Some(Self::DecodeSecond),
+            "prefill_second" => Some(Self::PrefillSecond),
+            _ => None,
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Agg => "agg",
+            Self::DecodeFirst => "decode_first",
+            Self::PrefillFirst => "prefill_first",
+            Self::DecodeSecond => "decode_second",
+            Self::PrefillSecond => "prefill_second",
+        }
+    }
+}
+
+#[pymethods]
+impl PyRouterWorkerPhase {
+    fn __str__(&self) -> &'static str {
+        self.as_str()
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct RouterWorkerPhaseArg(pub(super) PyRouterWorkerPhase);
+
+impl<'py> FromPyObject<'py> for RouterWorkerPhaseArg {
+    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(phase) = value.extract::<PyRouterWorkerPhase>() {
+            return Ok(Self(phase));
+        }
+        if let Ok(phase) = value.extract::<String>() {
+            return PyRouterWorkerPhase::parse(&phase).map(Self).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "invalid RouterWorkerPhase {phase:?}; expected one of: \
+                     agg, decode_first, prefill_first, decode_second, prefill_second"
+                ))
+            });
+        }
+        Err(PyTypeError::new_err(
+            "phase must be a RouterWorkerPhase or one of its exact string values",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod router_worker_phase_tests {
+    use super::*;
+
+    #[test]
+    fn exact_string_values_parse() {
+        for (value, phase) in [
+            ("agg", PyRouterWorkerPhase::Agg),
+            ("decode_first", PyRouterWorkerPhase::DecodeFirst),
+            ("prefill_first", PyRouterWorkerPhase::PrefillFirst),
+            ("decode_second", PyRouterWorkerPhase::DecodeSecond),
+            ("prefill_second", PyRouterWorkerPhase::PrefillSecond),
+        ] {
+            assert_eq!(PyRouterWorkerPhase::parse(value), Some(phase));
+            assert_eq!(phase.as_str(), value);
+        }
+    }
+
+    #[test]
+    fn unknown_string_is_rejected() {
+        assert_eq!(PyRouterWorkerPhase::parse("prefill"), None);
+        assert_eq!(PyRouterWorkerPhase::parse("unknown"), None);
     }
 }
 

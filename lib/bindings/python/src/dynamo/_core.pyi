@@ -464,6 +464,24 @@ class CancellationPolicy:
     ...
 
 
+class RouterWorkerPhase:
+    """
+    Closed routing phase used to attribute the B10-selected worker.
+
+    Aggregate populates both prefill and decode attribution. Decode phases
+    populate decode/serving attribution; prefill phases populate prefill
+    attribution. Exact string values are accepted for compatibility.
+    """
+
+    Agg: "RouterWorkerPhase"
+    DecodeFirst: "RouterWorkerPhase"
+    PrefillFirst: "RouterWorkerPhase"
+    DecodeSecond: "RouterWorkerPhase"
+    PrefillSecond: "RouterWorkerPhase"
+
+    def __str__(self) -> str: ...
+
+
 class PyRouterRequestNew:
     """
     Typed carrier of the six ``RouterRequest::New`` wire-body fields (minus the
@@ -537,7 +555,13 @@ class RouterWorkerCoordinator:
             tracing_enabled: bool = False,
             wait_for_first_response: bool = False,
             mark_prefill_on_response: bool = False,
-            phase: str | None = None,
+            phase: RouterWorkerPhase | Literal[
+                "agg",
+                "decode_first",
+                "prefill_first",
+                "decode_second",
+                "prefill_second",
+            ] | None = None,
         ) -> AdmittedRequest | DeniedRequest:
         """
         Route a KV-router ``new`` request, then generate on the routed worker.
@@ -552,6 +576,11 @@ class RouterWorkerCoordinator:
         ``RouterResponse::New`` is added to it under the ``router_response``
         field, so the worker (or a further forwarder) receives the routing
         decision, overlap estimate, and dp-rank instruction.
+
+        ``phase`` accepts a :class:`RouterWorkerPhase` or one of its five exact
+        string values. ``agg`` populates both prefill and decode attribution;
+        the other phases populate their corresponding attribution. Unknown
+        values are rejected before routing begins.
 
         When ``potential_loads_next_check`` is given, a *potential loads*
         preflight queries the *downstream* ``client`` it carries (another router,

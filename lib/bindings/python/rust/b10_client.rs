@@ -38,8 +38,9 @@ mod tests;
 // resolve as `crate::b10_client::Foo` (the crate-root path lib.rs expects).
 // Pyclasses are `pub(crate)` in `types` (and `pub(crate)` here on
 // `RouterWorkerCoordinator`); glob re-export would miss them.
+use types::RouterWorkerPhaseArg;
 pub(crate) use types::{
-    AdmittedRequest, CancellationPolicy, DeniedRequest, PyRouterRequestNew,
+    AdmittedRequest, CancellationPolicy, DeniedRequest, PyRouterRequestNew, PyRouterWorkerPhase,
     RouterCoordinatorPotentialLoadsCheck,
 };
 
@@ -190,6 +191,12 @@ impl RouterWorkerCoordinator {
     /// remain supported; this just makes that call optional without waiting for
     /// Python to consume the stream.
     ///
+    /// When provided, `phase` is a [`PyRouterWorkerPhase`] (or its exact string
+    /// representation). Aggregate and decode
+    /// variants record the selected worker as the serving/decode worker;
+    /// prefill variants record it as the prefill worker. A later phase of the
+    /// same kind overwrites the earlier attribution.
+    ///
     /// Returns a [`AdmittedRequest`] on a successful route (with the worker
     /// generation stream, lifecycle guard, setup timing/reroute accessors, and
     /// chosen `worker_id`) or a
@@ -223,7 +230,7 @@ impl RouterWorkerCoordinator {
         tracing_enabled: bool,
         wait_for_first_response: bool,
         mark_prefill_on_response: bool,
-        phase: Option<String>,
+        phase: Option<RouterWorkerPhaseArg>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let annotated = annotated.unwrap_or(false);
         let allow_cancel_routing = cancellation.allow_cancel_routing();
@@ -338,6 +345,8 @@ impl RouterWorkerCoordinator {
         let router_router = self.router.router.clone();
         let worker_router = self.worker.router.clone();
         let block_size = self.block_size;
+        let phase = phase.map(|phase| phase.0);
+        let phase_name = phase.map(|phase| phase.as_str().to_string());
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // `worker_args` must be a JSON object so the per-route
@@ -385,7 +394,7 @@ impl RouterWorkerCoordinator {
                 wait_for_first_response,
                 ROUTER_GUARD_NOTIFY_TIMEOUT,
                 tracing_enabled,
-                phase,
+                phase_name,
             );
             let outcome = if allow_cancel_routing {
                 loop_fut.await.map_err(to_pyerr)?
@@ -404,6 +413,21 @@ impl RouterWorkerCoordinator {
                     timings,
                 } => (guard, worker_id, stream, timings),
             };
+
+            if let (Some(phase), Some((worker_id, dp_rank))) = (phase, guard.routed_worker_info()) {
+                match phase {
+                    PyRouterWorkerPhase::Agg => {
+                        parent_context_for_stream.record_prefill_worker(worker_id, dp_rank);
+                        parent_context_for_stream.record_decode_worker(worker_id, dp_rank);
+                    }
+                    PyRouterWorkerPhase::DecodeFirst | PyRouterWorkerPhase::DecodeSecond => {
+                        parent_context_for_stream.record_decode_worker(worker_id, dp_rank);
+                    }
+                    PyRouterWorkerPhase::PrefillFirst | PyRouterWorkerPhase::PrefillSecond => {
+                        parent_context_for_stream.record_prefill_worker(worker_id, dp_rank);
+                    }
+                }
+            }
 
             if allow_cancel_stream && !allow_cancel_setup {
                 attach_worker_stream_to_parent_context(&stream, &parent_context_for_stream);

@@ -196,6 +196,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<b10_client::RouterCoordinatorPotentialLoadsCheck>()?;
     m.add_class::<b10_client::PyRouterRequestNew>()?;
     m.add_class::<b10_client::CancellationPolicy>()?;
+    m.add_class::<b10_client::PyRouterWorkerPhase>()?;
     m.add_class::<Instance>()?;
     m.add_class::<TransportType>()?;
     m.add_class::<AsyncResponseStream>()?;

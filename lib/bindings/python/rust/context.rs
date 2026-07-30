@@ -10,6 +10,7 @@
 // unified [`SpanProxy`] handle whose `set_attribute` / `add_event` /
 // `set_status` operations mirror the OTel `Span` API.
 
+use dynamo_llm::http::service::baseten::{RoutingMetadataKey, WorkerResponseMetadata};
 use dynamo_runtime::logging::DistributedTraceContext;
 pub use dynamo_runtime::pipeline::AsyncEngineContext;
 use dynamo_runtime::pipeline::context::Controller;
@@ -208,6 +209,48 @@ impl Context {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn record_routed_worker(
+        &self,
+        worker_key: &'static str,
+        rank_key: &'static str,
+        worker_id: u64,
+        dp_rank: u32,
+    ) {
+        let mut metadata = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        metadata.insert(worker_key.to_string(), worker_id.to_string());
+        metadata.insert(rank_key.to_string(), dp_rank.to_string());
+    }
+
+    pub(crate) fn record_prefill_worker(&self, worker_id: u64, dp_rank: u32) {
+        self.record_routed_worker(
+            RoutingMetadataKey::PrefillWorkerId.as_str(),
+            RoutingMetadataKey::PrefillDpRank.as_str(),
+            worker_id,
+            dp_rank,
+        );
+    }
+
+    pub(crate) fn record_decode_worker(&self, worker_id: u64, dp_rank: u32) {
+        self.record_routed_worker(
+            RoutingMetadataKey::DecodeWorkerId.as_str(),
+            RoutingMetadataKey::DecodeDpRank.as_str(),
+            worker_id,
+            dp_rank,
+        );
+    }
+
+    /// Snapshot valid routed-worker values for HTTP response headers.
+    pub(crate) fn routed_worker_info(&self) -> Option<WorkerResponseMetadata> {
+        let metadata = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        WorkerResponseMetadata::from_metadata(&metadata)
     }
 
     /// Build the `traceparent` header value. Prefers the engine.generate

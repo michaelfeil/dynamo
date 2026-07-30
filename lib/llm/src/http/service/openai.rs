@@ -45,6 +45,9 @@ use super::{
     service_v2,
 };
 use crate::engines::ValidateRequest;
+use crate::http::service::baseten::{
+    attach_worker_response_headers, take_worker_response_metadata,
+};
 use crate::preprocessor::PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY;
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::nvext::apply_header_routing_overrides;
@@ -69,9 +72,8 @@ use dynamo_protocols::types::Choice;
 use tracing::Instrument;
 
 const X_REQUEST_ID_HEADER: &str = "x-request-id";
-
-// Baseten: context-id construction has moved to `super::b10_context_id`.
-pub(super) use super::b10_context_id::get_or_create_context_id;
+// Baseten: context-id construction lives with the shared Baseten contracts.
+pub(super) use super::baseten::get_or_create_context_id;
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
@@ -613,7 +615,7 @@ async fn completions_single(
         err_response
     })?;
 
-    // capture the context to cancel the stream if the client disconnects
+    let worker_info = take_worker_response_metadata(&request_id);
     let ctx = stream.context();
 
     let annotations = annotations.map_or(Vec::new(), |annotations| {
@@ -669,7 +671,10 @@ async fn completions_single(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        Ok(attach_worker_response_headers(
+            sse_stream.into_response(),
+            worker_info,
+        ))
     } else {
         // Tap the stream to collect metrics for non-streaming requests without altering items
         let mut http_queue_guard = Some(http_queue_guard);
@@ -700,7 +705,10 @@ async fn completions_single(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
-        Ok(Json(response).into_response())
+        Ok(attach_worker_response_headers(
+            Json(response).into_response(),
+            worker_info,
+        ))
     }
 }
 
@@ -1494,7 +1502,7 @@ async fn chat_completions(
         err_response
     })?;
 
-    // capture the context to cancel the stream if the client disconnects
+    let worker_info = take_worker_response_metadata(&request_id);
     let ctx = stream.context();
 
     // prepare any requested annotations
@@ -1578,7 +1586,10 @@ async fn chat_completions(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        Ok(attach_worker_response_headers(
+            sse_stream.into_response(),
+            worker_info,
+        ))
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
         let stream_with_check =
@@ -1623,7 +1634,10 @@ async fn chat_completions(
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
-        Ok(Json(response).into_response())
+        Ok(attach_worker_response_headers(
+            Json(response).into_response(),
+            worker_info,
+        ))
     }
 }
 
@@ -1933,6 +1947,8 @@ async fn responses(
         err_response
     })?;
 
+    let worker_info = take_worker_response_metadata(&request_id);
+
     // Capture the context to cancel the stream if the client disconnects
     let ctx = engine_stream.context();
 
@@ -2022,7 +2038,10 @@ async fn responses(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        Ok(attach_worker_response_headers(
+            sse_stream.into_response(),
+            worker_info,
+        ))
     } else {
         // Non-streaming path: aggregate stream into single response
 
@@ -2080,7 +2099,10 @@ async fn responses(
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
 
-        Ok(Json(response).into_response())
+        Ok(attach_worker_response_headers(
+            Json(response).into_response(),
+            worker_info,
+        ))
     }
 }
 

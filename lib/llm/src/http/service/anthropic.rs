@@ -51,7 +51,9 @@ use crate::request_template::{RequestTemplate, resolve_request_model};
 use crate::types::Annotated;
 
 // Re-use helpers from sibling modules under service/.
-use super::b10_context_id::get_or_create_context_id;
+use super::baseten::{
+    attach_worker_response_headers, get_or_create_context_id, take_worker_response_metadata,
+};
 use super::metadata::extract_metadata_from_http;
 use super::openai::get_body_limit;
 
@@ -361,6 +363,7 @@ async fn anthropic_messages(
         anthropic_error_from_anyhow(e, "Failed to generate completions")
     })?;
 
+    let worker_info = take_worker_response_metadata(&request_id);
     let ctx = engine_stream.context();
 
     // NOTE: We intentionally do NOT apply a reasoning parser here.
@@ -452,7 +455,10 @@ async fn anthropic_messages(
             sse_stream = sse_stream.keep_alive(KeepAlive::default().interval(keep_alive));
         }
 
-        Ok(sse_stream.into_response())
+        Ok(attach_worker_response_headers(
+            sse_stream.into_response(),
+            worker_info,
+        ))
     } else {
         // Non-streaming path: aggregate stream into single response
 
@@ -498,7 +504,10 @@ async fn anthropic_messages(
 
         inflight_guard.mark_ok();
 
-        Ok(Json(response).into_response())
+        Ok(attach_worker_response_headers(
+            Json(response).into_response(),
+            worker_info,
+        ))
     }
 }
 

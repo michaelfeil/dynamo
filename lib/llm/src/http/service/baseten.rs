@@ -1,10 +1,143 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Helpers for building the Baseten context ID from inbound HTTP headers.
+//! Shared Baseten HTTP and request-context contracts.
 
 use axum::http::HeaderMap;
+use axum::response::Response;
 use serde::Deserialize;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{LazyLock, Mutex},
+};
+
+pub const X_BASETEN_DYN_WORKER_ID_HEADER: &str = "x-baseten-dyn-worker-id";
+pub const X_BASETEN_DYN_PREFILL_WORKER_ID_HEADER: &str = "x-baseten-dyn-prefill-worker-id";
+pub const X_BASETEN_DYN_PREFILL_DP_RANK_HEADER: &str = "x-baseten-dyn-prefill-dp-rank";
+pub const X_BASETEN_DYN_DECODE_DP_RANK_HEADER: &str = "x-baseten-dyn-decode-dp-rank";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerResponseMetadata {
+    pub prefill_worker_id: Option<u64>,
+    pub prefill_dp_rank: Option<u32>,
+    pub decode_worker_id: Option<u64>,
+    pub decode_dp_rank: Option<u32>,
+}
+
+impl WorkerResponseMetadata {
+    pub fn from_metadata(metadata: &BTreeMap<String, String>) -> Option<Self> {
+        let parse_u64 = |key: RoutingMetadataKey| {
+            metadata
+                .get(key.as_str())
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        let parse_u32 = |key: RoutingMetadataKey| {
+            metadata
+                .get(key.as_str())
+                .and_then(|value| value.parse::<u32>().ok())
+        };
+        let worker = Self {
+            prefill_worker_id: parse_u64(RoutingMetadataKey::PrefillWorkerId),
+            prefill_dp_rank: parse_u32(RoutingMetadataKey::PrefillDpRank),
+            decode_worker_id: parse_u64(RoutingMetadataKey::DecodeWorkerId),
+            decode_dp_rank: parse_u32(RoutingMetadataKey::DecodeDpRank),
+        };
+        (worker.prefill_worker_id.is_some() || worker.decode_worker_id.is_some()).then_some(worker)
+    }
+}
+
+// The Python HTTP engine has already awaited its first item when this is
+// published. This narrow side channel lets the handler set headers without
+// polling the response stream again or changing the runtime context trait.
+static WORKER_RESPONSE_METADATA: LazyLock<Mutex<HashMap<String, WorkerResponseMetadata>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn publish_worker_response_metadata(context_id: String, metadata: WorkerResponseMetadata) {
+    WORKER_RESPONSE_METADATA
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(context_id.clone(), metadata);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        take_worker_response_metadata(&context_id);
+    });
+}
+
+pub fn take_worker_response_metadata(context_id: &str) -> Option<WorkerResponseMetadata> {
+    WORKER_RESPONSE_METADATA
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(context_id)
+}
+
+pub fn apply_worker_response_headers(headers: &mut HeaderMap, worker: WorkerResponseMetadata) {
+    insert_numeric_header(
+        headers,
+        X_BASETEN_DYN_WORKER_ID_HEADER,
+        worker.decode_worker_id.or(worker.prefill_worker_id),
+    );
+    insert_numeric_header(
+        headers,
+        X_BASETEN_DYN_PREFILL_WORKER_ID_HEADER,
+        worker.prefill_worker_id,
+    );
+    insert_numeric_header(
+        headers,
+        X_BASETEN_DYN_PREFILL_DP_RANK_HEADER,
+        worker.prefill_dp_rank,
+    );
+    insert_numeric_header(
+        headers,
+        X_BASETEN_DYN_DECODE_DP_RANK_HEADER,
+        worker.decode_dp_rank,
+    );
+}
+
+pub fn attach_worker_response_headers(
+    mut response: Response,
+    worker: Option<WorkerResponseMetadata>,
+) -> Response {
+    if let Some(worker) = worker {
+        apply_worker_response_headers(response.headers_mut(), worker);
+    }
+    response
+}
+
+fn insert_numeric_header<T: std::fmt::Display>(
+    headers: &mut HeaderMap,
+    header_name: &'static str,
+    value: Option<T>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    headers.insert(
+        header_name,
+        value
+            .to_string()
+            .parse()
+            .expect("numeric routing metadata is a valid HTTP header value"),
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingMetadataKey {
+    PrefillWorkerId,
+    PrefillDpRank,
+    DecodeWorkerId,
+    DecodeDpRank,
+}
+
+impl RoutingMetadataKey {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrefillWorkerId => "dynamo.routing.prefill_worker_id",
+            Self::PrefillDpRank => "dynamo.routing.prefill_dp_rank",
+            Self::DecodeWorkerId => "dynamo.routing.decode_worker_id",
+            Self::DecodeDpRank => "dynamo.routing.decode_dp_rank",
+        }
+    }
+}
 
 /// JSON body of the `X-Baseten-Customer-Request-Context` header set by SEG.
 /// Field order here is also the order they are appended to the extras segment.
@@ -29,7 +162,7 @@ struct CustomerRequestContext {
 ///
 /// Consumers split on `--` into 3 or 4 parts (the 4th, `extras`, is optional).
 /// org/request/model_version are assumed `--`-free.
-pub(super) fn get_or_create_context_id(headers: &HeaderMap) -> String {
+pub(crate) fn get_or_create_context_id(headers: &HeaderMap) -> String {
     // Prefer the org-namespace header; fall back to the legacy billing-org header
     // (beefeater sets that on the direct BIS route).
     let org_namespace = nonempty_header(headers, "X-Baseten-Org-Namespace")

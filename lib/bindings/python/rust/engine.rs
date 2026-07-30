@@ -208,16 +208,16 @@ where
         //
         // Since we cannot predict the GIL contention, we will always use the blocking task and pay the
         // cost. The Python GIL is the gift that keeps on giving -- performance hits...
-        let stream = tokio::task::spawn_blocking(move || {
+        let (stream, response_context) = tokio::task::spawn_blocking(move || {
             Python::with_gil(|py| {
                 let py_request = pythonize(py, &request)?;
                 let context_id = ctx_python.id().to_string();
 
                 // Create context with trace information
-                let py_ctx = Py::new(
-                    py,
-                    Context::new(ctx_python.clone(), current_trace_context, None, metadata),
-                )?;
+                let py_context =
+                    Context::new(ctx_python.clone(), current_trace_context, None, metadata);
+                let response_context = py_context.clone();
+                let py_ctx = Py::new(py, py_context)?;
 
                 let gen_result = if has_context {
                     // Pass context as a kwarg
@@ -236,10 +236,11 @@ where
                 );
 
                 let locals = TaskLocals::new(event_loop.bind(py).clone());
-                pyo3_async_runtimes::tokio::into_stream_with_locals_v1(
+                let stream = pyo3_async_runtimes::tokio::into_stream_with_locals_v1(
                     locals,
                     gen_result.into_bound(py),
-                )
+                )?;
+                Ok::<_, PyErr>((stream, response_context))
             })
         })
         .await??;
@@ -287,6 +288,15 @@ where
         } else {
             stream
         };
+
+        if self.block_until_stream_item
+            && let Some(worker_info) = response_context.routed_worker_info()
+        {
+            dynamo_llm::http::service::baseten::publish_worker_response_metadata(
+                request_id.clone(),
+                worker_info,
+            );
+        }
 
         tokio::spawn(async move {
             tracing::debug!(
