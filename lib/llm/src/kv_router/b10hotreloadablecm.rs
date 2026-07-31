@@ -26,6 +26,10 @@ const ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX: f64 = 0.9999;
 const DEFAULT_ROUTER_RESIDENCY_EVICTION_COST: f64 = 0.0;
 const DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS: f64 = 120.0;
 const DEFAULT_ROUTER_ACTIVE_REQUEST_ISL_PENALTY_RAMP: (f64, f64) = (2048.0, 32_768.0);
+/// Floor for `router_temperature`. A temperature of 0 breaks exact ties by
+/// `worker_id` (u64); clamping to this tiny floor routes ties through
+/// `softmax_sample` (random) instead.
+const MIN_ROUTER_TEMPERATURE: f64 = 1e-12;
 static LOG_NO_CHANGES: AtomicBool = AtomicBool::new(false);
 static ENGINE_METRICS_TOTAL_KV_BLOCKS_OVERRIDE: std::sync::LazyLock<Arc<AtomicU64>> =
     std::sync::LazyLock::new(|| Arc::new(AtomicU64::new(0)));
@@ -215,10 +219,12 @@ impl Default for B10RoutingConfig {
 }
 
 fn default_router_temperature() -> f64 {
-    std::env::var("KV_ROUTER_TEMPERATURE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.01)
+    sanitize_router_temperature(
+        std::env::var("KV_ROUTER_TEMPERATURE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.01),
+    )
 }
 
 fn default_router_overlap_score_weight() -> f64 {
@@ -350,6 +356,26 @@ fn sanitize_router_residency_half_life(half_life: f64) -> f64 {
         "router_residency_half_life must be finite and > 0, using default"
     );
     DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS
+}
+
+/// Clamp `router_temperature` to `MIN_ROUTER_TEMPERATURE` when it is missing,
+/// zero, negative, or non-finite. This guarantees the selector never takes
+/// the deterministic `temperature == 0.0` branch that breaks ties by
+/// `worker_id` (u64); instead ties go through `softmax_sample`, which breaks
+/// them uniformly at random.
+pub(crate) fn sanitize_router_temperature(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        return value;
+    }
+
+    tracing::error!(
+        configured_temperature = ?value,
+        sanitized_temperature = MIN_ROUTER_TEMPERATURE,
+        "router_temperature must be finite and > 0; clamping to {:e} to avoid \
+         worker_id tie-breaking",
+        MIN_ROUTER_TEMPERATURE
+    );
+    MIN_ROUTER_TEMPERATURE
 }
 
 fn sanitize_engine_metrics_total_kv_blocks_override(value: Option<u64>) -> Option<u64> {
@@ -580,6 +606,7 @@ impl HotReloadableConfig {
             sanitize_router_residency_eviction_cost(routing.router_residency_eviction_cost);
         routing.router_residency_half_life =
             sanitize_router_residency_half_life(routing.router_residency_half_life);
+        routing.router_temperature = sanitize_router_temperature(routing.router_temperature);
         // Build UnifiedConfig with separate routing and runtime configs
         let engine_metrics_total_kv_blocks_override =
             sanitize_engine_metrics_total_kv_blocks_override(
@@ -1158,5 +1185,43 @@ engine_metrics_total_kv_blocks_override: 0
             enable_attention_dp: None,
         };
         assert_eq!(config5.compute_data_parallel_size(), Some(1));
+    }
+
+    #[test]
+    fn test_router_temperature_sanitization() {
+        use std::io::Write;
+
+        // Zero / negative / non-finite all clamp to the floor.
+        assert_eq!(sanitize_router_temperature(0.0), MIN_ROUTER_TEMPERATURE);
+        assert_eq!(sanitize_router_temperature(-1.0), MIN_ROUTER_TEMPERATURE);
+        assert_eq!(
+            sanitize_router_temperature(f64::NAN),
+            MIN_ROUTER_TEMPERATURE
+        );
+        assert_eq!(
+            sanitize_router_temperature(f64::INFINITY),
+            MIN_ROUTER_TEMPERATURE
+        );
+
+        // Positive finite values pass through unchanged.
+        assert_eq!(sanitize_router_temperature(0.01), 0.01);
+        assert_eq!(sanitize_router_temperature(1.0), 1.0);
+        // The floor itself is allowed (it is > 0 and finite).
+        assert_eq!(
+            sanitize_router_temperature(MIN_ROUTER_TEMPERATURE),
+            MIN_ROUTER_TEMPERATURE
+        );
+
+        // A config that explicitly sets temperature to 0 is clamped on load.
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let config_content = r#"
+b10_routing_config:
+  router_temperature: 0.0
+"#;
+        write!(temp_file, "{}", config_content).unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let config = HotReloadableConfig::load_config(&path).unwrap();
+        assert_eq!(config.routing.router_temperature, MIN_ROUTER_TEMPERATURE);
     }
 }

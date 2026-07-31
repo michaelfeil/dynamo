@@ -91,9 +91,14 @@ impl B10WorkerSelector {
     }
 
     /// Check if we should print this loop iteration (rate-limited based on worker count).
-    /// If workers > 5, print at most once every 2000ms, else once every 100ms.
+    /// If workers > 5, print at most once every `B10_KV_ROUTER_SELECTION_LOG_INTERVAL_MS`
+    /// (default 2000ms), else once every 100ms. The interval is read once at first use.
     fn should_print_this_loop(&self, num_workers: usize) -> bool {
-        let log_interval_ms = if num_workers > 5 { 2000 } else { 100 };
+        let log_interval_ms = if num_workers > 5 {
+            selection_log_interval_ms()
+        } else {
+            100
+        };
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -109,6 +114,20 @@ impl B10WorkerSelector {
             .compare_exchange(last_log, now_ms, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     }
+}
+
+/// Throttle interval for the per-worker scoring log when the pool is large
+/// (`workers > 5`). Read once from `B10_KV_ROUTER_SELECTION_LOG_INTERVAL_MS`
+/// and cached for the process lifetime; defaults to 2000ms.
+fn selection_log_interval_ms() -> u64 {
+    static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("B10_KV_ROUTER_SELECTION_LOG_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2000)
+    })
 }
 
 fn mean_active_requests_for_worker<C: WorkerConfigLike>(
@@ -317,11 +336,13 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         let active_request_isl_penalty_ramp = hot_reloadable_config
             .routing
             .router_active_request_isl_penalty_ramp;
-        let temperature = request
-            .router_config_override
-            .as_ref()
-            .and_then(|cfg| cfg.router_temperature)
-            .unwrap_or(hot_reloadable_config.routing.router_temperature);
+        let temperature = b10hotreloadablecm::sanitize_router_temperature(
+            request
+                .router_config_override
+                .as_ref()
+                .and_then(|cfg| cfg.router_temperature)
+                .unwrap_or(hot_reloadable_config.routing.router_temperature),
+        );
 
         let score_worker = |worker: WorkerWithDpRank| -> B10Score {
             score_worker(
@@ -433,20 +454,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
             return Err(KvSchedulerError::NoEndpoints);
         }
 
-        let (best_worker, best_logit) = if temperature == 0.0 {
-            let min_logit = worker_logits
-                .values()
-                .copied()
-                .fold(f64::INFINITY, f64::min);
-            worker_logits
-                .iter()
-                .filter(|(_, logit)| **logit == min_logit)
-                .min_by_key(|(worker, _)| (worker.worker_id, worker.dp_rank))
-                .map(|(worker, logit)| (*worker, *logit))
-                .expect("worker_logits non-empty")
-        } else {
-            softmax_sample(&worker_logits, temperature)
-        };
+        let (best_worker, best_logit) = softmax_sample(&worker_logits, temperature);
         let effective_overlap_blocks = request.effective_overlap_blocks_for(best_worker);
         let cached_tokens = request.effective_cached_tokens_for(best_worker);
 
@@ -710,8 +718,11 @@ mod tests {
     }
 
     #[test]
-    fn zero_temperature_selection_is_deterministic_without_tree_size_tiebreak() {
+    fn zero_temperature_is_floored_and_does_not_tiebreak_by_worker_id() {
         let selector = B10WorkerSelector::new();
+        // All workers identical -> all logits tie. A temperature of 0 is now
+        // floored to 1e-12, so ties go through softmax_sample (uniform random)
+        // instead of the old lowest-worker_id tiebreak.
         let workers = HashMap::from([
             (30, test_worker_config(0, 1)),
             (10, test_worker_config(0, 1)),
@@ -723,11 +734,20 @@ mod tests {
             ..Default::default()
         });
 
-        let result = selector
-            .select_worker(&workers, &request, request.eligibility(), 64)
-            .unwrap();
-
-        assert_eq!(result.worker, WorkerWithDpRank::new(10, 0));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let result = selector
+                .select_worker(&workers, &request, request.eligibility(), 64)
+                .unwrap();
+            seen.insert(result.worker);
+        }
+        // With 3 tied workers over 100 trials, uniform-random tiebreaking must
+        // produce more than one distinct winner. This guards against regressing
+        // back to a deterministic lowest-worker_id (u64) tiebreak.
+        assert!(
+            seen.len() > 1,
+            "temperature=0 should not deterministically pick the lowest worker_id; saw {seen:?}"
+        );
     }
 
     #[test]

@@ -508,6 +508,7 @@ Source commits:
 - `b52a41cb7` kv-router: remove noisy mark_free not-in-tracker log
 - `729a81cd6` kv-router: log cleanup - mark_free info, remove pool utilization, simplify queue-full msg
 - `c9bf0c4ed` fix: Make router active replicas hot configurable (#251)
+- `a75d34383` feat(kv-router): floor router temperature and make B10 log throttle configurable
 
 Purpose:
 
@@ -641,6 +642,17 @@ Heuristic and selector parity note:
   map, so `dynamo-llm` does not need to depend on `rustc-hash` for this path.
 - The zero-temperature selection path stays allocation-free; only the softmax
   sampling path collects entries.
+- `router_temperature` is floored to `1e-12` when set to `0`, negative, or
+  non-finite (sanitized at config load, env default, and the per-request
+  override site). A temperature of `0` previously broke exact logit ties by
+  the lowest `worker_id` (u64), which is endpoint-correlated and caused a
+  self-reinforcing traffic imbalance in multi-endpoint deployments. The floor
+  keeps selection effectively deterministic on the min logit while routing
+  ties through `softmax_sample` (uniform random). The dead `worker_id`
+  tiebreak branch was removed from `B10WorkerSelector`.
+- The per-worker scoring log throttle interval is configurable via
+  `B10_KV_ROUTER_SELECTION_LOG_INTERVAL_MS` (read once via `OnceLock`, default
+  `2000ms`), replacing the hardcoded `2000ms` for pools larger than 5 workers.
 
 Replay notes:
 
