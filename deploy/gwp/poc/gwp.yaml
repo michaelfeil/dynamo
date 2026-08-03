@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+endpoints:
+  master-fast:
+    ingress_url: http://composer-2-5-dyn12v2-mf-debugging-master-fast.dynamo.svc.cluster.local/v1
+    planner_url: http://composer-2-5-dyn12v2-mf-debugging-master-fast-planner.dynamo.svc.cluster.local/deep/health
+
+  kvbm-fast:
+    ingress_url: http://composer-2-5-dyn12v2-mf-debugging-kvbm-fast.dynamo.svc.cluster.local/v1
+    planner_url: http://composer-2-5-dyn12v2-mf-debugging-kvbm-fast-planner.dynamo.svc.cluster.local/deep/health
+
+routes:
+  - models:
+      - composer-2-5
+    endpoints:
+      - master-fast
+      - kvbm-fast
+
+served_alias_model_map:
+  composer-2-5-08-preview: composer-2-5
+  composer-2-5-fast: composer-2-5
+  composer-2-5-alt: composer-2-5
+  composer-2-5-fast-alt: composer-2-5
+
+session:
+  ttl_secs: 600
+  prompt_hash_fallback:
+    token_position: 100000
+  backend:
+    type: etcd
+    endpoints:
+      - http://127.0.0.1:2379
+
+routing:
+  pseudo_stride: 4
+  block_size: 32
+  planner_staleness_grace_secs: 30
+  replica_warmup_secs: 90
+  shutdown_grace_secs: 30
+  approx_indexer_ttl_secs: 120
+
+model_policies:
+  default:
+    affinity: true
+    trie: true
+  models: {}

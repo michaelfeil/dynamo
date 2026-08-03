@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v2
+name: gwp-datastores
+description: Optional shared Redis and etcd services for Dynamo GWP
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

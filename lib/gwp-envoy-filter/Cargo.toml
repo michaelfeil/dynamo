@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-gwp-envoy-filter"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Keep the Proxy-Wasm artifact out of Dynamo's native workspace build. It has
+# its own target and is built by this directory's Dockerfile/build script.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+log = "0.4"
+prost = "0.14.3"
+proxy-wasm = "0.2.5"
+
+[build-dependencies]
+prost-build = "0.14.3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

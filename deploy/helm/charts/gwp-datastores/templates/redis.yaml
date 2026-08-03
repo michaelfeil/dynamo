@@ -1,0 +1,62 @@
+{{/*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- if .Values.redis.enabled }}
+{{- $name := printf "%s-redis" (include "gwp-datastores.fullname" .) }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gwp-datastores.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ $name }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ $name }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "gwp-datastores.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ $name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+    spec:
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          args: [redis-server, --save, "", --appendonly, "no"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            runAsNonRoot: true
+            runAsUser: 999
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: [redis-cli, ping]
+          livenessProbe:
+            exec:
+              command: [redis-cli, ping]
+            initialDelaySeconds: 10
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+{{- end }}

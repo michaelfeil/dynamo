@@ -12,6 +12,7 @@ members = [
     "lib/kv-hashing",
     "lib/mocker",
     "lib/kv-router",
+    "lib/gwp",
     "lib/memory",
     "lib/kvbm-common",
     "lib/kvbm-config",
@@ -52,6 +53,7 @@ dynamo-kv-hashing = { path = "lib/kv-hashing", version = "1.2.0" }
 dynamo-memory = { path = "lib/memory", version = "1.2.0" }
 dynamo-mocker = { path = "lib/mocker", version = "1.2.0" }
 dynamo-kv-router = { path = "lib/kv-router", version = "1.2.0", features = ["metrics", "runtime-protocols"] }
+dynamo-gwp = { path = "lib/gwp", version = "1.2.0" }
 dynamo-protocols = { path = "lib/protocols", version = "1.2.0" }
 dynamo-parsers = { path = "lib/parsers", version = "1.2.0" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.2.0" }
@@ -120,6 +122,12 @@ reqwest = { version = "0.12.24", default-features = false, features = [
     "stream",
     "rustls-tls",
 ] }
+redis = { version = "1.0.4", features = [
+    "tokio-rustls-comp",
+    "tls-rustls-webpki-roots",
+    "connection-manager",
+] }
+rustls = { version = "0.23" }
 rmp-serde = { version = "1" }
 serde_bytes = { version = "0.11" }
 # "rc" is for async-openai. Allows serializing Rc and Arc. Generally avoid doing that.

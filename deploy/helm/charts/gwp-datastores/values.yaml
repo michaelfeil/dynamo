@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+nameOverride: ""
+fullnameOverride: ""
+
+etcd:
+  enabled: true
+  image:
+    repository: gcr.io/etcd-development/etcd
+    tag: v3.6.14
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: 7.4-alpine
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi

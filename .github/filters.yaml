@@ -137,6 +137,7 @@ snapshot:
 
 deploy:
   - *ci
+  - 'deploy/gwp/**'
   - 'deploy/helm/**'
   - 'deploy/utils/**'
   - 'deploy/snapshot/**'

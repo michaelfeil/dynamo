@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package dynamo.gwp.v1;
+
+import "google/protobuf/empty.proto";
+
+// Asynchronous request-lifecycle notifications emitted by Envoy after GWP
+// authorizes and books an inference request.
+service Lifecycle
+{
+  rpc ResponseStarted(ResponseStartedRequest) returns (google.protobuf.Empty);
+  rpc RequestFinished(RequestFinishedRequest) returns (google.protobuf.Empty);
+}
+
+message ResponseStartedRequest
+{
+  string request_id = 1;
+  optional uint64 actual_worker_id = 2;
+  uint32 upstream_status = 3;
+}
+
+message RequestFinishedRequest
+{
+  string request_id = 1;
+  optional string finish_reason = 2;
+}
+
+// Internal envelope used by the Proxy-Wasm shared queue. It deliberately
+// carries the exact public RPC messages so queue and wire encodings cannot
+// drift.
+message QueuedLifecycleEvent
+{
+  oneof event
+  {
+    ResponseStartedRequest response_started = 1;
+    RequestFinishedRequest request_finished = 2;
+  }
+}

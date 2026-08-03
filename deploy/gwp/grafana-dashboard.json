@@ -1,0 +1,3728 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Global Workload Plane traffic, latency, affinity, and scheduler load. GWP-owned totals are summed across replicas; synchronized worker views use max to avoid replica double-counting.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Requests routed by GWP per second, broken down by routed cluster. The axis starts at zero and has no fixed upper bound.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 2,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Routing RPS by Cluster",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of observed upstream responses classified as success.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 2,
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 95
+              },
+              {
+                "color": "green",
+                "value": 99
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "100 * sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\",outcome=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])), 0.000000001)",
+          "legendFormat": "success",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Upstream Success",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Responses classified as overloaded (HTTP 429, 503, or 529).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\",outcome=\"overloaded\"}[$__rate_interval]))",
+          "legendFormat": "overloaded",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Overload RPS",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Locally owned scheduled requests, summed across GWP replicas.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\"})",
+          "instant": false,
+          "legendFormat": "in-flight",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Scheduler In-flight",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Planner-derived live workers by routed cluster. Max is taken per cluster because GWP replicas publish the same synchronized view. The axis starts at zero and has no fixed upper bound.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (routed_endpoint) (dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\"})",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Live Workers by Cluster",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "id": 10,
+      "panels": [],
+      "title": "Traffic and Outcomes",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Routing decisions by selected endpoint.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 5
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Routing RPS by Endpoint",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "success, overloaded (429/503/529), client_error, and upstream_error.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 5
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Upstream Responses by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Non-200 responses release the provisional booking and do not rebook the returned worker.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 5
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (outcome, status) (rate(dynamo_component_gwp_denied_requests_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}} / {{status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Denied Responses by Class and Status",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 13
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (sticky) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "legendFormat": "sticky={{sticky}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Sticky vs Fresh Routing RPS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Provisional worker assignments moved to the worker ID returned by the upstream.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 13
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_rebooked_requests_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Worker Rebooks",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Terminal request lifecycle outcomes, including completion and disconnect paths.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 13
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(dynamo_component_gwp_request_outcomes_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Terminal Request Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      },
+      "id": 20,
+      "panels": [],
+      "title": "Latency",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Time from provisional booking until the first upstream response byte.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Time to First Byte",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "End-to-end time from provisional booking until the request is finally released.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "End-to-End Request Duration",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "id": 30,
+      "panels": [],
+      "title": "Cluster Scheduler Load",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Max per endpoint avoids counting the same planner snapshot once per GWP replica.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 31
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (routed_endpoint) (dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\"})",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Live Workers by Endpoint",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Locally owned requests summed across GWP replicas.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 31
+      },
+      "id": 32,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint) (dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\"})",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight Requests by Endpoint",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Locally owned scheduled requests divided by the endpoint's live-worker count.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 2,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 31
+      },
+      "id": 33,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint) (dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"per_live_worker\"})",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight Requests per Live Worker",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Per workload-plane, total scheduled input tokens stacked into cached and uncached components. Repeated by endpoint so each plane shows its own load broken down.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 39
+      },
+      "id": 34,
+      "repeat": "endpoint",
+      "repeatDirection": "h",
+      "maxPerRow": 3,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (cache_status) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\",cache_status=~\"cached|uncached\"})",
+          "legendFormat": "{{cache_status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight Tokens by Cache Estimate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Approximate cached and uncached scheduled tokens normalized by live workers.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 39
+      },
+      "id": 35,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint, cache_status) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"per_live_worker\",cache_status=~\"cached|uncached\"})",
+          "legendFormat": "{{routed_endpoint}} / {{cache_status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight Tokens per Live Worker",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Locally owned in-flight input tokens estimated to be cache hits by the approximate indexer, broken down by routed cluster and summed across GWP replicas.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 39
+      },
+      "id": 36,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\",cache_status=\"cached\"})",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Estimated Cached Tokens by Cluster",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "id": 40,
+      "panels": [],
+      "title": "Session Affinity",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Affinity lookup results. worker_unavailable and ineligible are expected fall-through paths.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 48
+      },
+      "id": 41,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (backend, outcome) (rate(dynamo_component_gwp_affinity_lookups_total{namespace=~\"$namespace\",backend=~\"$backend\"}[$__rate_interval]))",
+          "legendFormat": "{{backend}} / {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Affinity Lookup Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Returning sessions whose cached worker remained live and eligible.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 48
+      },
+      "id": 42,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "100 * sum(rate(dynamo_component_gwp_affinity_lookups_total{namespace=~\"$namespace\",backend=~\"$backend\",outcome=\"hit\"}[$__rate_interval])) / clamp_min(sum(rate(dynamo_component_gwp_affinity_lookups_total{namespace=~\"$namespace\",backend=~\"$backend\"}[$__rate_interval])), 0.000000001)",
+          "legendFormat": "hit rate",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Affinity Hit Rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Read/write failures talking to the configured session backend.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 48
+      },
+      "id": 43,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (backend, operation) (rate(dynamo_component_gwp_affinity_backend_errors_total{namespace=~\"$namespace\",backend=~\"$backend\"}[$__rate_interval]))",
+          "legendFormat": "{{backend}} / {{operation}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Affinity Backend Errors",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 56
+      },
+      "id": 50,
+      "panels": [],
+      "title": "Worker Scheduler Internals",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Synchronized worker state; max across GWP replicas avoids double-counting.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 57
+      },
+      "id": 51,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (worker_id, dp_rank, worker_type) (dynamo_frontend_worker_active_requests{namespace=~\"$namespace\"})",
+          "legendFormat": "worker={{worker_id}} dp={{dp_rank}} {{worker_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Active Requests by Worker",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Detailed synchronized prefill and decode request load per worker.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 57
+      },
+      "id": 52,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (worker_id, dp_rank) (dynamo_frontend_worker_active_prefill_requests{namespace=~\"$namespace\"})",
+          "legendFormat": "prefill worker={{worker_id}} dp={{dp_rank}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "max by (worker_id, dp_rank) (dynamo_frontend_worker_active_decode_requests{namespace=~\"$namespace\"})",
+          "legendFormat": "decode worker={{worker_id}} dp={{dp_rank}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Prefill and Decode Requests by Worker",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Planner/local scheduler token and KV-block load per worker.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 57
+      },
+      "id": 53,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (worker_id, dp_rank) (dynamo_frontend_worker_active_prefill_tokens{namespace=~\"$namespace\"})",
+          "legendFormat": "prefill tokens worker={{worker_id}} dp={{dp_rank}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "max by (worker_id, dp_rank) (dynamo_frontend_worker_active_decode_blocks{namespace=~\"$namespace\"})",
+          "legendFormat": "decode blocks worker={{worker_id}} dp={{dp_rank}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Worker Token and Block Load",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Replica-local scheduler queues; summed to show deployment-wide pending work.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 65
+      },
+      "id": 54,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (worker_type) (dynamo_frontend_router_queue_pending_requests{namespace=~\"$namespace\"})",
+          "legendFormat": "requests / {{worker_type}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum by (worker_type) (dynamo_frontend_router_queue_pending_isl_tokens{namespace=~\"$namespace\"})",
+          "legendFormat": "ISL tokens / {{worker_type}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Router Queue Depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Admission-control backpressure and requests cancelled before admission.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 65
+      },
+      "id": 55,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (worker_type, reason) (rate(dynamo_frontend_router_queue_backpressure_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "backpressure / {{worker_type}} / {{reason}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum by (worker_type) (rate(dynamo_frontend_router_queue_cancelled_requests_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "cancelled / {{worker_type}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Queue Backpressure and Cancellation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Configured gate thresholds, last measured gate load, and stale-request safety-net expiry.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 65
+      },
+      "id": 56,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "max by (worker_type, gate) (dynamo_frontend_router_queue_gate_threshold_tokens{namespace=~\"$namespace\"})",
+          "legendFormat": "threshold / {{worker_type}} / {{gate}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "max by (worker_type, gate) (dynamo_frontend_router_queue_gate_last_evaluated_tokens{namespace=~\"$namespace\"})",
+          "legendFormat": "evaluated / {{worker_type}} / {{gate}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum by (worker_type) (rate(dynamo_frontend_router_force_expired_requests_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "force-expired/s / {{worker_type}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Queue Gates and Safety Expiry",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 73
+      },
+      "id": 60,
+      "panels": [],
+      "title": "GWP Replica Lifecycle",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Requests currently owned by each GWP process. The total should track the cluster scheduler in-flight total.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 74
+      },
+      "id": 61,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "dynamo_component_gwp_inflight_requests{namespace=~\"$namespace\"}",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight Requests by GWP Replica",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Fresh scheduler selections and sticky session-affinity bookings split by configured endpoint and downstream authority.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 82
+      },
+      "id": 62,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint, downstream_authority, sticky) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "legendFormat": "{{routed_endpoint}} · {{downstream_authority}} · sticky={{sticky}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Sticky vs Fresh Routing by Endpoint and Authority",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Successful routing decisions by the identity source used for affinity, split into Redis/etcd affinity hits and fresh scheduler selections.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 90
+      },
+      "id": 63,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (source, sticky) (rate(dynamo_component_gwp_session_routing_decisions_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "{{source}} · sticky={{sticky}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Sticky vs Fresh Routing by Session Source",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Fresh scheduler selections made after Redis/etcd returned a binding whose worker was no longer live. Each series is a previous cluster → newly selected cluster migration and states whether it stayed on the same cluster, moved, or could not be compared because the binding predates endpoint-aware storage.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 98
+      },
+      "id": 64,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (previous_endpoint, routed_endpoint, cluster_result) (rate(dynamo_component_gwp_affinity_fallback_routings_total{namespace=~\"$namespace\",backend=~\"$backend\",reason=\"worker_unavailable\",routed_endpoint=~\"$endpoint\"}[$__rate_interval]))",
+          "legendFormat": "{{previous_endpoint}} → {{routed_endpoint}} · {{cluster_result}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dead-Worker Session Migration by Cluster",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 106
+      },
+      "id": 70,
+      "panels": [],
+      "title": "KV Cache Locality: Routing Plan vs Worker Execution",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Routing-plan estimate: fraction of locally owned in-flight input tokens that GWP's approximate indexer expected to be cached on its selected worker, broken down by routed cluster. This is not an execution-observed worker cache-hit rate. The axis is fixed at 0–1.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 2,
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 107
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.0.1",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (routed_endpoint) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\",cache_status=\"cached\"}) / clamp_min(sum by (routed_endpoint) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\",cache_status=\"total\"}), 1)",
+          "legendFormat": "{{routed_endpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Indexer-Estimated Cache Hit Ratio by Cluster (Routing Plan)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Execution-observed prefix-cache hit rate reported by each Dynamo engine worker through dynamo_component_kv_cache_hit_rate. The lines summarize the distribution across workers; unlike the adjacent panel, this is not GWP's routing-plan estimate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 2,
+          "max": 1,
+          "min": 0,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 107
+      },
+      "id": 71,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "quantile by (model_name) (0.5, dynamo_component_kv_cache_hit_rate{model_name=~\"$model\"})",
+          "legendFormat": "p50 workers · {{model_name}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "quantile by (model_name) (0.9, dynamo_component_kv_cache_hit_rate{model_name=~\"$model\"})",
+          "legendFormat": "p90 workers · {{model_name}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "topk by (model_name) (1, dynamo_component_kv_cache_hit_rate{model_name=~\"$model\"})",
+          "legendFormat": "best worker {{worker_id}} dp={{dp_rank}} · {{model_name}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Worker-Reported KV Cache Hit Rate (Execution)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 116
+      },
+      "id": 80,
+      "panels": [],
+      "title": "Envoy Client Boundary",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Responses completed at the client-facing Envoy listener, grouped by HTTP status class. This is Envoy's boundary view and includes requests that may not reach GWP. It is intentionally independent of model and routed-endpoint filters.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 0,
+        "y": 117
+      },
+      "id": 81,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (envoy_response_code_class) (rate(envoy_http_downstream_rq_xx{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\"}[$__rate_interval]))",
+          "legendFormat": "HTTP {{envoy_response_code_class}}xx",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(envoy_http_downstream_rq_rx_reset{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\"}[$__rate_interval])) + sum(rate(envoy_http_downstream_rq_tx_reset{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\"}[$__rate_interval]))",
+          "legendFormat": "downstream resets",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Envoy Response Results",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "End-to-end request duration measured by the client-facing Envoy listener, from downstream request arrival through response completion. Envoy reports this histogram in milliseconds; the queries convert it to seconds. Time to first byte remains available in Envoy's structured access logs via RESPONSE_DURATION.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 8,
+        "y": 117
+      },
+      "id": 82,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(envoy_http_downstream_rq_time_bucket{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Envoy End-to-End Response Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Low-cardinality outcomes from Envoy's native ext_authz scheduling filter and Rust Wasm lifecycle adapter. denied is a non-2xx GWP scheduling decision; error is a native transport failure or timeout; invalid is a malformed authorization response. Lifecycle dispatch failures are asynchronous and do not delay the client stream.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 117
+      },
+      "id": 83,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(envoy_http_ext_authz_ok{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\",envoy_ext_authz_prefix=\"gwp_schedule\"}[$__rate_interval]))",
+          "legendFormat": "schedule success",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(envoy_http_ext_authz_denied{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\",envoy_ext_authz_prefix=\"gwp_schedule\"}[$__rate_interval]))",
+          "legendFormat": "schedule denied",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(envoy_http_ext_authz_error{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\",envoy_ext_authz_prefix=\"gwp_schedule\"}[$__rate_interval]))",
+          "legendFormat": "schedule transport error",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(envoy_http_ext_authz_invalid{namespace=~\"$namespace\",envoy_http_conn_manager_prefix=\"gwp_ingress\",envoy_ext_authz_prefix=\"gwp_schedule\"}[$__rate_interval]))",
+          "legendFormat": "invalid schedule response",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(gwp_wasm_lifecycle_dispatched{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "lifecycle dispatched",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(dynamo_component_gwp_lifecycle_reconciliations_total{namespace=~\"$namespace\",outcome=\"response_after_finish\"}[$__rate_interval]))",
+          "legendFormat": "response-started arrived after finish",
+          "range": true,
+          "refId": "F"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(dynamo_component_gwp_lifecycle_reconciliations_total{namespace=~\"$namespace\",outcome=\"response_missing_at_grace\"}[$__rate_interval]))",
+          "legendFormat": "response-started missing at grace",
+          "range": true,
+          "refId": "G"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(gwp_wasm_lifecycle_dispatch_failure{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "lifecycle dispatch failure",
+          "range": true,
+          "refId": "H"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(rate(gwp_wasm_lifecycle_response_failure{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "lifecycle non-OK gRPC response",
+          "range": true,
+          "refId": "I"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum by (method, result) (rate(dynamo_component_gwp_lifecycle_rpc_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "server {{method}} {{result}}",
+          "range": true,
+          "refId": "J"
+        }
+      ],
+      "title": "Envoy GWP Control Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Native Envoy ext_authz filter-state latency for the body-bearing gRPC Check call. This is the external schedule round trip: loopback transport, protobuf body transfer, GWP queueing, affinity lookup, tokenization/selection when needed, booking, and response encoding. The envoy_grpc client does not populate cluster upstream_rq_time, so this panel intentionally uses envoy_gwp_schedule_round_trip_time. Below 20 ms is healthy; 20–100 ms is degraded and above 100 ms warrants investigation.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 20
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 126
+      },
+      "id": 84,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(envoy_gwp_schedule_round_trip_time_bucket{namespace=~\"$namespace\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "total p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(envoy_gwp_schedule_round_trip_time_bucket{namespace=~\"$namespace\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "total p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(envoy_gwp_schedule_round_trip_time_bucket{namespace=~\"$namespace\"}[$__rate_interval]))) / 1000",
+          "legendFormat": "total p99",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le) (rate(dynamo_component_gwp_schedule_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "GWP core p95",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.99, sum by (le) (rate(dynamo_component_gwp_schedule_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "GWP core p99",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.50, sum by (le) (rate(dynamo_component_gwp_schedule_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "GWP core p50",
+          "range": true,
+          "refId": "F"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clamp_min(histogram_quantile(0.99, sum by (le) (rate(envoy_gwp_schedule_round_trip_time_bucket{namespace=~\"$namespace\"}[$__rate_interval]))) / 1000 - 1000 * histogram_quantile(0.99, sum by (le) (rate(dynamo_component_gwp_schedule_service_duration_seconds_bucket{namespace=~\"$namespace\",adapter=\"ext_authz\"}[$__rate_interval]))), 0)",
+          "legendFormat": "proxy/transport residual p99 (approx)",
+          "range": true,
+          "refId": "G"
+        }
+      ],
+      "title": "Envoy → GWP Schedule Round-Trip Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Successful affinity peek latency on the scheduling critical path, measured inside GWP's instrumented backend wrapper. Compare this directly with the adjacent Envoy-observed schedule RTT to identify Redis/etcd contribution. Timeout and bulkhead outcomes remain visible in the affinity error panels.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 126
+      },
+      "id": 85,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.50, sum by (le, backend) (rate(dynamo_component_gwp_affinity_operation_duration_seconds_bucket{namespace=~\"$namespace\",backend=~\"$backend\",operation=\"peek\",result=\"success\"}[$__rate_interval])))",
+          "legendFormat": "p50 · {{backend}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, backend) (rate(dynamo_component_gwp_affinity_operation_duration_seconds_bucket{namespace=~\"$namespace\",backend=~\"$backend\",operation=\"peek\",result=\"success\"}[$__rate_interval])))",
+          "legendFormat": "p95 · {{backend}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.99, sum by (le, backend) (rate(dynamo_component_gwp_affinity_operation_duration_seconds_bucket{namespace=~\"$namespace\",backend=~\"$backend\",operation=\"peek\",result=\"success\"}[$__rate_interval])))",
+          "legendFormat": "p99 · {{backend}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.99, sum by (le, backend, result) (rate(dynamo_component_gwp_affinity_operation_duration_seconds_bucket{namespace=~\"$namespace\",backend=~\"$backend\",operation=\"peek\",result!=\"success\"}[$__rate_interval])))",
+          "legendFormat": "p99 · {{backend}} · {{result}}",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Affinity Store Peek Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Time spent inside GWP converting the OpenAI request into routing tokens. Real includes chat-template rendering and tokenizer execution; pseudo includes routing-text rendering and byte-chunk token generation.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 134
+      },
+      "id": 86,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.50, sum by (le, model, mode, result) (rate(dynamo_component_gwp_tokenization_duration_seconds_bucket{namespace=~\"$namespace\",model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p50 · {{model}} · {{mode}} · {{result}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, model, mode, result) (rate(dynamo_component_gwp_tokenization_duration_seconds_bucket{namespace=~\"$namespace\",model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p95 · {{model}} · {{mode}} · {{result}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.99, sum by (le, model, mode, result) (rate(dynamo_component_gwp_tokenization_duration_seconds_bucket{namespace=~\"$namespace\",model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "p99 · {{model}} · {{mode}} · {{result}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "GWP Tokenization Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Internal GWP schedule latency split by path. optimistic_affinity returns before tokenization, prefix hashing, index lookup, and scheduler booking; synchronous_affinity and scored_selection include those operations.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 142
+      },
+      "id": 87,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.50, sum by (le, path, result) (rate(dynamo_component_gwp_schedule_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p50 · {{path}} · {{result}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, path, result) (rate(dynamo_component_gwp_schedule_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p95 · {{path}} · {{result}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.99, sum by (le, path, result) (rate(dynamo_component_gwp_schedule_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p99 · {{path}} · {{result}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "GWP Schedule Latency by Path",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rates of bounded background-tokenization outcomes. Active jobs use the right axis and should remain at or below four per replica; saturated_fallback means the request used synchronous scheduling instead of entering an unbounded queue.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "reqps"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "active jobs"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 150
+      },
+      "id": 88,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (result) (rate(dynamo_component_gwp_optimistic_tokenization_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "sum(dynamo_component_gwp_optimistic_tokenization_active{namespace=~\"$namespace\"})",
+          "legendFormat": "active jobs",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Optimistic Sticky Scheduling Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Complete GWP control-service time from request arrival through body ingestion, JSON extraction, scheduling, and response encoding. Compare with Envoy schedule RTT to locate proxy/transport overhead. Quantile subtraction in the RTT panel is approximate because histogram observations are not paired.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 20
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 158
+      },
+      "id": 89,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.50, sum by (le, adapter, result) (rate(dynamo_component_gwp_schedule_service_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p50 · {{adapter}} · {{result}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, adapter, result) (rate(dynamo_component_gwp_schedule_service_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p95 · {{adapter}} · {{result}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "1000 * histogram_quantile(0.99, sum by (le, adapter, result) (rate(dynamo_component_gwp_schedule_service_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p99 · {{adapter}} · {{result}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "GWP Complete Schedule Service Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Schedule request body size observed by the native gRPC ext-authz service from the protobuf raw body. Instrumentation does not re-buffer the request body.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 158
+      },
+      "id": 90,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, adapter, result) (rate(dynamo_component_gwp_schedule_request_body_bytes_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p50 · {{adapter}} · {{result}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, adapter, result) (rate(dynamo_component_gwp_schedule_request_body_bytes_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p95 · {{adapter}} · {{result}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le, adapter, result) (rate(dynamo_component_gwp_schedule_request_body_bytes_bucket{namespace=~\"$namespace\"}[$__rate_interval])))",
+          "legendFormat": "p99 · {{adapter}} · {{result}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "GWP Schedule Request Body Size",
+      "type": "timeseries"
+    }
+  ],
+  "preload": false,
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": [
+    "dynamo",
+    "gwp",
+    "routing"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "VM-gla-ny1-prod-1arm",
+          "value": "VM-gla-ny1-prod-1arm"
+        },
+        "label": "Prometheus",
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": false,
+          "text": [
+            "gwp"
+          ],
+          "value": [
+            "gwp"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(dynamo_component_gwp_scheduler_live_workers, namespace)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Namespace",
+        "multi": true,
+        "name": "namespace",
+        "options": [],
+        "query": {
+          "query": "label_values(dynamo_component_gwp_scheduler_live_workers, namespace)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\"}, routed_endpoint)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Endpoint",
+        "multi": true,
+        "name": "endpoint",
+        "options": [],
+        "query": {
+          "query": "label_values(dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\"}, routed_endpoint)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\"}, model)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Model",
+        "multi": true,
+        "name": "model",
+        "options": [],
+        "query": {
+          "query": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\"}, model)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\"}, downstream_authority)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Downstream Authority",
+        "multi": true,
+        "name": "authority",
+        "options": [],
+        "query": {
+          "query": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\"}, downstream_authority)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(dynamo_component_gwp_affinity_lookups_total{namespace=~\"$namespace\"}, backend)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Affinity Backend",
+        "multi": true,
+        "name": "backend",
+        "options": [],
+        "query": {
+          "query": "label_values(dynamo_component_gwp_affinity_lookups_total{namespace=~\"$namespace\"}, backend)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Dynamo Global Workload Plane",
+  "uid": "dynamo-gwp",
+  "version": 1,
+  "weekStart": ""
+}

@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dynamo-gwp
+data:
+  # ETCD_ENDPOINTS configures router-replica discovery. Session affinity below
+  # may independently use etcd or Redis.
+  etcd-endpoints: http://gwp-stores-gwp-datastores-etcd.gwp.svc.cluster.local:2379
+  b10-router.yaml: |
+    b10_routing_config:
+      # Existing prefill-load contribution. Larger values avoid prefill-busy workers.
+      router_overlap_score_weight: 3.5
+      router_decode_block_weight: 1.0
+      router_cache_miss_weight: 0.02
+      router_cache_miss_min_isl: 40000
+      router_prefill_token_discount: 0.35
+      router_decode_token_discount: 0.8
+      router_active_request_weight: 5.0
+      router_temperature: 0.10
+  gwp.yaml: |
+    endpoints:
+      master-fast:
+        ingress_url: http://composer-2-5-dyn12v2-mf-debugging-master-fast.dynamo.svc.cluster.local/v1
+        planner_url: http://composer-2-5-dyn12v2-mf-debugging-master-fast-planner.dynamo.svc.cluster.local/deep/health
+
+      kvbm-fast:
+        ingress_url: http://composer-2-5-dyn12v2-mf-debugging-kvbm-fast.dynamo.svc.cluster.local/v1
+        planner_url: http://composer-2-5-dyn12v2-mf-debugging-kvbm-fast-planner.dynamo.svc.cluster.local/deep/health
+
+      prod-fast:
+        ingress_url: http://composer-2-5-dyn12v2-fast.dynamo.svc.cluster.local/v1
+        planner_url: http://composer-2-5-dyn12v2-fast-planner.dynamo.svc.cluster.local/deep/health
+
+      prod-alt-fast:
+        ingress_url: http://composer-2-5-dyn12v2-alt-fast.dynamo.svc.cluster.local/v1
+        planner_url: http://composer-2-5-dyn12v2-alt-fast-planner.dynamo.svc.cluster.local/deep/health
+
+    routes:
+      - models:
+          - composer-2-5
+        endpoints:
+          - master-fast
+          - kvbm-fast
+          - prod-fast
+          - prod-alt-fast
+
+    served_alias_model_map:
+      composer-2-5-08-preview: composer-2-5
+      composer-2-5-fast: composer-2-5
+      composer-2-5-alt: composer-2-5
+      composer-2-5-fast-alt: composer-2-5
+
+    session:
+      ttl_secs: 1800
+      prompt_hash_fallback:
+        token_position: 100000
+      # Production affinity must always use Redis. Etcd is reserved for
+      # router-replica discovery and must never be configured as this backend.
+      backend:
+        type: redis
+        url: redis://gwp-stores-gwp-datastores-redis.gwp.svc.cluster.local:6379/
+        key_prefix: "gwp:affinity:"
+
+    routing:
+      pseudo_stride: 4
+      block_size: 32
+      planner_staleness_grace_secs: 30
+      replica_warmup_secs: 90
+      shutdown_grace_secs: 30
+      approx_indexer_ttl_secs: 120
+
+    # Hot-reloadable. Per-model entries use canonical names and may override
+    # either stage independently; aliases inherit their canonical policy.
+    model_policies:
+      default:
+        affinity: true
+        trie: true
+      models: {}

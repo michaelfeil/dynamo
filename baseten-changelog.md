@@ -1923,6 +1923,34 @@ and may understate under fractional busy mode (>16 workers); counters are
 absent until first event (no zero-series materialization — use
 `or vector(0)`).
 
+## GWP Control Plane (global-routing)
+
+Status: `keep` — Baseten-specific control plane; not upstream.
+
+Replay unit covering the GWP Envoy data plane and its loopback control API,
+rebased onto `main-v1.2.0`. Native Envoy `ext_authz` owns body buffering and
+the synchronous schedule callout (`/gwp/v1/ext-authz`); a Rust Proxy-Wasm
+module (`lib/gwp-envoy-filter`) dispatches response-started and request-finished
+asynchronously via a VM-root shared queue so neither event blocks the client
+stream. The legacy Lua adapter (`deploy/gwp/poc/gwp.lua`) is retained as a
+fallback but is no longer bundled by the Kustomization.
+
+Core lifecycle (`lib/gwp/src/core.rs`) keeps per-request mutex-protected state;
+optimistic affinity hits defer tokenization and pinned booking into a bounded
+4-job background pool, falling back to synchronous scheduling when saturated.
+Finish-before-response retains the booking until `mark_prefill_completed` runs,
+then frees; a 5 s terminal grace reconciles out-of-order HTTP/2 control calls.
+
+Per-worker `LocalLoadAnchor` (`lib/gwp/src/router.rs`) replaces the
+generation-gated anchor reset so a publication for one endpoint no longer
+resets another's baseline; the reflector polls each endpoint on its own cadence
+(`lib/gwp/src/reflector.rs`). Endpoint ingress URLs must be plaintext `http://`
+ending in `/v1`; `api_key` is ascii-validated (CRLF guard) and, when empty,
+client `authorization` is explicitly removed rather than inherited.
+
+How to replay: copy the lib/gwp-* crates and the design docs.
+
+
 ## Document Guidelines Reminder
 
 Before adding another top-level patch section, check the document guidelines at

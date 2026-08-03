@@ -1,0 +1,342 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+admin:
+  ignore_global_conn_limit: true
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+
+overload_manager:
+  resource_monitors:
+    - name: envoy.resource_monitors.global_downstream_max_connections
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+        max_active_downstream_connections: 10000
+
+static_resources:
+  listeners:
+    # Read-only Prometheus bridge. The full Envoy admin API remains bound to
+    # loopback; this listener exposes only GET /stats/prometheus to scrapers.
+    - name: envoy_metrics
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 9902
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: gwp_metrics_bridge
+                route_config:
+                  name: envoy_metrics
+                  virtual_hosts:
+                    - name: envoy_metrics
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            path: "/stats/prometheus"
+                            headers:
+                              - name: ":method"
+                                string_match:
+                                  exact: "GET"
+                          route:
+                            cluster: envoy_admin
+                            timeout: 2s
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 404
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    - name: gwp_ingress
+      per_connection_buffer_limit_bytes: 52428800
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8080
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: gwp_ingress
+                request_timeout: 0s
+                stream_idle_timeout: 0s
+                generate_request_id: true
+                access_log:
+                  # ext_authz exposes its completed gRPC call latency as
+                  # per-stream filter state. Convert it into an Envoy-native
+                  # histogram so Prometheus observes the real Check round trip
+                  # (cluster upstream_rq_time is not populated by envoy_grpc).
+                  - name: envoy.access_loggers.stats
+                    filter:
+                      extension_filter:
+                        name: envoy.access_loggers.extension_filters.cel
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.filters.cel.v3.ExpressionFilter
+                          expression: 'filter_state["envoy.filters.http.ext_authz"].latency_us >= 0'
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stats.v3.Config
+                      stats_scope:
+                        prefix: gwp_schedule
+                      histograms:
+                        - stat:
+                            name: round_trip_time
+                          unit: Microseconds
+                          value_format: "%FILTER_STATE(envoy.filters.http.ext_authz:FIELD:latency_us)%"
+                  - name: envoy.access_loggers.stdout
+                    # Metrics are the primary happy-path signal. Retain every
+                    # non-2xx/flagged request and a small success sample for
+                    # request-level debugging without logging every stream.
+                    filter:
+                      or_filter:
+                        filters:
+                          - status_code_filter:
+                              comparison:
+                                op: GE
+                                value:
+                                  default_value: 300
+                                  runtime_key: gwp.access_log.minimum_status
+                          - response_flag_filter: {}
+                          - runtime_filter:
+                              runtime_key: gwp.access_log.success_sample
+                              percent_sampled:
+                                numerator: 1
+                                denominator: HUNDRED
+                              use_independent_randomness: true
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        json_format:
+                          log_type: gwp_envoy_access
+                          timestamp: "%START_TIME%"
+                          request_id: "%REQ(X-REQUEST-ID)%"
+                          method: "%REQ(:METHOD)%"
+                          path: "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%"
+                          protocol: "%PROTOCOL%"
+                          model: "%FILTER_STATE(wasm.dynamo.gwp.model:PLAIN)%"
+                          scheduled: "%FILTER_STATE(wasm.dynamo.gwp.scheduled:PLAIN)%"
+                          sticky: "%FILTER_STATE(wasm.dynamo.gwp.sticky:PLAIN)%"
+                          routed_endpoint: "%FILTER_STATE(wasm.dynamo.gwp.endpoint_id:PLAIN)%"
+                          downstream_authority: "%REQ(:AUTHORITY)%"
+                          upstream_host: "%UPSTREAM_HOST%"
+                          actual_worker_id: "%RESP(X-BASETEN-DYN-WORKER-ID)%"
+                          status: "%RESPONSE_CODE%"
+                          response_code_details: "%RESPONSE_CODE_DETAILS%"
+                          response_flags: "%RESPONSE_FLAGS%"
+                          time_to_first_byte_ms: "%RESPONSE_DURATION%"
+                          end_to_end_ms: "%DURATION%"
+                          bytes_received: "%BYTES_RECEIVED%"
+                          bytes_sent: "%BYTES_SENT%"
+                          schedule_round_trip_us: "%FILTER_STATE(envoy.filters.http.ext_authz:FIELD:latency_us)%"
+                          schedule_request_bytes: "%FILTER_STATE(envoy.filters.http.ext_authz:FIELD:bytesSent)%"
+                          schedule_response_bytes: "%FILTER_STATE(envoy.filters.http.ext_authz:FIELD:bytesReceived)%"
+                route_config:
+                  name: gwp_routes
+                  virtual_hosts:
+                    - name: openai
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            path: "/health"
+                          direct_response:
+                            status: 200
+                            body:
+                              inline_string: "ok\n"
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              disabled: true
+                        - match:
+                            path: "/ready"
+                          direct_response:
+                            status: 200
+                            body:
+                              inline_string: "ok\n"
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              disabled: true
+                        - match:
+                            path: "/live"
+                          direct_response:
+                            status: 200
+                            body:
+                              inline_string: "ok\n"
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              disabled: true
+                        - match:
+                            path: "/v1/models"
+                          direct_response:
+                            status: 404
+                            body:
+                              inline_string: |
+                                {"error":"model discovery is not exposed by this ingress"}
+                          response_headers_to_add:
+                            - header:
+                                key: content-type
+                                value: application/json
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_authz:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                              disabled: true
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: workload_planes
+                            timeout: 0s
+                          typed_per_filter_config:
+                            envoy.filters.http.dynamic_forward_proxy:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.PerRouteConfig
+                              host_rewrite_header: x-gwp-authority
+                http_filters:
+                  # Native Envoy owns body buffering and the critical-path
+                  # gRPC Check call. The service returns typed request-header
+                  # mutations after inspecting the complete OpenAI body.
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      stat_prefix: gwp_schedule
+                      emit_filter_state_stats: true
+                      clear_route_cache: true
+                      failure_mode_allow: false
+                      validate_mutations: true
+                      status_on_error:
+                        code: ServiceUnavailable
+                      allowed_headers:
+                        patterns:
+                          - safe_regex:
+                              regex: ".*"
+                      with_request_body:
+                        max_request_bytes: 52428800
+                        allow_partial_message: false
+                        pack_as_bytes: true
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: gwp_schedule_control
+                        timeout: 5s
+                      transport_api_version: V3
+                  # Rust owns response-started and exact stream-finish hooks.
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: dynamo_gwp_lifecycle
+                        root_id: dynamo_gwp_lifecycle
+                        vm_config:
+                          vm_id: dynamo_gwp
+                          runtime: envoy.wasm.runtime.v8
+                          code:
+                            local:
+                              filename: /usr/local/lib/dynamo_gwp_envoy_filter.wasm
+                  - name: envoy.filters.http.dynamic_forward_proxy
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+                      dns_cache_config:
+                        name: workload_plane_dns
+                        dns_lookup_family: V4_ONLY
+                  - name: gwp_internal_header_cleanup
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+                      mutations:
+                        request_mutations:
+                          - remove: x-gwp-authority
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: envoy_admin
+      type: STATIC
+      connect_timeout: 0.250s
+      load_assignment:
+        cluster_name: envoy_admin
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9901
+
+    # Keep body-heavy gRPC scheduling traffic on its own HTTP/2 connection pool.
+    # This gives it uncontaminated byte/connection metrics and prevents
+    # lifecycle notifications from sharing connection-level flow control. The
+    # ext_authz filter-state histogram above owns schedule latency.
+    - name: gwp_schedule_control
+      type: STATIC
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              initial_stream_window_size: 52428800
+              initial_connection_window_size: 52428800
+      load_assignment:
+        cluster_name: gwp_schedule_control
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8091
+
+    # Lifecycle calls carry tiny protobuf messages and are asynchronous. A separate pool
+    # isolates their delivery and response-code metrics from schedule latency.
+    - name: gwp_lifecycle_control
+      type: STATIC
+      connect_timeout: 1s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              initial_stream_window_size: 1048576
+              initial_connection_window_size: 1048576
+      load_assignment:
+        cluster_name: gwp_lifecycle_control
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8091
+
+    - name: workload_planes
+      lb_policy: CLUSTER_PROVIDED
+      connect_timeout: 5s
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 10000
+            max_pending_requests: 10000
+            max_requests: 20000
+            max_retries: 3
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          common_http_protocol_options:
+            max_requests_per_connection: 999
+      upstream_connection_options:
+        tcp_keepalive:
+          keepalive_time: 30
+          keepalive_interval: 10
+          keepalive_probes: 3
+      cluster_type:
+        name: envoy.clusters.dynamic_forward_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+          dns_cache_config:
+            name: workload_plane_dns
+            dns_lookup_family: V4_ONLY

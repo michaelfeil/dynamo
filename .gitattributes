@@ -14,3 +14,13 @@
 # Exclude test data files from linguist language detection
 lib/llm/tests/data/** linguist-vendored
 lib/llm/tests/snapshots/** linguist-vendored
+
+# Tokenizer bundles are immutable third-party model assets. Keep them out of
+# language statistics and do not render their multi-megabyte JSON as source
+# diffs; reviewers should validate bundle provenance and checksums instead.
+lib/gwp/vendored_tokenizers/** linguist-vendored
+lib/gwp/vendored_tokenizers/**/tokenizer.json -diff
+
+# Grafana exports are generated import artifacts. Keep them compact and out of
+# repository language statistics; dashboard behavior is validated by Grafana.
+deploy/gwp/grafana-dashboard.json linguist-generated

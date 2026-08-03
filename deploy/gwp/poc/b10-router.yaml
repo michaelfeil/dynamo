@@ -1,0 +1,16 @@
+# Hot-reloaded B10 worker-selection heuristics. GWP first reconciles delayed
+# planner load with locally observed lifecycle deltas, then scores that merged
+# view with these weights.
+b10_routing_config:
+  # Existing prefill-load contribution. Larger values avoid prefill-busy workers.
+  router_overlap_score_weight: 3.5
+  router_decode_block_weight: 1.0
+  # Absolute cache-miss penalty; short requests below this ISL bypass locality.
+  router_cache_miss_weight: 0.02
+  router_cache_miss_min_isl: 40000
+  # Discounts applied to prefill/decode load as requests progress.
+  router_prefill_token_discount: 0.35
+  router_decode_token_discount: 0.8
+  router_active_request_weight: 5.0
+  # Low temperature for near-deterministic min-cost selection with random tie-breaking.
+  router_temperature: 0.10

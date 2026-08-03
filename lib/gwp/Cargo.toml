@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-gwp"
+description = "Global Workload Plane - multi-cluster, session-aware reverse proxy reusing the KV router"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost"]
+
+[[bin]]
+name = "dynamo-gwp"
+path = "src/main.rs"
+required-features = ["server"]
+
+[features]
+default = []
+# etcd-backed session affinity store (reuses the existing etcd-client
+# workspace dependency).
+etcd = ["dep:etcd-client"]
+# Redis-backed multi-replica session affinity.
+redis = ["dep:redis", "dep:rustls"]
+# Run the Tonic scheduling, lifecycle, and health control plane.
+server = [
+    "dep:envoy-types",
+    "dep:http",
+    "dep:prost",
+    "dep:tonic",
+    "dep:tonic-health",
+    "dep:tonic-prost",
+]
+
+[dependencies]
+# repo
+dynamo-kv-router = { workspace = true }
+dynamo-runtime = { workspace = true }
+dynamo-llm = { path = "../llm", default-features = false }
+
+# workspace
+anyhow = { workspace = true }
+arc-swap = "1"
+async-trait = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+etcd-client = { workspace = true, optional = true }
+envoy-types = { version = "0.7.6", optional = true }
+futures = { workspace = true }
+http = { version = "1", optional = true }
+parking_lot = { workspace = true }
+prometheus = { workspace = true }
+reqwest = { workspace = true }
+redis = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { version = "0.14.5", features = ["transport"], optional = true }
+tonic-health = { version = "0.14.5", optional = true }
+tonic-prost = { version = "0.14.5", optional = true }
+prost = { version = "0.14.3", optional = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+# crate-specific
+basetenkenizer = { version = "0.2.8", default-features = false }
+serde_yaml = "0.9"
+
+[build-dependencies]
+tonic-prost-build = "0.14.5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+tokio-stream = { workspace = true, features = ["net"] }

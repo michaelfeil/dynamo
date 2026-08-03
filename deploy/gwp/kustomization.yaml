@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gwp
+
+resources:
+  - kubernetes/configmap.yaml
+  - kubernetes/deployment.yaml
+  - kubernetes/service.yaml
+  - kubernetes/pdb.yaml
+  - kubernetes/servicemonitor.yaml
+
+configMapGenerator:
+  - name: dynamo-gwp-envoy
+    files:
+      - envoy.yaml=poc/envoy.yaml
+
+images:
+  - name: dynamo-gwp
+    newName: baseten/dynamo-gwp
+    newTag: 9bd877db9-amd64
+  - name: dynamo-gwp-envoy
+    newName: baseten/dynamo-gwp-envoy
+    newTag: 9bd877db9-amd64

@@ -1,0 +1,108 @@
+name: GWP Image Push
+
+run-name: "GWP images @ ${{ inputs.ref || github.ref_name }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit to build. Defaults to the selected branch."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gwp-image-push-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve image tags
+    runs-on: depot-ubuntu-24.04-64
+    outputs:
+      commit_sha: ${{ steps.image-tags.outputs.commit_sha }}
+      gwp_image: ${{ steps.image-tags.outputs.gwp_image }}
+      envoy_image: ${{ steps.image-tags.outputs.envoy_image }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || '' }}
+          fetch-depth: 0
+          filter: blob:none
+          lfs: 'false'
+
+      - name: Resolve immutable image tags
+        id: image-tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          commit_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short HEAD)"
+          image_tag="${short_sha}-amd64"
+
+          echo "commit_sha=${commit_sha}" >> "$GITHUB_OUTPUT"
+          echo "gwp_image=baseten/dynamo-gwp:${image_tag}" >> "$GITHUB_OUTPUT"
+          echo "envoy_image=baseten/dynamo-gwp-envoy:${image_tag}" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    name: Build and push ${{ matrix.name }}
+    needs: resolve
+    runs-on: depot-ubuntu-24.04-64
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: dynamo-gwp
+            dockerfile: lib/gwp/Dockerfile
+            image_output: gwp_image
+          - name: dynamo-gwp-envoy
+            dockerfile: lib/gwp-envoy-filter/Dockerfile
+            image_output: envoy_image
+    steps:
+      - name: Checkout resolved commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.commit_sha }}
+          fetch-depth: 1
+          lfs: 'false'
+
+      - name: Set up Depot builder
+        uses: depot/use-action@v1
+        with:
+          project: ${{ secrets.DEPOT_DYNAMO_CI_PROJECT_ID }}
+          token: ${{ secrets.DEPOT_DYNAMO_CI_PROJECT_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push image
+        shell: bash
+        env:
+          GWP_IMAGE: ${{ needs.resolve.outputs.gwp_image }}
+          ENVOY_IMAGE: ${{ needs.resolve.outputs.envoy_image }}
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.image_output }}" in
+            gwp_image) image="$GWP_IMAGE" ;;
+            envoy_image) image="$ENVOY_IMAGE" ;;
+            *) echo "Unknown image output" >&2; exit 1 ;;
+          esac
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --file "${{ matrix.dockerfile }}" \
+            --tag "$image" \
+            --push \
+            .
+
+          echo "### ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$image\`" >> "$GITHUB_STEP_SUMMARY"
