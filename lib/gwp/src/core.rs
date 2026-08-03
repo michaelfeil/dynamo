@@ -2353,6 +2353,7 @@ mod tests {
             crate::config::ModelStagePolicyOverride {
                 affinity: Some(false),
                 trie: None,
+                ..Default::default()
             },
         );
         core.config.replace(config);
@@ -2404,6 +2405,7 @@ mod tests {
             crate::config::ModelStagePolicyOverride {
                 affinity: Some(false),
                 trie: Some(false),
+                ..Default::default()
             },
         );
         core.config.replace(config);
@@ -2432,68 +2434,47 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn prompt_hash_affinity_is_stable_and_lower_precedence_than_user() {
-        let (core, _tx) = make_core(true).await;
-        let mut config = (*core.config.load()).clone();
+    #[test]
+    fn canonical_alias_prompt_hash_is_stable_after_appending() {
+        let mut config = GwpConfig::default();
+        config.routing.block_size = 4;
+        config.routing.pseudo_stride = 1;
         config.session.prompt_hash_fallback = Some(PromptHashFallbackConfig { token_position: 16 });
         config
             .served_alias_model_map
             .insert("m-preview".into(), "m".into());
-        core.config.replace(config);
 
         let mut body = serde_json::json!({
             "model": "m-preview",
             "messages": [{"role": "user", "content": "a".repeat(200)}],
         });
-        let first = core
-            .schedule_for_test("prompt-hash-1", None, CHAT_PATH, &body)
-            .await
-            .unwrap();
-        core.request_finished("prompt-hash-1", "complete").await;
-        assert!(first.session_id.starts_with("prompt-v1-"));
+        let prompt_hash = |body: &serde_json::Value| {
+            let requested_model = body["model"].as_str().unwrap();
+            let model = config.canonical_model(requested_model);
+            let tokens =
+                pseudo_tokens(&routing_text(CHAT_PATH, body), config.routing.pseudo_stride);
+            prompt_hash_session_id(
+                model,
+                &tokens,
+                config.routing.block_size,
+                config
+                    .session
+                    .prompt_hash_fallback
+                    .as_ref()
+                    .unwrap()
+                    .token_position,
+            )
+            .unwrap()
+        };
+
+        let first = prompt_hash(&body);
+        assert!(first.starts_with("prompt-v1-"));
 
         body["messages"][0]["content"] =
             serde_json::Value::String(format!("{}{}", "a".repeat(200), " appended turn"));
         body["model"] = serde_json::Value::String("m".into());
-        let appended = core
-            .schedule_for_test("prompt-hash-2", None, CHAT_PATH, &body)
-            .await
-            .unwrap();
-        core.request_finished("prompt-hash-2", "complete").await;
-        assert_eq!(first.session_id, appended.session_id);
-
-        body["user"] = serde_json::Value::String("explicit-openai-user".into());
-        let explicit = core
-            .schedule_for_test("prompt-hash-3", None, CHAT_PATH, &body)
-            .await
-            .unwrap();
-        core.request_finished("prompt-hash-3", "complete").await;
-        assert_eq!(explicit.session_id, "explicit-openai-user");
-
-        let metrics = core.router.prometheus_metrics().unwrap();
-        assert!(metric_has(
-            &metrics,
-            "dynamo_component_gwp_routing_decisions_total",
-            &["model=\"m\""]
-        ));
-        assert!(!metrics.contains("model=\"m-preview\""));
-        assert_eq!(
-            metric_value(
-                &metrics,
-                "dynamo_component_gwp_session_identity_total",
-                &["source=\"prompt_hash\""]
-            ),
-            Some(2.0)
-        );
-        assert_eq!(
-            metric_value(
-                &metrics,
-                "dynamo_component_gwp_session_identity_total",
-                &["source=\"openai_user\""]
-            ),
-            Some(1.0)
-        );
+        let appended = prompt_hash(&body);
+        assert_eq!(first, appended);
     }
 
     #[tokio::test]

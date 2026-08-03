@@ -73,9 +73,20 @@ data:
       approx_indexer_ttl_secs: 120
 
     # Hot-reloadable. Per-model entries use canonical names and may override
-    # either stage independently; aliases inherit their canonical policy.
+    # stages and selector weights independently; aliases inherit their
+    # canonical policy. Unset load-balancing terms inherit b10-router.yaml.
     model_policies:
       default:
         affinity: true
         trie: true
+      # models:
+      #   composer-2-5:
+      #     load_balancing:
+      #       planner_weight: 1.0
+      #       local_weight: 1.0
+      #       prefill_weight: 3.5
+      #       decode_weight: 1.0
+      #       active_request_weight: 0.0
+      #       cache_miss_weight: 0.0
+      #       temperature: 0.0
       models: {}

@@ -204,7 +204,7 @@ pub struct TokenizationConfig {
 }
 
 /// Fully resolved request-stage policy for one canonical model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelStagePolicy {
     /// Read and write session affinity bindings.
@@ -213,6 +213,9 @@ pub struct ModelStagePolicy {
     /// successful routes. Generic scheduler active-prefix and load tracking
     /// remain enabled when this is false.
     pub trie: bool,
+    /// Optional per-model selector tuning. Unset fields inherit the
+    /// hot-reloaded process-wide B10 routing configuration.
+    pub load_balancing: LoadBalancingPolicy,
 }
 
 impl Default for ModelStagePolicy {
@@ -220,16 +223,51 @@ impl Default for ModelStagePolicy {
         Self {
             affinity: true,
             trie: true,
+            load_balancing: LoadBalancingPolicy::default(),
+        }
+    }
+}
+
+/// GWP-specific per-model load-source and scoring overrides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoadBalancingPolicy {
+    /// Weight for the delayed, cache-blind planner baseline.
+    pub planner_weight: Option<f64>,
+    /// Weight for current cache-aware local scheduler load, including the
+    /// candidate request's trie-adjusted prefill cost. With both source
+    /// weights at 1, this is applied as a signed delta from the refresh anchor.
+    pub local_weight: Option<f64>,
+    pub prefill_weight: Option<f64>,
+    pub decode_weight: Option<f64>,
+    pub active_request_weight: Option<f64>,
+    pub cache_miss_weight: Option<f64>,
+    pub temperature: Option<f64>,
+}
+
+impl LoadBalancingPolicy {
+    fn merge(self, overrides: Self) -> Self {
+        Self {
+            planner_weight: overrides.planner_weight.or(self.planner_weight),
+            local_weight: overrides.local_weight.or(self.local_weight),
+            prefill_weight: overrides.prefill_weight.or(self.prefill_weight),
+            decode_weight: overrides.decode_weight.or(self.decode_weight),
+            active_request_weight: overrides
+                .active_request_weight
+                .or(self.active_request_weight),
+            cache_miss_weight: overrides.cache_miss_weight.or(self.cache_miss_weight),
+            temperature: overrides.temperature.or(self.temperature),
         }
     }
 }
 
 /// Partial per-model override merged on top of `model_policies.default`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelStagePolicyOverride {
     pub affinity: Option<bool>,
     pub trie: Option<bool>,
+    pub load_balancing: LoadBalancingPolicy,
 }
 
 impl ModelStagePolicyOverride {
@@ -240,11 +278,12 @@ impl ModelStagePolicyOverride {
         if let Some(enabled) = self.trie {
             policy.trie = enabled;
         }
+        policy.load_balancing = policy.load_balancing.merge(self.load_balancing);
         policy
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelPoliciesConfig {
     pub default: ModelStagePolicy,
@@ -491,6 +530,33 @@ impl GwpConfig {
                 routed_models.contains(model.as_str()),
                 "model_policies.models references unrouted canonical model {model}"
             );
+        }
+        for (scope, policy) in std::iter::once((
+            "model_policies.default".to_string(),
+            self.model_policies.default.load_balancing,
+        ))
+        .chain(self.model_policies.models.iter().map(|(model, policy)| {
+            (
+                format!("model_policies.models.{model}"),
+                policy.load_balancing,
+            )
+        })) {
+            for (name, value) in [
+                ("planner_weight", policy.planner_weight),
+                ("local_weight", policy.local_weight),
+                ("prefill_weight", policy.prefill_weight),
+                ("decode_weight", policy.decode_weight),
+                ("active_request_weight", policy.active_request_weight),
+                ("cache_miss_weight", policy.cache_miss_weight),
+                ("temperature", policy.temperature),
+            ] {
+                if let Some(value) = value {
+                    anyhow::ensure!(
+                        value.is_finite() && value >= 0.0,
+                        "{scope}.load_balancing.{name} must be finite and non-negative"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -775,9 +841,13 @@ model_policies:
   default:
     affinity: true
     trie: false
+    load_balancing:
+      planner_weight: 0.75
   models:
     deepseek-v3:
       trie: true
+      load_balancing:
+        local_weight: 1.25
     llama-3-70b:
       affinity: false
 "#;
@@ -825,6 +895,11 @@ model_policies:
             ModelStagePolicy {
                 affinity: true,
                 trie: true,
+                load_balancing: LoadBalancingPolicy {
+                    planner_weight: Some(0.75),
+                    local_weight: Some(1.25),
+                    ..Default::default()
+                },
             }
         );
         assert_eq!(
@@ -832,6 +907,10 @@ model_policies:
             ModelStagePolicy {
                 affinity: false,
                 trie: false,
+                load_balancing: LoadBalancingPolicy {
+                    planner_weight: Some(0.75),
+                    ..Default::default()
+                },
             }
         );
         assert_eq!(

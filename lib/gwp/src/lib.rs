@@ -41,10 +41,11 @@ pub mod router;
 pub mod server;
 pub mod session;
 pub mod tokens;
+mod worker_selector;
 
 pub use config::{
-    ConfigStore, EndpointConfig, EndpointId, GwpConfig, ModelRoute, ModelTokenizationConfig,
-    RoutingConfig, SessionConfig, TokenizationConfig,
+    ConfigStore, EndpointConfig, EndpointId, GwpConfig, LoadBalancingPolicy, ModelRoute,
+    ModelTokenizationConfig, RoutingConfig, SessionConfig, TokenizationConfig,
 };
 pub use identity::EndpointTable;
 pub use router::{GwpRouter, WorkerConfigSender};

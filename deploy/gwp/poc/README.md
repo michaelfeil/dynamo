@@ -76,6 +76,7 @@ curl -fsS http://127.0.0.1:9090/metrics
 curl -fsS 'http://127.0.0.1:9901/stats/prometheus?filter=gwp'
 ```
 
-Edit `gwp.yaml` to exercise endpoint or route hot reload. B10 selector changes
-in `b10-router.yaml` are reloaded independently. Kubernetes manifests and
+Edit `gwp.yaml` to exercise endpoint, route, or per-model load-balancing hot
+reload. Process-wide scoring defaults in `b10-router.yaml` are reloaded
+independently. Kubernetes manifests and
 scraping details live in [`deploy/gwp/kubernetes`](../kubernetes/README.md).

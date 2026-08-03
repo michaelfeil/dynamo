@@ -44,4 +44,7 @@ model_policies:
   default:
     affinity: true
     trie: true
+    # load_balancing:
+    #   planner_weight: 1.0
+    #   local_weight: 1.0
   models: {}

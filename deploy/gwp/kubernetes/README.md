@@ -26,9 +26,10 @@ Edit `configmap.yaml` before deployment:
 4. Declare every external model alias under `routes`.
 5. Add dimensioned endpoint `properties` (for example `region: [us]`) when
    Alyx routing-requirement filtering is needed.
-6. Tune B10 worker scoring in `data.b10-router.yaml`. The overlap weight,
-   prefill/decode discounts, active-request weight, and temperature are
-   hot-reloaded every 15 seconds.
+6. Tune GWP worker scoring defaults in `data.b10-router.yaml`, or override
+   planner/local source weights and scoring terms per canonical model under
+   `model_policies.models.<model>.load_balancing` in `gwp.yaml`. Both files are
+   hot-reloaded.
 
 The ConfigMap name is stable so mounted `gwp.yaml` and `b10-router.yaml`
 updates are hot-reloaded. Changing endpoint and route references in one update

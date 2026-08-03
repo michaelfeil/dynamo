@@ -33,13 +33,10 @@ use std::sync::Arc;
 
 use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
 use dynamo_kv_router::protocols::{
-    RoutingConstraints, TokensWithHashes, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
+    RoutingConstraints, TokensWithHashes, WorkerId, WorkerWithDpRank,
 };
-use dynamo_kv_router::scheduling::{KvSchedulerError, SchedulingRequest};
-use dynamo_kv_router::selector::WorkerSelector;
-use dynamo_llm::entrypoint::RouterSelector;
 use dynamo_llm::kv_router::{
-    ACTIVE_SEQUENCES_SUBJECT, BasetenWorkerSelector, FindBestMatchOutcome, KvRouter,
+    ACTIVE_SEQUENCES_SUBJECT, FindBestMatchOutcome, KvRouter,
     metrics::register_global_metrics_with_component,
 };
 use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
@@ -50,10 +47,15 @@ use dynamo_runtime::distributed::{DiscoveryBackend, DistributedConfig, RequestPl
 use dynamo_runtime::metrics::MetricsHierarchy;
 use dynamo_runtime::storage::kv;
 use dynamo_runtime::{DistributedRuntime, Runtime};
-use parking_lot::RwLock;
 use tokio::sync::watch;
 
-use crate::{config::ModelStagePolicy, metrics::GwpMetrics};
+use crate::{
+    config::ModelStagePolicy,
+    metrics::GwpMetrics,
+    worker_selector::{GwpWorkerSelector, LocalLoadAnchor, SelectionPolicyStore},
+};
+
+pub use crate::worker_selector::{RemoteLoadStore, RemoteWorkerLoad};
 
 /// The sender half of the worker feed. Owned by the reflector: every planner
 /// poll publishes a full `HashMap<WorkerId, ModelRuntimeConfig>` snapshot of
@@ -68,192 +70,6 @@ pub struct RouteSelection {
 
 /// Worker type label used for GWP-tier metrics.
 const GWP_WORKER_TYPE: &str = "decode";
-
-/// Delayed planner ground truth for one worker. The selector combines this
-/// baseline with local load accumulated after the snapshot before delegating
-/// to the configured selector. Production GWP uses `B10WorkerSelector`; the
-/// adapter remains compatible with a code-supplied custom selector.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RemoteWorkerLoad {
-    pub prefill_tokens: usize,
-    pub decode_blocks: usize,
-    pub active_requests: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct RemoteLoadSnapshot {
-    loads: HashMap<WorkerId, RemoteWorkerLoad>,
-    anchors: HashMap<WorkerId, LocalLoadAnchor>,
-}
-
-#[derive(Clone, Default)]
-pub struct RemoteLoadStore {
-    inner: Arc<RwLock<RemoteLoadSnapshot>>,
-}
-
-impl RemoteLoadStore {
-    pub fn replace(&self, loads: HashMap<WorkerId, RemoteWorkerLoad>) {
-        self.replace_refreshed(loads, &HashMap::new());
-    }
-
-    fn replace_refreshed(
-        &self,
-        loads: HashMap<WorkerId, RemoteWorkerLoad>,
-        refreshed_anchors: &HashMap<WorkerId, LocalLoadAnchor>,
-    ) {
-        let mut snapshot = self.inner.write();
-        snapshot
-            .anchors
-            .retain(|worker_id, _| loads.contains_key(worker_id));
-        snapshot
-            .anchors
-            .extend(refreshed_anchors.iter().map(|(id, anchor)| (*id, *anchor)));
-        snapshot.loads = loads;
-    }
-
-    fn snapshot(&self) -> RemoteLoadSnapshot {
-        self.inner.read().clone()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct LocalLoadAnchor {
-    prefill_tokens: usize,
-    decode_blocks: usize,
-    active_requests: usize,
-}
-
-struct GwpWorkerSelector {
-    inner: BasetenWorkerSelector,
-    remote: RemoteLoadStore,
-}
-
-impl GwpWorkerSelector {
-    fn new(config: KvRouterConfig, remote: RemoteLoadStore, selector: RouterSelector) -> Self {
-        Self {
-            inner: BasetenWorkerSelector::new(selector, Some(config), GWP_WORKER_TYPE),
-            remote,
-        }
-    }
-
-    fn scoring_request(&self, request: &SchedulingRequest) -> Option<SchedulingRequest> {
-        let remote = self.remote.snapshot();
-        let locality_enabled = locality_enabled(request);
-        if remote.loads.is_empty() && locality_enabled {
-            return None;
-        }
-
-        let mut decode_blocks = request.decode_blocks.clone();
-        let mut prefill_tokens = request.prefill_tokens.clone();
-        let mut active_requests = request.active_requests.clone();
-        for (worker_id, load) in remote.loads {
-            let worker = WorkerWithDpRank::new(worker_id, 0);
-            let anchor = remote.anchors.get(&worker_id).copied().unwrap_or_default();
-            let local_decode = decode_blocks.get(&worker).copied().unwrap_or_default();
-            let local_prefill = prefill_tokens.get(&worker).copied().unwrap_or_default();
-            let local_requests = active_requests.get(&worker).copied().unwrap_or_default();
-
-            decode_blocks.insert(
-                worker,
-                reconcile_delayed_load(load.decode_blocks, local_decode, anchor.decode_blocks),
-            );
-            prefill_tokens.insert(
-                worker,
-                reconcile_delayed_load(load.prefill_tokens, local_prefill, anchor.prefill_tokens),
-            );
-            active_requests.insert(
-                worker,
-                reconcile_delayed_load(
-                    load.active_requests,
-                    local_requests,
-                    anchor.active_requests,
-                ),
-            );
-        }
-
-        // SchedulingRequest is intentionally not Clone because it may own a
-        // response sender. This view is used only for scoring; booking still
-        // uses the original request.
-        Some(SchedulingRequest {
-            maybe_request_id: request.maybe_request_id.clone(),
-            token_seq: request.token_seq.clone(),
-            isl_tokens: request.isl_tokens,
-            lora_name: request.lora_name.clone(),
-            expected_output_tokens: request.expected_output_tokens,
-            pinned_worker: request.pinned_worker,
-            allowed_worker_ids: request.allowed_worker_ids.clone(),
-            routing_constraints: request.routing_constraints.clone(),
-            router_config_override: request.router_config_override.clone(),
-            track_prefill_tokens: request.track_prefill_tokens,
-            priority_jump: request.priority_jump,
-            priority_load_shed_percent: request.priority_load_shed_percent,
-            do_not_queue: request.do_not_queue,
-            tier_overlap_blocks: if locality_enabled {
-                request.tier_overlap_blocks.clone()
-            } else {
-                Default::default()
-            },
-            effective_overlap_blocks: if locality_enabled {
-                request.effective_overlap_blocks.clone()
-            } else {
-                Default::default()
-            },
-            effective_cached_tokens: if locality_enabled {
-                request.effective_cached_tokens.clone()
-            } else {
-                Default::default()
-            },
-            shared_cache_hits: locality_enabled
-                .then(|| request.shared_cache_hits.clone())
-                .flatten(),
-            decode_blocks,
-            prefill_tokens,
-            active_requests,
-            active_request_isl_stats: request.active_request_isl_stats.clone(),
-            eviction_costs: request.eviction_costs.clone(),
-            update_states: request.update_states,
-            resp_tx: None,
-        })
-    }
-}
-
-fn reconcile_delayed_load(remote: usize, local: usize, anchor: usize) -> usize {
-    remote
-        .saturating_add(local.saturating_sub(anchor))
-        .max(local)
-}
-
-fn locality_enabled(request: &SchedulingRequest) -> bool {
-    // `book` owns this override, making zero overlap credit an unambiguous
-    // GWP-local signal that this model disabled trie scoring. B10 and custom
-    // selectors can inspect locality fields directly, so the scoring view must
-    // remove those fields too.
-    request
-        .router_config_override
-        .as_ref()
-        .and_then(|config| config.overlap_score_credit)
-        != Some(0.0)
-}
-
-impl WorkerSelector<ModelRuntimeConfig> for GwpWorkerSelector {
-    fn select_worker(
-        &self,
-        workers: &HashMap<WorkerId, ModelRuntimeConfig>,
-        request: &SchedulingRequest,
-        eligibility: dynamo_kv_router::scheduling::RoutingEligibility<'_>,
-        block_size: u32,
-    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
-        match self.scoring_request(request) {
-            Some(scored) => {
-                self.inner
-                    .select_worker(workers, &scored, scored.eligibility(), block_size)
-            }
-            None => self
-                .inner
-                .select_worker(workers, request, eligibility, block_size),
-        }
-    }
-}
 
 fn gwp_kv_router_config(ttl_secs: u64) -> KvRouterConfig {
     KvRouterConfig {
@@ -292,6 +108,7 @@ fn gwp_distributed_config() -> DistributedConfig {
 pub struct GwpRouter {
     kv: KvRouter<GwpWorkerSelector>,
     remote_loads: RemoteLoadStore,
+    selection_policies: SelectionPolicyStore,
     metrics: GwpMetrics,
     block_size: u32,
     /// Keeps the shared-discovery runtime (and its cancellation token, which
@@ -307,23 +124,10 @@ impl GwpRouter {
         block_size: u32,
         approx_indexer_ttl_secs: u64,
     ) -> anyhow::Result<(Arc<Self>, WorkerConfigSender)> {
-        Self::new_with_selector(block_size, approx_indexer_ttl_secs, RouterSelector::B10).await
-    }
-
-    /// Build GWP with a code-supplied selector. The production binary uses
-    /// [`RouterSelector::B10`]; embedders can provide
-    /// [`RouterSelector::Custom`] while retaining GWP's delayed planner-load
-    /// reconciliation and replica lifecycle accounting.
-    pub async fn new_with_selector(
-        block_size: u32,
-        approx_indexer_ttl_secs: u64,
-        selector: RouterSelector,
-    ) -> anyhow::Result<(Arc<Self>, WorkerConfigSender)> {
         Self::new_with_distributed_config(
             block_size,
             approx_indexer_ttl_secs,
             gwp_distributed_config(),
-            selector,
         )
         .await
     }
@@ -337,7 +141,6 @@ impl GwpRouter {
             block_size,
             approx_indexer_ttl_secs,
             DistributedConfig::process_local(),
-            RouterSelector::B10,
         )
         .await
     }
@@ -346,7 +149,6 @@ impl GwpRouter {
         block_size: u32,
         approx_indexer_ttl_secs: u64,
         distributed_config: DistributedConfig,
-        router_selector: RouterSelector,
     ) -> anyhow::Result<(Arc<Self>, WorkerConfigSender)> {
         let runtime = Runtime::from_current()?;
         let drt = DistributedRuntime::new(runtime, distributed_config).await?;
@@ -360,8 +162,8 @@ impl GwpRouter {
         let (tx, rx) = watch::channel(HashMap::new());
         let config = gwp_kv_router_config(approx_indexer_ttl_secs);
         let remote_loads = RemoteLoadStore::default();
-        let selector =
-            GwpWorkerSelector::new(config.clone(), remote_loads.clone(), router_selector);
+        let selection_policies = SelectionPolicyStore::default();
+        let selector = GwpWorkerSelector::new(remote_loads.clone(), selection_policies.clone());
 
         let kv = KvRouter::new(
             endpoint,
@@ -382,6 +184,7 @@ impl GwpRouter {
             Arc::new(Self {
                 kv,
                 remote_loads,
+                selection_policies,
                 metrics,
                 block_size,
                 _drt: drt,
@@ -431,8 +234,8 @@ impl GwpRouter {
 
     /// Replace the planner-sourced baseline used by the selector. For workers
     /// refreshed by this planner result, capture the scheduler's local view at
-    /// this exact boundary. Later selections add only local growth after that
-    /// anchor; publications for other endpoints preserve it.
+    /// this exact boundary. Later selections apply the signed local change
+    /// after that anchor; publications for other endpoints preserve it.
     pub async fn replace_remote_loads(
         &self,
         loads: HashMap<WorkerId, RemoteWorkerLoad>,
@@ -524,6 +327,7 @@ impl GwpRouter {
         allowed_worker_ids: Option<std::collections::HashSet<WorkerId>>,
         policy: ModelStagePolicy,
     ) -> anyhow::Result<RouteSelection> {
+        let _policy_guard = self.selection_policies.install(rid, policy.load_balancing);
         let request_override = RouterConfigOverride {
             overlap_score_credit: (!policy.trie).then_some(0.0),
             ..Default::default()
@@ -656,37 +460,6 @@ impl GwpRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dynamo_kv_router::scheduling::{RoutingEligibility, SchedulingRequest, TierOverlapBlocks};
-
-    /// Deliberately consumes cached-token fields directly, like B10 can. This
-    /// catches regressions where zero overlap credit only affects the default
-    /// selector formula but locality still leaks into delegated selectors.
-    struct DirectCacheSelector;
-
-    impl WorkerSelector<ModelRuntimeConfig> for DirectCacheSelector {
-        fn select_worker(
-            &self,
-            _workers: &HashMap<WorkerId, ModelRuntimeConfig>,
-            request: &SchedulingRequest,
-            _eligibility: RoutingEligibility<'_>,
-            block_size: u32,
-        ) -> Result<WorkerSelectionResult, KvSchedulerError> {
-            let (worker, cached_tokens) = request
-                .effective_cached_tokens
-                .iter()
-                .max_by_key(|(_, cached_tokens)| *cached_tokens)
-                .map(|(worker, cached_tokens)| (*worker, *cached_tokens))
-                .filter(|(_, cached_tokens)| *cached_tokens > 0)
-                .unwrap_or((WorkerWithDpRank::from_worker_id(2), 0));
-            Ok(WorkerSelectionResult {
-                worker,
-                required_blocks: request.request_blocks(block_size),
-                effective_overlap_blocks: request.effective_overlap_blocks_for(worker),
-                cached_tokens,
-                dp_strict_rank: false,
-            })
-        }
-    }
 
     #[test]
     fn production_runtime_uses_etcd_discovery_and_zmq() {
@@ -790,6 +563,7 @@ mod tests {
                 ModelStagePolicy {
                     affinity: true,
                     trie: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -806,62 +580,6 @@ mod tests {
         assert!(load.potential_decode_blocks > 0);
 
         router.free("trie-disabled").await;
-    }
-
-    #[test]
-    fn trie_disabled_scrubs_locality_before_delegated_selection() {
-        let selector = GwpWorkerSelector::new(
-            gwp_kv_router_config(120),
-            RemoteLoadStore::default(),
-            RouterSelector::Custom(Arc::new(DirectCacheSelector)),
-        );
-        let workers = HashMap::from([
-            (1, ModelRuntimeConfig::default()),
-            (2, ModelRuntimeConfig::default()),
-        ]);
-        let warm_worker = WorkerWithDpRank::from_worker_id(1);
-        let mut request = SchedulingRequest {
-            maybe_request_id: None,
-            token_seq: None,
-            isl_tokens: 32,
-            lora_name: None,
-            expected_output_tokens: None,
-            pinned_worker: None,
-            allowed_worker_ids: None,
-            routing_constraints: RoutingConstraints::default(),
-            router_config_override: None,
-            track_prefill_tokens: true,
-            priority_jump: 0.0,
-            priority_load_shed_percent: 0,
-            do_not_queue: true,
-            tier_overlap_blocks: TierOverlapBlocks::default(),
-            effective_overlap_blocks: HashMap::from([(warm_worker, 8.0)]),
-            effective_cached_tokens: HashMap::from([(warm_worker, 32)]),
-            shared_cache_hits: None,
-            decode_blocks: Default::default(),
-            prefill_tokens: Default::default(),
-            active_requests: HashMap::new(),
-            active_request_isl_stats: None,
-            eviction_costs: HashMap::new(),
-            update_states: false,
-            resp_tx: None,
-        };
-
-        let enabled = selector
-            .select_worker(&workers, &request, request.eligibility(), 4)
-            .expect("select with locality");
-        assert_eq!(enabled.worker, warm_worker);
-        assert_eq!(enabled.cached_tokens, 32);
-
-        request.router_config_override = Some(RouterConfigOverride {
-            overlap_score_credit: Some(0.0),
-            ..Default::default()
-        });
-        let disabled = selector
-            .select_worker(&workers, &request, request.eligibility(), 4)
-            .expect("select without locality");
-        assert_eq!(disabled.worker, WorkerWithDpRank::from_worker_id(2));
-        assert_eq!(disabled.cached_tokens, 0);
     }
 
     /// Workers fed AFTER construction must become routable (the reflector
@@ -885,77 +603,6 @@ mod tests {
             .expect("pick");
         assert_eq!(picked.worker.worker_id, 7);
         router.free("rid-late").await;
-    }
-
-    #[test]
-    fn delayed_planner_load_is_reconciled_before_b10_selection() {
-        let remote = RemoteLoadStore::default();
-        remote.replace(HashMap::from([(
-            1,
-            RemoteWorkerLoad {
-                decode_blocks: 100,
-                ..Default::default()
-            },
-        )]));
-        let selector =
-            GwpWorkerSelector::new(gwp_kv_router_config(120), remote, RouterSelector::B10);
-        let workers = HashMap::from([
-            (1, ModelRuntimeConfig::default()),
-            (2, ModelRuntimeConfig::default()),
-        ]);
-        let request = SchedulingRequest {
-            maybe_request_id: None,
-            token_seq: None,
-            isl_tokens: 64,
-            lora_name: None,
-            expected_output_tokens: None,
-            pinned_worker: None,
-            allowed_worker_ids: None,
-            routing_constraints: RoutingConstraints::default(),
-            router_config_override: None,
-            track_prefill_tokens: true,
-            priority_jump: 0.0,
-            priority_load_shed_percent: 0,
-            do_not_queue: true,
-            tier_overlap_blocks: TierOverlapBlocks::default(),
-            effective_overlap_blocks: HashMap::new(),
-            effective_cached_tokens: HashMap::new(),
-            shared_cache_hits: None,
-            decode_blocks: Default::default(),
-            prefill_tokens: Default::default(),
-            active_requests: HashMap::new(),
-            active_request_isl_stats: None,
-            eviction_costs: HashMap::new(),
-            update_states: false,
-            resp_tx: None,
-        };
-
-        let selected = selector
-            .select_worker(&workers, &request, request.eligibility(), 64)
-            .expect("select");
-        assert_eq!(
-            selected.worker.worker_id, 2,
-            "remote planner load must steer away from the loaded worker"
-        );
-    }
-
-    #[test]
-    fn delayed_ground_truth_adds_only_post_snapshot_local_growth() {
-        // The local 80 was already present when the planner reported 100, so
-        // it must not be counted twice.
-        assert_eq!(reconcile_delayed_load(100, 80, 80), 100);
-
-        // Forty units arrived after the snapshot and are not in its ground
-        // truth yet.
-        assert_eq!(reconcile_delayed_load(100, 120, 80), 140);
-
-        // Never score below the current local view when the delayed planner
-        // snapshot is lower.
-        assert_eq!(reconcile_delayed_load(20, 80, 80), 80);
-
-        // A local completion does not subtract from the delayed baseline; the
-        // next planner generation will re-anchor it.
-        assert_eq!(reconcile_delayed_load(100, 40, 80), 100);
     }
 
     #[test]

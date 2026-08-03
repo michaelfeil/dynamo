@@ -1,6 +1,7 @@
-# Hot-reloaded B10 worker-selection heuristics. GWP first reconciles delayed
-# planner load with locally observed lifecycle deltas, then scores that merged
-# view with these weights.
+# Hot-reloaded process-wide defaults for GWP worker selection. Per-model
+# `model_policies.*.load_balancing` values override the corresponding scoring
+# terms. GWP blends delayed cache-blind planner load with its cache-aware local
+# scheduler view before applying these weights.
 b10_routing_config:
   # Existing prefill-load contribution. Larger values avoid prefill-busy workers.
   router_overlap_score_weight: 3.5

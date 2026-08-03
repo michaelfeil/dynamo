@@ -328,6 +328,14 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           common_http_protocol_options:
             max_requests_per_connection: 999
+          upstream_http_protocol_options:
+            auto_sni: true
+            auto_san_validation: true
+          # Typed HTTP protocol options require one upstream protocol-selection
+          # mode. This dynamic cluster can contain H1-only and H2-capable
+          # plaintext ingresses, so use their HTTP/1.1 common denominator.
+          explicit_http_config:
+            http_protocol_options: {}
       upstream_connection_options:
         tcp_keepalive:
           keepalive_time: 30

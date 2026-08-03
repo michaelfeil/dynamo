@@ -1271,6 +1271,10 @@ mod tests {
     use crate::test_utils::{NoopSequencePublisher, SimpleWorkerConfig};
     use crate::{DefaultWorkerSelector, WorkerSelector};
 
+    // These tests exercise a process-global hot-reload setting and therefore
+    // must not reset it underneath each other.
+    static DECODE_THRESHOLD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn decay_now() -> Instant {
         Instant::now()
     }
@@ -2917,6 +2921,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_decode_tokens_backpressure_queues_request() {
+        let _threshold_guard = DECODE_THRESHOLD_TEST_LOCK.lock().await;
         let block_size = 16;
         let isl = 512;
         // High prefill threshold so prefill-busy never triggers; isolate decode check.
@@ -2962,6 +2967,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_decode_tokens_backpressure_do_not_queue_rejects() {
+        let _threshold_guard = DECODE_THRESHOLD_TEST_LOCK.lock().await;
         let block_size = 16;
         let isl = 512;
         let (queue, slots) = make_queue(1, block_size, isl, Some(10000.0));
