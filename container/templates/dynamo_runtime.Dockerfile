@@ -143,15 +143,25 @@ RUN --mount=type=bind,from=wheel_builder,source=/usr/local/include,target=/tmp/u
     ldconfig
 USER dynamo
 
-{% if target in ("dev", "local-dev") %}
-# Dev/local-dev: skip dynamo wheel install (users build from source via cargo build + maturin develop).
-# Install NIXL wheel only (pre-built C++ binary, not buildable from source). The nixl
-# wheelhouse copied above is independent of dynamo source, so this layer stays
-# cached when only Rust/Python source changes.
-RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+# Install the NIXL wheels (all targets). The nixl wheelhouse copied above is
+# independent of dynamo source, so this layer stays cached when only
+# Rust/Python source changes. That caching carries real weight: nixl-cu12
+# pulls in torch and the full nvidia-* CUDA library stack (~6 GB), which
+# previously resolved inside the source-dependent dynamo-wheel install below —
+# re-installing and re-pushing a multi-GB layer on every build. Constraints and
+# indexes match the dynamo-wheel install so nothing here can drift its pins.
+RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
+    --mount=type=bind,source=./container/deps/requirements.planner.txt,target=/tmp/requirements.planner.txt \
+    --mount=type=bind,source=./container/deps/requirements.frontend.txt,target=/tmp/requirements.frontend.txt \
+    --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
     export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
-    uv pip install /opt/dynamo/wheelhouse/nixl/nixl*.whl
-{% endif %}
+    uv pip install \
+        --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        --constraint /tmp/requirements.common.txt \
+        --constraint /tmp/requirements.planner.txt \
+        --constraint /tmp/requirements.frontend.txt \
+        /opt/dynamo/wheelhouse/nixl/nixl*.whl
 
 # ===========================================================================
 # Source-DEPENDENT layers (rebuilt when dynamo source / wheels change)
@@ -165,6 +175,9 @@ COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/whe
 # Install dynamo wheels (runtime packages only, no test dependencies).
 # The requirements files ride along as --constraint so this install cannot
 # up/downgrade anything the requirements layer pinned (grpcio/protobuf etc.).
+# The nixl wheels (and their torch/CUDA dependency stack) are already installed
+# in the cached layer above and deliberately NOT re-listed here — re-installing
+# local wheels would duplicate their content into this source-dependent layer.
 # uv handles its own locking for the cache, no need to add sharing=locked
 ARG ENABLE_KVBM
 RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
@@ -179,8 +192,7 @@ RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tm
     --constraint /tmp/requirements.planner.txt \
     --constraint /tmp/requirements.frontend.txt \
     /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
-    /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
-    /opt/dynamo/wheelhouse/nixl/nixl*.whl && \
+    /opt/dynamo/wheelhouse/ai_dynamo*any.whl && \
     if [ "$ENABLE_KVBM" = "true" ]; then \
         KVBM_WHEEL=$(ls /opt/dynamo/wheelhouse/kvbm*.whl 2>/dev/null | head -1); \
         if [ -z "$KVBM_WHEEL" ]; then \

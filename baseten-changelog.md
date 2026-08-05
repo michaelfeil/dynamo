@@ -1652,6 +1652,7 @@ Status: `keep`
 Source commits:
 
 - Current PR: feat: overhaul CI image builds — Depot builders, sccache, multi-arch, runtime target
+- Current PR: ci: keep torch/CUDA in a cached layer, drop resolve-image-tag job (#495)
 
 Purpose:
 
@@ -1668,6 +1669,12 @@ multi-arch). Build-infra only; no runtime behavior changes.
 - lld links Rust; Rust test sources excluded from the docker build context.
 - dynamo_runtime template: environment layers ordered before wheel_builder-
   derived layers; wheel install takes requirements as `--constraint`.
+- dynamo_runtime template: nixl wheels (and their torch/CUDA ~6 GB dependency
+  stack) install in the source-independent section for all targets, keeping
+  that layer cached instead of re-installed/re-pushed on every source change.
+- resolve-image-tag jobs removed from post-merge-build and
+  bis-dynamo-image-push; each job computes the deterministic tag inline with
+  `git rev-parse --short=9` (pinned so shallow/full checkouts agree).
 
 Replay notes:
 

@@ -9,27 +9,15 @@ on:
 permissions:
   contents: read
 
-jobs:
-  resolve-image-tag:
-    outputs:
-      image_tag: ${{ steps.tags.outputs.image_tag }}
-    runs-on: depot-ubuntu-24.04-64
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Resolve image tag
-        id: tags
-        run: |
-          version_base="$(tr -d '[:space:]' < .version-base)"
-          version_base="${version_base#v}"
-          short_sha="$(git rev-parse --short HEAD)"
-          image_tag="baseten/dynamo-test:v${version_base}.dev.${short_sha}-none"
-          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+# The image tag is deterministic from the commit (.version-base + short sha), so
+# every job computes it locally instead of waiting on a shared resolve job — a
+# dedicated job cost a full runner boot (~2.5 min) of serial latency before the
+# builds could start. The sha abbreviation is pinned to 9 hex chars so all jobs
+# agree regardless of checkout depth (git's auto length depends on local object
+# count and would diverge between full and shallow clones).
 
+jobs:
   build-and-push:
-    needs: resolve-image-tag
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +34,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          # Full commit history + tags are required: build.sh derives the version
+          # from `git describe`/`git tag`, and tools/version-stamp.sh counts
+          # commits in `v1.2.0..HEAD`. `filter: blob:none` keeps the whole commit
+          # graph while fetching file blobs lazily, so checkout stays light.
           fetch-depth: 0
+          filter: blob:none
+      - name: Resolve image tag
+        id: tags
+        run: |
+          version_base="$(tr -d '[:space:]' < .version-base)"
+          version_base="${version_base#v}"
+          short_sha="$(git rev-parse --short=9 HEAD)"
+          image_tag="baseten/dynamo-test:v${version_base}.dev.${short_sha}-none"
+          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image tag: ${image_tag}"
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -68,7 +70,7 @@ jobs:
           # (no provenance/SBOM attestation indexes).
           BUILDX_NO_DEFAULT_ATTESTATIONS: 1
         run: |
-          image_tag="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          image_tag="${{ steps.tags.outputs.image_tag }}"
           arch_image_tag="${image_tag}-${{ matrix.arch }}"
 
           # Rust compilation cache: sccache → Depot Cache (WebDAV). Depot-managed
@@ -101,10 +103,22 @@ jobs:
 
   publish-multi-arch-image:
     needs:
-      - resolve-image-tag
       - build-and-push
     runs-on: depot-ubuntu-24.04-64
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        # Depth-1 is enough here: only .version-base and HEAD's sha are needed,
+        # and the abbreviation length is pinned (see note at the top).
+      - name: Resolve image tag
+        id: tags
+        run: |
+          version_base="$(tr -d '[:space:]' < .version-base)"
+          version_base="${version_base#v}"
+          short_sha="$(git rev-parse --short=9 HEAD)"
+          image_tag="baseten/dynamo-test:v${version_base}.dev.${short_sha}-none"
+          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image tag: ${image_tag}"
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -112,7 +126,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
       - name: Create and push multi-arch manifest
         run: |
-          image_tag="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          image_tag="${{ steps.tags.outputs.image_tag }}"
 
           docker buildx imagetools create \
             --tag "${image_tag}" \

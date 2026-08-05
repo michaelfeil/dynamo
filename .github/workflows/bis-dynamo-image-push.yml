@@ -34,35 +34,15 @@ on:
 permissions:
   contents: read
 
-jobs:
-  resolve-image-tag:
-    outputs:
-      image_tag: ${{ steps.tags.outputs.image_tag }}
-    runs-on: depot-ubuntu-24.04-64
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || '' }}
-          # Full history so `git rev-parse --short HEAD` picks the same
-          # abbreviation length as build.sh's full checkout in the build jobs.
-          fetch-depth: 0
-          filter: blob:none
-          lfs: 'false'
-      - name: Resolve image tag
-        id: tags
-        run: |
-          # Mirrors build.sh's default version-stamped tag so downstream
-          # consumers see the same scheme as post-merge builds.
-          version_base="$(tr -d '[:space:]' < .version-base)"
-          version_base="${version_base#v}"
-          short_sha="$(git rev-parse --short HEAD)"
-          image_tag="${{ inputs.image-repo }}:v${version_base}.dev.${short_sha}-none"
-          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
-          echo "Resolved image tag: ${image_tag}"
+# The image tag is deterministic from the commit (.version-base + short sha), so
+# every job computes it locally instead of waiting on a shared resolve job — a
+# dedicated job cost a full runner boot (~2.5 min) of serial latency before the
+# builds could start. The sha abbreviation is pinned to 9 hex chars so all jobs
+# agree regardless of checkout depth (git's auto length depends on local object
+# count and would diverge between full and shallow clones).
 
+jobs:
   build-and-push:
-    needs: resolve-image-tag
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +70,18 @@ jobs:
           # LFS media (test fixtures) are not needed to build the image; skipping the
           # LFS pull removes a large, slow download from every run.
           lfs: 'false'
+
+      - name: Resolve image tag
+        id: tags
+        run: |
+          # Mirrors build.sh's default version-stamped tag so downstream
+          # consumers see the same scheme as post-merge builds.
+          version_base="$(tr -d '[:space:]' < .version-base)"
+          version_base="${version_base#v}"
+          short_sha="$(git rev-parse --short=9 HEAD)"
+          image_tag="${{ inputs.image-repo }}:v${version_base}.dev.${short_sha}-none"
+          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image tag: ${image_tag}"
 
       - name: Set up Depot builder
         # Routes docker buildx builds to Depot's remote builders, whose BuildKit
@@ -122,7 +114,7 @@ jobs:
         run: |
           set -o pipefail
 
-          image_tag="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          image_tag="${{ steps.tags.outputs.image_tag }}"
           arch_image_tag="${image_tag}-${{ matrix.arch }}"
 
           # Layer caching is handled by the Depot builder's persistent BuildKit
@@ -202,10 +194,27 @@ jobs:
 
   publish-multi-arch-image:
     needs:
-      - resolve-image-tag
       - build-and-push
     runs-on: depot-ubuntu-24.04-64
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          # Depth-1 is enough here: only .version-base and HEAD's sha are
+          # needed, and the abbreviation length is pinned (see note at the top).
+          lfs: 'false'
+
+      - name: Resolve image tag
+        id: tags
+        run: |
+          version_base="$(tr -d '[:space:]' < .version-base)"
+          version_base="${version_base#v}"
+          short_sha="$(git rev-parse --short=9 HEAD)"
+          image_tag="${{ inputs.image-repo }}:v${version_base}.dev.${short_sha}-none"
+          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image tag: ${image_tag}"
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -214,7 +223,7 @@ jobs:
 
       - name: Create and push multi-arch manifest
         run: |
-          image_tag="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          image_tag="${{ steps.tags.outputs.image_tag }}"
 
           docker buildx imagetools create \
             --tag "${image_tag}" \
@@ -224,7 +233,7 @@ jobs:
       - name: Publish image-tag artifact
         run: |
           set -euo pipefail
-          image_tag="${{ needs.resolve-image-tag.outputs.image_tag }}"
+          image_tag="${{ steps.tags.outputs.image_tag }}"
           echo -n "${image_tag}" > image-tag.txt
           echo "Resolved image ref: ${image_tag}"
 
