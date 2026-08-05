@@ -1653,6 +1653,7 @@ Source commits:
 
 - Current PR: feat: overhaul CI image builds — Depot builders, sccache, multi-arch, runtime target
 - Current PR: ci: keep torch/CUDA in a cached layer, drop resolve-image-tag job (#495)
+- Current PR: ci: dedupe image-push workflows (post-merge calls bis via workflow_call)
 
 Purpose:
 
@@ -1674,7 +1675,13 @@ multi-arch). Build-infra only; no runtime behavior changes.
   that layer cached instead of re-installed/re-pushed on every source change.
 - resolve-image-tag jobs removed from post-merge-build and
   bis-dynamo-image-push; each job computes the deterministic tag inline with
-  `git rev-parse --short=9` (pinned so shallow/full checkouts agree).
+  `git rev-parse --short=9` (pinned so shallow/full checkouts agree), via the
+  `.github/actions/resolve-image-tag` composite action.
+- post-merge-build.yml is a thin `workflow_call` caller of
+  bis-dynamo-image-push.yml (the pipelines were duplicates); post-merge builds
+  thereby gain the sccache-verification step, S3 sccache fallback, job
+  timeout, lfs skip, and image-tag artifact that previously existed only on
+  the dispatched path.
 
 Replay notes:
 

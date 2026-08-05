@@ -1,0 +1,35 @@
+name: Resolve image tag
+description: >
+  Compute the version-stamped image tag (.version-base + short sha) for
+  framework=none image builds. The tag is deterministic from the commit, so
+  every job computes it locally instead of waiting on a shared resolve job —
+  a dedicated job cost a full runner boot (~2.5 min) of serial latency before
+  the builds could start. The sha abbreviation is pinned to 9 hex chars so all
+  jobs agree regardless of checkout depth (git's auto length depends on local
+  object count and would diverge between full and shallow clones). Requires
+  the repo to be checked out first; depth-1 is sufficient.
+
+inputs:
+  image-repo:
+    description: "Docker Hub repo the tag is prefixed with."
+    required: true
+
+outputs:
+  image_tag:
+    description: "Fully-qualified image tag, e.g. baseten/dynamo-test:v1.2.0.dev.<sha9>-none"
+    value: ${{ steps.tags.outputs.image_tag }}
+
+runs:
+  using: composite
+  steps:
+    - id: tags
+      shell: bash
+      run: |
+        # Mirrors build.sh's default version-stamped tag so downstream
+        # consumers see the same scheme everywhere.
+        version_base="$(tr -d '[:space:]' < .version-base)"
+        version_base="${version_base#v}"
+        short_sha="$(git rev-parse --short=9 HEAD)"
+        image_tag="${{ inputs.image-repo }}:v${version_base}.dev.${short_sha}-none"
+        echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+        echo "Resolved image tag: ${image_tag}"

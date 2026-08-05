@@ -1,13 +1,18 @@
 name: BIS Dynamo Image Push
 
-# Dispatchable build+push of the Dynamo runtime image for the bis-deploy
-# service. The caller passes a branch; the workflow checks it out, builds
-# native amd64 + arm64 images via the repo's standard `container/build.sh
-# --framework none --push` (same structure as post-merge-build.yml), stitches
-# them into a multi-arch manifest list under the version-stamped tag
-# (e.g. baseten/dynamo-test:v1.2.0.dev.<sha>-none), and publishes that exact
-# resolved ref as the `image-tag` artifact. The run-name carries `(prefix=…)`
-# so bis-deploy can correlate the dispatched run.
+# Build+push of the Dynamo runtime image, used two ways:
+#
+#   - workflow_dispatch: bis-deploy dispatches it with a branch; the run-name
+#     carries `(prefix=…)` so bis-deploy can correlate the dispatched run.
+#   - workflow_call: post-merge-build.yml calls it on every push to the main
+#     fork branch — the pipeline (builders, caches, tag scheme) is identical,
+#     so post-merge is just a thin caller instead of a duplicated copy.
+#
+# The workflow checks out the ref (or the triggering commit), builds native
+# amd64 + arm64 images via the repo's standard `container/build.sh --framework
+# none --push`, stitches them into a multi-arch manifest list under the
+# version-stamped tag (e.g. baseten/dynamo-test:v1.2.0.dev.<sha>-none), and
+# publishes that exact resolved ref as the `image-tag` artifact.
 
 run-name: "Dynamo image @ ${{ inputs.ref || github.ref_name }} (prefix=${{ inputs.image-tag-prefix }})"
 
@@ -30,16 +35,23 @@ on:
         description: "Docker Hub repo to push to (matches container/build.sh's tag prefix)."
         type: string
         default: "baseten/dynamo-test"
+  workflow_call:
+    inputs:
+      ref:
+        description: "Branch (or ref) to build; empty builds the triggering commit."
+        type: string
+        default: ""
+      notify-on-failure:
+        description: "Post to #mp-ci-alerts on failure (needs MP_CI_SLACK_WEBHOOK_URL)."
+        type: boolean
+        default: false
+      image-repo:
+        description: "Docker Hub repo to push to (matches container/build.sh's tag prefix)."
+        type: string
+        default: "baseten/dynamo-test"
 
 permissions:
   contents: read
-
-# The image tag is deterministic from the commit (.version-base + short sha), so
-# every job computes it locally instead of waiting on a shared resolve job — a
-# dedicated job cost a full runner boot (~2.5 min) of serial latency before the
-# builds could start. The sha abbreviation is pinned to 9 hex chars so all jobs
-# agree regardless of checkout depth (git's auto length depends on local object
-# count and would diverge between full and shallow clones).
 
 jobs:
   build-and-push:
@@ -73,15 +85,9 @@ jobs:
 
       - name: Resolve image tag
         id: tags
-        run: |
-          # Mirrors build.sh's default version-stamped tag so downstream
-          # consumers see the same scheme as post-merge builds.
-          version_base="$(tr -d '[:space:]' < .version-base)"
-          version_base="${version_base#v}"
-          short_sha="$(git rev-parse --short=9 HEAD)"
-          image_tag="${{ inputs.image-repo }}:v${version_base}.dev.${short_sha}-none"
-          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
-          echo "Resolved image tag: ${image_tag}"
+        uses: ./.github/actions/resolve-image-tag
+        with:
+          image-repo: ${{ inputs.image-repo }}
 
       - name: Set up Depot builder
         # Routes docker buildx builds to Depot's remote builders, whose BuildKit
@@ -151,8 +157,9 @@ jobs:
             echo "::warning title=sccache disabled::No SCCACHE_WEBDAV_TOKEN (Depot runner) or SCCACHE_S3_BUCKET/AWS credentials available — Rust compiles will run uncached."
           fi
 
-          # --no-tag-latest: dispatched builds come from arbitrary refs and must
-          # not move the shared latest-none tag; only the post-merge build does.
+          # --no-tag-latest: builds come from arbitrary refs (dispatch) or the main
+          # fork branch (post-merge); nothing here should move the shared
+          # latest-none tag implicitly.
           # --target runtime: consumers only need the runtime env + /opt/dynamo
           # wheelhouse (the monorepo bis image copies the wheels out); the dev
           # target's tooling stages (~5 min + huge layers) are dead weight here.
@@ -202,18 +209,14 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           # Depth-1 is enough here: only .version-base and HEAD's sha are
-          # needed, and the abbreviation length is pinned (see note at the top).
+          # needed, and the abbreviation length is pinned (see the action).
           lfs: 'false'
 
       - name: Resolve image tag
         id: tags
-        run: |
-          version_base="$(tr -d '[:space:]' < .version-base)"
-          version_base="${version_base#v}"
-          short_sha="$(git rev-parse --short=9 HEAD)"
-          image_tag="${{ inputs.image-repo }}:v${version_base}.dev.${short_sha}-none"
-          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
-          echo "Resolved image tag: ${image_tag}"
+        uses: ./.github/actions/resolve-image-tag
+        with:
+          image-repo: ${{ inputs.image-repo }}
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
