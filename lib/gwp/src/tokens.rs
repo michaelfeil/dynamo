@@ -6,7 +6,9 @@
 //! Pseudo tokenization is the default. A model can explicitly opt into a
 //! startup-loaded `tokenizer.json` plus chat template, which keeps request-path
 //! tokenization local and ensures every request for that model uses one hash
-//! space.
+//! space. A `template_only` policy applies the chat template but still
+//! pseudo-tokenizes the rendered text, keeping the template's effect on prefix
+//! identity without the real tokenizer's cost.
 //!
 //! Tier 3 (pseudo) packs each `stride`-byte chunk of the plain-rendered
 //! conversation into one `u32` (little-endian, zero-padded tail). This is a
@@ -38,6 +40,9 @@ pub enum Tier {
     ExactTemplate,
     /// Real tokenizer on a completions prompt (no chat template).
     TokenizerNoTemplate,
+    /// Chat template rendered, then byte-chunk heuristic on the rendered text.
+    /// Keeps the template's effect on prefix identity without a real tokenizer.
+    TemplatePseudo,
     /// Byte-chunk heuristic (each `stride`-byte chunk -> u32).
     Pseudo,
 }
@@ -46,6 +51,7 @@ impl Tier {
     pub fn mode(self) -> &'static str {
         match self {
             Self::ExactTemplate | Self::TokenizerNoTemplate => "real",
+            Self::TemplatePseudo => "template",
             Self::Pseudo => "pseudo",
         }
     }
@@ -59,7 +65,9 @@ pub struct ApproxTokens {
 }
 
 struct ModelTokenizer {
-    tokenizer: Tokenizer,
+    /// `None` for [`ModelTokenizationConfig::TemplateOnly`]: render the chat
+    /// template but pseudo-tokenize the rendered text instead of encoding it.
+    tokenizer: Option<Tokenizer>,
     renderer: ChatTemplateRenderer,
     add_generation_prompt: bool,
     special_tokens: Map<String, Value>,
@@ -115,30 +123,26 @@ impl TokenizationError {
 impl TokenizerRegistry {
     /// Stable low-cardinality metric label for the configured implementation.
     pub fn mode_for(&self, model: &str) -> &'static str {
-        if self.models.contains_key(model) {
-            "real"
-        } else {
-            "pseudo"
+        match self.models.get(model) {
+            Some(entry) if entry.tokenizer.is_some() => "real",
+            Some(_) => "template",
+            None => "pseudo",
         }
     }
 
-    /// Load every explicitly configured real tokenizer. A broken opt-in is a
-    /// startup error; silently degrading would mix incompatible prefix hashes.
+    /// Load every explicitly configured real or template-only tokenizer. A
+    /// broken opt-in is a startup error; silently degrading would mix
+    /// incompatible prefix hashes.
     pub fn from_config(config: &GwpConfig) -> anyhow::Result<Self> {
         let mut models = HashMap::new();
         for (model, policy) in &config.tokenization.models {
-            let ModelTokenizationConfig::Real { directory } = policy else {
-                continue;
+            let directory = match policy {
+                ModelTokenizationConfig::Real { directory }
+                | ModelTokenizationConfig::TemplateOnly { directory } => directory,
+                ModelTokenizationConfig::Pseudo => continue,
             };
-            let tokenizer_json = directory.join("tokenizer.json");
             let chat_template = directory.join("chat_template.jinja");
             let tokenizer_config = directory.join("tokenizer_config.json");
-            let tokenizer = Tokenizer::from_file(&tokenizer_json).with_context(|| {
-                format!(
-                    "loading tokenizer.json for model {model} from {}",
-                    tokenizer_json.display()
-                )
-            })?;
             let template = std::fs::read_to_string(&chat_template).with_context(|| {
                 format!(
                     "reading chat template for model {model} from {}",
@@ -157,6 +161,19 @@ impl TokenizerRegistry {
                     tokenizer_config.display()
                 )
             })?;
+            let tokenizer = match policy {
+                ModelTokenizationConfig::Real { .. } => {
+                    let tokenizer_json = directory.join("tokenizer.json");
+                    Some(Tokenizer::from_file(&tokenizer_json).with_context(|| {
+                        format!(
+                            "loading tokenizer.json for model {model} from {}",
+                            tokenizer_json.display()
+                        )
+                    })?)
+                }
+                ModelTokenizationConfig::TemplateOnly { .. } => None,
+                ModelTokenizationConfig::Pseudo => unreachable!(),
+            };
             models.insert(
                 model.clone(),
                 ModelTokenizer {
@@ -196,23 +213,32 @@ impl TokenizerRegistry {
                 .renderer
                 .render(messages, options)
                 .map_err(|error| TokenizationError::new(model, error))?;
-            (
-                real.tokenizer
-                    .encode(&rendered)
-                    .map_err(|error| TokenizationError::new(model, error))?,
-                Tier::ExactTemplate,
-            )
+            match &real.tokenizer {
+                Some(tokenizer) => (
+                    tokenizer
+                        .encode(&rendered)
+                        .map_err(|error| TokenizationError::new(model, error))?,
+                    Tier::ExactTemplate,
+                ),
+                None => (
+                    pseudo_tokens(&rendered, pseudo_stride),
+                    Tier::TemplatePseudo,
+                ),
+            }
         } else {
             let prompt = body
                 .get("prompt")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            (
-                real.tokenizer
-                    .encode(prompt)
-                    .map_err(|error| TokenizationError::new(model, error))?,
-                Tier::TokenizerNoTemplate,
-            )
+            match &real.tokenizer {
+                Some(tokenizer) => (
+                    tokenizer
+                        .encode(prompt)
+                        .map_err(|error| TokenizationError::new(model, error))?,
+                    Tier::TokenizerNoTemplate,
+                ),
+                None => (pseudo_tokens(prompt, pseudo_stride), Tier::TemplatePseudo),
+            }
         };
 
         Ok(ApproxTokens {
@@ -511,5 +537,70 @@ mod tests {
             )
             .expect("pseudo fallback");
         assert_eq!(unknown.tier, Tier::Pseudo);
+    }
+
+    #[test]
+    fn template_only_renders_chat_template_but_pseudo_tokenizes() {
+        let mut config = GwpConfig::default();
+        config.tokenization.models.insert(
+            "glm-5.2".to_string(),
+            ModelTokenizationConfig::TemplateOnly {
+                directory: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("vendored_tokenizers/glm5.2"),
+            },
+        );
+        let registry = TokenizerRegistry::from_config(&config).expect("load template-only bundle");
+        assert_eq!(registry.mode_for("glm-5.2"), "template");
+
+        let chat = registry
+            .tokenize(
+                "glm-5.2",
+                "/v1/chat/completions",
+                &json!({
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "enable_thinking": false
+                }),
+                4,
+            )
+            .expect("tokenize chat");
+        assert_eq!(chat.tier, Tier::TemplatePseudo);
+
+        // The chat template wraps the message with control tokens, so the
+        // rendered text is longer than the plain `role:content` rendering and
+        // produces more byte-chunk tokens than the bare pseudo path would.
+        let plain = pseudo_tokens(
+            &routing_text(
+                "/v1/chat/completions",
+                &json!({"messages": [{"role": "user", "content": "hello"}]}),
+            ),
+            4,
+        );
+        assert!(
+            chat.tokens.len() > plain.len(),
+            "template rendering must contribute the chat template's control tokens"
+        );
+
+        let completion = registry
+            .tokenize(
+                "glm-5.2",
+                "/v1/completions",
+                &json!({"model": "glm-5.2", "prompt": "hello"}),
+                4,
+            )
+            .expect("tokenize completion");
+        assert_eq!(completion.tier, Tier::TemplatePseudo);
+        assert!(!completion.tokens.is_empty());
+
+        let unknown = registry
+            .tokenize(
+                "not-configured",
+                "/v1/chat/completions",
+                &json!({"messages": [{"role": "user", "content": "hello"}]}),
+                4,
+            )
+            .unwrap();
+        assert_eq!(unknown.tier, Tier::Pseudo);
+        assert_eq!(registry.mode_for("not-configured"), "pseudo");
     }
 }

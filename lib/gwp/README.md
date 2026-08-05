@@ -37,5 +37,17 @@ docker build -f lib/gwp/Dockerfile -t dynamo-gwp:dev .
 
 Pseudo tokenization is the default. A real tokenizer bundle is a directory
 containing `tokenizer.json`, `chat_template.jinja`, and
-`tokenizer_config.json`. Tokenizer selection and affinity backend selection
-are startup configuration because they define stable routing identities.
+`tokenizer_config.json`. A `template_only` policy loads only
+`chat_template.jinja` and `tokenizer_config.json` — it renders the chat
+template for chat-completions but pseudo-tokenizes the rendered text, keeping
+the template's effect on prefix identity without the real tokenizer's startup
+and per-request cost. Tokenizer selection and affinity backend selection are
+startup configuration because they define stable routing identities.
+
+```yaml
+tokenization:
+  models:
+    glm-5.2:
+      mode: template_only
+      directory: /workspace/lib/gwp/vendored_tokenizers/glm5.2
+```

@@ -193,6 +193,13 @@ pub enum ModelTokenizationConfig {
     /// Load `tokenizer.json`, `chat_template.jinja`, and
     /// `tokenizer_config.json` from one portable model bundle.
     Real { directory: PathBuf },
+    /// Render `chat_template.jinja` (for chat-completions) but tokenize the
+    /// rendered text with the cheap pseudo byte-chunk heuristic instead of a
+    /// real tokenizer. Loads `chat_template.jinja` and
+    /// `tokenizer_config.json`; `tokenizer.json` is not required. This keeps
+    /// the chat template's effect on prefix identity without paying the real
+    /// tokenizer's startup and per-request cost.
+    TemplateOnly { directory: PathBuf },
 }
 
 /// Per-model tokenization settings. Models absent from this map use pseudo
@@ -510,7 +517,9 @@ impl GwpConfig {
                 !self.served_alias_model_map.contains_key(model),
                 "tokenization.models must use canonical model names; {model} is an alias"
             );
-            if let ModelTokenizationConfig::Real { directory } = tokenization {
+            if let ModelTokenizationConfig::Real { directory }
+            | ModelTokenizationConfig::TemplateOnly { directory } = tokenization
+            {
                 anyhow::ensure!(
                     !directory.as_os_str().is_empty(),
                     "tokenization.models.{model}.directory must not be empty"
