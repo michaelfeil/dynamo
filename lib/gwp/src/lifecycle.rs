@@ -4,9 +4,10 @@
 //! Process lifecycle and readiness state.
 //!
 //! Liveness only means that the gRPC server can make progress. Readiness is stricter:
-//! the reflector must have completed a planner reconciliation, every configured
-//! route must have a live endpoint, at least one worker must be routable, and a
-//! joining replica must have observed the configured peer warm-up window.
+//! the topology pipeline must have published an initial snapshot, at least one worker
+//! must be routable, and a joining replica must have observed the configured peer
+//! warm-up window. Individual model availability is enforced when scheduling so one
+//! unavailable model cannot remove the whole GWP replica from service.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,15 +17,14 @@ use tokio::sync::watch;
 
 #[derive(Debug)]
 struct State {
-    planner_reconciled: bool,
+    topology_reconciled: bool,
     routable_workers: usize,
-    configured_routes_covered: bool,
     peer_replicas_at_startup: usize,
     peer_warmup_until: Option<tokio::time::Instant>,
     draining: bool,
 }
 
-/// Shared lifecycle state used by the reflector, gRPC probes, and shutdown
+/// Shared lifecycle state used by the topology controller, gRPC probes, and shutdown
 /// coordinator.
 #[derive(Clone, Debug)]
 pub struct Lifecycle {
@@ -39,9 +39,8 @@ pub struct HealthReport {
     pub live: bool,
     pub phase: &'static str,
     pub reason: &'static str,
-    pub planner_reconciled: bool,
+    pub topology_reconciled: bool,
     pub routable_workers: usize,
-    pub configured_routes_covered: bool,
     pub peer_replicas_at_startup: usize,
     pub peer_warmup_remaining_secs: u64,
     pub draining: bool,
@@ -55,9 +54,8 @@ impl Lifecycle {
             .then(|| tokio::time::Instant::now() + peer_warmup);
         Self {
             inner: Arc::new(RwLock::new(State {
-                planner_reconciled: false,
+                topology_reconciled: false,
                 routable_workers: 0,
-                configured_routes_covered: false,
                 peer_replicas_at_startup: peer_replicas,
                 peer_warmup_until,
                 draining: false,
@@ -70,17 +68,16 @@ impl Lifecycle {
     #[cfg(test)]
     pub(crate) fn ready_for_tests() -> Self {
         let lifecycle = Self::starting(0, Duration::ZERO);
-        lifecycle.update_routing(1, true);
+        lifecycle.update_routing(1);
         lifecycle
     }
 
-    /// Publish the result of a complete reflector cycle.
-    pub fn update_routing(&self, routable_workers: usize, configured_routes_covered: bool) {
+    /// Publish one complete topology generation.
+    pub fn update_routing(&self, routable_workers: usize) {
         {
             let mut state = self.inner.write();
-            state.planner_reconciled = true;
+            state.topology_reconciled = true;
             state.routable_workers = routable_workers;
-            state.configured_routes_covered = configured_routes_covered;
         }
         self.notify_changed();
     }
@@ -132,15 +129,10 @@ impl Lifecycle {
 
         let (phase, reason) = if state.draining {
             ("draining", "process is draining existing requests")
-        } else if !state.planner_reconciled {
-            ("starting", "waiting for initial planner reconciliation")
+        } else if !state.topology_reconciled {
+            ("starting", "waiting for initial topology snapshot")
         } else if state.routable_workers == 0 {
-            ("not_ready", "no planner-observed worker is routable")
-        } else if !state.configured_routes_covered {
-            (
-                "not_ready",
-                "one or more configured routes have no live endpoint",
-            )
+            ("not_ready", "no topology worker is routable")
         } else if warmup_remaining_secs > 0 {
             (
                 "warming",
@@ -156,9 +148,8 @@ impl Lifecycle {
             live: true,
             phase,
             reason,
-            planner_reconciled: state.planner_reconciled,
+            topology_reconciled: state.topology_reconciled,
             routable_workers: state.routable_workers,
-            configured_routes_covered: state.configured_routes_covered,
             peer_replicas_at_startup: state.peer_replicas_at_startup,
             peer_warmup_remaining_secs: warmup_remaining_secs,
             draining: state.draining,
@@ -171,11 +162,11 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn readiness_requires_reconciliation_route_coverage_and_warmup() {
+    async fn readiness_requires_reconciliation_a_worker_and_warmup() {
         let lifecycle = Lifecycle::starting(2, Duration::from_secs(90));
         assert_eq!(lifecycle.report().phase, "starting");
 
-        lifecycle.update_routing(4, true);
+        lifecycle.update_routing(4);
         let warming = lifecycle.report();
         assert_eq!(warming.phase, "warming");
         assert_eq!(warming.peer_warmup_remaining_secs, 90);
@@ -185,9 +176,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(lifecycle.is_ready());
 
-        lifecycle.update_routing(4, false);
-        assert_eq!(lifecycle.report().phase, "not_ready");
-        lifecycle.update_routing(0, true);
+        lifecycle.update_routing(0);
         assert_eq!(lifecycle.report().phase, "not_ready");
     }
 

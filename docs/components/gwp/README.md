@@ -261,8 +261,9 @@ GWP balances a non-sticky request in five stages:
 3. Honor a shared affinity binding when that worker's endpoint is still live
    and model-eligible.
 4. Otherwise, run the existing Dynamo selector using the replica-local
-   approximate prefix index, planner-observed baseline load, and GWP in-flight
-   load synchronized across replicas.
+   approximate prefix index, topology-provider observed baseline load, and GWP
+   in-flight load synchronized across replicas. The current provider obtains
+   the observed baseline from planners.
 5. Forward to the selected ingress, whose local Dynamo router chooses the
    internal worker. On a successful response,
    `x-baseten-dyn-worker-id` identifies the actual worker.

@@ -45,20 +45,20 @@ async fn main() -> anyhow::Result<()> {
         .add_service(built.health_service)
         .serve_with_shutdown(grpc_address, async move { grpc_graceful.cancelled().await });
     tokio::pin!(grpc_served);
-    let mut reflector_handle = built.reflector_handle;
+    let mut topology_handle = built.topology_handle;
 
     let result = tokio::select! {
         grpc_served = &mut grpc_served => {
             server_shutdown.cancel();
             grpc_served.map_err(anyhow::Error::from)
         },
-        _ = &mut reflector_handle => {
-            tracing::error!("reflector loop exited unexpectedly");
+        _ = &mut topology_handle => {
+            tracing::error!("topology pipeline exited unexpectedly");
             built.lifecycle.begin_draining();
-            built.core.force_finish_all("reflector_exit").await;
+            built.core.force_finish_all("topology_exit").await;
             server_shutdown.cancel();
             (&mut grpc_served).await.map_err(anyhow::Error::from)?;
-            anyhow::bail!("reflector loop exited unexpectedly")
+            anyhow::bail!("topology pipeline exited unexpectedly")
         },
     };
 

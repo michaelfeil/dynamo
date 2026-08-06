@@ -67,25 +67,33 @@ All replicas must reach:
 
 - etcd on its client port;
 - every configured ingress and planner URL;
-- every other GWP pod on dynamically allocated TCP ports used by direct ZMQ
-  publisher/subscriber synchronization.
+- when `DYN_EVENT_PLANE=zmq`, every other GWP pod on dynamically allocated TCP
+  ports used by direct publisher/subscriber synchronization;
+- when `DYN_EVENT_PLANE=nats`, the configured `NATS_SERVER` on its client port.
 
 If a NetworkPolicy is present, allow pod-to-pod TCP between pods labeled
 `app.kubernetes.io/name=dynamo-gwp`. The Service is not used for ZMQ because
 each publisher advertises its own pod address through etcd.
 
-The rolling update keeps one replica available, readiness waits for configured
-route coverage and replica warm-up, and the 45-second pod termination grace
-exceeds GWP's 30-second scheduler drain window.
+The checked-in ConfigMap defaults to direct ZMQ. Set its `event-plane` value to
+`nats` to move replica lifecycle events to NATS Core pub-sub; etcd remains the
+membership/discovery plane in either mode. The request plane remains TCP.
+
+The rolling update keeps one replica available. Readiness waits for an initial
+topology with at least one routable worker and for replica warm-up; an individual
+model without workers fails at scheduling time without removing the whole GWP
+replica from service. The 45-second pod termination grace exceeds GWP's
+30-second scheduler drain window.
 
 ## Optional development datastores
 
 For a self-contained development or proof-of-concept deployment, the
 [`gwp-datastores`](../../helm/charts/gwp-datastores/README.md) Helm chart
-installs one shared Redis and one shared etcd instance. These are separate
-cluster services rather than per-GWP sidecars. The chart is intentionally
-single-replica and ephemeral; use managed, highly available services in
-production.
+installs one shared Redis, etcd, and NATS instance. These are separate cluster
+services rather than per-GWP sidecars. NATS is available for consumers that are
+explicitly configured to use it; installing the chart does not replace GWP's
+ZMQ event plane. The chart is intentionally single-replica and ephemeral; use
+managed, highly available services in production.
 
 ## Metrics scraping
 

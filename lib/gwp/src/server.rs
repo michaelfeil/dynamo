@@ -8,13 +8,17 @@ use std::time::Duration;
 
 use crate::config::{ConfigStore, GwpConfig, SessionBackendConfig};
 use crate::core::GwpCore;
-use crate::identity::EndpointTable;
 use crate::lifecycle::Lifecycle;
 use crate::reflector::Reflector;
 use crate::session::{AffinityStore, InstrumentedAffinityStore};
+use crate::topology::{TopologyController, TopologySnapshot, TopologyStore};
+
+/// Absorb bursts when several endpoint polls resolve while the controller is
+/// capturing scheduler load anchors.
+const TOPOLOGY_UPDATE_BUFFER: usize = 16;
 
 pub struct BuiltServer {
-    pub reflector_handle: tokio::task::JoinHandle<()>,
+    pub topology_handle: tokio::task::JoinHandle<()>,
     pub health_task: tokio::task::JoinHandle<()>,
     pub core: GwpCore,
     pub lifecycle: Lifecycle,
@@ -61,34 +65,30 @@ async fn build_inner(
         );
     }
 
-    let table = EndpointTable::new();
-    let models = crate::models::ModelCatalog::new();
-    let reflector = Reflector::with_state(
-        config.clone(),
-        table.clone(),
-        workers_tx,
-        models.clone(),
-        router.remote_load_store(),
-    )
-    .with_metrics(router.metrics().clone())
-    .with_load_anchor_router(router.clone())
-    .with_lifecycle(lifecycle.clone());
-    let liveness = reflector.liveness();
-    let reflector_handle = reflector.spawn();
+    let topology = TopologyStore::new(TopologySnapshot::from_config(&initial, Default::default())?);
+    let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(TOPOLOGY_UPDATE_BUFFER);
+    let controller =
+        TopologyController::new(topology.clone(), workers_tx, router.observed_load_store())
+            .with_metrics(router.metrics().clone())
+            .with_router(router.clone())
+            .with_lifecycle(lifecycle.clone());
+    let mut controller_handle = controller.spawn(updates_rx);
+    let mut reflector_handle = Reflector::new(config.clone(), updates_tx)
+        .with_metrics(router.metrics().clone())
+        .spawn();
+    // Either side exiting tears down the whole topology pipeline.
+    let topology_handle = tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut reflector_handle => controller_handle.abort(),
+            _ = &mut controller_handle => reflector_handle.abort(),
+        }
+    });
 
     let affinity = Arc::new(InstrumentedAffinityStore::new(
         make_affinity(&initial).await?,
         router.metrics().clone(),
     ));
-    let core = GwpCore::with_models_and_tokenizers(
-        router,
-        affinity,
-        liveness,
-        table,
-        config.clone(),
-        models,
-        tokenizers,
-    );
+    let core = GwpCore::with_tokenizers(router, affinity, topology, config.clone(), tokenizers);
     core.spawn_janitor();
     if let Some(path) = reload_path {
         config.spawn_file_reloader(path, Duration::from_secs(1));
@@ -100,7 +100,7 @@ async fn build_inner(
     };
     let (health_service, health_task) = crate::grpc::health_server(lifecycle.clone()).await;
     Ok(BuiltServer {
-        reflector_handle,
+        topology_handle,
         health_task,
         core,
         lifecycle,

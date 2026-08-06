@@ -19,9 +19,11 @@ stream.
 
 Today the Dynamo KV Router picks the best *worker within a single deployment*
 using prefix-overlap scoring against a radix-tree indexer populated by KV
-events. The Global Workload Plane feeds the workers advertised by every
-configured endpoint's planner into one router, provisionally picks a worker,
-then returns that worker's owning endpoint authority to Envoy. The selected
+events. The Global Workload Plane consumes an immutable topology snapshot and
+feeds its workers into one router, provisionally picks a worker, then returns
+that worker's owning endpoint authority to Envoy. The current topology producer
+combines configured routes/endpoints with every endpoint planner's worker and
+load observations. The selected
 endpoint's own router remains responsible for the final internal-worker
 choice. GWP reconciles that provisional booking from the worker ID returned in
 the response. GWP is deployed as its own crate / component with multiple
@@ -35,7 +37,7 @@ The mental model for when a session sticks vs. falls through:
 
 - **Stick** — honor the session iff `(session→worker binding exists in etcd)
   AND (that worker and its endpoint are still alive and serve the requested
-  model)` per the reflector and model catalog. Route directly to that worker's
+  model)` in one topology snapshot. Route directly to that worker's
   endpoint; do not re-run `find_best_match` for the provisional decision.
 - **Unstick** — if the bound worker or endpoint is gone or does not serve the
   requested model,
@@ -62,7 +64,7 @@ actually served it in `x-baseten-dyn-worker-id`. If it differs from the
 provisional choice, GWP frees the provisional scheduler booking and re-books
 the same workload under a distinct accounting request ID on the actual worker.
 Prefix ownership and session affinity are then attached to the actual worker,
-while the endpoint table still supplies the only addressable egress authority.
+while the same topology snapshot supplies the only addressable egress authority.
 
 A background **endpoint reflector** polls **each endpoint's planner service**
 (`planner_common.py`, one per dynamo graph) every ~1s — its `deep/health`
@@ -413,12 +415,14 @@ periodic force-expiry.
             │  │ schedule │   │             │   │  indexer +   │    │
             │  │ started  │   └─────────────┘   │  selector)   │    │
             │  │ finished │                     └──────▲───────┘    │
-            │  └──────────┘   ┌─────────────┐          │            │
-            │                 │  reflector  │──────────┘            │
-            │                 │  (endpoint  │  1s poll, per endpoint │
-            │                 │   feed +    │◀───────── each graph's │
-            │                 │   liveness) │  planner deep/health:  │
-            │                 └─────────────┘  workers + load        │
+            │  └──────────┘   ┌─────────────┐   ┌──────┴───────┐    │
+            │                 │  current    │──▶│  topology    │    │
+            │                 │  producer   │   │  controller  │    │
+            │                 │ (reflector) │   │ + snapshots  │    │
+            │                 └──────▲──────┘   └──────────────┘    │
+            │                        │ 1s poll, per endpoint         │
+            │                        │ each graph's planner          │
+            │                        │ deep/health: workers + load   │
             └────────────────────────────────────────────────────────┘
 
  Envoy ── proxies bytes ──▶ selected endpoint ingress (authority from the
@@ -435,27 +439,32 @@ periodic force-expiry.
   event plane. `router_replica_sync=true` shares add/prefill/free lifecycle
   events across GWP replicas, so each selector sees global GWP in-flight load.
   `use_kv_events=false` retains a replica-local prune-TTL'd radix indexer
-  populated by `record_routing_decision`; planner worker configs arrive
-  through a plain `watch` channel owned by each replica's reflector.
-- **reflector** — background task. Reads a ConfigMap (path from
+  populated by `record_routing_decision`; worker configs arrive through a
+  plain `watch` channel owned by the topology controller.
+- **topology controller** — validates complete, source-neutral topology
+  generations, atomically replaces the request-path snapshot, and fans the
+  same generation out to the router worker feed, observed-load fusion,
+  readiness, and metrics. Structurally invalid updates retain the last valid
+  generation.
+- **current topology producer (reflector)** — background task. Reads a ConfigMap (path from
   `DYN_GWP_CONFIG_PATH`, default `/configs/gwp.yaml`) with separate
   `endpoints`, `routes`, `session`, and `routing` sections. Every 1s it polls
-  every endpoint planner concurrently and drives three things: worker
-  liveness, endpoint ownership, and the worker/config feed consumed by
-  `KvRouter`. It preserves each planner worker's coherent load tuple. A failed poll
+  every endpoint planner concurrently and emits complete topology generations.
+  It preserves each planner worker's coherent load tuple. A failed poll
   (non-200/timeout/`detailed_load_data: null`) holds that endpoint's
   last-known-good for `routing.planner_staleness_grace_secs` (default 30);
   an empty but usable worker set evicts it immediately.
-- **live configuration + model catalog** — the ConfigMap-mounted YAML is
+- **live configuration** — the ConfigMap-mounted YAML is
   polled and atomically hot-reloaded. Adding or removing an endpoint reconciles
-  its planner, liveness, identity mapping, and routing eligibility
+  its producer state and routing eligibility
   without restarting GWP. Configured routes are the authoritative external
   model catalog because a downstream `/v1/models` response may be unavailable
   or expose internal IDs instead of client-facing aliases. Every routable
   model names its endpoint candidates explicitly. GWP does not depend on or
   expose a `/v1/models` control-plane diagnostic.
-- **authority mapping** — the chosen planner `WorkerId` maps via the endpoint
-  table to its `ingress_url`; GWP returns that URL's host:port and configured
+- **authority mapping** — the chosen `WorkerId` maps through the request's
+  immutable topology snapshot to its endpoint and `ingress_url`; GWP returns
+  that URL's host:port and configured
   endpoint name as ext-authz header mutations. Envoy owns the actual egress:
   TLS, pooling, retries, streaming.
 
@@ -524,12 +533,12 @@ live match return 503. `preferred` is accepted but not scored yet. Envoy must
 fail closed whenever this header is present and scheduling fails; its normal
 default-endpoint fallback is forbidden on the constrained path.
 
-### Identity mapping
+### Topology identity mapping
 
 `KvRouter` and `WorkerSelector` operate on `WorkerId` (u64) and
-`WorkerWithDpRank` and on a `HashMap<WorkerId, ModelRuntimeConfig>`. We feed
-planner IDs directly and maintain their endpoint ownership without changing
-the crate:
+`WorkerWithDpRank` and on a `HashMap<WorkerId, ModelRuntimeConfig>`. The
+topology controller projects those inputs from one generation without changing
+the crate; the current producer uses planner IDs directly:
 
 | GWP concept        | `dynamo-kv-router` type                  |
 |--------------------|------------------------------------------|
@@ -539,9 +548,9 @@ the crate:
 | response echo      | `x-routed-endpoint: <endpoint_id>` and required `x-baseten-dyn-worker-id` |
 | `ModelRuntimeConfig` | synthesized once per live planner worker |
 
-The endpoint table maps every planner worker ID back to the configured
-endpoint. Worker IDs are stable across GWP polls and restarts, so bindings
-survive as long as the planner continues to advertise that worker.
+The topology snapshot maps every worker ID back to the configured endpoint.
+Worker IDs are stable across GWP polls and restarts, so bindings survive as
+long as the current provider continues to advertise that worker.
 
 ### Data Flow
 
@@ -626,12 +635,12 @@ the local etcd-backed discovery plane. Remote clusters are not in local etcd.
    `MockDiscovery` (`lib/runtime/src/discovery/mock.rs:15`) and feed it from
    the reflector.
 4. *Feed the watch channel directly* — `RuntimeConfigWatch` is just
-   `watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>`; the reflector owns
-   the `watch::Sender` and publishes a full snapshot per poll.
+   `watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>`; GWP's topology
+   controller owns the `watch::Sender` and publishes a full generation.
 
 **Decision:** Option 4 for endpoint configuration, combined with shared router
 lifecycle synchronization. Remote endpoints are not registered in discovery;
-each replica feeds the planner worker IDs and endpoint ownership locally.
+each replica feeds provider-observed worker IDs and endpoint ownership locally.
 The GWP routers themselves use etcd discovery and ZMQ events so
 `router_replica_sync` can mirror active-sequence load across replicas without a
 NATS dependency.
@@ -778,13 +787,13 @@ per-worker load** in `detailed_load_data`: `num_prefill_tokens`,
 disaggregation `role` — sourced from the cluster's own router's potential
 loads (~1s-cached).
 
-**Decision:** The reflector parses `detailed_load_data` and preserves each
+**Decision:** The current producer parses `detailed_load_data` and preserves each
 worker's coherent load tuple. Each new planner generation anchors GWP's current
 local load. Selection uses the delayed planner tuple plus only local growth
 since that anchor, never less than the current local view. This prevents a
 request visible in both sources from being counted twice while covering work
 that started after the delayed snapshot. GWP then delegates to the existing
-`B10WorkerSelector`, mixing prefix overlap and reconciled load without
+fixed B10 scoring module, mixing prefix overlap and reconciled load without
 changing the generic KV router. The downstream response corrects the
 provisional choice when the endpoint's local router selects another worker.
 
@@ -796,13 +805,13 @@ worker that actually served the request.
 
 **Context:** Prefix overlap should be balanced against endpoint load.
 
-**Decision:** Use `B10WorkerSelector` after GWP reconciles delayed planner load
-with local lifecycle deltas. Its hot-reloadable `b10_routing_config` controls
+**Decision:** Keep one concrete B10 scorer, separate from worker eligibility
+and sampling, after GWP reconciles provider-observed load with local lifecycle
+deltas. Its hot-reloadable `b10_routing_config` controls
 the overlap/prefill weight, decode-block weight, prefill/decode token
-discounts, active-request weight, and temperature. A code embedder may supply
-`RouterSelector::Custom`; the same GWP load-reconciliation adapter runs before
-that selector. A hard per-endpoint admission cap is not part of this PoC and
-can be added later if production traces show it is necessary.
+discounts, active-request weight, and temperature. A hard per-endpoint
+admission cap is not part of this PoC and can be added later if production
+traces show it is necessary.
 
 ### Decision 6: Mint a session id and echo the selected endpoint
 
@@ -903,12 +912,32 @@ fn approx_tokens(req, model_name) -> (Vec<u32>, Tier):
     return (toks, Tier::Pseudo)
 ```
 
-### Reflector loop
+### Topology pipeline and current planner producer
 
-The reflector keeps a **last-known-good** endpoint observation and a
-configurable **staleness grace** (default 30s) **per endpoint**, so a planner
-blip is a non-event, not a mass re-route. The naive "clear liveness on a failed
-poll" would unstick sessions during a transient outage. Instead:
+Routing consumes one immutable `TopologySnapshot` containing routable endpoint
+metadata, canonical model bindings, resolved model profiles, worker ownership,
+worker runtime configuration/taints, and observed load. A topology controller
+validates each complete update and publishes the same generation to request
+routing, the scheduler worker watch, load fusion, readiness, and metrics.
+
+Exactly one producer is authoritative for a GWP process. Today that producer
+combines the hot-reloaded ConfigMap with planner observations. A future
+database or Kafka adapter can emit the same complete snapshot without adding
+source-specific behavior to request routing. Protocol failure and replay
+semantics remain producer-owned; the controller retains its last valid
+snapshot when an update is structurally invalid.
+
+Endpoint properties and worker taints remain distinct. Endpoint properties
+apply hard deployment-level routing requirements before scheduling. Worker
+taints travel in `ModelRuntimeConfig` and participate in the router's required
+and preferred worker-level constraints. The current planner payload does not
+include runtime configs, so its adapter emits the same default, untainted
+worker configs as before.
+
+The current planner producer keeps a **last-known-good** endpoint observation
+and a configurable **staleness grace** (default 30s) **per endpoint**, so a
+planner blip is a non-event, not a mass re-route. The naive "clear liveness on
+a failed poll" would unstick sessions during a transient outage. Instead:
 
 - a **usable non-empty poll** (200 with `detailed_load_data` present) reconciles
   the endpoint immediately and publishes every planner worker;
@@ -1070,6 +1099,8 @@ requests in one session get distinct IDs and never collide. At
   request-body delivery produces a measured critical-path improvement.
 - Replace the 1s poll with a watch/stream where the planner supports it
   (e.g. SSE on `list_workers_url`).
+- Add database or Kafka topology producers that emit the same complete
+  snapshot contract; select exactly one authoritative producer per process.
 - Support controlled tokenizer-bundle rollouts without requiring a full
   replica restart while preserving one prefix-hash space during the rollout.
 - Share the GWP approximate indexer state across replicas (today each replica

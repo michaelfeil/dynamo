@@ -1,22 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The GWP approximate router: a `KvRouter` using etcd discovery and the ZMQ
-//! event plane for cross-replica active-sequence synchronization.
+//! The GWP approximate router: a `KvRouter` using etcd discovery and a
+//! configurable event plane for cross-replica active-sequence synchronization.
 //!
 //! This is the critical-path reuse from the design doc (Decision 1), resolved
 //! more simply than the `MockDiscovery` sketch: `RuntimeConfigWatch` is just a
-//! `watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>`, so the reflector
-//! owns the matching `watch::Sender` and feeds planner worker snapshots
-//! directly. The worker feed remains local because every replica reflects the
-//! same configured endpoints and planners, while the `DistributedRuntime` uses etcd to
-//! discover peer GWP routers and ZMQ to exchange request lifecycle events.
+//! `watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>`, so the topology
+//! controller owns the matching `watch::Sender` and feeds complete worker
+//! snapshots directly. The worker feed remains local because every replica
+//! observes the same topology, while the `DistributedRuntime` uses etcd to
+//! discover peer GWP routers and ZMQ or NATS to exchange request lifecycle
+//! events.
 //!
 //! Config choices (see `gwp_kv_router_config`):
 //! - `use_kv_events: false` — the primary indexer is a local prune-TTL'd radix
 //!   tree populated by `record_routing_decision` (the "approximate indexer");
 //!   remote endpoints never publish KV events to us.
-//! - `skip_initial_worker_wait: false` — REQUIRED for the reflector feed: this
+//! - `skip_initial_worker_wait: false` — REQUIRED for the topology feed: this
 //!   flag doubles as "watch worker configs" in `KvScheduler::start`
 //!   (`scheduler.rs:94`); setting it to true would freeze the worker set at
 //!   construction time. With `DYN_ROUTER_MIN_INITIAL_WORKERS` unset the
@@ -26,7 +27,8 @@
 //! - `router_queue_threshold: None` — GWP never parks requests; downstream
 //!   endpoints do their own queueing.
 //! - `router_replica_sync: true` — replicas exchange add/prefill/free events
-//!   over ZMQ so every selector sees global GWP in-flight load.
+//!   over the configured event plane so every selector sees global GWP
+//!   in-flight load.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,14 +54,14 @@ use tokio::sync::watch;
 use crate::{
     config::ModelStagePolicy,
     metrics::GwpMetrics,
-    worker_selector::{GwpWorkerSelector, LocalLoadAnchor, SelectionPolicyStore},
+    scoring::LocalLoadAnchor,
+    worker_selector::{GwpWorkerSelector, SelectionPolicyStore},
 };
 
-pub use crate::worker_selector::{RemoteLoadStore, RemoteWorkerLoad};
+pub use crate::scoring::{ObservedLoadStore, ObservedWorkerLoad};
 
-/// The sender half of the worker feed. Owned by the reflector: every planner
-/// poll publishes a full `HashMap<WorkerId, ModelRuntimeConfig>` snapshot of
-/// the live planner workers.
+/// The sender half of the worker feed. Owned by the topology controller, which
+/// publishes a full `HashMap<WorkerId, ModelRuntimeConfig>` generation.
 pub type WorkerConfigSender = watch::Sender<HashMap<WorkerId, ModelRuntimeConfig>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,15 +86,33 @@ fn gwp_kv_router_config(ttl_secs: u64) -> KvRouterConfig {
     }
 }
 
-/// GWP replicas discover each other's event channels through etcd and exchange
-/// active-sequence events directly over ZMQ. `ETCD_ENDPOINTS` and the standard
-/// etcd auth environment variables configure the discovery connection.
-fn gwp_distributed_config() -> DistributedConfig {
+/// GWP keeps etcd as its discovery plane while allowing replica events to use
+/// either direct ZMQ (the backwards-compatible default) or NATS Core pub-sub.
+/// `DYN_EVENT_PLANE=nats` selects NATS and `NATS_SERVER` configures its server.
+fn gwp_distributed_config() -> anyhow::Result<DistributedConfig> {
+    let event_transport_kind = match std::env::var(
+        dynamo_runtime::config::environment_names::event_plane::DYN_EVENT_PLANE,
+    ) {
+        Ok(value) if value == "nats" => EventTransportKind::Nats,
+        Ok(value) if value == "zmq" || value.is_empty() => EventTransportKind::Zmq,
+        Err(std::env::VarError::NotPresent) => EventTransportKind::Zmq,
+        Ok(value) => anyhow::bail!(
+            "invalid DYN_EVENT_PLANE value '{value}'; valid values are 'nats' and 'zmq'"
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("DYN_EVENT_PLANE must contain valid Unicode")
+        }
+    };
+
+    Ok(gwp_distributed_config_for(event_transport_kind))
+}
+
+fn gwp_distributed_config_for(event_transport_kind: EventTransportKind) -> DistributedConfig {
     DistributedConfig {
         discovery_backend: DiscoveryBackend::KvStore(kv::Selector::Etcd(Box::default())),
-        nats_config: None,
+        nats_config: (event_transport_kind == EventTransportKind::Nats).then(Default::default),
         request_plane: RequestPlaneMode::Tcp,
-        event_transport_kind: EventTransportKind::Zmq,
+        event_transport_kind,
     }
 }
 
@@ -102,12 +122,12 @@ fn gwp_distributed_config() -> DistributedConfig {
 /// | proxy event                  | call                        |
 /// |------------------------------|-----------------------------|
 /// | fall-through decision        | [`GwpRouter::pick`]         |
-/// | sticky hit                   | [`GwpRouter::add_request`]  |
+/// | sticky hit                   | `GwpRouter::add_request`    |
 /// | upstream response headers    | [`GwpRouter::mark_prefill_completed`] |
 /// | stream end / abort / error   | [`GwpRouter::free`]         |
 pub struct GwpRouter {
     kv: KvRouter<GwpWorkerSelector>,
-    remote_loads: RemoteLoadStore,
+    observed_loads: ObservedLoadStore,
     selection_policies: SelectionPolicyStore,
     metrics: GwpMetrics,
     block_size: u32,
@@ -119,7 +139,7 @@ pub struct GwpRouter {
 impl GwpRouter {
     /// Build the router and the worker feed. Must be called from within a
     /// tokio runtime. The returned [`WorkerConfigSender`] is handed to the
-    /// reflector; workers only become routable once a snapshot is sent.
+    /// topology controller; workers only become routable once a snapshot is sent.
     pub async fn new(
         block_size: u32,
         approx_indexer_ttl_secs: u64,
@@ -127,7 +147,7 @@ impl GwpRouter {
         Self::new_with_distributed_config(
             block_size,
             approx_indexer_ttl_secs,
-            gwp_distributed_config(),
+            gwp_distributed_config()?,
         )
         .await
     }
@@ -161,9 +181,9 @@ impl GwpRouter {
 
         let (tx, rx) = watch::channel(HashMap::new());
         let config = gwp_kv_router_config(approx_indexer_ttl_secs);
-        let remote_loads = RemoteLoadStore::default();
+        let observed_loads = ObservedLoadStore::default();
         let selection_policies = SelectionPolicyStore::default();
-        let selector = GwpWorkerSelector::new(remote_loads.clone(), selection_policies.clone());
+        let selector = GwpWorkerSelector::new(observed_loads.clone(), selection_policies.clone());
 
         let kv = KvRouter::new(
             endpoint,
@@ -183,7 +203,7 @@ impl GwpRouter {
         Ok((
             Arc::new(Self {
                 kv,
-                remote_loads,
+                observed_loads,
                 selection_policies,
                 metrics,
                 block_size,
@@ -232,17 +252,17 @@ impl GwpRouter {
         self._drt.shutdown();
     }
 
-    /// Replace the planner-sourced baseline used by the selector. For workers
-    /// refreshed by this planner result, capture the scheduler's local view at
+    /// Replace the provider-observed baseline used by the selector. For workers
+    /// refreshed by this update, capture the scheduler's local view at
     /// this exact boundary. Later selections apply the signed local change
     /// after that anchor; publications for other endpoints preserve it.
-    pub async fn replace_remote_loads(
+    pub async fn replace_observed_loads(
         &self,
-        loads: HashMap<WorkerId, RemoteWorkerLoad>,
+        loads: HashMap<WorkerId, ObservedWorkerLoad>,
         refreshed_workers: &std::collections::HashSet<WorkerId>,
     ) -> anyhow::Result<()> {
         if refreshed_workers.is_empty() {
-            self.remote_loads.replace(loads);
+            self.observed_loads.replace(loads);
             return Ok(());
         }
         let local = self.kv.get_potential_loads(&[], None, None, None).await?;
@@ -260,17 +280,17 @@ impl GwpRouter {
                 };
             }
         }
-        self.remote_loads.replace_refreshed(loads, &anchors);
+        self.observed_loads.replace_refreshed(loads, &anchors);
         Ok(())
     }
 
-    pub fn remote_load_store(&self) -> RemoteLoadStore {
-        self.remote_loads.clone()
+    pub fn observed_load_store(&self) -> ObservedLoadStore {
+        self.observed_loads.clone()
     }
 
     /// Fall-through decision: score all live workers and provisionally
     /// register the request in the scheduler (`update_states=true` — do NOT
-    /// also call [`Self::add_request`], that would double-count). The
+    /// also call `Self::add_request`, that would double-count). The
     /// approximate index is updated only after the endpoint reports the worker
     /// that actually served the request.
     ///
@@ -462,8 +482,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_runtime_uses_etcd_discovery_and_zmq() {
-        let config = gwp_distributed_config();
+    fn production_runtime_uses_etcd_discovery_and_selected_event_plane() {
+        let config = gwp_distributed_config_for(EventTransportKind::Zmq);
         match config.discovery_backend {
             DiscoveryBackend::KvStore(kv::Selector::Etcd(options)) => {
                 assert!(options.attach_lease);
@@ -473,6 +493,11 @@ mod tests {
         assert_eq!(config.event_transport_kind, EventTransportKind::Zmq);
         assert_eq!(config.request_plane, RequestPlaneMode::Tcp);
         assert!(config.nats_config.is_none());
+
+        let config = gwp_distributed_config_for(EventTransportKind::Nats);
+        assert_eq!(config.event_transport_kind, EventTransportKind::Nats);
+        assert_eq!(config.request_plane, RequestPlaneMode::Tcp);
+        assert!(config.nats_config.is_some());
     }
 
     #[test]
@@ -606,11 +631,11 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_remote_publication_preserves_worker_anchor() {
-        let store = RemoteLoadStore::default();
+    fn unrelated_observed_publication_preserves_worker_anchor() {
+        let store = ObservedLoadStore::default();
         let loads = HashMap::from([
-            (1, RemoteWorkerLoad::default()),
-            (2, RemoteWorkerLoad::default()),
+            (1, ObservedWorkerLoad::default()),
+            (2, ObservedWorkerLoad::default()),
         ]);
         store.replace_refreshed(
             loads.clone(),

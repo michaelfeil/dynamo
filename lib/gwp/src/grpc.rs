@@ -434,7 +434,7 @@ fn response_result(response: &CheckResponse) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -446,9 +446,8 @@ mod tests {
 
     use crate::config::{EndpointConfig, EndpointId, GwpConfig, ModelRoute, RoutingConfig};
     use crate::core::GwpCore;
-    use crate::identity::EndpointTable;
-    use crate::reflector::LivenessSet;
     use crate::session::InMemoryAffinityStore;
+    use crate::topology::{TopologySnapshot, TopologyStore, TopologyWorker};
 
     async fn test_state() -> ControlState {
         let endpoint = EndpointId("test-endpoint".into());
@@ -479,10 +478,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let table = EndpointTable::new();
-        table.upsert_worker(10, endpoint).unwrap();
-        let liveness = LivenessSet::new();
-        liveness.replace(HashSet::from([10]));
+        let topology = TopologyStore::new(
+            TopologySnapshot::from_config(
+                &config,
+                HashMap::from([(
+                    10,
+                    TopologyWorker {
+                        endpoint,
+                        runtime: ModelRuntimeConfig::default(),
+                        observed_load: None,
+                    },
+                )]),
+            )
+            .unwrap(),
+        );
         workers_tx
             .send(HashMap::from([(10, ModelRuntimeConfig::default())]))
             .unwrap();
@@ -491,8 +500,7 @@ mod tests {
             core: GwpCore::new(
                 router,
                 Arc::new(InMemoryAffinityStore::new()),
-                liveness,
-                table,
+                topology,
                 Arc::new(config),
             ),
             lifecycle: crate::lifecycle::Lifecycle::ready_for_tests(),
@@ -651,7 +659,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn grpc_health_tracks_warmup_and_drain() {
         let lifecycle = crate::lifecycle::Lifecycle::starting(1, Duration::from_secs(2));
-        lifecycle.update_routing(1, true);
+        lifecycle.update_routing(1);
         let reporter = HealthReporter::new();
         publish_health(&reporter, &lifecycle).await;
         let service = HealthService::from_health_reporter(reporter.clone());

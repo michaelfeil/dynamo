@@ -25,13 +25,8 @@ use dashmap::mapref::entry::Entry;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::config::{
-    ConfigStore, EndpointConfig, EndpointId, ModelStagePolicy, RoutingRequirements,
-};
-use crate::identity::EndpointTable;
+use crate::config::{ConfigStore, EndpointId, ModelStagePolicy, RoutingRequirements};
 use crate::metrics::ResponseOutcome;
-use crate::models::ModelCatalog;
-use crate::reflector::LivenessSet;
 use crate::router::GwpRouter;
 use crate::session::{
     AffinityBinding, AffinityStore, mint_session_id, prompt_hash_session_id, request_session_id,
@@ -39,6 +34,7 @@ use crate::session::{
 use crate::tokens::{ApproxTokens, TokenizerRegistry};
 #[cfg(test)]
 use crate::tokens::{pseudo_tokens, routing_text};
+use crate::topology::{RoutableEndpoint, TopologySnapshot, TopologyStore};
 
 /// Upper bound on how long an in-flight entry may live without a
 /// `request_finished`. Generous — real LLM streams run minutes, not hours.
@@ -81,6 +77,7 @@ struct ResponseStarted {
     status: u16,
     outcome: ResponseOutcome,
     confirmed: WorkerWithDpRank,
+    route_retired: bool,
 }
 
 /// Mutable lifecycle state. Every transition and its scheduler side effects
@@ -186,7 +183,7 @@ pub struct Scheduled {
     /// absent for newly minted sessions and normal scored selections.
     pub affine_worker_id: Option<u64>,
     pub endpoint_id: EndpointId,
-    pub endpoint: EndpointConfig,
+    pub endpoint: RoutableEndpoint,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -243,10 +240,8 @@ pub fn parse_routing_requirements(raw: Option<&str>) -> Result<RoutingRequiremen
 pub struct GwpCore {
     pub router: Arc<GwpRouter>,
     pub affinity: Arc<dyn AffinityStore>,
-    pub liveness: LivenessSet,
-    pub table: EndpointTable,
+    pub topology: TopologyStore,
     pub config: ConfigStore,
-    pub models: ModelCatalog,
     pub tokenizers: TokenizerRegistry,
     inflight: Arc<DashMap<String, Arc<RequestSlot>>>,
     active_inflight: Arc<AtomicUsize>,
@@ -300,7 +295,7 @@ impl Drop for ScheduleReservationGuard {
     }
 }
 
-fn downstream_authority(endpoint: &EndpointConfig) -> String {
+fn downstream_authority(endpoint: &RoutableEndpoint) -> String {
     let host = endpoint.ingress_url.host_str().unwrap_or("unknown");
     let host = if host.contains(':') {
         format!("[{host}]")
@@ -317,54 +312,28 @@ impl GwpCore {
     pub fn new(
         router: Arc<GwpRouter>,
         affinity: Arc<dyn AffinityStore>,
-        liveness: LivenessSet,
-        table: EndpointTable,
+        topology: TopologyStore,
         config: impl Into<ConfigStore>,
-    ) -> Self {
-        Self::with_models(
-            router,
-            affinity,
-            liveness,
-            table,
-            config,
-            ModelCatalog::new(),
-        )
-    }
-
-    pub fn with_models(
-        router: Arc<GwpRouter>,
-        affinity: Arc<dyn AffinityStore>,
-        liveness: LivenessSet,
-        table: EndpointTable,
-        config: impl Into<ConfigStore>,
-        models: ModelCatalog,
     ) -> Self {
         let config = config.into();
         let tokenizers = TokenizerRegistry::from_config(&config.load())
             .expect("configured model tokenizer bundles must load");
-        Self::with_models_and_tokenizers(
-            router, affinity, liveness, table, config, models, tokenizers,
-        )
+        Self::with_tokenizers(router, affinity, topology, config, tokenizers)
     }
 
-    pub fn with_models_and_tokenizers(
+    pub fn with_tokenizers(
         router: Arc<GwpRouter>,
         affinity: Arc<dyn AffinityStore>,
-        liveness: LivenessSet,
-        table: EndpointTable,
+        topology: TopologyStore,
         config: impl Into<ConfigStore>,
-        models: ModelCatalog,
         tokenizers: TokenizerRegistry,
     ) -> Self {
         let config = config.into();
-        models.replace_from_config(&config.load());
         Self {
             router,
             affinity,
-            liveness,
-            table,
+            topology,
             config,
-            models,
             tokenizers,
             inflight: Arc::new(DashMap::new()),
             active_inflight: Arc::new(AtomicUsize::new(0)),
@@ -376,27 +345,34 @@ impl GwpCore {
 
     fn endpoint_for(
         &self,
+        topology: &TopologySnapshot,
         worker: WorkerWithDpRank,
-    ) -> Result<(EndpointId, EndpointConfig), ScheduleError> {
-        let endpoint_id = self.table.get(worker.worker_id).ok_or_else(|| {
-            ScheduleError::UnknownEndpoint(format!(
-                "endpoint candidate {} vanished between decision and lookup",
-                worker.worker_id
-            ))
-        })?;
-        let endpoint = self
-            .config
-            .load()
-            .endpoints
-            .get(&endpoint_id)
-            .cloned()
+    ) -> Result<(EndpointId, RoutableEndpoint), ScheduleError> {
+        let endpoint_id = topology
+            .worker_endpoint(worker.worker_id)
             .ok_or_else(|| {
                 ScheduleError::UnknownEndpoint(format!(
-                    "endpoint {} not in GWP config",
-                    endpoint_id.0
+                    "endpoint candidate {} vanished between decision and lookup",
+                    worker.worker_id
                 ))
-            })?;
+            })?
+            .clone();
+        let endpoint = topology.endpoint(&endpoint_id).cloned().ok_or_else(|| {
+            ScheduleError::UnknownEndpoint(format!(
+                "endpoint {} not in GWP topology",
+                endpoint_id.0
+            ))
+        })?;
         Ok((endpoint_id, endpoint))
+    }
+
+    #[cfg(test)]
+    fn replace_config_for_test(&self, config: crate::config::GwpConfig) {
+        let workers = self.topology.load().workers.clone();
+        let topology = TopologySnapshot::from_config(&config, workers)
+            .expect("test config must produce valid topology");
+        self.topology.replace(topology);
+        self.config.replace(config);
     }
 
     /// Lifecycle step 1 (Envoy ext-authz scheduling call).
@@ -518,9 +494,10 @@ impl GwpCore {
         let session_header_present = session_id.is_some();
         let supplied_session_id = request_session_id(session_id, &body);
         let config = self.config.load();
+        let topology = self.topology.load();
         let routing_requirements =
             parse_routing_requirements(routing_requirements_header.as_deref())?;
-        let eligible_endpoints = config.routing_candidates(&routing_requirements);
+        let eligible_endpoints = topology.routing_candidates(&routing_requirements);
         let requested_model = routing_model_id
             .as_deref()
             .filter(|model| !model.is_empty())
@@ -530,30 +507,29 @@ impl GwpCore {
                     "request does not specify a model known to GWP routing".into(),
                 )
             })?;
-        let canonical_model = config.canonical_model(requested_model);
-        if config.configured_candidates(canonical_model).is_none() {
+        let Some((canonical_model, binding)) = topology.model_binding(requested_model) else {
             return Err(ScheduleError::InvalidModel(format!(
                 "model {requested_model:?} is not known to GWP routing"
             )));
-        }
-        let model = canonical_model.to_string();
-        let policy = config.model_policy(&model);
+        };
+        let model = canonical_model.clone();
+        let policy = topology
+            .profile(binding)
+            .ok_or_else(|| ScheduleError::Internal(format!("model {model} has no profile")))?
+            .stages;
         self.router
             .metrics()
             .record_model_stage(&model, "affinity", policy.affinity);
         self.router
             .metrics()
             .record_model_stage(&model, "trie", policy.trie);
-        let metric_model = canonical_model.to_string();
+        let metric_model = canonical_model.clone();
         let pseudo_stride = config.routing.pseudo_stride;
         let block_size = config.routing.block_size;
         let prompt_hash_fallback = config.session.prompt_hash_fallback.clone();
-        let mut endpoints = self.models.endpoints_for_model(canonical_model);
-        if let Some(configured) = config.configured_candidates(canonical_model) {
-            endpoints.retain(|endpoint| configured.contains(endpoint));
-        }
+        let mut endpoints = binding.endpoints.clone();
         endpoints.retain(|endpoint| eligible_endpoints.contains(endpoint));
-        let allowed_worker_ids = Some(self.table.workers_in_endpoints(&endpoints));
+        let allowed_worker_ids = Some(topology.workers_in_endpoints(&endpoints));
         if allowed_worker_ids
             .as_ref()
             .is_some_and(std::collections::HashSet::is_empty)
@@ -612,7 +588,7 @@ impl GwpCore {
                         .record_affinity_lookup(affinity_backend, "miss");
                     None
                 }
-                Ok(Some(binding)) if !self.liveness.is_alive(binding.worker.worker_id) => {
+                Ok(Some(binding)) if !topology.is_alive(binding.worker.worker_id) => {
                     self.router
                         .metrics()
                         .record_affinity_lookup(affinity_backend, "worker_unavailable");
@@ -650,7 +626,7 @@ impl GwpCore {
             }
         };
         if let Some(worker) = bound {
-            let (endpoint_id, endpoint) = self.endpoint_for(worker)?;
+            let (endpoint_id, endpoint) = self.endpoint_for(&topology, worker)?;
             let authority = downstream_authority(&endpoint);
             let metadata = RequestMetadata::new(
                 sid.clone(),
@@ -783,7 +759,7 @@ impl GwpCore {
             .pick(rid, &tokens, allowed_worker_ids, policy)
             .await
             .map_err(|e| ScheduleError::NoRoutableEndpoint(e.to_string()))?;
-        let (endpoint_id, endpoint) = match self.endpoint_for(selection.worker) {
+        let (endpoint_id, endpoint) = match self.endpoint_for(&topology, selection.worker) {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 self.router.free(rid).await;
@@ -997,6 +973,21 @@ impl GwpCore {
             }
             return;
         }
+        if state
+            .response
+            .is_some_and(|response| response.route_retired)
+        {
+            tracing::debug!(rid, "route retired before optimistic booking");
+            self.router
+                .metrics()
+                .optimistic_tokenization_finished("retired_endpoint");
+            let remove = state.finished_at.is_some() && state.terminal_outcome_recorded;
+            drop(state);
+            if remove {
+                self.remove_slot_if_same(rid, slot);
+            }
+            return;
+        }
         if state.finished_at.is_some() {
             tracing::debug!(rid, "request finished before optimistic booking");
             self.router
@@ -1074,6 +1065,8 @@ impl GwpCore {
     ///
     /// - A non-200 response immediately releases the provisional booking and
     ///   is never re-booked.
+    /// - If the routed endpoint has been removed, release local accounting
+    ///   without re-booking, indexing, or persisting affinity.
     /// - On 200, re-book the request on the downstream worker reported by
     ///   `x-baseten-dyn-worker-id` when it differs from the provisional pick.
     /// - Mark prefill completed on the confirmed booking.
@@ -1126,12 +1119,19 @@ impl GwpCore {
             metadata.routed_at.elapsed(),
         );
 
+        let topology = self.topology.load();
+        let route_retired = status == 200 && topology.endpoint(&metadata.endpoint_id).is_none();
+        if route_retired {
+            self.router
+                .metrics()
+                .record_lifecycle_reconciliation("retired_endpoint_response");
+        }
         let mut confirmed = metadata.planned;
-        if status == 200 {
+        if status == 200 && !route_retired {
             if let Some(actual_worker_id) = actual_worker_remote {
                 let actual = WorkerWithDpRank::from_worker_id(actual_worker_id);
-                let valid_owner = match self.table.get(actual_worker_id) {
-                    Some(owner) if owner == metadata.endpoint_id => true,
+                let valid_owner = match topology.worker_endpoint(actual_worker_id) {
+                    Some(owner) if owner == &metadata.endpoint_id => true,
                     Some(owner) => {
                         tracing::error!(
                             rid,
@@ -1143,15 +1143,10 @@ impl GwpCore {
                         false
                     }
                     None => match self
-                        .table
-                        .upsert_worker(actual_worker_id, metadata.endpoint_id.clone())
+                        .topology
+                        .confirm_worker(&metadata.endpoint_id, actual_worker_id)
                     {
-                        Ok(()) => {
-                            // A successful response is positive liveness evidence.
-                            // The next planner snapshot remains authoritative.
-                            self.liveness.insert(actual_worker_id);
-                            true
-                        }
+                        Ok(()) => true,
                         Err(error) => {
                             tracing::error!(rid, actual_worker_id, %error);
                             false
@@ -1172,6 +1167,7 @@ impl GwpCore {
             status,
             outcome,
             confirmed,
+            route_retired,
         });
 
         if status != 200 {
@@ -1198,6 +1194,20 @@ impl GwpCore {
                 status,
                 endpoint = %metadata.endpoint_id.0,
                 "upstream denied request; released scheduler booking"
+            );
+        } else if route_retired {
+            if let Some(booking) = state.booking.take() {
+                self.router.free(&booking.accounting_rid).await;
+                self.router.metrics().scheduler_request_finished(
+                    &metadata.endpoint_id,
+                    booking.tokens.len(),
+                    booking.cached_tokens,
+                );
+            }
+            tracing::info!(
+                rid,
+                endpoint = %metadata.endpoint_id.0,
+                "routed endpoint retired; released local booking without reconciliation"
             );
         } else if let Some(mut booking) = state.booking.take() {
             let rebooked = confirmed != booking.decision;
@@ -1259,7 +1269,7 @@ impl GwpCore {
             && state.terminal_outcome_recorded;
         drop(state);
 
-        if status == 200 && metadata.policy.affinity {
+        if status == 200 && !route_retired && metadata.policy.affinity {
             let affinity = self.affinity.clone();
             let ttl = Duration::from_secs(self.config.load().session.ttl_secs);
             let binding = AffinityBinding::with_endpoint(confirmed, metadata.endpoint_id.clone());
@@ -1512,11 +1522,11 @@ impl GwpCore {
 mod tests {
     use super::*;
     use crate::config::{
-        EndpointId, GwpConfig, ModelRoute, PromptHashFallbackConfig, RoutingConfig,
+        EndpointConfig, EndpointId, GwpConfig, ModelRoute, PromptHashFallbackConfig, RoutingConfig,
     };
     use crate::session::{AffinityStore, InMemoryAffinityStore, InstrumentedAffinityStore};
     use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     const ENDPOINT: &str = "core-endpoint";
     const WORKER: u64 = 10;
@@ -1670,26 +1680,29 @@ mod tests {
         )
         .await
         .unwrap();
-        let table = EndpointTable::new();
-        let liveness = LivenessSet::new();
-        let mut live_ids = HashSet::new();
+        let mut topology_workers = HashMap::new();
         let mut configs = HashMap::new();
         if live {
-            table
-                .upsert_worker(WORKER, EndpointId(ENDPOINT.into()))
-                .unwrap();
-            live_ids.insert(WORKER);
+            topology_workers.insert(
+                WORKER,
+                crate::topology::TopologyWorker {
+                    endpoint: EndpointId(ENDPOINT.into()),
+                    runtime: ModelRuntimeConfig::default(),
+                    observed_load: None,
+                },
+            );
             configs.insert(WORKER, ModelRuntimeConfig::default());
         }
-        liveness.replace(live_ids);
         workers_tx.send(configs).unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let topology =
+            TopologyStore::new(TopologySnapshot::from_config(&config, topology_workers).unwrap());
 
         let core = GwpCore::new(
             router,
             Arc::new(InMemoryAffinityStore::new()),
-            liveness,
-            table,
+            topology,
             Arc::new(config),
         );
         (core, workers_tx)
@@ -1726,24 +1739,28 @@ mod tests {
             ..Default::default()
         };
         let (router, workers_tx) = GwpRouter::new_process_local(4, 120).await.unwrap();
-        let table = EndpointTable::new();
-        let liveness = LivenessSet::new();
-        let mut live = HashSet::new();
+        let mut topology_workers = HashMap::new();
         let mut configs = HashMap::new();
         for (offset, endpoint_id) in config.endpoints.keys().enumerate() {
             let worker = 100 + offset as u64;
-            table.upsert_worker(worker, endpoint_id.clone()).unwrap();
-            live.insert(worker);
+            topology_workers.insert(
+                worker,
+                crate::topology::TopologyWorker {
+                    endpoint: endpoint_id.clone(),
+                    runtime: ModelRuntimeConfig::default(),
+                    observed_load: None,
+                },
+            );
             configs.insert(worker, ModelRuntimeConfig::default());
         }
-        liveness.replace(live);
         workers_tx.send(configs).unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
+        let topology =
+            TopologyStore::new(TopologySnapshot::from_config(&config, topology_workers).unwrap());
         let core = GwpCore::new(
             router,
             Arc::new(InMemoryAffinityStore::new()),
-            liveness,
-            table,
+            topology,
             config,
         );
         (core, workers_tx)
@@ -1769,7 +1786,7 @@ mod tests {
             .get_mut(&EndpointId("glm-b".into()))
             .unwrap()
             .properties = standard;
-        core.config.replace(config);
+        core.replace_config_for_test(config);
     }
 
     async fn wait_for_binding(core: &GwpCore, sid: &str, worker_id: u64) {
@@ -1815,6 +1832,23 @@ mod tests {
         let gate = Arc::new(Semaphore::new(0));
         core.tokenization_gate = Some(gate.clone());
         gate
+    }
+
+    fn retire_selected_endpoint(core: &GwpCore) {
+        let mut config = (*core.config.load()).clone();
+        let mut replacement = config.endpoints.values().next().unwrap().clone();
+        replacement.ingress_url = url::Url::parse("https://replacement.example/v1").unwrap();
+        replacement.planner_url =
+            url::Url::parse("http://replacement.example/deep/health").unwrap();
+        let replacement_id = EndpointId("replacement".into());
+        config.endpoints = BTreeMap::from([(replacement_id.clone(), replacement)]);
+        config.routes = vec![ModelRoute {
+            models: vec!["m".into()],
+            endpoints: vec![replacement_id],
+        }];
+        let topology = TopologySnapshot::from_config(&config, HashMap::new()).unwrap();
+        core.topology.replace(topology);
+        core.config.replace(config);
     }
 
     #[tokio::test]
@@ -1989,6 +2023,36 @@ mod tests {
                 .iter()
                 .all(|load| load.active_requests == 0)
         );
+    }
+
+    #[tokio::test]
+    async fn retired_endpoint_before_tokenization_never_books() {
+        let (mut core, _tx) = make_core(true).await;
+        let rid = "retired-before-tokenization";
+        let gate = configure_blocked_affinity_hit(&mut core, rid).await;
+        core.schedule_for_test(rid, Some(rid.into()), CHAT_PATH, &chat_body())
+            .await
+            .unwrap();
+
+        retire_selected_endpoint(&core);
+        core.response_started(rid, Some(20), 200).await;
+        gate.add_permits(1);
+        wait_for_optimistic_job(&core, rid).await;
+
+        let slot = core.inflight.get(rid).unwrap().clone();
+        let state = slot.state.lock().await;
+        assert!(state.response.unwrap().route_retired);
+        assert!(state.booking.is_none());
+        drop(state);
+        let metrics = core.router.prometheus_metrics().unwrap();
+        assert!(metric_has(
+            &metrics,
+            "dynamo_component_gwp_optimistic_tokenization_total",
+            &["result=\"retired_endpoint\""]
+        ));
+
+        core.request_finished(rid, "complete").await;
+        assert_eq!(core.inflight_len(), 0);
     }
 
     #[tokio::test]
@@ -2356,7 +2420,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        core.config.replace(config);
+        core.replace_config_for_test(config);
 
         let sid = "disabled-affinity";
         let first = core
@@ -2408,7 +2472,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        core.config.replace(config);
+        core.replace_config_for_test(config);
 
         // This request captured the old policy and must still complete its
         // affinity write even though the live ConfigMap policy changed.
@@ -2704,6 +2768,40 @@ mod tests {
         assert!(second.sticky);
         assert_eq!(second.worker.worker_id, 20);
         core.request_finished("rid-2", "complete").await;
+    }
+
+    #[tokio::test]
+    async fn retired_endpoint_releases_booking_without_reconciliation_or_affinity() {
+        let (core, _tx) = make_core(true).await;
+        let rid = "retired-endpoint";
+        let scheduled = core
+            .schedule_for_test(rid, None, CHAT_PATH, &chat_body())
+            .await
+            .unwrap();
+        let slot = core.inflight.get(rid).unwrap().clone();
+        assert!(slot.state.lock().await.booking.is_some());
+
+        retire_selected_endpoint(&core);
+        core.response_started(rid, Some(20), 200).await;
+
+        let state = slot.state.lock().await;
+        assert!(state.response.unwrap().route_retired);
+        assert!(state.booking.is_none());
+        drop(state);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            core.affinity.peek(&scheduled.session_id).await.unwrap(),
+            None
+        );
+        let metrics = core.router.prometheus_metrics().unwrap();
+        assert!(metric_has(
+            &metrics,
+            "dynamo_component_gwp_lifecycle_reconciliations_total",
+            &["outcome=\"retired_endpoint_response\""]
+        ));
+
+        core.request_finished(rid, "complete").await;
+        assert_eq!(core.inflight_len(), 0);
     }
 
     #[tokio::test]

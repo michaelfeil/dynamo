@@ -68,6 +68,7 @@ pub struct GwpMetrics {
     scheduler_inflight_requests: GaugeVec,
     scheduler_inflight_tokens: GaugeVec,
     scheduler_live_workers: IntGaugeVec,
+    topology_ambiguous_workers: IntGauge,
     scheduler_load: Arc<Mutex<HashMap<EndpointId, ClusterSchedulerLoad>>>,
     time_to_first_byte_seconds: HistogramVec,
     request_duration_seconds: HistogramVec,
@@ -302,8 +303,13 @@ impl GwpMetrics {
             )?,
             scheduler_live_workers: metrics.create_intgaugevec(
                 "gwp_scheduler_live_workers",
-                "Planner-observed live workers in the routed endpoint. Use max rather than sum across GWP replicas.",
+                "Topology-provider live workers in the routed endpoint. Use max rather than sum across GWP replicas.",
                 &["routed_endpoint"],
+                &[],
+            )?,
+            topology_ambiguous_workers: metrics.create_intgauge(
+                "gwp_topology_ambiguous_workers",
+                "Worker IDs excluded because multiple endpoints currently advertise them. Use max rather than sum across GWP replicas.",
                 &[],
             )?,
             scheduler_load: Arc::default(),
@@ -577,6 +583,11 @@ impl GwpMetrics {
         for (endpoint, load) in snapshots {
             self.publish_scheduler_load(&endpoint, load);
         }
+    }
+
+    pub fn set_topology_ambiguous_workers(&self, value: usize) {
+        self.topology_ambiguous_workers
+            .set(i64::try_from(value).unwrap_or(i64::MAX));
     }
 
     fn publish_scheduler_load(&self, endpoint: &EndpointId, load: ClusterSchedulerLoad) {

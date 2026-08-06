@@ -17,10 +17,10 @@
 //!    model-eligible).
 //! 2. Approximate tier - new/unstuck sessions are pseudo-tokenized via
 //!    [`tokens`], scored by a [`router::GwpRouter`] (a `KvRouter` with etcd
-//!    discovery and ZMQ replica sync), and fed the workers observed behind
-//!    each routable endpoint by the
-//!    [`reflector::Reflector`]'s 1s planner poll, and the resolved session id
-//!    is returned in the response headers.
+//!    discovery and configurable ZMQ/NATS replica sync), and fed an immutable
+//!    [`topology::TopologySnapshot`]. The current topology producer combines
+//!    ConfigMap routes with [`reflector::Reflector`]'s 1s planner observations.
+//!    The resolved session id is returned in the response headers.
 //!
 //! The production control plane is served over gRPC by [`server`] (feature
 //! `server`; binary `dynamo-gwp`). Multi-replica session affinity uses etcd
@@ -31,21 +31,21 @@ pub mod control;
 pub mod core;
 #[cfg(feature = "server")]
 pub mod grpc;
-pub mod identity;
 pub mod lifecycle;
 pub mod metrics;
-pub mod models;
 pub mod reflector;
 pub mod router;
+mod scoring;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod session;
 pub mod tokens;
+pub mod topology;
 mod worker_selector;
 
 pub use config::{
     ConfigStore, EndpointConfig, EndpointId, GwpConfig, LoadBalancingPolicy, ModelRoute,
     ModelTokenizationConfig, RoutingConfig, SessionConfig, TokenizationConfig,
 };
-pub use identity::EndpointTable;
 pub use router::{GwpRouter, WorkerConfigSender};
+pub use topology::{RoutableEndpoint, TopologySnapshot, TopologyStore};

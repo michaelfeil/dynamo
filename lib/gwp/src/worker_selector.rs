@@ -1,13 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! GWP-owned worker scoring.
-//!
-//! Planner load is a delayed, cache-blind observation. The local scheduler is
-//! immediate and cache-aware. The default score starts from the planner
-//! snapshot and applies the signed change in GWP's local load since that
-//! refresh boundary. This avoids double-counting while allowing both new
-//! bookings and completions to affect routing before the next poll.
+//! Eligibility, sampling, and result construction around GWP's B10 scorer.
 
 use std::collections::HashMap;
 use std::sync::{
@@ -20,95 +14,18 @@ use dynamo_kv_router::protocols::{
     WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
 };
 use dynamo_kv_router::scheduling::{
-    IslStats, KvSchedulerError, RoutingEligibility, SchedulingRequest, WorkerEligibilityError,
+    KvSchedulerError, RoutingEligibility, SchedulingRequest, WorkerEligibilityError,
 };
 use dynamo_kv_router::selector::{WorkerSelector, softmax_sample};
-use dynamo_llm::kv_router::b10hotreloadablecm;
 use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
-use parking_lot::RwLock;
 
 use crate::config::LoadBalancingPolicy;
-
-const MIN_ROUTER_TEMPERATURE: f64 = 1e-12;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RemoteWorkerLoad {
-    pub prefill_tokens: usize,
-    pub decode_blocks: usize,
-    pub active_requests: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct LocalLoadAnchor {
-    pub prefill_tokens: usize,
-    pub decode_blocks: usize,
-    pub active_requests: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RemoteLoadSnapshot {
-    pub(crate) loads: HashMap<WorkerId, RemoteWorkerLoad>,
-    pub(crate) anchors: HashMap<WorkerId, LocalLoadAnchor>,
-}
-
-#[derive(Clone, Default)]
-pub struct RemoteLoadStore {
-    inner: Arc<RwLock<RemoteLoadSnapshot>>,
-}
-
-impl RemoteLoadStore {
-    pub fn replace(&self, loads: HashMap<WorkerId, RemoteWorkerLoad>) {
-        self.replace_refreshed(loads, &HashMap::new());
-    }
-
-    pub(crate) fn replace_refreshed(
-        &self,
-        loads: HashMap<WorkerId, RemoteWorkerLoad>,
-        refreshed_anchors: &HashMap<WorkerId, LocalLoadAnchor>,
-    ) {
-        let mut snapshot = self.inner.write();
-        snapshot
-            .anchors
-            .retain(|worker_id, _| loads.contains_key(worker_id));
-        snapshot
-            .anchors
-            .extend(refreshed_anchors.iter().map(|(id, anchor)| (*id, *anchor)));
-        snapshot.loads = loads;
-    }
-
-    pub(crate) fn snapshot(&self) -> RemoteLoadSnapshot {
-        self.inner.read().clone()
-    }
-}
-
-/// Applies the signed cache-aware local delta to the delayed cache-blind
-/// planner baseline, while never scoring below the current local view.
+use crate::scoring::{B10Scorer, ObservedLoadStore, ScoreBreakdown};
 #[cfg(test)]
-fn reconcile_delayed_load(planner: usize, local: usize, anchor: usize) -> usize {
-    planner.saturating_sub(anchor).saturating_add(local)
-}
-
-fn locality_enabled(request: &SchedulingRequest) -> bool {
-    request
-        .router_config_override
-        .as_ref()
-        .and_then(|config| config.overlap_score_credit)
-        != Some(0.0)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct GwpScore {
-    logit: f64,
-    prefill_blocks: f64,
-    decode_blocks: f64,
-    active_requests: f64,
-    cache_miss_tokens: usize,
-    residency_cost: f64,
-    isl_penalty: f64,
-}
+use crate::scoring::{LocalLoadAnchor, ObservedWorkerLoad};
 
 pub struct GwpWorkerSelector {
-    remote: RemoteLoadStore,
+    scorer: B10Scorer,
     policies: SelectionPolicyStore,
     last_log_time_ms: AtomicU64,
 }
@@ -153,69 +70,12 @@ impl Drop for SelectionPolicyGuard {
     }
 }
 
-struct ScoringRequest {
-    request: SchedulingRequest,
-    planner_loads: HashMap<WorkerId, RemoteWorkerLoad>,
-    anchors: HashMap<WorkerId, LocalLoadAnchor>,
-}
-
 impl GwpWorkerSelector {
-    pub fn new(remote: RemoteLoadStore, policies: SelectionPolicyStore) -> Self {
+    pub fn new(observed: ObservedLoadStore, policies: SelectionPolicyStore) -> Self {
         Self {
-            remote,
+            scorer: B10Scorer::new(observed),
             policies,
             last_log_time_ms: AtomicU64::new(0),
-        }
-    }
-
-    fn scoring_request(&self, request: &SchedulingRequest) -> ScoringRequest {
-        let remote = self.remote.snapshot();
-        let locality_enabled = locality_enabled(request);
-
-        let request = SchedulingRequest {
-            maybe_request_id: request.maybe_request_id.clone(),
-            token_seq: request.token_seq.clone(),
-            isl_tokens: request.isl_tokens,
-            lora_name: request.lora_name.clone(),
-            expected_output_tokens: request.expected_output_tokens,
-            pinned_worker: request.pinned_worker,
-            allowed_worker_ids: request.allowed_worker_ids.clone(),
-            routing_constraints: request.routing_constraints.clone(),
-            router_config_override: request.router_config_override.clone(),
-            track_prefill_tokens: request.track_prefill_tokens,
-            priority_jump: request.priority_jump,
-            priority_load_shed_percent: request.priority_load_shed_percent,
-            do_not_queue: request.do_not_queue,
-            tier_overlap_blocks: if locality_enabled {
-                request.tier_overlap_blocks.clone()
-            } else {
-                Default::default()
-            },
-            effective_overlap_blocks: if locality_enabled {
-                request.effective_overlap_blocks.clone()
-            } else {
-                Default::default()
-            },
-            effective_cached_tokens: if locality_enabled {
-                request.effective_cached_tokens.clone()
-            } else {
-                Default::default()
-            },
-            shared_cache_hits: locality_enabled
-                .then(|| request.shared_cache_hits.clone())
-                .flatten(),
-            decode_blocks: request.decode_blocks.clone(),
-            prefill_tokens: request.prefill_tokens.clone(),
-            active_requests: request.active_requests.clone(),
-            active_request_isl_stats: request.active_request_isl_stats.clone(),
-            eviction_costs: request.eviction_costs.clone(),
-            update_states: request.update_states,
-            resp_tx: None,
-        };
-        ScoringRequest {
-            request,
-            planner_loads: remote.loads,
-            anchors: remote.anchors,
         }
     }
 
@@ -251,201 +111,6 @@ fn selection_log_interval_ms() -> u64 {
     })
 }
 
-fn weighted_load(
-    planner: usize,
-    local: usize,
-    anchor: usize,
-    planner_weight: f64,
-    local_weight: f64,
-) -> f64 {
-    let planner_component = planner_weight * planner as f64;
-    let local_delta = local_weight * (local as f64 - anchor as f64);
-    (planner_component + local_delta).max(local_weight * local as f64)
-}
-
-fn mean_active_requests<C: WorkerConfigLike>(
-    workers: &HashMap<WorkerId, C>,
-    scoring: &ScoringRequest,
-    worker: WorkerWithDpRank,
-    planner_weight: f64,
-    local_weight: f64,
-) -> f64 {
-    let Some(config) = workers.get(&worker.worker_id) else {
-        return 0.0;
-    };
-    let start = config.data_parallel_start_rank();
-    let end = start.saturating_add(config.data_parallel_size());
-    if start == end {
-        return 0.0;
-    }
-    (start..end)
-        .map(|rank| {
-            let candidate = WorkerWithDpRank::new(worker.worker_id, rank);
-            let planner = (rank == 0)
-                .then(|| scoring.planner_loads.get(&worker.worker_id))
-                .flatten()
-                .copied()
-                .unwrap_or_default();
-            let anchor = (rank == 0)
-                .then(|| scoring.anchors.get(&worker.worker_id))
-                .flatten()
-                .copied()
-                .unwrap_or_default();
-            weighted_load(
-                planner.active_requests,
-                scoring.request.active_requests_for(candidate),
-                anchor.active_requests,
-                planner_weight,
-                local_weight,
-            )
-        })
-        .sum::<f64>()
-        / (end - start) as f64
-}
-
-fn active_request_isl_penalty(
-    request: &SchedulingRequest,
-    worker: WorkerWithDpRank,
-    mismatch_penalty: f64,
-    ramp: (f64, f64),
-) -> f64 {
-    let (start, full) = ramp;
-    if mismatch_penalty <= 0.0
-        || !mismatch_penalty.is_finite()
-        || start < 0.0
-        || !start.is_finite()
-        || full <= start
-        || !full.is_finite()
-    {
-        return 0.0;
-    }
-    let Some(stats) = request.active_request_isl_stats.as_ref() else {
-        return 0.0;
-    };
-    let factor = |tokens: f64| ((tokens - start) / (full - start)).clamp(0.0, 1.0);
-    let penalty = |stats: &IslStats| {
-        if stats.count == 0 || !stats.mean.is_finite() || !stats.stddev.is_finite() {
-            return 0.0;
-        }
-        mismatch_penalty
-            * factor((request.isl_tokens as f64 - stats.mean.max(0.0)).abs())
-                .max(factor(stats.stddev.max(0.0)))
-    };
-    let worker_penalty = stats
-        .by_worker_id
-        .get(&worker.worker_id)
-        .map(penalty)
-        .unwrap_or(0.0);
-    let rank_penalty = stats
-        .by_worker_with_dp_rank
-        .as_ref()
-        .and_then(|by_rank| by_rank.get(&worker))
-        .map(penalty)
-        .unwrap_or(0.0);
-    worker_penalty.max(rank_penalty)
-}
-
-fn score_worker<C: WorkerConfigLike>(
-    workers: &HashMap<WorkerId, C>,
-    scoring: &ScoringRequest,
-    worker: WorkerWithDpRank,
-    block_size: u32,
-    policy: LoadBalancingPolicy,
-) -> GwpScore {
-    let request = &scoring.request;
-    let config = b10hotreloadablecm::get_config().get();
-    let routing = &config.routing;
-    let prefill_weight = policy
-        .prefill_weight
-        .or_else(|| {
-            request
-                .router_config_override
-                .as_ref()
-                .and_then(|config| config.prefill_load_scale)
-        })
-        .unwrap_or(routing.router_overlap_score_weight);
-    let planner_weight = policy.planner_weight.unwrap_or(1.0);
-    let local_weight = policy.local_weight.unwrap_or(1.0);
-    let planner = (worker.dp_rank == 0)
-        .then(|| scoring.planner_loads.get(&worker.worker_id))
-        .flatten()
-        .copied()
-        .unwrap_or_default();
-    let anchor = (worker.dp_rank == 0)
-        .then(|| scoring.anchors.get(&worker.worker_id))
-        .flatten()
-        .copied()
-        .unwrap_or_default();
-    let local_prefill = request.prefill_tokens_for(worker);
-    let prefill_blocks = weighted_load(
-        planner.prefill_tokens,
-        local_prefill,
-        anchor.prefill_tokens,
-        planner_weight,
-        local_weight,
-    ) / block_size as f64;
-    let local_decode = request
-        .decode_blocks
-        .get(&worker)
-        .copied()
-        .unwrap_or(prefill_blocks.floor() as usize);
-    let decode_blocks = weighted_load(
-        planner.decode_blocks,
-        local_decode,
-        anchor.decode_blocks,
-        planner_weight,
-        local_weight,
-    );
-    let cache_miss_tokens = if request.isl_tokens <= routing.router_cache_miss_min_isl {
-        request.isl_tokens
-    } else {
-        request
-            .isl_tokens
-            .saturating_sub(request.effective_cached_tokens_for(worker))
-    };
-    let active_requests_worker = weighted_load(
-        planner.active_requests,
-        request.active_requests_for(worker),
-        anchor.active_requests,
-        planner_weight,
-        local_weight,
-    );
-    let active_requests = active_requests_worker * (1.0 - routing.router_active_request_dp_blend)
-        + mean_active_requests(workers, scoring, worker, planner_weight, local_weight)
-            * routing.router_active_request_dp_blend;
-    let residency_cost = routing.router_residency_eviction_cost * request.eviction_cost_for(worker);
-    let isl_penalty = active_request_isl_penalty(
-        request,
-        worker,
-        routing.router_active_request_isl_mismatch_penalty,
-        routing.router_active_request_isl_penalty_ramp,
-    );
-    let logit = prefill_weight * prefill_blocks
-        + policy
-            .decode_weight
-            .unwrap_or(routing.router_decode_block_weight)
-            * decode_blocks
-        + policy
-            .active_request_weight
-            .unwrap_or(routing.router_active_request_weight)
-            * active_requests
-        + policy
-            .cache_miss_weight
-            .unwrap_or(routing.router_cache_miss_weight)
-            * cache_miss_tokens as f64
-        + residency_cost
-        + isl_penalty;
-    GwpScore {
-        logit,
-        prefill_blocks,
-        decode_blocks,
-        active_requests,
-        cache_miss_tokens,
-        residency_cost,
-        isl_penalty,
-    }
-}
-
 fn strict_dp_rank(
     scores: impl IntoIterator<Item = (WorkerWithDpRank, f64)>,
     selected: WorkerWithDpRank,
@@ -472,9 +137,7 @@ fn strict_dp_rank(
 
 impl WorkerSelector<ModelRuntimeConfig> for GwpWorkerSelector {
     fn residency_eviction_half_life(&self) -> Option<Duration> {
-        let config = b10hotreloadablecm::get_config().get();
-        (config.routing.router_residency_eviction_cost > 0.0)
-            .then(|| Duration::from_secs_f64(config.routing.router_residency_half_life))
+        self.scorer.residency_eviction_half_life()
     }
 
     fn select_worker(
@@ -497,25 +160,11 @@ impl WorkerSelector<ModelRuntimeConfig> for GwpWorkerSelector {
         }
 
         let policy = self.policies.get(request.maybe_request_id.as_deref());
-        let scoring = self.scoring_request(request);
+        let scoring = self.scorer.prepare(request, policy, block_size);
         let request = &scoring.request;
         let request_blocks = request.request_blocks(block_size);
         let verbose = self.should_log(workers.len());
-        let config = b10hotreloadablecm::get_config().get();
-        let temperature = policy
-            .temperature
-            .or_else(|| {
-                request
-                    .router_config_override
-                    .as_ref()
-                    .and_then(|config| config.router_temperature)
-            })
-            .unwrap_or(config.routing.router_temperature);
-        let temperature = if temperature.is_finite() && temperature > 0.0 {
-            temperature.max(MIN_ROUTER_TEMPERATURE)
-        } else {
-            MIN_ROUTER_TEMPERATURE
-        };
+        let temperature = scoring.temperature();
 
         if let Some(worker) = eligibility.pinned_worker() {
             match eligibility.validate_worker_rank(workers, worker) {
@@ -532,7 +181,7 @@ impl WorkerSelector<ModelRuntimeConfig> for GwpWorkerSelector {
                 }
                 Err(_) => return Err(KvSchedulerError::NoEndpoints),
             }
-            let score = score_worker(workers, &scoring, worker, block_size, policy);
+            let score = scoring.score(workers, worker);
             log_score(verbose, worker, score, 1.0);
             return Ok(WorkerSelectionResult {
                 worker,
@@ -545,7 +194,7 @@ impl WorkerSelector<ModelRuntimeConfig> for GwpWorkerSelector {
 
         let mut scores = HashMap::new();
         eligibility.for_each_eligible_worker_rank(workers, |worker, worker_config| {
-            let score = score_worker(workers, &scoring, worker, block_size, policy);
+            let score = scoring.score(workers, worker);
             let taint_multiplier = request
                 .routing_constraints
                 .preferred_taint_multiplier(worker_config.taints())
@@ -575,7 +224,12 @@ impl WorkerSelector<ModelRuntimeConfig> for GwpWorkerSelector {
     }
 }
 
-fn log_score(verbose: bool, worker: WorkerWithDpRank, score: GwpScore, taint_multiplier: f64) {
+fn log_score(
+    verbose: bool,
+    worker: WorkerWithDpRank,
+    score: ScoreBreakdown,
+    taint_multiplier: f64,
+) {
     if !verbose {
         return;
     }
@@ -631,24 +285,16 @@ mod tests {
     }
 
     #[test]
-    fn delayed_planner_baseline_applies_signed_local_delta() {
-        assert_eq!(reconcile_delayed_load(100, 80, 80), 100);
-        assert_eq!(reconcile_delayed_load(100, 120, 80), 140);
-        assert_eq!(reconcile_delayed_load(20, 80, 80), 80);
-        assert_eq!(reconcile_delayed_load(100, 40, 80), 60);
-    }
-
-    #[test]
     fn planner_load_steers_away_from_loaded_worker() {
-        let remote = RemoteLoadStore::default();
-        remote.replace(HashMap::from([(
+        let observed = ObservedLoadStore::default();
+        observed.replace(HashMap::from([(
             1,
-            RemoteWorkerLoad {
+            ObservedWorkerLoad {
                 decode_blocks: 100,
                 ..Default::default()
             },
         )]));
-        let selector = GwpWorkerSelector::new(remote, SelectionPolicyStore::default());
+        let selector = GwpWorkerSelector::new(observed, SelectionPolicyStore::default());
         let workers = HashMap::from([
             (1, ModelRuntimeConfig::default()),
             (2, ModelRuntimeConfig::default()),
@@ -662,8 +308,10 @@ mod tests {
 
     #[test]
     fn trie_disabled_scrubs_locality_fields() {
-        let selector =
-            GwpWorkerSelector::new(RemoteLoadStore::default(), SelectionPolicyStore::default());
+        let selector = GwpWorkerSelector::new(
+            ObservedLoadStore::default(),
+            SelectionPolicyStore::default(),
+        );
         let worker = WorkerWithDpRank::from_worker_id(1);
         let mut request = request("no-trie");
         request.effective_overlap_blocks.insert(worker, 8.0);
@@ -673,18 +321,20 @@ mod tests {
             ..Default::default()
         });
 
-        let scored = selector.scoring_request(&request);
+        let scored = selector
+            .scorer
+            .prepare(&request, LoadBalancingPolicy::default(), 64);
         assert!(scored.request.effective_overlap_blocks.is_empty());
         assert!(scored.request.effective_cached_tokens.is_empty());
     }
 
     #[test]
     fn request_policy_can_choose_planner_or_local_signal() {
-        let remote = RemoteLoadStore::default();
-        remote.replace_refreshed(
+        let observed = ObservedLoadStore::default();
+        observed.replace_refreshed(
             HashMap::from([(
                 1,
-                RemoteWorkerLoad {
+                ObservedWorkerLoad {
                     decode_blocks: 100,
                     ..Default::default()
                 },
@@ -698,7 +348,7 @@ mod tests {
             )]),
         );
         let policies = SelectionPolicyStore::default();
-        let selector = GwpWorkerSelector::new(remote, policies.clone());
+        let selector = GwpWorkerSelector::new(observed, policies.clone());
         let worker = WorkerWithDpRank::from_worker_id(1);
         let other_worker = WorkerWithDpRank::from_worker_id(2);
         let mut request = request("weighted");

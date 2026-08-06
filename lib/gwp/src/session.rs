@@ -5,7 +5,7 @@
 //! Decision 2, and "Approximate router lifecycle".
 //!
 //! The resolver honors a binding iff the bound worker is still alive (per the
-//! reflector's [`LivenessSet`](crate::reflector::LivenessSet)); otherwise it
+//! current [`TopologySnapshot`](crate::topology::TopologySnapshot); otherwise it
 //! unsticks and falls through to the approximate router. Stickiness is a
 //! **bypass for the scoring decision** (`find_best_match`), not a bypass of
 //! the scheduler: a stick still tokenizes and `add_request`s the bound worker
@@ -71,7 +71,7 @@ impl AffinityBinding {
 /// Semantics (mirroring `dynamo_llm::kv_router::sticky::AffinityStore`):
 /// - `peek` reads the binding **without** refreshing TTL — used on the request
 ///   path for the stick/unstick check. The caller then consults the
-///   [`LivenessSet`](crate::reflector::LivenessSet) to decide stick vs. unstick.
+///   [`TopologySnapshot`](crate::topology::TopologySnapshot) to decide stick vs. unstick.
 /// - `put` writes the selected endpoint after the upstream responds
 ///   successfully. Backend errors are logged, not returned.
 /// - `get` refreshes TTL; not used on the hot path, kept for admin/diag.

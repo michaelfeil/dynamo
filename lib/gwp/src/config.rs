@@ -5,11 +5,13 @@
 //!
 //! The schema mirrors the boundary GWP can control:
 //!
-//! `model route -> endpoint deployment -> planner-observed internal workers`.
+//! `model route -> endpoint deployment`. The current topology producer joins
+//! this configuration with planner-observed workers; alternate producers can
+//! populate the same normalized topology boundary.
 //!
 //! Endpoints are defined once and model routes reference them. Workers never
-//! appear in configuration; they are observations used to estimate endpoint
-//! load, not independently addressable egress targets.
+//! appear in this schema; they are provider observations used to estimate
+//! endpoint load, not independently addressable egress targets.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -75,6 +77,18 @@ pub struct DimensionRequirements {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RoutingRequirements(pub BTreeMap<String, DimensionRequirements>);
+
+pub(crate) fn properties_satisfy_routing_requirements(
+    properties: &BTreeMap<String, BTreeSet<String>>,
+    requirements: &RoutingRequirements,
+) -> bool {
+    requirements.0.iter().all(|(dimension, constraint)| {
+        constraint.required.is_empty()
+            || properties
+                .get(dimension)
+                .is_some_and(|values| !values.is_disjoint(&constraint.required))
+    })
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -655,13 +669,7 @@ impl GwpConfig {
         self.endpoints
             .iter()
             .filter(|(_, endpoint)| {
-                requirements.0.iter().all(|(dimension, constraint)| {
-                    constraint.required.is_empty()
-                        || endpoint
-                            .properties
-                            .get(dimension)
-                            .is_some_and(|values| !values.is_disjoint(&constraint.required))
-                })
+                properties_satisfy_routing_requirements(&endpoint.properties, requirements)
             })
             .map(|(endpoint_id, _)| endpoint_id.clone())
             .collect()

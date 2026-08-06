@@ -31,3 +31,17 @@ redis:
     limits:
       cpu: "1"
       memory: 2Gi
+
+nats:
+  enabled: true
+  image:
+    repository: nats
+    tag: 2.11.4
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi

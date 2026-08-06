@@ -9,6 +9,10 @@ data:
   # ETCD_ENDPOINTS configures router-replica discovery. Session affinity below
   # may independently use etcd or Redis.
   etcd-endpoints: http://gwp-stores-gwp-datastores-etcd.gwp.svc.cluster.local:2379
+  # GWP replica events can use "zmq" (direct pod-to-pod, the default) or
+  # "nats" (NATS Core pub-sub). The NATS address is unused in ZMQ mode.
+  event-plane: zmq
+  nats-server: nats://gwp-stores-gwp-datastores-nats.gwp.svc.cluster.local:4222
   b10-router.yaml: |
     b10_routing_config:
       # Existing prefill-load contribution. Larger values avoid prefill-busy workers.

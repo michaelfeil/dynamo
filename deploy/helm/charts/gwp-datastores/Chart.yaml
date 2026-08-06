@@ -3,7 +3,7 @@
 
 apiVersion: v2
 name: gwp-datastores
-description: Optional shared Redis and etcd services for Dynamo GWP
+description: Optional shared Redis, etcd, and NATS services for Dynamo GWP
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"

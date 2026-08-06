@@ -60,6 +60,16 @@ spec:
                 configMapKeyRef:
                   name: dynamo-gwp
                   key: etcd-endpoints
+            - name: DYN_EVENT_PLANE
+              valueFrom:
+                configMapKeyRef:
+                  name: dynamo-gwp
+                  key: event-plane
+            - name: NATS_SERVER
+              valueFrom:
+                configMapKeyRef:
+                  name: dynamo-gwp
+                  key: nats-server
           ports:
             - name: schedule-grpc
               containerPort: 8091

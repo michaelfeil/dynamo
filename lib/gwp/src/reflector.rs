@@ -1,20 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The reflector. See design doc "Reflector loop" and Decision 1.
+//! The current ConfigMap/planner topology producer. See the design doc's
+//! "Topology pipeline and current planner producer" section and Decision 1.
 //!
 //! Every ~1s, polls each endpoint deployment's planner service. Its
 //! `GET /deep/health` returns the internal worker list
 //! with per-worker load in `detailed_load_data` (keyed by u64 worker id, with
 //! prefill/decode token counts, block counts, request counts, and the
-//! disaggregation role). One poll cycle drives three things:
+//! disaggregation role). Each resolved poll emits a complete
+//! [`TopologySnapshot`] through the topology controller. The snapshot contains:
 //!
 //! 1. **Endpoint liveness** — a binding is honored iff its deployment still
 //!    has at least one planner-observed worker.
 //! 2. **Endpoint ownership** — every planner worker maps back to its
 //!    independently routable ingress.
-//! 3. **The router feed** — a full `HashMap<WorkerId, ModelRuntimeConfig>`
-//!    snapshot of live planner workers.
+//! 3. **Worker configuration and load** — the full live planner worker set
+//!    consumed by routing and scoring.
 //!
 //! Failure semantics: **last-known-good + staleness grace, per endpoint**. A
 //! usable poll (200 with `detailed_load_data` present) reconciles that
@@ -27,20 +29,15 @@
 //! endpoint's planner blip never disturbs another endpoint.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
 use futures::stream::{FuturesUnordered, StreamExt};
-use parking_lot::RwLock;
 
 use crate::config::{ConfigStore, EndpointConfig, EndpointId};
-use crate::identity::EndpointTable;
-use crate::lifecycle::Lifecycle;
 use crate::metrics::GwpMetrics;
-use crate::models::ModelCatalog;
-use crate::router::{GwpRouter, RemoteLoadStore, RemoteWorkerLoad, WorkerConfigSender};
+use crate::router::ObservedWorkerLoad;
+use crate::topology::{TopologySnapshot, TopologyUpdate, TopologyUpdateSender, TopologyWorker};
 
 /// How often the reflector polls the planners.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -75,45 +72,6 @@ pub struct DeepHealthResponse {
     /// endpoint.
     #[serde(default)]
     pub detailed_load_data: Option<HashMap<u64, DetailedLoadData>>,
-}
-
-/// The set of currently alive planner `WorkerId`s. The session resolver consults
-/// this to decide stick vs. unstick (design doc "Stick/unstick" mental model).
-#[derive(Clone, Default)]
-pub struct LivenessSet {
-    inner: Arc<RwLock<HashSet<u64>>>,
-}
-
-impl LivenessSet {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// True iff `worker_id` is currently advertised by a live endpoint.
-    /// This is the stick/unstick predicate.
-    pub fn is_alive(&self, worker_id: u64) -> bool {
-        self.inner.read().contains(&worker_id)
-    }
-
-    pub fn replace(&self, live: HashSet<u64>) {
-        *self.inner.write() = live;
-    }
-
-    pub fn insert(&self, worker_id: u64) {
-        self.inner.write().insert(worker_id);
-    }
-
-    pub fn clear(&self) {
-        self.inner.write().clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.read().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.read().is_empty()
-    }
 }
 
 /// Grace-window state machine, one per endpoint. Time is injected so tests can
@@ -156,49 +114,21 @@ impl PollState {
 struct EndpointState {
     poll: PollState,
     last_good_workers: HashSet<u64>,
-    last_good_loads: HashMap<u64, RemoteWorkerLoad>,
+    last_good_loads: HashMap<u64, ObservedWorkerLoad>,
 }
 
-/// Background task polling every endpoint planner and reflecting deployment
-/// candidates into the local router's world. Construct with the
-/// [`EndpointTable`] shared with the proxy and the [`WorkerConfigSender`]
-/// returned by [`GwpRouter::new`](crate::router::GwpRouter::new).
+/// Current topology producer: combines ConfigMap endpoint/model policy with
+/// planner worker observations and emits complete source-neutral snapshots.
 pub struct Reflector {
     config: ConfigStore,
     http: reqwest::Client,
-    table: EndpointTable,
-    liveness: LivenessSet,
-    models: ModelCatalog,
-    remote_loads: RemoteLoadStore,
-    load_anchor_router: Option<Arc<GwpRouter>>,
-    workers_tx: WorkerConfigSender,
+    updates: TopologyUpdateSender,
     endpoints: HashMap<EndpointId, EndpointState>,
-    lifecycle: Option<Lifecycle>,
     metrics: Option<GwpMetrics>,
 }
 
 impl Reflector {
-    pub fn new(
-        config: impl Into<ConfigStore>,
-        table: EndpointTable,
-        workers_tx: WorkerConfigSender,
-    ) -> Self {
-        Self::with_state(
-            config,
-            table,
-            workers_tx,
-            ModelCatalog::new(),
-            RemoteLoadStore::default(),
-        )
-    }
-
-    pub fn with_state(
-        config: impl Into<ConfigStore>,
-        table: EndpointTable,
-        workers_tx: WorkerConfigSender,
-        models: ModelCatalog,
-        remote_loads: RemoteLoadStore,
-    ) -> Self {
+    pub fn new(config: impl Into<ConfigStore>, updates: TopologyUpdateSender) -> Self {
         let config = config.into();
         let current = config.load();
         let now = tokio::time::Instant::now();
@@ -216,7 +146,6 @@ impl Reflector {
                 )
             })
             .collect();
-        models.replace_from_config(&current);
         let http = reqwest::Client::builder()
             .timeout(POLL_TIMEOUT)
             .build()
@@ -224,44 +153,15 @@ impl Reflector {
         Self {
             config,
             http,
-            table,
-            liveness: LivenessSet::new(),
-            models,
-            remote_loads,
-            load_anchor_router: None,
-            workers_tx,
+            updates,
             endpoints,
-            lifecycle: None,
             metrics: None,
         }
-    }
-
-    /// Report each complete published routing view into process readiness.
-    pub fn with_lifecycle(mut self, lifecycle: Lifecycle) -> Self {
-        self.lifecycle = Some(lifecycle);
-        self
     }
 
     pub fn with_metrics(mut self, metrics: GwpMetrics) -> Self {
         self.metrics = Some(metrics);
         self
-    }
-
-    /// Capture local scheduler load at each successful planner snapshot. This
-    /// is installed by the production builder; reflector-only tests can keep
-    /// using the store without constructing a full router.
-    pub fn with_load_anchor_router(mut self, router: Arc<GwpRouter>) -> Self {
-        self.load_anchor_router = Some(router);
-        self
-    }
-
-    /// The liveness set the session resolver consults for stick/unstick.
-    pub fn liveness(&self) -> LivenessSet {
-        self.liveness.clone()
-    }
-
-    pub fn models(&self) -> ModelCatalog {
-        self.models.clone()
     }
 
     fn reconcile_config(&mut self, config: &crate::config::GwpConfig) {
@@ -297,7 +197,6 @@ impl Reflector {
                 );
             }
         }
-        self.models.replace_from_config(config);
     }
 
     /// Feed every planner worker as a scheduler candidate and retain its
@@ -312,14 +211,10 @@ impl Reflector {
         let mut live = HashSet::new();
         let mut loads = HashMap::new();
         for (worker_id, load) in workers {
-            if let Err(error) = self.table.upsert_worker(worker_id, endpoint_id.clone()) {
-                tracing::error!(endpoint = %endpoint_id.0, worker_id, %error);
-                continue;
-            }
             live.insert(worker_id);
             loads.insert(
                 worker_id,
-                RemoteWorkerLoad {
+                ObservedWorkerLoad {
                     prefill_tokens: load.num_prefill_tokens.max(0) as usize,
                     decode_blocks: load.num_decode_blocks.max(0) as usize,
                     active_requests: load.num_requests.max(0) as usize,
@@ -332,62 +227,61 @@ impl Reflector {
         }
     }
 
-    /// Rebuild the global view (liveness, endpoint table, router feed) as the
-    /// union of all endpoints' last-known-good candidates.
+    /// Rebuild and emit the complete topology as the union of every
+    /// endpoint's last-known-good planner observation.
     async fn publish(&self, refreshed_workers: &HashSet<u64>) {
-        let mut live = HashSet::new();
-        for state in self.endpoints.values() {
-            live.extend(state.last_good_workers.iter().copied());
-        }
-        let configs: HashMap<u64, ModelRuntimeConfig> = live
-            .iter()
-            .map(|&gwp_id| (gwp_id, ModelRuntimeConfig::default()))
-            .collect();
-        let loads: HashMap<u64, RemoteWorkerLoad> = self
-            .endpoints
-            .values()
-            .flat_map(|state| state.last_good_loads.iter().map(|(id, load)| (*id, *load)))
-            .collect();
-        let routable_workers = live.len();
-        if let Some(metrics) = &self.metrics {
-            metrics.replace_scheduler_live_workers(
-                self.endpoints
-                    .iter()
-                    .map(|(endpoint, state)| (endpoint.clone(), state.last_good_workers.len()))
-                    .collect(),
-            );
-        }
-
-        self.table.retain(&live);
-        self.liveness.replace(live);
-        if let Some(router) = &self.load_anchor_router {
-            if let Err(error) = router
-                .replace_remote_loads(loads.clone(), refreshed_workers)
-                .await
-            {
-                tracing::warn!(%error, "failed to capture local load anchors; publishing planner loads with existing anchors");
-                self.remote_loads.replace(loads);
+        let mut workers: HashMap<u64, TopologyWorker> = HashMap::new();
+        let mut ambiguous_workers = HashSet::new();
+        for (endpoint, state) in &self.endpoints {
+            for worker_id in &state.last_good_workers {
+                if ambiguous_workers.contains(worker_id) {
+                    continue;
+                }
+                let worker = TopologyWorker {
+                    endpoint: endpoint.clone(),
+                    runtime: Default::default(),
+                    observed_load: state.last_good_loads.get(worker_id).copied(),
+                };
+                if let Some(previous) = workers.get(worker_id)
+                    && previous.endpoint != *endpoint
+                {
+                    let first_endpoint = previous.endpoint.clone();
+                    workers.remove(worker_id);
+                    ambiguous_workers.insert(*worker_id);
+                    tracing::error!(
+                        worker_id,
+                        first_endpoint = %first_endpoint.0,
+                        second_endpoint = %endpoint.0,
+                        "worker is advertised by multiple endpoints; excluding it from topology"
+                    );
+                    continue;
+                }
+                workers.insert(*worker_id, worker);
             }
-        } else {
-            self.remote_loads.replace(loads);
         }
-        if let Some(lifecycle) = &self.lifecycle {
-            let config = self.config.load();
-            let configured_routes_covered = config.routes.iter().all(|route| {
-                route.models.iter().all(|model| {
-                    route.endpoints.iter().any(|endpoint_id| {
-                        self.endpoints.get(endpoint_id).is_some_and(|state| {
-                            !state.last_good_workers.is_empty()
-                                && self.models.endpoint_serves(endpoint_id, model)
-                        })
-                    })
-                })
-            });
-            lifecycle.update_routing(routable_workers, configured_routes_covered);
+        if let Some(metrics) = &self.metrics {
+            metrics.set_topology_ambiguous_workers(ambiguous_workers.len());
         }
-        // send() fails only when the router is gone; the loop exits via the
-        // JoinHandle then anyway.
-        let _ = self.workers_tx.send(configs);
+        let config = self.config.load();
+        let refreshed_workers = refreshed_workers
+            .iter()
+            .filter(|worker_id| workers.contains_key(worker_id))
+            .copied()
+            .collect();
+        let snapshot = match TopologySnapshot::from_config(&config, workers) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::error!(%error, "failed to build topology snapshot");
+                return;
+            }
+        };
+        let _ = self
+            .updates
+            .send(TopologyUpdate {
+                snapshot,
+                refreshed_workers,
+            })
+            .await;
     }
 
     async fn fetch(
@@ -539,8 +433,8 @@ impl Reflector {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if self.workers_tx.is_closed() {
-                        tracing::info!("router dropped; reflector exiting");
+                    if self.updates.is_closed() {
+                        tracing::info!("topology controller dropped; reflector exiting");
                         return;
                     }
                     let current = self.config.load();
@@ -578,8 +472,8 @@ impl Reflector {
         }
     }
 
-    /// Spawn the poll loop. The task ends when the [`WorkerConfigSender`]'s
-    /// receiver (the router) is dropped.
+    /// Spawn the poll loop. The task ends when the topology controller drops
+    /// its [`TopologyUpdateSender`].
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move { self.run().await })
     }
@@ -591,6 +485,7 @@ mod tests {
     use crate::config::{EndpointId, GwpConfig, ModelRoute};
     use crate::lifecycle::Lifecycle;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -618,10 +513,47 @@ mod tests {
         }
     }
 
-    fn make_reflector(endpoints: &[&str]) -> (Reflector, crate::router::WorkerConfigSender) {
-        let (tx, _rx) = tokio::sync::watch::channel(HashMap::new());
-        let reflector = Reflector::new(test_config(endpoints), EndpointTable::new(), tx.clone());
-        (reflector, tx)
+    fn make_reflector_with_config(
+        config: GwpConfig,
+        lifecycle: Option<Lifecycle>,
+    ) -> (
+        Reflector,
+        crate::topology::TopologyStore,
+        tokio::sync::watch::Receiver<
+            HashMap<u64, dynamo_llm::local_model::runtime_config::ModelRuntimeConfig>,
+        >,
+    ) {
+        let initial = crate::topology::TopologySnapshot::from_config(&config, HashMap::new())
+            .expect("test topology");
+        let topology = crate::topology::TopologyStore::new(initial);
+        let (workers_tx, workers_rx) = tokio::sync::watch::channel(HashMap::new());
+        let mut controller = crate::topology::TopologyController::new(
+            topology.clone(),
+            workers_tx,
+            crate::router::ObservedLoadStore::default(),
+        );
+        if let Some(lifecycle) = lifecycle {
+            controller = controller.with_lifecycle(lifecycle);
+        }
+        let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(16);
+        controller.spawn(updates_rx);
+        (Reflector::new(config, updates_tx), topology, workers_rx)
+    }
+
+    fn make_reflector(
+        endpoints: &[&str],
+    ) -> (
+        Reflector,
+        crate::topology::TopologyStore,
+        tokio::sync::watch::Receiver<
+            HashMap<u64, dynamo_llm::local_model::runtime_config::ModelRuntimeConfig>,
+        >,
+    ) {
+        make_reflector_with_config(test_config(endpoints), None)
+    }
+
+    async fn flush_topology() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     async fn spawn_planner(
@@ -698,21 +630,22 @@ mod tests {
             state.poll.on_success(tokio::time::Instant::now());
         }
         reflector.publish(&workers.iter().copied().collect()).await;
+        flush_topology().await;
     }
 
     #[tokio::test]
     async fn apply_feeds_every_planner_worker_with_endpoint_ownership() {
-        let (mut reflector, tx) = make_reflector(&["us-east", "eu-west"]);
-        let mut rx = tx.subscribe();
+        let (mut reflector, topology, mut rx) = make_reflector(&["us-east", "eu-west"]);
 
         apply(&mut reflector, "us-east", &[11, 12]).await;
         apply(&mut reflector, "eu-west", &[22, 23]).await;
 
+        let snapshot = topology.load();
         for worker in [11, 12, 22, 23] {
-            assert!(reflector.liveness().is_alive(worker));
+            assert!(snapshot.is_alive(worker));
         }
-        assert_eq!(reflector.table.get(11), Some(eid("us-east")));
-        assert_eq!(reflector.table.get(22), Some(eid("eu-west")));
+        assert_eq!(snapshot.worker_endpoint(11), Some(&eid("us-east")));
+        assert_eq!(snapshot.worker_endpoint(22), Some(&eid("eu-west")));
 
         let configs = rx.borrow_and_update().clone();
         assert_eq!(configs.len(), 4);
@@ -724,24 +657,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_remains_live_while_any_internal_worker_exists() {
-        let (mut reflector, _tx) = make_reflector(&["us-east"]);
-        apply(&mut reflector, "us-east", &[1, 2]).await;
-        assert!(reflector.liveness().is_alive(1));
-        assert!(reflector.liveness().is_alive(2));
+    async fn colliding_worker_is_excluded_without_freezing_topology() {
+        let (mut reflector, topology, mut rx) = make_reflector(&["us-east", "eu-west"]);
 
-        apply(&mut reflector, "us-east", &[2]).await;
-        assert!(!reflector.liveness().is_alive(1));
-        assert!(reflector.liveness().is_alive(2));
+        apply(&mut reflector, "us-east", &[11, 12]).await;
+        apply(&mut reflector, "eu-west", &[11, 22]).await;
 
-        apply(&mut reflector, "us-east", &[]).await;
-        assert!(!reflector.liveness().is_alive(2));
-        assert!(reflector.table.get(1).is_none());
-        assert!(reflector.table.get(2).is_none());
+        let snapshot = topology.load();
+        assert!(!snapshot.is_alive(11));
+        assert_eq!(snapshot.worker_endpoint(12), Some(&eid("us-east")));
+        assert_eq!(snapshot.worker_endpoint(22), Some(&eid("eu-west")));
+        let configs = rx.borrow_and_update().clone();
+        assert!(!configs.contains_key(&11));
+        assert!(configs.contains_key(&12));
+        assert!(configs.contains_key(&22));
     }
 
     #[tokio::test]
-    async fn readiness_tracks_worker_and_configured_route_coverage() {
+    async fn endpoint_remains_live_while_any_internal_worker_exists() {
+        let (mut reflector, topology, _rx) = make_reflector(&["us-east"]);
+        apply(&mut reflector, "us-east", &[1, 2]).await;
+        assert!(topology.load().is_alive(1));
+        assert!(topology.load().is_alive(2));
+
+        apply(&mut reflector, "us-east", &[2]).await;
+        assert!(!topology.load().is_alive(1));
+        assert!(topology.load().is_alive(2));
+
+        apply(&mut reflector, "us-east", &[]).await;
+        assert!(!topology.load().is_alive(2));
+        assert!(topology.load().worker_endpoint(1).is_none());
+        assert!(topology.load().worker_endpoint(2).is_none());
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_any_worker_not_every_model() {
         let mut config = test_config(&["us-east", "eu-west"]);
         config.routes = vec![
             ModelRoute {
@@ -753,16 +703,14 @@ mod tests {
                 endpoints: vec![eid("eu-west")],
             },
         ];
-        let (tx, _rx) = tokio::sync::watch::channel(HashMap::new());
         let lifecycle = Lifecycle::starting(0, Duration::ZERO);
-        let mut reflector =
-            Reflector::new(config, EndpointTable::new(), tx).with_lifecycle(lifecycle.clone());
+        let (mut reflector, _topology, _rx) =
+            make_reflector_with_config(config, Some(lifecycle.clone()));
 
         apply(&mut reflector, "us-east", &[1]).await;
         let missing_route = lifecycle.report();
         assert_eq!(missing_route.routable_workers, 1);
-        assert!(!missing_route.configured_routes_covered);
-        assert!(!missing_route.ready);
+        assert!(missing_route.ready);
 
         apply(&mut reflector, "eu-west", &[2]).await;
         assert!(lifecycle.is_ready());
@@ -770,13 +718,17 @@ mod tests {
         apply(&mut reflector, "us-east", &[]).await;
         let removed = lifecycle.report();
         assert_eq!(removed.routable_workers, 1);
-        assert!(!removed.configured_routes_covered);
-        assert!(!removed.ready);
+        assert!(removed.ready);
+
+        apply(&mut reflector, "eu-west", &[]).await;
+        let empty = lifecycle.report();
+        assert_eq!(empty.routable_workers, 0);
+        assert!(!empty.ready);
     }
 
     #[tokio::test]
     async fn endpoint_load_preserves_each_planner_worker_tuple() {
-        let (mut reflector, _tx) = make_reflector(&["us-east"]);
+        let (mut reflector, _topology, _rx) = make_reflector(&["us-east"]);
         reflector.apply_endpoint_workers(
             &eid("us-east"),
             HashMap::from([
@@ -805,7 +757,7 @@ mod tests {
         let state = &reflector.endpoints[&eid("us-east")];
         assert_eq!(
             state.last_good_loads[&1],
-            RemoteWorkerLoad {
+            ObservedWorkerLoad {
                 prefill_tokens: 640,
                 decode_blocks: 20,
                 active_requests: 2,
@@ -813,7 +765,7 @@ mod tests {
         );
         assert_eq!(
             state.last_good_loads[&2],
-            RemoteWorkerLoad {
+            ObservedWorkerLoad {
                 prefill_tokens: 64,
                 decode_blocks: 1,
                 active_requests: 1,
@@ -823,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_endpoints_outage_does_not_disturb_another() {
-        let (mut reflector, _tx) = make_reflector(&["us-east", "eu-west"]);
+        let (mut reflector, topology, _rx) = make_reflector(&["us-east", "eu-west"]);
         apply(&mut reflector, "us-east", &[1]).await;
         apply(&mut reflector, "eu-west", &[2]).await;
         let (us, eu) = (1, 2);
@@ -834,18 +786,20 @@ mod tests {
         assert!(state.poll.on_failure(late, grace));
         state.last_good_workers = HashSet::new();
         reflector.publish(&HashSet::new()).await;
+        flush_topology().await;
 
-        assert!(reflector.liveness().is_alive(us));
-        assert!(!reflector.liveness().is_alive(eu));
-        assert!(reflector.table.get(us).is_some());
-        assert!(reflector.table.get(eu).is_none());
+        assert!(topology.load().is_alive(us));
+        assert!(!topology.load().is_alive(eu));
+        assert!(topology.load().worker_endpoint(us).is_some());
+        assert!(topology.load().worker_endpoint(eu).is_none());
     }
 
     #[tokio::test]
     async fn config_reload_adds_and_removes_endpoints_without_restart() {
         let store = ConfigStore::new(test_config(&["us-east", "eu-west"]));
-        let (tx, _rx) = tokio::sync::watch::channel(HashMap::new());
-        let mut reflector = Reflector::new(store.clone(), EndpointTable::new(), tx.clone());
+        let (mut reflector, topology, _rx) =
+            make_reflector_with_config((*store.load()).clone(), None);
+        reflector.config = store.clone();
         apply(&mut reflector, "us-east", &[1]).await;
         apply(&mut reflector, "eu-west", &[2]).await;
 
@@ -853,9 +807,10 @@ mod tests {
         let next = store.load();
         reflector.reconcile_config(&next);
         reflector.publish(&HashSet::new()).await;
+        flush_topology().await;
 
-        assert!(reflector.liveness().is_alive(1));
-        assert!(!reflector.liveness().is_alive(2));
+        assert!(topology.load().is_alive(1));
+        assert!(!topology.load().is_alive(2));
         assert!(!reflector.endpoints.contains_key(&eid("eu-west")));
 
         store.replace(test_config(&["us-east", "ap-south"]));
@@ -872,7 +827,7 @@ mod tests {
             None,
         )
         .await;
-        let (mut reflector, _tx) = make_reflector(&["us-east"]);
+        let (mut reflector, topology, _rx) = make_reflector(&["us-east"]);
         apply(&mut reflector, "us-east", &[1]).await;
         let mut config = test_config(&["us-east"]);
         config
@@ -883,9 +838,10 @@ mod tests {
         reflector.config.replace(config);
 
         reflector.poll_once().await;
+        flush_topology().await;
 
-        assert!(!reflector.liveness().is_alive(1));
-        assert!(reflector.table.get(1).is_none());
+        assert!(!topology.load().is_alive(1));
+        assert!(topology.load().worker_endpoint(1).is_none());
     }
 
     #[tokio::test]
@@ -905,8 +861,7 @@ mod tests {
         let mut config = test_config(&["fast", "slow"]);
         config.endpoints.get_mut(&eid("fast")).unwrap().planner_url = fast;
         config.endpoints.get_mut(&eid("slow")).unwrap().planner_url = slow;
-        let (tx, mut rx) = tokio::sync::watch::channel(HashMap::new());
-        let mut reflector = Reflector::new(config, EndpointTable::new(), tx);
+        let (mut reflector, _topology, mut rx) = make_reflector_with_config(config, None);
 
         let poll = tokio::spawn(async move { reflector.poll_once().await });
         tokio::time::timeout(Duration::from_millis(500), async {
@@ -935,8 +890,8 @@ mod tests {
         let mut config = test_config(&["fast", "slow"]);
         config.endpoints.get_mut(&eid("fast")).unwrap().planner_url = fast;
         config.endpoints.get_mut(&eid("slow")).unwrap().planner_url = slow;
-        let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
-        let handle = Reflector::new(config, EndpointTable::new(), tx).spawn();
+        let (reflector, _topology, rx) = make_reflector_with_config(config, None);
+        let handle = reflector.spawn();
 
         tokio::time::sleep(Duration::from_millis(2_400)).await;
         assert!(
@@ -965,9 +920,9 @@ mod tests {
             .unwrap()
             .planner_url = planner;
         let store = ConfigStore::new(config);
-        let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
-        let reflector = Reflector::new(store.clone(), EndpointTable::new(), tx);
-        let liveness = reflector.liveness();
+        let (mut reflector, topology, rx) =
+            make_reflector_with_config((*store.load()).clone(), None);
+        reflector.config = store.clone();
         let handle = reflector.spawn();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -978,7 +933,7 @@ mod tests {
         store.replace(test_config(&[]));
         tokio::time::sleep(Duration::from_millis(1_700)).await;
         assert!(
-            !liveness.is_alive(9),
+            !topology.load().is_alive(9),
             "removed endpoint was resurrected by an old planner response"
         );
         drop(rx);
