@@ -29,6 +29,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -304,6 +305,25 @@ pub struct RuntimeSequenceSubscriber {
     pending: VecDeque<ActiveSequenceEvent>,
 }
 
+fn envelope_delivery_age(published_at: u64) -> Duration {
+    let received_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0);
+    envelope_delivery_age_at(published_at, received_at)
+}
+
+fn envelope_delivery_age_at(published_at: u64, received_at: u64) -> Duration {
+    let Some(age_ms) = received_at.checked_sub(published_at) else {
+        tracing::debug!(
+            clock_skew_ms = published_at - received_at,
+            "Replica event publication time is ahead of the subscriber clock; clamping age to zero"
+        );
+        return Duration::ZERO;
+    };
+    Duration::from_millis(age_ms)
+}
+
 impl RuntimeSequenceSubscriber {
     pub(crate) async fn for_endpoint(endpoint: &Endpoint) -> Result<Self> {
         let transport_kind = endpoint.drt().default_event_transport_kind();
@@ -326,10 +346,8 @@ impl RuntimeSequenceSubscriber {
             pending: VecDeque::new(),
         })
     }
-}
 
-impl SequenceSubscriber for RuntimeSequenceSubscriber {
-    async fn next_event(&mut self) -> Option<anyhow::Result<ActiveSequenceEvent>> {
+    async fn next_sequence_event(&mut self) -> Option<anyhow::Result<ActiveSequenceEvent>> {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some(Ok(event));
@@ -337,19 +355,29 @@ impl SequenceSubscriber for RuntimeSequenceSubscriber {
             match &mut self.inner {
                 ActiveSequenceEventSubscriber::Nats(subscriber) => {
                     return match subscriber.next().await? {
-                        Ok((_envelope, event)) => Some(Ok(event)),
+                        Ok((envelope, mut event)) => {
+                            event.delivery_age = envelope_delivery_age(envelope.published_at);
+                            Some(Ok(event))
+                        }
                         Err(error) => Some(Err(error)),
                     };
                 }
                 ActiveSequenceEventSubscriber::Zmq(subscriber) => match subscriber.next().await? {
-                    Ok((_envelope, batch)) => self.pending.extend(batch.events),
+                    Ok((envelope, batch)) => {
+                        let delivery_age = envelope_delivery_age(envelope.published_at);
+                        self.pending
+                            .extend(batch.events.into_iter().map(|mut event| {
+                                event.delivery_age = delivery_age;
+                                event
+                            }));
+                    }
                     Err(error) => return Some(Err(error)),
                 },
             }
         }
     }
 
-    fn poll_next_event(
+    fn poll_next_sequence_event(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<anyhow::Result<ActiveSequenceEvent>>> {
@@ -360,20 +388,45 @@ impl SequenceSubscriber for RuntimeSequenceSubscriber {
             match &mut self.inner {
                 ActiveSequenceEventSubscriber::Nats(subscriber) => {
                     return match subscriber.poll_next(cx) {
-                        Poll::Ready(Some(Ok((_envelope, event)))) => Poll::Ready(Some(Ok(event))),
+                        Poll::Ready(Some(Ok((envelope, mut event)))) => {
+                            event.delivery_age = envelope_delivery_age(envelope.published_at);
+                            Poll::Ready(Some(Ok(event)))
+                        }
                         Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
                         Poll::Ready(None) => Poll::Ready(None),
                         Poll::Pending => Poll::Pending,
                     };
                 }
                 ActiveSequenceEventSubscriber::Zmq(subscriber) => match subscriber.poll_next(cx) {
-                    Poll::Ready(Some(Ok((_envelope, batch)))) => self.pending.extend(batch.events),
+                    Poll::Ready(Some(Ok((envelope, batch)))) => {
+                        let delivery_age = envelope_delivery_age(envelope.published_at);
+                        self.pending
+                            .extend(batch.events.into_iter().map(|mut event| {
+                                event.delivery_age = delivery_age;
+                                event
+                            }));
+                    }
                     Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
                     Poll::Ready(None) => return Poll::Ready(None),
                     Poll::Pending => return Poll::Pending,
                 },
             }
         }
+    }
+}
+
+impl SequenceSubscriber for RuntimeSequenceSubscriber {
+    fn next_event(
+        &mut self,
+    ) -> impl Future<Output = Option<anyhow::Result<ActiveSequenceEvent>>> + Send {
+        self.next_sequence_event()
+    }
+
+    fn poll_next_event(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<anyhow::Result<ActiveSequenceEvent>>> {
+        self.poll_next_sequence_event(cx)
     }
 }
 
@@ -490,6 +543,15 @@ mod tests {
         })
     }
 
+    #[test]
+    fn envelope_age_uses_delivery_lag_and_clamps_future_publication() {
+        assert_eq!(
+            envelope_delivery_age_at(1_000, 1_250),
+            Duration::from_millis(250)
+        );
+        assert_eq!(envelope_delivery_age_at(1_250, 1_000), Duration::ZERO);
+    }
+
     fn free_event(request_id: impl Into<String>) -> ActiveSequenceEvent {
         ActiveSequenceEvent {
             request_id: request_id.into(),
@@ -497,6 +559,7 @@ mod tests {
             data: ActiveSequenceEventData::Free,
             router_id: 7,
             lora_name: None,
+            delivery_age: Duration::ZERO,
         }
     }
 
@@ -512,6 +575,7 @@ mod tests {
             },
             router_id: 7,
             lora_name: None,
+            delivery_age: Duration::ZERO,
         }
     }
 
@@ -522,6 +586,7 @@ mod tests {
             data: ActiveSequenceEventData::MarkPrefillCompleted,
             router_id: 7,
             lora_name: None,
+            delivery_age: Duration::ZERO,
         }
     }
 
@@ -752,11 +817,13 @@ mod tests {
             ActiveSequenceEventWireFormat::Batch
         );
 
-        let event = free_event("request");
+        let mut event = free_event("request");
+        event.delivery_age = Duration::from_secs(5);
         let singleton_payload = MsgpackCodec.encode_payload(&event).unwrap();
         let decoded_singleton: ActiveSequenceEvent =
             MsgpackCodec.decode_payload(&singleton_payload).unwrap();
         assert_eq!(decoded_singleton.request_id, "request");
+        assert_eq!(decoded_singleton.delivery_age, Duration::ZERO);
         assert!(
             MsgpackCodec
                 .decode_payload::<ActiveSequenceEventBatch>(&singleton_payload)
@@ -771,6 +838,7 @@ mod tests {
         let decoded_batch: ActiveSequenceEventBatch =
             MsgpackCodec.decode_payload(&batch_payload).unwrap();
         assert_eq!(decoded_batch.events[0].request_id, "request");
+        assert_eq!(decoded_batch.events[0].delivery_age, Duration::ZERO);
         assert!(
             MsgpackCodec
                 .decode_payload::<ActiveSequenceEvent>(&batch_payload)

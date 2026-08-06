@@ -1176,6 +1176,7 @@ mod tests {
                 data: ActiveSequenceEventData::MarkPrefillCompleted,
                 router_id: 1,
                 lora_name: None,
+                delivery_age: Duration::ZERO,
             })
             .unwrap();
 
@@ -1261,6 +1262,7 @@ mod tests {
                 data: ActiveSequenceEventData::Free,
                 router_id: 1,
                 lora_name: None,
+                delivery_age: Duration::ZERO,
             })
             .unwrap();
 
@@ -1345,6 +1347,7 @@ mod tests {
                 data: ActiveSequenceEventData::Free,
                 router_id: 1,
                 lora_name: None,
+                delivery_age: Duration::ZERO,
             })
             .unwrap();
 

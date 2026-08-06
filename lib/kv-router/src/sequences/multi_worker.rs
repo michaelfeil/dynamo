@@ -777,6 +777,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             },
             router_id: self.router_id,
             lora_name: req.lora_name.clone(),
+            delivery_age: Duration::ZERO,
         });
         self.add_request_local(req, decay_now, lazily_register_worker)?;
         if let Some(event) = event {
@@ -1286,6 +1287,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             data: event_data,
             router_id: self.router_id,
             lora_name,
+            delivery_age: Duration::ZERO,
         });
         Ok(())
     }
@@ -1311,6 +1313,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             data: event_data,
             router_id: self.router_id,
             lora_name,
+            delivery_age: Duration::ZERO,
         });
         Ok(())
     }
@@ -1723,6 +1726,7 @@ mod tests {
             },
             router_id: 99,
             lora_name: None,
+            delivery_age: Duration::ZERO,
         }
     }
 
@@ -1736,6 +1740,7 @@ mod tests {
             data: ActiveSequenceEventData::Free,
             router_id: 99,
             lora_name: None,
+            delivery_age: Duration::ZERO,
         }
     }
 
@@ -1749,7 +1754,16 @@ mod tests {
             data: ActiveSequenceEventData::MarkPrefillCompleted,
             router_id: 99,
             lora_name: None,
+            delivery_age: Duration::ZERO,
         }
+    }
+
+    fn delivered_after(
+        mut event: ActiveSequenceEvent,
+        delivery_age: Duration,
+    ) -> ActiveSequenceEvent {
+        event.delivery_age = delivery_age;
+        event
     }
 
     fn local_sequence_request(request_id: &str, worker: WorkerWithDpRank) -> SequenceRequest {
@@ -2758,6 +2772,7 @@ mod tests {
                     },
                     router_id: 99,
                     lora_name: None,
+                    delivery_age: Duration::ZERO,
                 }),
                 Ok(ActiveSequenceEvent {
                     request_id: "req-1".to_string(),
@@ -2765,6 +2780,7 @@ mod tests {
                     data: ActiveSequenceEventData::Free,
                     router_id: 99,
                     lora_name: None,
+                    delivery_age: Duration::ZERO,
                 }),
             ]),
         };
@@ -2781,7 +2797,115 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn replica_sync_modeled_remaining_prefill_time_uses_receive_time_and_clears() {
+    async fn replica_delivery_age_preserves_absolute_prefill_decay() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let make_sequences = || {
+            ActiveSequencesMultiWorker::new(
+                NoopSequencePublisher,
+                4,
+                HashMap::from([(1_u64, (0_u32, 1_u32))]),
+                true,
+                0,
+                "test",
+            )
+        };
+        let event = |request_id: &str| ActiveSequenceEvent {
+            request_id: request_id.to_string(),
+            worker,
+            data: ActiveSequenceEventData::AddRequest {
+                token_sequence: Some(vec![1, 2, 3]),
+                track_prefill_tokens: true,
+                expected_output_tokens: None,
+                prefill_load_hint: modeled_hint(12, 10),
+            },
+            router_id: 99,
+            lora_name: None,
+            delivery_age: Duration::ZERO,
+        };
+        let first = make_sequences();
+        let second = make_sequences();
+
+        first.apply_replica_batch(vec![delivered_after(
+            event("first"),
+            Duration::from_secs(2),
+        )]);
+        tokio::time::advance(Duration::from_secs(3)).await;
+        second.apply_replica_batch(vec![delivered_after(
+            event("second"),
+            Duration::from_secs(5),
+        )]);
+
+        let now = Instant::now();
+        assert_eq!(
+            modeled_time_loads_by_worker(&first, now)
+                .get(&worker)
+                .copied(),
+            Some(Ok(5_000))
+        );
+        assert_eq!(
+            modeled_time_loads_by_worker(&second, now)
+                .get(&worker)
+                .copied(),
+            Some(Ok(5_000))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replica_delivery_age_advances_stale_request_expiry() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let sequences = ActiveSequencesMultiWorker::new_with_expiry_duration(
+            NoopSequencePublisher,
+            4,
+            HashMap::from([(1_u64, (0_u32, 1_u32))]),
+            true,
+            0,
+            "test",
+            Duration::from_secs(35),
+        );
+
+        sequences.apply_replica_batch(vec![delivered_after(
+            replica_add("aged", worker, vec![1, 2, 3]),
+            Duration::from_secs(10),
+        )]);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        sequences.force_expire_requests_across_all_workers();
+
+        assert_eq!(active_request_count(&sequences, worker), 0);
+    }
+
+    #[test]
+    fn replica_add_expired_on_arrival_is_dropped_and_cleanup_stays_idempotent() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let sequences = ActiveSequencesMultiWorker::new_with_expiry_duration(
+            NoopSequencePublisher,
+            4,
+            HashMap::from([(1_u64, (0_u32, 1_u32))]),
+            true,
+            0,
+            "test",
+            Duration::from_secs(5),
+        );
+
+        sequences.apply_replica_batch(vec![delivered_after(
+            replica_add("expired", worker, vec![1, 2, 3]),
+            Duration::from_secs(5),
+        )]);
+        assert_eq!(active_request_count(&sequences, worker), 0);
+
+        sequences.apply_replica_batch(vec![replica_add("cleanup", worker, vec![4, 5, 6])]);
+        sequences.apply_replica_batch(vec![delivered_after(
+            replica_free("cleanup", worker),
+            Duration::from_secs(60),
+        )]);
+        sequences.apply_replica_batch(vec![delivered_after(
+            replica_free("cleanup", worker),
+            Duration::from_secs(60),
+        )]);
+        assert_eq!(active_request_count(&sequences, worker), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replica_sync_modeled_remaining_prefill_time_uses_zero_age_fallback_and_clears() {
         let sequences = ActiveSequencesMultiWorker::new(
             NoopSequencePublisher,
             4,
@@ -2806,6 +2930,7 @@ mod tests {
                         },
                         router_id: 99,
                         lora_name: None,
+                        delivery_age: Duration::ZERO,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2825,6 +2950,7 @@ mod tests {
                         data: ActiveSequenceEventData::MarkPrefillCompleted,
                         router_id: 99,
                         lora_name: None,
+                        delivery_age: Duration::ZERO,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2849,6 +2975,7 @@ mod tests {
                         },
                         router_id: 99,
                         lora_name: None,
+                        delivery_age: Duration::ZERO,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2868,6 +2995,7 @@ mod tests {
                         data: ActiveSequenceEventData::Free,
                         router_id: 99,
                         lora_name: None,
+                        delivery_age: Duration::ZERO,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2907,6 +3035,7 @@ mod tests {
                             },
                             router_id: 99,
                             lora_name: None,
+                            delivery_age: Duration::ZERO,
                         }),
                         Ok(ActiveSequenceEvent {
                             request_id: later.clone(),
@@ -2919,6 +3048,7 @@ mod tests {
                             },
                             router_id: 99,
                             lora_name: None,
+                            delivery_age: Duration::ZERO,
                         }),
                     ]),
                 },
@@ -2945,6 +3075,7 @@ mod tests {
                         data: ActiveSequenceEventData::Free,
                         router_id: 99,
                         lora_name: None,
+                        delivery_age: Duration::ZERO,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2983,6 +3114,7 @@ mod tests {
                 },
                 router_id: 99,
                 lora_name: None,
+                delivery_age: Duration::ZERO,
             })]),
         };
 

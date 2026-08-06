@@ -161,15 +161,21 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             data,
             router_id,
             lora_name,
+            delivery_age,
         } = event;
 
         if router_id == self.router_id {
             return;
         }
 
-        // ActiveSequenceEvent does not carry prompt-load decay timestamps yet.
-        // Peer routers still approximate decay anchoring with local receive time.
-        let decay_now = Instant::now();
+        let receive_now = Instant::now();
+        let decay_now = receive_now.checked_sub(delivery_age).unwrap_or_else(|| {
+            tracing::debug!(
+                delivery_age_ms = delivery_age.as_millis(),
+                "Replica event age exceeds the local monotonic clock range; using receive time"
+            );
+            receive_now
+        });
 
         match data {
             ActiveSequenceEventData::AddRequest {
@@ -182,6 +188,17 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                     self.ensure_worker_registered(event_worker);
                 }
                 let table = self.workers.read();
+                if table
+                    .expiry_duration()
+                    .is_some_and(|expiry_duration| delivery_age >= expiry_duration)
+                {
+                    tracing::trace!(
+                        request_id,
+                        delivery_age_ms = delivery_age.as_millis(),
+                        "Dropping replica AddRequest that expired before arrival"
+                    );
+                    return;
+                }
                 let Some(&idx) = table.index.get(&event_worker) else {
                     tracing::debug!(
                         worker = ?event_worker,
