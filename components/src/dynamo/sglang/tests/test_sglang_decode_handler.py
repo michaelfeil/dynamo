@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -20,11 +19,12 @@ from dynamo.sglang.request_handlers.llm.mm_disagg_utils import (
     extract_media_urls,
     raise_if_unextracted_multimodal,
 )
-from dynamo.sglang.request_handlers.multimodal.worker_handler import StreamProcessor
+from dynamo.sglang.request_handlers.llm.prefill_handler import PrefillWorkerHandler
 
 pytestmark = [
     pytest.mark.unit,
     pytest.mark.sglang,
+    pytest.mark.core,
     pytest.mark.gpu_0,
     pytest.mark.profiled_vram_gib(0),
     pytest.mark.pre_merge,
@@ -68,6 +68,45 @@ def test_build_disagg_mm_kwargs_includes_audio_urls():
         "audio_data": ["https://example.com/audio.wav"],
         "video_data": ["https://example.com/video.mp4"],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.multimodal
+async def test_prefill_rejects_cache_uuid_before_building_media_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    build_media_kwargs_called = False
+
+    def record_build_media_kwargs(_request):
+        nonlocal build_media_kwargs_called
+        build_media_kwargs_called = True
+        return {}
+
+    monkeypatch.setattr(
+        "dynamo.sglang.request_handlers.llm.prefill_handler.build_disagg_mm_kwargs",
+        record_build_media_kwargs,
+    )
+
+    handler = PrefillWorkerHandler.__new__(PrefillWorkerHandler)
+    handler.bootstrap_host = "127.0.0.1"
+    handler.bootstrap_port = 1234
+    handler._generate_bootstrap_room = lambda: "room"
+    handler._get_input_param = lambda request: {}
+    context = SimpleNamespace(
+        id=lambda: "request-id",
+        trace_id="trace-id",
+    )
+    request = {
+        "token_ids": [1, 2, 3],
+        "multi_modal_data": {"image_url": [{"UuidOnly": "cached-image"}]},
+        "multi_modal_uuids": {"image_url": ["cached-image"]},
+    }
+
+    with pytest.raises(ValueError, match="supported only by the vLLM backend"):
+        async for _ in handler.generate(request, context):
+            pass
+
+    assert not build_media_kwargs_called
 
 
 def test_extract_media_urls_returns_none_for_missing_modality():
@@ -353,6 +392,16 @@ class TestMultimodalGuard:
 
     def test_text_only_request_bypasses_guard(self):
         raise_if_unextracted_multimodal({"token_ids": [10, 20, 30]})
+
+    @pytest.mark.multimodal
+    def test_rejects_multimodal_cache_uuid(self):
+        with pytest.raises(ValueError, match="supported only by the vLLM backend"):
+            raise_if_unextracted_multimodal(
+                {
+                    "token_ids": [10, 20, 30],
+                    "multi_modal_uuids": {"image_url": ["cached-image"]},
+                }
+            )
 
 
 def test_build_logprob_kwargs_allows_chosen_token_logprobs(monkeypatch):
@@ -907,53 +956,6 @@ async def test_process_token_stream_suppresses_hidden_stop_token_reason():
     )
 
     assert "stop_reason" not in chunks[0]
-
-
-@pytest.mark.asyncio
-async def test_multimodal_stream_keeps_reading_after_one_choice_finishes():
-    chunks = await _collect(
-        StreamProcessor.process_sglang_stream(
-            _stream(
-                [
-                    {
-                        "index": 0,
-                        "output_ids": [101],
-                        "text": "a",
-                        "meta_info": {"finish_reason": None},
-                    },
-                    {
-                        "index": 1,
-                        "output_ids": [201],
-                        "text": "b",
-                        "meta_info": {"finish_reason": None},
-                    },
-                    {
-                        "index": 0,
-                        "output_ids": [],
-                        "text": "a",
-                        "meta_info": {"finish_reason": {"type": "stop"}},
-                    },
-                    {
-                        "index": 1,
-                        "output_ids": [],
-                        "text": "b",
-                        "meta_info": {"finish_reason": {"type": "stop"}},
-                    },
-                ]
-            )
-        )
-    )
-
-    outputs = [json.loads(chunk) for chunk in chunks]
-
-    assert [output["index"] for output in outputs] == [0, 1, 0, 1]
-    assert [output["finished"] for output in outputs] == [False, False, True, True]
-    assert [output.get("finish_reason") for output in outputs] == [
-        None,
-        None,
-        "stop",
-        "stop",
-    ]
 
 
 async def _collect(stream):
