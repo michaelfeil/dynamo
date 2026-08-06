@@ -2851,7 +2851,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn replica_delivery_age_advances_stale_request_expiry() {
+    async fn replica_delivery_age_drives_expiry_and_preserves_cleanup() {
         let worker = WorkerWithDpRank::new(1, 0);
         let sequences = ActiveSequencesMultiWorker::new_with_expiry_duration(
             NoopSequencePublisher,
@@ -2864,34 +2864,15 @@ mod tests {
         );
 
         sequences.apply_replica_batch(vec![delivered_after(
+            replica_add("expired", worker, vec![1, 2, 3]),
+            Duration::from_secs(35),
+        )]);
+        assert_eq!(active_request_count(&sequences, worker), 0);
+
+        sequences.apply_replica_batch(vec![delivered_after(
             replica_add("aged", worker, vec![1, 2, 3]),
             Duration::from_secs(10),
         )]);
-        tokio::time::advance(Duration::from_secs(30)).await;
-        sequences.force_expire_requests_across_all_workers();
-
-        assert_eq!(active_request_count(&sequences, worker), 0);
-    }
-
-    #[test]
-    fn replica_add_expired_on_arrival_is_dropped_and_cleanup_stays_idempotent() {
-        let worker = WorkerWithDpRank::new(1, 0);
-        let sequences = ActiveSequencesMultiWorker::new_with_expiry_duration(
-            NoopSequencePublisher,
-            4,
-            HashMap::from([(1_u64, (0_u32, 1_u32))]),
-            true,
-            0,
-            "test",
-            Duration::from_secs(5),
-        );
-
-        sequences.apply_replica_batch(vec![delivered_after(
-            replica_add("expired", worker, vec![1, 2, 3]),
-            Duration::from_secs(5),
-        )]);
-        assert_eq!(active_request_count(&sequences, worker), 0);
-
         sequences.apply_replica_batch(vec![replica_add("cleanup", worker, vec![4, 5, 6])]);
         sequences.apply_replica_batch(vec![delivered_after(
             replica_free("cleanup", worker),
@@ -2901,6 +2882,11 @@ mod tests {
             replica_free("cleanup", worker),
             Duration::from_secs(60),
         )]);
+        assert_eq!(active_request_count(&sequences, worker), 1);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        sequences.force_expire_requests_across_all_workers();
+
         assert_eq!(active_request_count(&sequences, worker), 0);
     }
 

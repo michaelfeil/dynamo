@@ -346,8 +346,10 @@ impl RuntimeSequenceSubscriber {
             pending: VecDeque::new(),
         })
     }
+}
 
-    async fn next_sequence_event(&mut self) -> Option<anyhow::Result<ActiveSequenceEvent>> {
+impl SequenceSubscriber for RuntimeSequenceSubscriber {
+    async fn next_event(&mut self) -> Option<anyhow::Result<ActiveSequenceEvent>> {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some(Ok(event));
@@ -377,7 +379,7 @@ impl RuntimeSequenceSubscriber {
         }
     }
 
-    fn poll_next_sequence_event(
+    fn poll_next_event(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<anyhow::Result<ActiveSequenceEvent>>> {
@@ -412,21 +414,6 @@ impl RuntimeSequenceSubscriber {
                 },
             }
         }
-    }
-}
-
-impl SequenceSubscriber for RuntimeSequenceSubscriber {
-    fn next_event(
-        &mut self,
-    ) -> impl Future<Output = Option<anyhow::Result<ActiveSequenceEvent>>> + Send {
-        self.next_sequence_event()
-    }
-
-    fn poll_next_event(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<anyhow::Result<ActiveSequenceEvent>>> {
-        self.poll_next_sequence_event(cx)
     }
 }
 
