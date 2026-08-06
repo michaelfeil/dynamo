@@ -11,6 +11,7 @@ use crate::protocols::WorkerWithDpRank;
 pub(super) struct RequestIndex {
     request_to_worker: DashMap<RequestId, WorkerWithDpRank>,
     request_to_lora: DashMap<RequestId, String>,
+    request_to_replica_source: DashMap<RequestId, u64>,
 }
 
 impl RequestIndex {
@@ -32,17 +33,34 @@ impl RequestIndex {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn set_request(
         &self,
         request_id: RequestId,
         worker: WorkerWithDpRank,
         lora_name: Option<String>,
     ) {
+        self.set_request_from_replica_source(request_id, worker, lora_name, None);
+    }
+
+    pub(super) fn set_request_from_replica_source(
+        &self,
+        request_id: RequestId,
+        worker: WorkerWithDpRank,
+        lora_name: Option<String>,
+        replica_source_id: Option<u64>,
+    ) {
         self.request_to_worker.insert(request_id.clone(), worker);
         if let Some(lora_name) = lora_name {
-            self.request_to_lora.insert(request_id, lora_name);
+            self.request_to_lora.insert(request_id.clone(), lora_name);
         } else {
             self.request_to_lora.remove(&request_id);
+        }
+        if let Some(replica_source_id) = replica_source_id {
+            self.request_to_replica_source
+                .insert(request_id, replica_source_id);
+        } else {
+            self.request_to_replica_source.remove(&request_id);
         }
     }
 
@@ -62,7 +80,16 @@ impl RequestIndex {
             .remove(request_id)
             .map(|(_request_id, worker)| worker);
         self.request_to_lora.remove(request_id);
+        self.request_to_replica_source.remove(request_id);
         worker
+    }
+
+    pub(super) fn requests_for_replica_source(&self, replica_source_id: u64) -> Vec<RequestId> {
+        self.request_to_replica_source
+            .iter()
+            .filter(|entry| *entry.value() == replica_source_id)
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     pub(super) fn remove_requests<'a>(&self, request_ids: impl IntoIterator<Item = &'a RequestId>) {
@@ -93,7 +120,9 @@ impl RequestIndex {
 
     #[cfg(any(test, feature = "bench"))]
     pub(super) fn is_empty(&self) -> bool {
-        self.request_to_worker.is_empty() && self.request_to_lora.is_empty()
+        self.request_to_worker.is_empty()
+            && self.request_to_lora.is_empty()
+            && self.request_to_replica_source.is_empty()
     }
 
     #[cfg(any(test, feature = "bench"))]

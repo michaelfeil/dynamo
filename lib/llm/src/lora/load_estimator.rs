@@ -761,6 +761,7 @@ mod tests {
             data,
             router_id: 7,
             lora_name: lora_name.map(str::to_string),
+            publisher_id: None,
         }
     }
 

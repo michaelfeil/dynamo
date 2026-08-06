@@ -624,6 +624,9 @@ pub struct ActiveSequenceEvent {
     pub router_id: u64,
     #[serde(default)]
     pub lora_name: Option<String>,
+    /// Event-envelope publisher attribution populated locally by replica-sync subscribers.
+    #[serde(skip)]
+    pub publisher_id: Option<u64>,
 }
 
 /// Active-sequence lifecycle events carried in publisher-queue arrival order.

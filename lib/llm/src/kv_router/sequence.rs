@@ -21,6 +21,9 @@ pub use dynamo_kv_router::sequence::{ActiveSequences, RequestId};
 
 use anyhow::Result;
 use dynamo_runtime::component::Endpoint;
+use dynamo_runtime::discovery::{
+    DiscoveryEvent, DiscoveryInstanceId, DiscoveryQuery, EventChannelQuery,
+};
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::transports::event_plane::{
     EventPublisher, EventSubscriber, EventTransportKind, TypedEventSubscriber,
@@ -30,6 +33,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tokio_stream::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use super::metrics::{RouterWorkerStatusMetrics, WORKER_LOAD_METRICS};
@@ -265,12 +269,21 @@ impl SequenceSubscriber for RuntimeSequenceSubscriber {
             match &mut self.inner {
                 ActiveSequenceEventSubscriber::Nats(subscriber) => {
                     return match subscriber.next().await? {
-                        Ok((_envelope, event)) => Some(Ok(event)),
+                        Ok((envelope, mut event)) => {
+                            event.publisher_id = Some(envelope.publisher_id);
+                            Some(Ok(event))
+                        }
                         Err(error) => Some(Err(error)),
                     };
                 }
                 ActiveSequenceEventSubscriber::Zmq(subscriber) => match subscriber.next().await? {
-                    Ok((_envelope, batch)) => self.pending.extend(batch.events),
+                    Ok((envelope, batch)) => {
+                        self.pending
+                            .extend(batch.events.into_iter().map(|mut event| {
+                                event.publisher_id = Some(envelope.publisher_id);
+                                event
+                            }))
+                    }
                     Err(error) => return Some(Err(error)),
                 },
             }
@@ -288,14 +301,23 @@ impl SequenceSubscriber for RuntimeSequenceSubscriber {
             match &mut self.inner {
                 ActiveSequenceEventSubscriber::Nats(subscriber) => {
                     return match subscriber.poll_next(cx) {
-                        Poll::Ready(Some(Ok((_envelope, event)))) => Poll::Ready(Some(Ok(event))),
+                        Poll::Ready(Some(Ok((envelope, mut event)))) => {
+                            event.publisher_id = Some(envelope.publisher_id);
+                            Poll::Ready(Some(Ok(event)))
+                        }
                         Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
                         Poll::Ready(None) => Poll::Ready(None),
                         Poll::Pending => Poll::Pending,
                     };
                 }
                 ActiveSequenceEventSubscriber::Zmq(subscriber) => match subscriber.poll_next(cx) {
-                    Poll::Ready(Some(Ok((_envelope, batch)))) => self.pending.extend(batch.events),
+                    Poll::Ready(Some(Ok((envelope, batch)))) => {
+                        self.pending
+                            .extend(batch.events.into_iter().map(|mut event| {
+                                event.publisher_id = Some(envelope.publisher_id);
+                                event
+                            }))
+                    }
                     Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
                     Poll::Ready(None) => return Poll::Ready(None),
                     Poll::Pending => return Poll::Pending,
@@ -307,6 +329,43 @@ impl SequenceSubscriber for RuntimeSequenceSubscriber {
 
 /// Type alias for the runtime-wired multi-worker sequence tracker.
 pub type ActiveSequencesMulti = ActiveSequencesMultiWorker<RuntimeSequencePublisher>;
+
+async fn start_replica_source_watch(
+    endpoint: Endpoint,
+    tracker: Arc<ActiveSequencesMulti>,
+    cancellation_token: CancellationToken,
+) -> Result<()> {
+    let query = DiscoveryQuery::EventChannels(EventChannelQuery::endpoint_topic(
+        endpoint.id(),
+        ACTIVE_SEQUENCES_SUBJECT,
+    ));
+    let mut watch = endpoint
+        .drt()
+        .discovery()
+        .list_and_watch(query, Some(cancellation_token.clone()))
+        .await?;
+
+    tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                event = watch.next() => event,
+                _ = cancellation_token.cancelled() => return,
+            };
+            match event {
+                Some(Ok(DiscoveryEvent::Removed(DiscoveryInstanceId::EventChannel(id)))) => {
+                    tracker.replica_source_removed(id.instance_id);
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "Replica-sync publisher liveness watch failed");
+                }
+                None => return,
+            }
+        }
+    });
+
+    Ok(())
+}
 
 /// Convenience async constructor that creates the event-plane publishers/subscribers
 /// and returns an `Arc<ActiveSequencesMulti>` with replica sync already running.
@@ -387,6 +446,8 @@ pub async fn create_multi_worker_sequences(
             .await?;
         } else {
             let subscriber = RuntimeSequenceSubscriber::for_endpoint(&endpoint).await?;
+            start_replica_source_watch(endpoint, arc.clone(), cancellation_token.child_token())
+                .await?;
             arc.start_replica_sync(subscriber, cancellation_token.child_token());
         }
     }
@@ -417,6 +478,7 @@ mod tests {
             data: ActiveSequenceEventData::Free,
             router_id: 7,
             lora_name: None,
+            publisher_id: None,
         }
     }
 

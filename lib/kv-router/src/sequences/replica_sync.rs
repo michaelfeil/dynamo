@@ -53,11 +53,51 @@ impl ReplicaBatchEffects {
 impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
     /// Apply one decoded replica-sync batch and flush its deferred effects once.
     pub fn apply_replica_batch(&self, events: Vec<ActiveSequenceEvent>) {
+        self.apply_sourced_replica_batch(None, events);
+    }
+
+    /// Apply a decoded replica-sync batch attributed to one event publisher.
+    pub fn apply_replica_batch_from_source(
+        &self,
+        publisher_id: u64,
+        events: Vec<ActiveSequenceEvent>,
+    ) {
+        self.apply_sourced_replica_batch(Some(publisher_id), events);
+    }
+
+    fn apply_sourced_replica_batch(
+        &self,
+        publisher_id: Option<u64>,
+        events: Vec<ActiveSequenceEvent>,
+    ) {
         let mut effects = ReplicaBatchEffects::default();
-        for event in events {
+        for mut event in events {
+            event.publisher_id = publisher_id;
             self.apply_replica_event(event, &mut effects);
         }
         self.flush_replica_batch_effects(&mut effects);
+    }
+
+    /// Release scheduler state owned by a publisher that discovery has expired.
+    pub fn replica_source_removed(&self, publisher_id: u64) {
+        self.dead_replica_sources.insert(publisher_id);
+
+        // Tombstone before scanning so a late AddRequest cannot race with eviction.
+        let request_ids = self.request_index.requests_for_replica_source(publisher_id);
+        let mut effects = ReplicaBatchEffects::default();
+        let decay_now = Instant::now();
+        for request_id in &request_ids {
+            self.apply_replica_free(request_id, decay_now, &mut effects);
+        }
+        self.flush_replica_batch_effects(&mut effects);
+
+        if !request_ids.is_empty() {
+            tracing::warn!(
+                publisher_id,
+                evicted_requests = request_ids.len(),
+                "Evicted scheduler state owned by dead router replica publisher"
+            );
+        }
     }
 
     /// Spawn a background task that subscribes to replica-sync events from peer routers
@@ -161,9 +201,14 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             data,
             router_id,
             lora_name,
+            publisher_id,
         } = event;
 
         if router_id == self.router_id {
+            return;
+        }
+
+        if publisher_id.is_some_and(|id| self.dead_replica_sources.contains(&id)) {
             return;
         }
 
@@ -190,8 +235,12 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                     return;
                 };
 
-                self.request_index
-                    .set_request(request_id.clone(), event_worker, lora_name);
+                self.request_index.set_request_from_replica_source(
+                    request_id.clone(),
+                    event_worker,
+                    lora_name,
+                    publisher_id,
+                );
                 let (expired_request_ids, load) = {
                     let slot = &table.slots[idx];
                     let mut seq = slot.sequences.write();
@@ -215,30 +264,20 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 drop(table);
                 self.request_index
                     .remove_requests(expired_request_ids.iter());
+
+                // Close the only insertion race with replica_source_removed: if discovery
+                // expired this publisher while AddRequest was being applied, release it now.
+                if let Some(publisher_id) = publisher_id
+                    && self.dead_replica_sources.contains(&publisher_id)
+                {
+                    self.replica_source_removed(publisher_id);
+                    return;
+                }
                 effects.record_worker_load(event_worker, load, true);
                 effects.cleanup_prompt_trie = true;
             }
             ActiveSequenceEventData::Free => {
-                let Some(worker) = self.request_index.remove_request(&request_id) else {
-                    return;
-                };
-                let table = self.workers.read();
-                let Some(&idx) = table.index.get(&worker) else {
-                    return;
-                };
-                let load = {
-                    let slot = &table.slots[idx];
-                    let mut seq = slot.sequences.write();
-                    let delta = seq.free(&request_id, decay_now);
-                    let load = seq.worker_load_snapshot();
-                    self.prompt_registry
-                        .apply_membership_delta_and_load_without_cleanup(worker, delta, load);
-                    load
-                };
-                drop(table);
-                effects.record_worker_load(worker, load, true);
-                effects.wake_scheduler = true;
-                effects.cleanup_prompt_trie = true;
+                self.apply_replica_free(&request_id, decay_now, effects);
             }
             ActiveSequenceEventData::MarkPrefillCompleted => {
                 let Some(worker) = self.request_index.worker_for(&request_id) else {
@@ -260,6 +299,34 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 effects.wake_scheduler = true;
             }
         }
+    }
+
+    fn apply_replica_free(
+        &self,
+        request_id: &String,
+        decay_now: Instant,
+        effects: &mut ReplicaBatchEffects,
+    ) {
+        let Some(worker) = self.request_index.remove_request(request_id) else {
+            return;
+        };
+        let table = self.workers.read();
+        let Some(&idx) = table.index.get(&worker) else {
+            return;
+        };
+        let load = {
+            let slot = &table.slots[idx];
+            let mut seq = slot.sequences.write();
+            let delta = seq.free(request_id, decay_now);
+            let load = seq.worker_load_snapshot();
+            self.prompt_registry
+                .apply_membership_delta_and_load_without_cleanup(worker, delta, load);
+            load
+        };
+        drop(table);
+        effects.record_worker_load(worker, load, true);
+        effects.wake_scheduler = true;
+        effects.cleanup_prompt_trie = true;
     }
 
     fn flush_replica_batch_effects(&self, effects: &mut ReplicaBatchEffects) {

@@ -222,6 +222,7 @@ pub struct SequenceRequest {
 pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     pub(super) workers: RwLock<WorkerTable>,
     pub(super) request_index: RequestIndex,
+    pub(super) dead_replica_sources: dashmap::DashSet<u64>,
     pub(super) prompt_registry: PromptRegistry,
     block_size: usize,
     pub(super) router_id: u64,
@@ -364,6 +365,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         Self {
             workers: RwLock::new(workers),
             request_index: RequestIndex::default(),
+            dead_replica_sources: dashmap::DashSet::new(),
             prompt_registry,
             block_size,
             router_id,
@@ -631,6 +633,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             },
             router_id: self.router_id,
             lora_name: req.lora_name.clone(),
+            publisher_id: None,
         });
         self.add_request_local(req, decay_now, lazily_register_worker)?;
         if let Some(event) = event {
@@ -1138,6 +1141,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             data: event_data,
             router_id: self.router_id,
             lora_name,
+            publisher_id: None,
         });
         Ok(())
     }
@@ -1163,6 +1167,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             data: event_data,
             router_id: self.router_id,
             lora_name,
+            publisher_id: None,
         });
         Ok(())
     }
@@ -1341,8 +1346,8 @@ mod tests {
             .collect()
     }
 
-    fn active_request_count(
-        sequences: &ActiveSequencesMultiWorker<NoopSequencePublisher>,
+    fn active_request_count<P: SequencePublisher + 'static>(
+        sequences: &ActiveSequencesMultiWorker<P>,
         worker: WorkerWithDpRank,
     ) -> usize {
         sequences
@@ -1578,6 +1583,7 @@ mod tests {
             },
             router_id: 99,
             lora_name: None,
+            publisher_id: None,
         }
     }
 
@@ -1591,6 +1597,7 @@ mod tests {
             data: ActiveSequenceEventData::Free,
             router_id: 99,
             lora_name: None,
+            publisher_id: None,
         }
     }
 
@@ -1604,6 +1611,7 @@ mod tests {
             data: ActiveSequenceEventData::MarkPrefillCompleted,
             router_id: 99,
             lora_name: None,
+            publisher_id: None,
         }
     }
 
@@ -2228,6 +2236,41 @@ mod tests {
     }
 
     #[test]
+    fn expired_replica_source_frees_owned_requests_and_rejects_late_events() {
+        let worker_a = WorkerWithDpRank::new(1, 0);
+        let worker_b = WorkerWithDpRank::new(2, 0);
+        let (sequences, _) = make_recording_sequences(HashMap::from([
+            (1_u64, (0_u32, 1_u32)),
+            (2_u64, (0_u32, 1_u32)),
+        ]));
+        let dead_publisher = 17;
+
+        sequences.apply_replica_batch_from_source(
+            dead_publisher,
+            vec![replica_add("dead", worker_a, vec![1, 2, 3])],
+        );
+        sequences.apply_replica_batch_from_source(
+            18,
+            vec![replica_add("live", worker_b, vec![4, 5, 6])],
+        );
+
+        sequences.replica_source_removed(dead_publisher);
+
+        assert_eq!(active_request_count(&sequences, worker_a), 0);
+        assert_eq!(active_request_count(&sequences, worker_b), 1);
+        assert_eq!(sequences.remote_state_update_count(), 1);
+
+        sequences.apply_replica_batch_from_source(
+            dead_publisher,
+            vec![replica_add("late", worker_a, vec![7, 8, 9])],
+        );
+        assert_eq!(
+            sequences.request_index.worker_for(&"late".to_string()),
+            None
+        );
+    }
+
+    #[test]
     fn replica_batches_apply_concurrently_to_independent_workers() {
         let worker_a = WorkerWithDpRank::new(1, 0);
         let worker_b = WorkerWithDpRank::new(2, 0);
@@ -2498,6 +2541,7 @@ mod tests {
                     },
                     router_id: 99,
                     lora_name: None,
+                    publisher_id: None,
                 }),
                 Ok(ActiveSequenceEvent {
                     request_id: "req-1".to_string(),
@@ -2505,6 +2549,7 @@ mod tests {
                     data: ActiveSequenceEventData::Free,
                     router_id: 99,
                     lora_name: None,
+                    publisher_id: None,
                 }),
             ]),
         };
@@ -2546,6 +2591,7 @@ mod tests {
                         },
                         router_id: 99,
                         lora_name: None,
+                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2565,6 +2611,7 @@ mod tests {
                         data: ActiveSequenceEventData::MarkPrefillCompleted,
                         router_id: 99,
                         lora_name: None,
+                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2589,6 +2636,7 @@ mod tests {
                         },
                         router_id: 99,
                         lora_name: None,
+                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2608,6 +2656,7 @@ mod tests {
                         data: ActiveSequenceEventData::Free,
                         router_id: 99,
                         lora_name: None,
+                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2647,6 +2696,7 @@ mod tests {
                             },
                             router_id: 99,
                             lora_name: None,
+                            publisher_id: None,
                         }),
                         Ok(ActiveSequenceEvent {
                             request_id: later.clone(),
@@ -2659,6 +2709,7 @@ mod tests {
                             },
                             router_id: 99,
                             lora_name: None,
+                            publisher_id: None,
                         }),
                     ]),
                 },
@@ -2685,6 +2736,7 @@ mod tests {
                         data: ActiveSequenceEventData::Free,
                         router_id: 99,
                         lora_name: None,
+                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2723,6 +2775,7 @@ mod tests {
                 },
                 router_id: 99,
                 lora_name: None,
+                publisher_id: None,
             })]),
         };
 
