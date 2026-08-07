@@ -341,7 +341,13 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 routing_inputs,
                 ..
             } = &mut *state;
-            if candidates.is_empty() {
+            if let Some(preferred) = request.preferred_worker
+                && let Some(candidate) = candidates
+                    .iter()
+                    .find(|candidate| candidate.worker == preferred)
+            {
+                Some((candidate.worker, candidate.cost))
+            } else if candidates.is_empty() {
                 None
             } else {
                 debug_assert!(

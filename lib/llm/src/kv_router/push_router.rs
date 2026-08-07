@@ -230,7 +230,7 @@ where
         }
 
         let request_context = request.context();
-        let mut operation = affinity
+        let operation = affinity
             .acquire_with_context(&session_id, explicit, request_context.as_ref())
             .await?;
         let worker = operation.target().and_then(affinity_worker);
@@ -240,9 +240,7 @@ where
                     && !affinity_target_matches_selection(target, &selection)
                 {
                     operation.invalidate();
-                    operation = affinity
-                        .acquire_with_context(&session_id, None, request_context.as_ref())
-                        .await?;
+                    return Ok((selection, None));
                 }
                 Ok((selection, Some(operation)))
             }

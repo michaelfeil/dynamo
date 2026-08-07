@@ -146,8 +146,8 @@ where
                 return Ok(None);
             }
         };
-        let pinned_worker = match request_pinned_worker {
-            Some(worker) => Some(worker),
+        let affinity_worker = match request_pinned_worker {
+            Some(_) => None,
             None => match decode_affinity_target {
                 Some(target) => {
                     let Some(dp_rank) = target
@@ -165,6 +165,13 @@ where
                 }
                 None => None,
             },
+        };
+        let (pinned_worker, preferred_worker) = match request_pinned_worker {
+            Some(worker) => (Some(worker), None),
+            None if decode_router.kv_router_config().session_affinity_soft => {
+                (None, affinity_worker)
+            }
+            None => (affinity_worker, None),
         };
         let routing_constraints = req
             .routing
@@ -187,7 +194,7 @@ where
                 session_id.clone(),
                 expected_output_tokens,
                 pinned_worker,
-                None,
+                preferred_worker,
                 allowed_worker_ids,
                 routing_constraints,
             )
