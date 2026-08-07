@@ -682,46 +682,39 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         worker_assignment_count: &AtomicUsize,
         num_workers: usize,
         synthetic_event_id: &AtomicU64,
-        prune_manager: &WorkerPruneManager,
         entries: Vec<BlockEntry>,
     ) {
-        let mut by_worker = BTreeMap::<WorkerWithDpRank, Vec<_>>::new();
+        let mut by_worker: BTreeMap<WorkerWithDpRank, BTreeSet<ExternalSequenceBlockHash>> =
+            BTreeMap::new();
         for entry in entries {
-            by_worker.entry(entry.worker).or_default().push(entry);
+            by_worker.entry(entry.worker).or_default().insert(entry.key);
         }
 
-        for (worker, entries) in by_worker {
+        for (worker, hashes) in by_worker {
+            let event_id = Self::next_synthetic_event_id(synthetic_event_id);
+            let event = RouterEvent::new(
+                worker.worker_id,
+                KvCacheEvent {
+                    event_id,
+                    data: KvCacheEventData::Removed(KvCacheRemoveData {
+                        block_hashes: hashes.into_iter().collect(),
+                    }),
+                    dp_rank: worker.dp_rank,
+                },
+            );
             let thread_idx = Self::get_or_assign_thread_idx(
                 worker_assignments,
                 worker_assignment_count,
                 worker,
                 num_workers,
             );
-            prune_manager.enqueue_prune_removes(entries, |entries| {
-                let hashes = entries
-                    .into_iter()
-                    .map(|entry| entry.key)
-                    .collect::<BTreeSet<_>>();
-                let event_id = Self::next_synthetic_event_id(synthetic_event_id);
-                let event = RouterEvent::new(
-                    worker.worker_id,
-                    KvCacheEvent {
-                        event_id,
-                        data: KvCacheEventData::Removed(KvCacheRemoveData {
-                            block_hashes: hashes.into_iter().collect(),
-                        }),
-                        dp_rank: worker.dp_rank,
-                    },
+            if let Err(error) = worker_event_channels[thread_idx].send(WorkerTask::Event(event)) {
+                tracing::warn!(
+                    thread_idx,
+                    ?error,
+                    "Failed to enqueue approximate TTL remove event"
                 );
-                if let Err(error) = worker_event_channels[thread_idx].send(WorkerTask::Event(event))
-                {
-                    tracing::warn!(
-                        thread_idx,
-                        ?error,
-                        "Failed to enqueue approximate TTL remove event"
-                    );
-                }
-            });
+            }
         }
     }
 
@@ -755,7 +748,6 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
                                     &worker_assignment_count,
                                     num_workers,
                                     &synthetic_event_id,
-                                    &prune_manager,
                                     entries,
                                 );
                             }
@@ -806,7 +798,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
 
         let event_id = Self::next_synthetic_event_id(&self.synthetic_event_id);
         let event = Self::stored_event_for_hashes(worker, local_hashes, sequence_hashes, event_id);
-        let mut prune_entries = Some(Self::block_entries_for_hashes(worker, sequence_hashes));
+        let prune_entries = Self::block_entries_for_hashes(worker, sequence_hashes);
         let thread_idx = Self::get_or_assign_thread_idx(
             &self.worker_assignments,
             &self.worker_assignment_count,
@@ -821,23 +813,13 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
                 resp: resp_tx,
             })
         };
-        let result = if let Some(ttl) = ttl_override {
-            match prune_entries.take() {
-                Some(entries) => prune_manager
-                    .enqueue_and_insert_worker_block_entries(worker, entries, ttl, enqueue),
-                None => enqueue(),
-            }
-        } else {
-            enqueue()
-        };
-        result.map_err(|_| KvRouterError::IndexerOffline)?;
+        prune_manager
+            .enqueue_and_insert_worker_block_entries(worker, prune_entries, ttl_override, enqueue)
+            .map_err(|_| KvRouterError::IndexerOffline)?;
 
-        let applied = resp_rx
+        resp_rx
             .await
             .map_err(|_| KvRouterError::IndexerDroppedRequest)?;
-        if applied && let Some(prune_entries) = prune_entries {
-            prune_manager.insert_worker_block_entries(worker, prune_entries, None);
-        }
 
         Ok(())
     }
@@ -1187,7 +1169,6 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
                 &self.worker_assignment_count,
                 self.num_workers,
                 &self.synthetic_event_id,
-                prune_manager,
                 entries,
             );
             self.flush().await;
@@ -1200,7 +1181,6 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
                 &self.worker_assignment_count,
                 self.num_workers,
                 &self.synthetic_event_id,
-                prune_manager,
                 entries,
             );
             if has_entries {

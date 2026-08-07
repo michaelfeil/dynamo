@@ -191,10 +191,6 @@ impl<K: Clone + Hash + Eq + Ord> PruneManager<K> {
         expired_keys
     }
 
-    fn contains(&self, key: &K) -> bool {
-        self.timers.contains_key(key)
-    }
-
     /// Returns the next non-stale expiry time, if it exists.
     pub fn peek_next_valid_expiry(&mut self) -> Option<Instant> {
         self.expirations
@@ -250,10 +246,6 @@ impl WorkerPruneState {
 
     fn pop_expired(&mut self, now: Instant) -> Vec<BlockEntry> {
         self.timers.pop_expired(now)
-    }
-
-    fn contains(&self, entry: &BlockEntry) -> bool {
-        self.timers.contains(entry)
     }
 
     fn peek_next_valid_expiry(&mut self) -> Option<Instant> {
@@ -354,17 +346,12 @@ impl WorkerPruneManager {
         }
     }
 
-    pub fn insert_worker_block_entries(
-        &self,
-        worker: WorkerWithDpRank,
-        entries: Vec<BlockEntry>,
-        ttl_override: Option<Duration>,
-    ) {
+    pub fn insert_worker_block_entries(&self, worker: WorkerWithDpRank, entries: Vec<BlockEntry>) {
         if entries.is_empty() {
             return;
         }
 
-        if self.insert_worker_block_entries_at(worker, entries, Instant::now(), ttl_override) {
+        if self.insert_worker_block_entries_at(worker, entries, Instant::now(), None) {
             self.inner.bump_schedule();
         }
     }
@@ -395,7 +382,7 @@ impl WorkerPruneManager {
         &self,
         worker: WorkerWithDpRank,
         entries: Vec<BlockEntry>,
-        ttl: Duration,
+        ttl_override: Option<Duration>,
         enqueue: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), E> {
         if entries.is_empty() {
@@ -410,7 +397,7 @@ impl WorkerPruneManager {
             let mut state = state.lock().expect("worker prune state mutex poisoned");
             enqueue()?;
             let old_next = state.peek_next_valid_expiry();
-            state.insert_block_entries(entries, Instant::now(), Some(ttl));
+            state.insert_block_entries(entries, Instant::now(), ttl_override);
             let new_next = state.peek_next_valid_expiry();
             (old_next, new_next)
         };
@@ -432,17 +419,6 @@ impl WorkerPruneManager {
                 true
             }
             (Some(old_next), Some(new_next)) if new_next < old_next => {
-                tracing::warn!(
-                    worker_id = worker.worker_id,
-                    dp_rank = worker.dp_rank,
-                    ?old_next,
-                    ?new_next,
-                    "Approximate prune expiry moved earlier during insert; rescheduling"
-                );
-                debug_assert!(
-                    new_next >= old_next,
-                    "approximate prune expiry moved earlier during insert"
-                );
                 self.inner.push_worker_expiry(worker, new_next);
                 true
             }
@@ -529,27 +505,6 @@ impl WorkerPruneManager {
             .expect("pending prune remove queue mutex poisoned")
             .drain(..)
             .collect()
-    }
-
-    pub(super) fn enqueue_prune_removes(
-        &self,
-        entries: Vec<BlockEntry>,
-        enqueue: impl FnOnce(Vec<BlockEntry>),
-    ) {
-        let Some(worker) = entries.first().map(|entry| entry.worker) else {
-            return;
-        };
-        let Some(state) = self.inner.workers.get(&worker) else {
-            return;
-        };
-        let state = state.lock().expect("worker prune state mutex poisoned");
-        let expired = entries
-            .into_iter()
-            .filter(|entry| !state.contains(entry))
-            .collect::<Vec<_>>();
-        if !expired.is_empty() {
-            enqueue(expired);
-        }
     }
 
     pub fn subscribe_ready(&self) -> watch::Receiver<u64> {
@@ -845,10 +800,15 @@ mod tests {
         });
         let now = pm.bucket_origin + Duration::from_millis(1);
 
-        pm.insert_at(vec![1], now, Some(Duration::from_secs(5)));
+        pm.insert_at(vec![1], now, None);
+        pm.insert_at(vec![2], now, Some(Duration::from_secs(120)));
+        let default_expiry = *pm.get_expiry(&1).expect("default expiry missing");
+        assert_eq!(pm.get_expiry(&2), Some(&default_expiry));
+
+        pm.insert_at(vec![3], now, Some(Duration::from_secs(5)));
         pm.insert_at(vec![2], now, Some(Duration::from_secs(300)));
-        let short_expiry = *pm.get_expiry(&1).unwrap();
-        let long_expiry = *pm.get_expiry(&2).unwrap();
+        let short_expiry = *pm.get_expiry(&3).expect("short expiry missing");
+        let long_expiry = *pm.get_expiry(&2).expect("long expiry missing");
         pm.insert_at(vec![2], now, Some(Duration::from_secs(5)));
 
         assert!(short_expiry < long_expiry);
@@ -908,23 +868,6 @@ mod tests {
 
         time::advance(Duration::from_secs(5)).await;
         assert_eq!(manager.drain_due_and_pending(Instant::now()), vec![block]);
-        manager.shutdown();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_worker_expiry_queue_drops_refreshed_removal() {
-        let manager = WorkerPruneManager::new(PruneConfig {
-            ttl: Duration::from_secs(120),
-        });
-        let worker = WorkerWithDpRank::from_worker_id(7);
-        let block = test_block(worker, 707, 0);
-
-        manager.insert_worker_block_entries(worker, vec![block], Some(Duration::from_secs(5)));
-        time::advance(Duration::from_secs(5) + EXPIRY_BUCKET).await;
-        manager.inner.queue_due(Instant::now());
-        manager.insert_worker_block_entries(worker, vec![block], Some(Duration::from_secs(300)));
-
-        assert!(manager.drain_pending_removes().is_empty());
         manager.shutdown();
     }
 }
