@@ -156,7 +156,12 @@ impl<'a> RouteRecordingTarget<'a> {
                     .await
             }
             Self::PrimaryRemote(primary) => primary
-                .record_hashed_routing_decision(worker, hashes.local_hashes, hashes.sequence_hashes)
+                .record_hashed_routing_decision(
+                    worker,
+                    hashes.local_hashes,
+                    hashes.sequence_hashes,
+                    ttl_override,
+                )
                 .await
                 .map_err(|error| {
                     tracing::warn!(error = %error, "Remote indexer write failed");

@@ -295,6 +295,8 @@ pub struct IndexerRecordRoutingDecisionRequest {
     pub local_hashes: Vec<LocalBlockHash>,
     /// Locally-computed rolling sequence hashes for the routed request.
     pub sequence_hashes: Vec<SequenceHash>,
+    /// Optional pruning TTL for this routing decision.
+    pub ttl_override: Option<Duration>,
 }
 
 /// Precomputed hashes for recording a route-time indexer update.

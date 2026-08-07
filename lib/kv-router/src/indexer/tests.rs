@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use dynamo_tokens::SequenceHash;
 use rstest::rstest;
 use rstest_reuse::{self, *};
 use tokio::time;
@@ -2853,6 +2854,34 @@ mod local_indexer_tests {
         assert_eq!(decoded.dp_rank, 3);
         assert_eq!(decoded.end_event_id, Some(9));
         assert!(!decoded.supports_tree_dump_failed);
+    }
+
+    #[test]
+    fn routing_decision_ttl_override_is_wire_compatible() {
+        #[derive(serde::Serialize)]
+        struct LegacyRequest {
+            model_name: String,
+            worker: WorkerWithDpRank,
+            local_hashes: Vec<LocalBlockHash>,
+            sequence_hashes: Vec<SequenceHash>,
+        }
+
+        let encoded = rmp_serde::to_vec_named(&LegacyRequest {
+            model_name: "model".to_string(),
+            worker: WorkerWithDpRank::new(7, 0),
+            local_hashes: vec![LocalBlockHash(11)],
+            sequence_hashes: vec![12],
+        })
+        .unwrap();
+        let mut decoded: IndexerRecordRoutingDecisionRequest =
+            rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.ttl_override, None);
+
+        decoded.ttl_override = Some(Duration::from_millis(25));
+        let encoded = rmp_serde::to_vec_named(&decoded).unwrap();
+        let round_trip: IndexerRecordRoutingDecisionRequest =
+            rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(round_trip.ttl_override, decoded.ttl_override);
     }
 
     #[tokio::test]
