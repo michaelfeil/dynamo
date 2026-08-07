@@ -346,10 +346,16 @@ where
         if let Some(session_affinity) = session_affinity {
             probe_context.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity.clone());
         }
-        let preferred_worker = router
+        let affinity_worker = router
             .query_affinity_worker(&probe_context, RequestPhase::Prefill)
             .ok()
             .flatten();
+        let (pinned_worker, preferred_worker) =
+            if router.chooser.kv_router_config().session_affinity_soft {
+                (None, affinity_worker)
+            } else {
+                (affinity_worker, None)
+            };
 
         let outcome = router
             .chooser
@@ -366,7 +372,7 @@ where
                 policy_class,
                 session_id,
                 expected_output_tokens,
-                None,
+                pinned_worker,
                 preferred_worker,
                 allowed_worker_ids,
                 routing_constraints,

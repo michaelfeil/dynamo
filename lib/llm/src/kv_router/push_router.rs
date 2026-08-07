@@ -170,7 +170,7 @@ where
         request: &SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
         is_query_only: bool,
-        preferred_worker: Option<WorkerWithDpRank>,
+        affinity_worker: Option<WorkerWithDpRank>,
     ) -> Result<WorkerSelection, Error> {
         let context_id = request.context().id().to_string();
         let policy_class = request.metadata().get("policy-class").cloned();
@@ -188,7 +188,8 @@ where
                 phase,
                 is_query_only,
                 SelectionOptions {
-                    preferred_worker,
+                    affinity_worker,
+                    soft_affinity: self.chooser.kv_router_config().session_affinity_soft,
                     policy_class,
                     session_id,
                 },
