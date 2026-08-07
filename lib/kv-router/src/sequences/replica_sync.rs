@@ -13,6 +13,7 @@ use super::multi_worker::{
     ActiveSequencesMultiWorker, ReplicaWorkerPolicy, SequencePublisher, SequenceSubscriber,
 };
 use super::prompt_registry::WorkerLoadSnapshot;
+use super::request_maps::SchedulerEvent;
 use crate::protocols::{
     ActiveSequenceEvent, ActiveSequenceEventData, MAX_REPLICA_BATCH_DURATION,
     MAX_REPLICA_BATCH_EVENTS, SCHEDULER_HEARTBEAT_INTERVAL, WorkerWithDpRank,
@@ -63,7 +64,19 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
     fn apply_replica_batch_inner(&self, events: Vec<ActiveSequenceEvent>, track_scheduler: bool) {
         let mut effects = ReplicaBatchEffects::default();
         for event in events {
-            self.apply_replica_event(event, track_scheduler, &mut effects);
+            let track_event = if track_scheduler {
+                match self
+                    .request_index
+                    .scheduler_event(event.router_id, Instant::now())
+                {
+                    SchedulerEvent::Untracked => false,
+                    SchedulerEvent::Track => true,
+                    SchedulerEvent::Reject => continue,
+                }
+            } else {
+                false
+            };
+            self.apply_replica_event(event, track_event, &mut effects);
         }
         self.flush_replica_batch_effects(&mut effects);
     }
@@ -276,7 +289,6 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                         event_worker,
                         lora_name,
                         router_id,
-                        decay_now,
                         apply,
                     )
                 } else {

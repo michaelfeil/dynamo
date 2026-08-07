@@ -2502,6 +2502,8 @@ mod tests {
             event
         };
 
+        sequences.scheduler_heartbeat_at(17, now);
+        sequences.scheduler_heartbeat_at(18, now);
         sequences.apply_scheduler_replica_batch(vec![event("dead", worker_a, 17, vec![1, 2, 3])]);
         sequences.apply_scheduler_replica_batch(vec![event("live", worker_b, 18, vec![4, 5, 6])]);
         sequences.scheduler_heartbeat_at(18, now + Duration::from_secs(10));
@@ -2517,16 +2519,28 @@ mod tests {
             sequences.request_index.worker_for(&"late".to_string()),
             None
         );
+
+        sequences.scheduler_heartbeat_at(17, now + Duration::from_secs(17));
+        sequences.apply_scheduler_replica_batch(vec![event(
+            "recovered",
+            worker_a,
+            17,
+            vec![10, 11, 12],
+        )]);
+        assert_eq!(
+            sequences.request_index.worker_for(&"recovered".to_string()),
+            Some(worker_a)
+        );
     }
 
     #[test]
-    fn ordinary_replica_batches_do_not_expire_with_schedulers() {
+    fn heartbeatless_replica_batches_do_not_expire_with_schedulers() {
         let worker = WorkerWithDpRank::new(1, 0);
         let (sequences, _) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
         let mut event = replica_add("request", worker, vec![1, 2, 3]);
         event.router_id = 17;
 
-        sequences.apply_replica_batch(vec![event]);
+        sequences.apply_scheduler_replica_batch(vec![event]);
         sequences.expire_schedulers_at(Instant::now() + Duration::from_secs(60));
 
         assert_eq!(active_request_count(&sequences, worker), 1);

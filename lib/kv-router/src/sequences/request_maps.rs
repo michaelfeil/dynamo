@@ -15,6 +15,12 @@ struct SchedulerRequests {
     expired: bool,
 }
 
+pub(super) enum SchedulerEvent {
+    Untracked,
+    Track,
+    Reject,
+}
+
 impl SchedulerRequests {
     fn new(now: Instant) -> Self {
         Self {
@@ -68,13 +74,9 @@ impl RequestIndex {
         worker: WorkerWithDpRank,
         lora_name: Option<String>,
         scheduler_id: u64,
-        now: Instant,
         apply: impl FnOnce() -> T,
     ) -> Option<T> {
-        let mut scheduler = self
-            .scheduler_requests
-            .entry(scheduler_id)
-            .or_insert_with(|| SchedulerRequests::new(now));
+        let mut scheduler = self.scheduler_requests.get_mut(&scheduler_id)?;
         if scheduler.expired {
             return None;
         }
@@ -138,9 +140,19 @@ impl RequestIndex {
             .scheduler_requests
             .entry(scheduler_id)
             .or_insert_with(|| SchedulerRequests::new(now));
-        if !scheduler.expired {
-            scheduler.deadline = now + SCHEDULER_EXPIRATION_TIMEOUT;
+        scheduler.expired = false;
+        scheduler.deadline = now + SCHEDULER_EXPIRATION_TIMEOUT;
+    }
+
+    pub(super) fn scheduler_event(&self, scheduler_id: u64, now: Instant) -> SchedulerEvent {
+        let Some(mut scheduler) = self.scheduler_requests.get_mut(&scheduler_id) else {
+            return SchedulerEvent::Untracked;
+        };
+        if scheduler.expired {
+            return SchedulerEvent::Reject;
         }
+        scheduler.deadline = now + SCHEDULER_EXPIRATION_TIMEOUT;
+        SchedulerEvent::Track
     }
 
     pub(super) fn expire_schedulers(&self, now: Instant) -> Vec<(u64, Vec<RequestId>)> {
