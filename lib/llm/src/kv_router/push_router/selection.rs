@@ -7,12 +7,17 @@ use dynamo_kv_router::{
     RouterConfigOverride,
     indexer::RoutingDecisionHashes,
     protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank},
-    scheduling::{RequestLifecycleLease, RequestProgressUpdater, RoutingEligibility},
+    scheduling::RoutingEligibility,
+    selector::WorkerSelector,
 };
 use dynamo_runtime::{dynamo_nvtx_range, pipeline::Error};
 
 use crate::{
-    kv_router::{FindBestMatchOutcome, push_router::KvPushRouter},
+    kv_router::{
+        FindBestMatchAdmission, FindBestMatchInnerOutcome, FindBestMatchOutcome,
+        push_router::KvPushRouter,
+    },
+    local_model::runtime_config::ModelRuntimeConfig,
     preprocessor::PreprocessedRequest,
     protocols::{
         TokenIdType,
@@ -27,7 +32,6 @@ pub(super) struct WorkerSelection {
     pub(super) effective_overlap_blocks: f64,
     pub(super) cached_tokens: usize,
     pub(super) routing_hashes: Option<RoutingDecisionHashes>,
-    pub(super) lifecycle: Option<(RequestProgressUpdater, RequestLifecycleLease)>,
 }
 
 #[derive(Clone, Copy)]
@@ -70,9 +74,12 @@ struct BestMatchArgs<'a> {
     routing_constraints: RoutingConstraints,
 }
 
-impl KvPushRouter {
+impl<Sel> KvPushRouter<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     async fn select_best_match(&self, args: BestMatchArgs<'_>) -> Result<WorkerSelection, Error> {
-        let (outcome, lifecycle) = self
+        let outcome = self
             .chooser
             .find_best_match_details_with_policy_class_inner(
                 Some(args.context_id),
@@ -91,15 +98,24 @@ impl KvPushRouter {
                 args.pinned_worker,
                 args.allowed_worker_ids,
                 args.routing_constraints,
-                true,
+                FindBestMatchAdmission::WithAdmission {
+                    track_lifecycle: true,
+                },
             )
             .await?;
+        let outcome = match outcome {
+            FindBestMatchInnerOutcome::WithAdmission(outcome) => outcome,
+            FindBestMatchInnerOutcome::WithoutAdmission(_) => {
+                unreachable!("with-admission routing returned advisory outcome")
+            }
+        };
         match outcome {
             FindBestMatchOutcome::Routed {
                 worker,
                 overlap_blocks,
                 effective_overlap_blocks,
                 cached_tokens,
+                potential_decode_blocks: _,
                 routing_hashes,
             } => Ok(WorkerSelection {
                 instance_id: worker.worker_id,
@@ -108,7 +124,6 @@ impl KvPushRouter {
                 effective_overlap_blocks,
                 cached_tokens,
                 routing_hashes,
-                lifecycle,
             }),
             FindBestMatchOutcome::QueueRejected { rejection } => Err(rejection.into()),
         }

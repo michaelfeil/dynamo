@@ -3,7 +3,10 @@
 
 use std::{sync::Arc, time::Duration};
 
-use dynamo_kv_router::protocols::{TokensWithHashes, WorkerWithDpRank};
+use dynamo_kv_router::{
+    protocols::{TokensWithHashes, WorkerWithDpRank},
+    selector::WorkerSelector,
+};
 use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
     metrics::frontend_perf::{STAGE_ROUTE, StageGuard},
@@ -17,7 +20,8 @@ use futures::stream::{self, StreamExt};
 use tracing::Instrument;
 
 use crate::{
-    kv_router::{KvRouter, metrics::RouterRequestMetrics},
+    kv_router::{KvRouter, metrics::RouterRequestMetrics, scheduler::DefaultWorkerSelector},
+    local_model::runtime_config::ModelRuntimeConfig,
     preprocessor::PreprocessedRequest,
     protocols::common::{
         FinishReason,
@@ -53,11 +57,14 @@ fn invalidate_on_non_cancellation(operation: &mut Option<AffinityAcquire>, error
     }
 }
 
-fn monitor_response_stream(
+fn monitor_response_stream<Sel>(
     mut response_stream: ManyOut<Annotated<LLMEngineOutput>>,
     context: Arc<dyn AsyncEngineContext>,
-    mut guard: RequestGuard,
-) -> impl futures::Stream<Item = Annotated<LLMEngineOutput>> + Send {
+    mut guard: RequestGuard<Sel>,
+) -> impl futures::Stream<Item = Annotated<LLMEngineOutput>> + Send
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     async_stream::stream! {
         // Keep one cancellation future alive for the whole response stream. Calling
         // `stopped()` for every item repeatedly clones and polls a watch receiver.
@@ -80,16 +87,6 @@ fn monitor_response_stream(
                     };
                     failed |= response_item_failed(&item);
                     guard.on_item(&item).await;
-                    let completed_terminal = !failed
-                        && item
-                            .data
-                            .as_ref()
-                            .is_some_and(|data| data.finish_reason.is_some());
-                    if completed_terminal {
-                        guard.mark_completed_terminal();
-                    }
-                    // Mark before yielding so a client drop completes admission, then keep
-                    // polling for the request-plane EOF after the application terminal item.
                     yield item;
                 }
             }
@@ -103,17 +100,23 @@ fn monitor_response_stream(
     }
 }
 
-pub struct KvPushRouter {
+pub struct KvPushRouter<Sel = DefaultWorkerSelector>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-    pub chooser: Arc<KvRouter>,
+    pub chooser: Arc<KvRouter<Sel>>,
     request_metrics: Arc<RouterRequestMetrics>,
     affinity: Option<AffinityCoordinator>,
 }
 
-impl KvPushRouter {
+impl<Sel> KvPushRouter<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
     pub fn new(
         inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-        chooser: Arc<KvRouter>,
+        chooser: Arc<KvRouter<Sel>>,
         session_affinity_ttl: Option<Duration>,
     ) -> Result<Self, Error> {
         let affinity = session_affinity_ttl
@@ -125,7 +128,7 @@ impl KvPushRouter {
 
     pub(crate) fn new_with_coordinator(
         inner: PushRouter<PreprocessedRequest, Annotated<LLMEngineOutput>>,
-        chooser: Arc<KvRouter>,
+        chooser: Arc<KvRouter<Sel>>,
         affinity: Option<AffinityCoordinator>,
     ) -> Self {
         // Eagerly register router request metrics (as zeros) so they are
@@ -140,6 +143,22 @@ impl KvPushRouter {
             request_metrics,
             affinity,
         }
+    }
+
+    pub(crate) fn query_affinity_worker(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+    ) -> Result<Option<WorkerWithDpRank>, Error> {
+        let Some(affinity) = self.affinity.as_ref() else {
+            return Ok(None);
+        };
+        let Some(session_id) = affinity_id(request)? else {
+            return Ok(None);
+        };
+        let explicit = explicit_target(request, phase)?;
+        let target = affinity.query_target(&session_id, explicit)?;
+        Ok(target.and_then(affinity_worker))
     }
 
     async fn select_request(
@@ -242,7 +261,7 @@ impl KvPushRouter {
         request: &SingleIn<PreprocessedRequest>,
         selection: &mut WorkerSelection,
         is_query_only: bool,
-    ) -> Result<RequestGuard, Error> {
+    ) -> Result<RequestGuard<Sel>, Error> {
         let context_id = request.context().id().to_string();
         let request_context = request.context().clone();
         let routing_parts = RoutingRequestParts::new(request);
@@ -253,7 +272,6 @@ impl KvPushRouter {
             context_id.clone(),
             request,
             !is_query_only,
-            selection.lifecycle.take(),
         );
 
         let record_result: Result<(), Error> = async {
@@ -329,7 +347,7 @@ impl KvPushRouter {
         &self,
         request: SingleIn<PreprocessedRequest>,
         selection: WorkerSelection,
-        mut guard: RequestGuard,
+        mut guard: RequestGuard<Sel>,
         exact: bool,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let context_id = request.context().id().to_string();
@@ -380,7 +398,7 @@ impl KvPushRouter {
             }
         };
 
-        guard.mark_dispatched().await;
+        guard.mark_dispatched();
         let stream_context = response_stream.context();
         let wrapped_stream = Box::pin(monitor_response_stream(
             response_stream,
@@ -478,8 +496,10 @@ impl KvPushRouter {
 }
 
 #[async_trait]
-impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
-    for KvPushRouter
+impl<Sel> AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutput>>, Error>
+    for KvPushRouter<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
 {
     /// Generate method that handles KV-aware routing with three distinct behaviors:
     ///
@@ -656,27 +676,16 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 mod tests {
     use std::{
         collections::HashMap,
-        future,
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicBool, Ordering},
         },
         time::Duration,
     };
 
-    use dynamo_kv_router::{
-        ActiveSequencesMultiWorker, DefaultWorkerSelector, SequencePublisher,
-        config::{KvRouterConfig, RouterQueuePolicy},
-        protocols::{ActiveLoad, ActiveSequenceEvent, RoutingConstraints},
-        scheduling::{
-            AdmissionAction, AdmissionDecision, AdmissionEvent, AdmissionId, AdmissionRequest,
-            LocalScheduler, NoopOverlapScoresRefresh, OverlapSignals, PolicyClassAdmissionPolicies,
-            PolicyClassAdmissionPolicy, PolicyProfile, ScheduleMode, ScheduleRequest,
-            WorkerPlacement,
-        },
-    };
+    use dynamo_kv_router::{DefaultWorkerSelector, WorkerSelectionPolicy, config::KvRouterConfig};
     use dynamo_runtime::{
-        CancellationToken, DistributedRuntime, Runtime,
+        DistributedRuntime, Runtime,
         distributed::DistributedConfig,
         error::{ErrorType, match_error_chain},
         pipeline::{AsyncEngineContext, Context, PushRouter, RouterMode, context::Controller},
@@ -700,34 +709,6 @@ mod tests {
             .unwrap()
     }
 
-    struct NoopSequencePublisher;
-
-    impl SequencePublisher for NoopSequencePublisher {
-        fn publish_event(
-            &self,
-            _event: &ActiveSequenceEvent,
-        ) -> impl future::Future<Output = anyhow::Result<()>> + Send {
-            future::ready(Ok(()))
-        }
-
-        fn publish_load(&self, _load: ActiveLoad) {}
-
-        fn observe_load(&self, _: &WorkerWithDpRank, _: &str, _: usize, _: usize) {}
-    }
-
-    struct RecordingAdmissionPolicy(Arc<Mutex<Vec<AdmissionEvent>>>);
-
-    impl PolicyClassAdmissionPolicy for RecordingAdmissionPolicy {
-        fn admit(&mut self, _request: AdmissionRequest<'_>) -> AdmissionDecision {
-            AdmissionDecision::Ready(WorkerPlacement::Any)
-        }
-
-        fn on_event(&mut self, event: AdmissionEvent) -> Vec<AdmissionAction> {
-            self.0.lock().unwrap().push(event);
-            Vec::new()
-        }
-    }
-
     #[test]
     fn response_item_failed_includes_typed_terminal_failures() {
         let mut output = LLMEngineOutput::default();
@@ -743,137 +724,11 @@ mod tests {
         assert!(!response_item_failed(&Annotated::from_data(output)));
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn dropping_stream_after_terminal_item_reports_admission_completed() {
-        let (router, runtime) = router(None).await;
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let slots = Arc::new(ActiveSequencesMultiWorker::new(
-            NoopSequencePublisher,
-            16,
-            HashMap::from([(7, (0, 1))]),
-            false,
-            0,
-            "decode",
-        ));
-        let (_config_tx, config_rx) =
-            watch::channel(HashMap::from([(7, ModelRuntimeConfig::default())]));
-        let mut policies = PolicyClassAdmissionPolicies::new();
-        policies.insert(
-            "default".to_owned(),
-            Box::new(RecordingAdmissionPolicy(Arc::clone(&events))),
-        );
-        let cancel = CancellationToken::new();
-        let scheduler = LocalScheduler::new_with_policy_profile(
-            Arc::clone(&slots),
-            config_rx,
-            PolicyProfile::synthetic(None, RouterQueuePolicy::Fcfs),
-            16,
-            DefaultWorkerSelector::new(None, "decode"),
-            None,
-            None::<Arc<NoopOverlapScoresRefresh>>,
-            None,
-            Duration::from_secs(60),
-            true,
-            cancel.clone(),
-            "decode",
-            false,
-            policies,
-        )
-        .unwrap();
+    #[test]
+    fn selector_state_remains_owned_by_the_scheduler_actor() {
+        fn assert_send_sync<T: Send + Sync>() {}
 
-        for (index, finish_reason) in [FinishReason::Stop, FinishReason::EoS, FinishReason::Length]
-            .into_iter()
-            .enumerate()
-        {
-            let request_id = format!("terminal-drop-{index}");
-            let mut response = scheduler
-                .schedule_request(ScheduleRequest {
-                    mode: ScheduleMode::TrackedWithLifecycle {
-                        request_id: request_id.clone(),
-                    },
-                    token_seq: Some(vec![1]),
-                    block_hashes: None,
-                    isl_tokens: 1,
-                    lora_name: None,
-                    expected_output_tokens: None,
-                    pinned_worker: None,
-                    allowed_worker_ids: None,
-                    routing_constraints: RoutingConstraints::default(),
-                    router_config_override: None,
-                    priority_jump: 0.0,
-                    strict_priority: 0,
-                    policy_class: None,
-                    session_id: None,
-                    overlap: OverlapSignals::default(),
-                    shared_cache_hits: None,
-                })
-                .await
-                .unwrap();
-            let worker = response.best_worker;
-            let mut guard = RequestGuard::new(
-                Arc::clone(&router.chooser),
-                Arc::clone(&router.request_metrics),
-                request_id.clone(),
-                &request(),
-                true,
-                response
-                    .request_progress
-                    .take()
-                    .zip(response.lifecycle_lease.take()),
-            );
-            guard.mark_dispatched().await;
-
-            let context = Context::new(()).context();
-            let source = ResponseStream::new(
-                Box::pin(stream::iter([Annotated::from_data(LLMEngineOutput {
-                    finish_reason: Some(finish_reason.clone()),
-                    ..Default::default()
-                })])),
-                Arc::clone(&context),
-            );
-            {
-                let monitored = monitor_response_stream(source, context, guard);
-                tokio::pin!(monitored);
-                let item = monitored.next().await.unwrap();
-                assert_eq!(
-                    item.data.and_then(|output| output.finish_reason),
-                    Some(finish_reason)
-                );
-            }
-
-            let expected_len = (index + 1) * 2;
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while events.lock().unwrap().len() < expected_len {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("terminal stream drop did not report admission completion");
-            assert_eq!(
-                &events.lock().unwrap()[index * 2..expected_len],
-                [
-                    AdmissionEvent::Dispatched {
-                        id: AdmissionId::new(index as u64),
-                        worker,
-                    },
-                    AdmissionEvent::Completed {
-                        id: AdmissionId::new(index as u64),
-                        context_tokens: 1,
-                    },
-                ]
-            );
-        }
-
-        assert!(
-            slots
-                .active_request_counts()
-                .values()
-                .all(|count| *count == 0)
-        );
-        cancel.cancel();
-        drop(router);
-        runtime.shutdown();
+        assert_send_sync::<KvPushRouter<WorkerSelectionPolicy>>();
     }
 
     #[tokio::test]
@@ -899,7 +754,6 @@ mod tests {
             "terminal-drain".to_string(),
             &request(),
             false,
-            None,
         );
         let monitored = monitor_response_stream(source, context, guard);
         tokio::pin!(monitored);
@@ -1035,7 +889,7 @@ mod tests {
 
         let (_, _, mut completed_guard) = track_request(&router, false).await;
         completed_guard.start_dispatch("aggregated");
-        completed_guard.mark_dispatched().await;
+        completed_guard.mark_dispatched();
         completed_guard.finish().await;
         drop(completed_guard);
         assert_eq!(metrics.requests_started_total().get(), started_before + 3);
@@ -1139,6 +993,49 @@ mod tests {
         };
         assert_eq!(target, original_target);
         drop(lease);
+
+        drop(router);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn query_affinity_worker_returns_existing_binding_without_reserving() {
+        let (router, runtime) = router(Some(Duration::from_secs(10))).await;
+        let session_id = SessionAffinityId::new("query-existing-binding");
+        let target = AffinityTarget {
+            worker_id: 7,
+            dp_rank: Some(0),
+        };
+        let AffinityAcquire::Initialize(initializer) = router
+            .affinity
+            .as_ref()
+            .unwrap()
+            .acquire(&session_id, None)
+            .await
+            .unwrap()
+        else {
+            panic!("first request must initialize");
+        };
+        drop(initializer.commit(target).unwrap());
+
+        let mut request = Context::new(request());
+        request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_id.clone());
+
+        assert_eq!(
+            router
+                .query_affinity_worker(&request, RequestPhase::Prefill)
+                .unwrap(),
+            Some(WorkerWithDpRank::new(7, 0))
+        );
+        assert_eq!(
+            router
+                .affinity
+                .as_ref()
+                .unwrap()
+                .query_target(&session_id, None)
+                .unwrap(),
+            Some(target)
+        );
 
         drop(router);
         runtime.shutdown();

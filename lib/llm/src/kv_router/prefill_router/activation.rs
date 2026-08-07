@@ -7,7 +7,12 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use tokio::sync::oneshot;
 
-use dynamo_kv_router::{PrefillLoadEstimator, config::KvRouterConfig};
+use dynamo_kv_router::{
+    DEFAULT_ROUTING_GROUP, PrefillLoadEstimator, RoutingPartitionRef,
+    conditional_disagg::make_conditional_disagg_policy,
+    config::KvRouterConfig,
+    selector::{DefaultWorkerSelector, WorkerSelector},
+};
 use dynamo_runtime::{
     component::{Client, Endpoint},
     discovery::DiscoveryQuery,
@@ -19,7 +24,8 @@ use dynamo_runtime::{
 use super::{InnerPrefillRouter, PrefillLifecycleState, PrefillRouter};
 use crate::{
     discovery::ModelManager,
-    kv_router::KvPushRouter,
+    kv_router::{KvPushRouter, KvRouter, WorkerSelectorFactory},
+    local_model::runtime_config::ModelRuntimeConfig,
     model_card::ModelDeploymentCard,
     protocols::common::{
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -28,26 +34,14 @@ use crate::{
     session_affinity::create_affinity_coordinator,
 };
 
-impl PrefillRouter {
+impl PrefillRouter<DefaultWorkerSelector> {
     /// Create a disabled prefill router that will never activate (passthrough only)
     pub fn disabled(
         model_manager: Arc<ModelManager>,
         router_mode: RouterMode,
         session_affinity_ttl_secs: Option<u64>,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            prefill_router: std::sync::OnceLock::new(),
-            model_manager,
-            endpoint_id: std::sync::OnceLock::new(),
-            cancel_token: tokio_util::sync::CancellationToken::new(),
-            router_mode,
-            session_affinity_ttl: session_affinity_ttl_secs.map(std::time::Duration::from_secs),
-            prefill_load_estimator: None,
-            model_name: String::new(), // Not used for disabled router
-            namespace: String::new(),  // Not used for disabled router
-            is_eagle: false,
-            lifecycle: std::sync::atomic::AtomicU8::new(PrefillLifecycleState::Pending as u8),
-        })
+        Self::disabled_with_selector(model_manager, router_mode, session_affinity_ttl_secs)
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -57,6 +51,73 @@ impl PrefillRouter {
         router_mode: RouterMode,
         kv_cache_block_size: u32,
         kv_router_config: Option<KvRouterConfig>,
+        decode_router: Option<Arc<KvRouter>>,
+        prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
+        session_affinity_ttl_secs: Option<u64>,
+        model_name: String,
+        namespace: String,
+        is_eagle: bool,
+        worker_monitor: Option<crate::discovery::KvWorkerMonitor>,
+    ) -> Arc<Self> {
+        Self::new_with_selector_factory(
+            activation_rx,
+            model_manager,
+            router_mode,
+            kv_cache_block_size,
+            kv_router_config,
+            decode_router,
+            Arc::new(|config, worker_type, _partition| {
+                DefaultWorkerSelector::new(Some(config.clone()), worker_type)
+            }),
+            prefill_load_estimator,
+            session_affinity_ttl_secs,
+            model_name,
+            namespace,
+            is_eagle,
+            worker_monitor,
+        )
+    }
+}
+
+impl<Sel> PrefillRouter<Sel>
+where
+    Sel: WorkerSelector<ModelRuntimeConfig> + Send + 'static,
+{
+    pub(crate) fn disabled_with_selector(
+        model_manager: Arc<ModelManager>,
+        router_mode: RouterMode,
+        session_affinity_ttl_secs: Option<u64>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            prefill_router: std::sync::OnceLock::new(),
+            decode_router: None,
+            worker_selector_factory: None,
+            decode_session_affinity: std::sync::OnceLock::new(),
+            model_manager,
+            endpoint_id: std::sync::OnceLock::new(),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            router_mode,
+            session_affinity_ttl: session_affinity_ttl_secs.map(std::time::Duration::from_secs),
+            conditional_disagg_policy: make_conditional_disagg_policy(None),
+            conditional_disagg_prefill_busy_threshold: None,
+            conditional_disagg_decode_busy_threshold: None,
+            prefill_load_estimator: None,
+            model_name: String::new(), // Not used for disabled router
+            namespace: String::new(),  // Not used for disabled router
+            is_eagle: false,
+            lifecycle: std::sync::atomic::AtomicU8::new(PrefillLifecycleState::Pending as u8),
+        })
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new_with_selector_factory(
+        activation_rx: oneshot::Receiver<Endpoint>,
+        model_manager: Arc<ModelManager>,
+        router_mode: RouterMode,
+        kv_cache_block_size: u32,
+        kv_router_config: Option<KvRouterConfig>,
+        decode_router: Option<Arc<KvRouter<Sel>>>,
+        worker_selector_factory: WorkerSelectorFactory<Sel>,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         session_affinity_ttl_secs: Option<u64>,
         model_name: String,
@@ -66,14 +127,28 @@ impl PrefillRouter {
     ) -> Arc<Self> {
         let prefill_router = std::sync::OnceLock::new();
         let cancel_token = tokio_util::sync::CancellationToken::new();
+        let conditional_disagg_policy = make_conditional_disagg_policy(kv_router_config.as_ref());
+        let conditional_disagg_prefill_busy_threshold = kv_router_config.as_ref().and_then(|c| {
+            c.conditional_disagg_prefill_busy_threshold
+                .or(c.router_queue_threshold)
+        });
+        let conditional_disagg_decode_busy_threshold = kv_router_config
+            .as_ref()
+            .and_then(|c| c.conditional_disagg_decode_busy_threshold);
 
         let router = Arc::new(Self {
             prefill_router,
+            decode_router,
+            worker_selector_factory: Some(worker_selector_factory),
+            decode_session_affinity: std::sync::OnceLock::new(),
             model_manager: model_manager.clone(),
             endpoint_id: std::sync::OnceLock::new(),
             cancel_token: cancel_token.clone(),
             router_mode,
             session_affinity_ttl: session_affinity_ttl_secs.map(std::time::Duration::from_secs),
+            conditional_disagg_policy,
+            conditional_disagg_prefill_busy_threshold,
+            conditional_disagg_decode_busy_threshold,
             prefill_load_estimator,
             model_name,
             namespace,
@@ -159,12 +234,23 @@ impl PrefillRouter {
             };
 
             // Create KV chooser using the endpoint (this is a prefill router)
+            let effective_kv_router_config = kv_router_config.clone().unwrap_or_default();
+            let selector = (self
+                .worker_selector_factory
+                .as_ref()
+                .expect("enabled prefill router has a worker selector factory"))(
+                &effective_kv_router_config,
+                WORKER_TYPE_PREFILL,
+                RoutingPartitionRef::new(&self.model_name, DEFAULT_ROUTING_GROUP),
+            );
             let kv_chooser = model_manager
-                .kv_chooser_for(
+                .kv_chooser_for_with_selector(
                     &endpoint,
                     kv_cache_block_size,
+                    selector,
                     kv_router_config,
                     prefill_load_estimator,
+                    Some(crate::worker_type::WorkerType::Prefill),
                     WORKER_TYPE_PREFILL,
                     Some(self.model_name.clone()),
                     is_eagle,
