@@ -520,7 +520,7 @@ impl SyncIndexer for LowerTierIndexer {
                         c.inc(kind, result);
                     }
                 }
-                WorkerTask::EventWithAck { event, resp, .. } => {
+                WorkerTask::EventWithAck { event, resp } => {
                     let kind = EventKind::of(&event.event.data);
                     let result = self.apply_event(&mut worker_blocks, event);
                     let applied = result.is_ok();
@@ -532,7 +532,6 @@ impl SyncIndexer for LowerTierIndexer {
                     }
                     let _ = resp.send(applied);
                 }
-                WorkerTask::Prune { .. } => continue,
                 #[cfg(feature = "bench")]
                 WorkerTask::InstallObservation { writer, resp } => {
                     observation.install(writer, resp);

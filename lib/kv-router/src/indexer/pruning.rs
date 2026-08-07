@@ -17,9 +17,7 @@ use tokio::sync::watch;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::protocols::{
-    ExternalSequenceBlockHash, KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank,
-};
+use crate::protocols::{ExternalSequenceBlockHash, WorkerId, WorkerWithDpRank};
 
 const WORKER_EXPIRY_HEAP_REBUILD_THRESHOLD: usize = 10;
 /// Approximate TTL expirations are rounded up to this interval. A non-zero TTL
@@ -173,13 +171,6 @@ impl<K: Clone + Hash + Eq + Ord> PruneManager<K> {
     /// Polls for expired timers and returns a list of keys for all timers
     /// that have expired up to `now`.
     pub fn pop_expired(&mut self, now: Instant) -> Vec<K> {
-        self.pop_expired_with_expiry(now)
-            .into_iter()
-            .filter_map(|(key, expiry)| self.take_expired(&key, expiry).then_some(key))
-            .collect()
-    }
-
-    fn pop_expired_with_expiry(&mut self, now: Instant) -> Vec<(K, Instant)> {
         let mut expired_keys = Vec::new();
 
         while let Some((&expiry_time, _)) = self.expirations.first_key_value() {
@@ -191,7 +182,8 @@ impl<K: Clone + Hash + Eq + Ord> PruneManager<K> {
             expired_keys.reserve(bucket.len());
             for key in bucket {
                 if self.timers.get(&key) == Some(&expiry_time) {
-                    expired_keys.push((key, expiry_time));
+                    self.timers.remove(&key);
+                    expired_keys.push(key);
                 }
             }
         }
@@ -199,12 +191,8 @@ impl<K: Clone + Hash + Eq + Ord> PruneManager<K> {
         expired_keys
     }
 
-    fn take_expired(&mut self, key: &K, expiry: Instant) -> bool {
-        if self.timers.get(key) != Some(&expiry) {
-            return false;
-        }
-        self.timers.remove(key);
-        true
+    fn contains(&self, key: &K) -> bool {
+        self.timers.contains_key(key)
     }
 
     /// Returns the next non-stale expiry time, if it exists.
@@ -260,12 +248,12 @@ impl WorkerPruneState {
         self.timers.remove(entry);
     }
 
-    fn pop_expired(&mut self, now: Instant) -> Vec<(BlockEntry, Instant)> {
-        self.timers.pop_expired_with_expiry(now)
+    fn pop_expired(&mut self, now: Instant) -> Vec<BlockEntry> {
+        self.timers.pop_expired(now)
     }
 
-    fn take_expired(&mut self, entry: &BlockEntry, expiry: Instant) -> bool {
-        self.timers.take_expired(entry, expiry)
+    fn contains(&self, entry: &BlockEntry) -> bool {
+        self.timers.contains(entry)
     }
 
     fn peek_next_valid_expiry(&mut self) -> Option<Instant> {
@@ -282,7 +270,7 @@ struct WorkerPruneManagerInner {
     config: PruneConfig,
     workers: DashMap<WorkerWithDpRank, Mutex<WorkerPruneState>, FxBuildHasher>,
     next_expiries: Mutex<BinaryHeap<(Reverse<Instant>, WorkerWithDpRank)>>,
-    pending_removes: Mutex<VecDeque<(BlockEntry, Instant)>>,
+    pending_removes: Mutex<VecDeque<BlockEntry>>,
     ready_tx: watch::Sender<u64>,
     schedule_tx: watch::Sender<u64>,
     cancel: CancellationToken,
@@ -400,6 +388,44 @@ impl WorkerPruneManager {
             (old_next, new_next)
         };
 
+        self.update_worker_expiry(worker, old_next, new_next)
+    }
+
+    pub(super) fn enqueue_and_insert_worker_block_entries<E>(
+        &self,
+        worker: WorkerWithDpRank,
+        entries: Vec<BlockEntry>,
+        ttl: Duration,
+        enqueue: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if entries.is_empty() {
+            return enqueue();
+        }
+
+        let (old_next, new_next) = {
+            let state =
+                self.inner.workers.entry(worker).or_insert_with(|| {
+                    Mutex::new(WorkerPruneState::new(self.inner.config.clone()))
+                });
+            let mut state = state.lock().expect("worker prune state mutex poisoned");
+            enqueue()?;
+            let old_next = state.peek_next_valid_expiry();
+            state.insert_block_entries(entries, Instant::now(), Some(ttl));
+            let new_next = state.peek_next_valid_expiry();
+            (old_next, new_next)
+        };
+        if self.update_worker_expiry(worker, old_next, new_next) {
+            self.inner.bump_schedule();
+        }
+        Ok(())
+    }
+
+    fn update_worker_expiry(
+        &self,
+        worker: WorkerWithDpRank,
+        old_next: Option<Instant>,
+        new_next: Option<Instant>,
+    ) -> bool {
         match (old_next, new_next) {
             (None, Some(next_expiry)) => {
                 self.inner.push_worker_expiry(worker, next_expiry);
@@ -456,7 +482,7 @@ impl WorkerPruneManager {
             .pending_removes
             .lock()
             .expect("pending prune remove queue mutex poisoned")
-            .retain(|(entry, _)| !removed_entries.contains(entry));
+            .retain(|entry| !removed_entries.contains(entry));
         self.inner.bump_schedule();
     }
 
@@ -477,7 +503,7 @@ impl WorkerPruneManager {
             .pending_removes
             .lock()
             .expect("pending prune remove queue mutex poisoned")
-            .retain(|(entry, _)| entry.worker.worker_id != worker_id);
+            .retain(|entry| entry.worker.worker_id != worker_id);
         self.inner.bump_schedule();
     }
 
@@ -487,26 +513,16 @@ impl WorkerPruneManager {
             .pending_removes
             .lock()
             .expect("pending prune remove queue mutex poisoned")
-            .retain(|(entry, _)| entry.worker != worker);
+            .retain(|entry| entry.worker != worker);
         self.inner.bump_schedule();
     }
 
     pub fn drain_due_and_pending(&self, now: Instant) -> Vec<BlockEntry> {
-        let entries = self.drain_due_expiries(now);
-        self.take_expired(entries)
-    }
-
-    pub(super) fn drain_due_expiries(&self, now: Instant) -> Vec<(BlockEntry, Instant)> {
         self.inner.queue_due(now);
-        self.drain_pending_expiries()
+        self.drain_pending_removes()
     }
 
     pub fn drain_pending_removes(&self) -> Vec<BlockEntry> {
-        let entries = self.drain_pending_expiries();
-        self.take_expired(entries)
-    }
-
-    pub(super) fn drain_pending_expiries(&self) -> Vec<(BlockEntry, Instant)> {
         self.inner
             .pending_removes
             .lock()
@@ -515,38 +531,25 @@ impl WorkerPruneManager {
             .collect()
     }
 
-    pub(super) fn take_expired(&self, entries: Vec<(BlockEntry, Instant)>) -> Vec<BlockEntry> {
-        let mut expired = Vec::with_capacity(entries.len());
-        for (entry, expiry) in entries {
-            let Some(state) = self.inner.workers.get(&entry.worker) else {
-                continue;
-            };
-            if state
-                .lock()
-                .expect("worker prune state mutex poisoned")
-                .take_expired(&entry, expiry)
-            {
-                expired.push(entry);
-            }
-        }
-        expired
-    }
-
-    pub(super) fn resolve_prune_event(
+    pub(super) fn enqueue_prune_removes(
         &self,
-        mut event: RouterEvent,
-        entries: Vec<(BlockEntry, Instant)>,
-    ) -> Option<RouterEvent> {
-        let keys: FxHashSet<_> = self
-            .take_expired(entries)
-            .into_iter()
-            .map(|entry| entry.key)
-            .collect();
-        let KvCacheEventData::Removed(data) = &mut event.event.data else {
-            return None;
+        entries: Vec<BlockEntry>,
+        enqueue: impl FnOnce(Vec<BlockEntry>),
+    ) {
+        let Some(worker) = entries.first().map(|entry| entry.worker) else {
+            return;
         };
-        data.block_hashes.retain(|key| keys.contains(key));
-        (!data.block_hashes.is_empty()).then_some(event)
+        let Some(state) = self.inner.workers.get(&worker) else {
+            return;
+        };
+        let state = state.lock().expect("worker prune state mutex poisoned");
+        let expired = entries
+            .into_iter()
+            .filter(|entry| !state.contains(entry))
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
+            enqueue(expired);
+        }
     }
 
     pub fn subscribe_ready(&self) -> watch::Receiver<u64> {

@@ -7,9 +7,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
-use tokio::time::Instant as Expiration;
 
-use super::pruning::{BlockEntry, WorkerPruneManager};
 use crate::protocols::*;
 use dynamo_tokens::SequenceHash;
 use rustc_hash::FxHashMap;
@@ -477,15 +475,9 @@ impl WorkerLookupStats {
 
 pub enum WorkerTask {
     Event(RouterEvent),
-    Prune {
-        event: RouterEvent,
-        entries: Vec<(BlockEntry, Expiration)>,
-        manager: WorkerPruneManager,
-    },
     EventWithAck {
         event: RouterEvent,
         resp: oneshot::Sender<bool>,
-        prune: Option<PruneInsert>,
     },
     #[cfg(feature = "bench")]
     InstallObservation {
@@ -526,34 +518,6 @@ pub enum WorkerTask {
     Stats(oneshot::Sender<WorkerLookupStats>),
     Flush(oneshot::Sender<()>),
     Terminate,
-}
-
-#[doc(hidden)]
-pub struct PruneInsert {
-    pub(super) manager: WorkerPruneManager,
-    pub(super) worker: WorkerWithDpRank,
-    pub(super) entries: Vec<BlockEntry>,
-    pub(super) ttl: Duration,
-}
-
-impl PruneInsert {
-    pub(super) fn apply(self) {
-        self.manager
-            .insert_worker_block_entries(self.worker, self.entries, Some(self.ttl));
-    }
-}
-
-impl WorkerTask {
-    pub(super) fn resolve_prune(self) -> Option<Self> {
-        match self {
-            Self::Prune {
-                event,
-                entries,
-                manager,
-            } => manager.resolve_prune_event(event, entries).map(Self::Event),
-            task => Some(task),
-        }
-    }
 }
 
 /// A request to process a routing decision.
