@@ -761,7 +761,6 @@ mod tests {
             data,
             router_id: 7,
             lora_name: lora_name.map(str::to_string),
-            publisher_id: None,
         }
     }
 
@@ -810,6 +809,7 @@ mod tests {
                         lora_event("alpha", Some("lora-alpha"), ActiveSequenceEventData::Free),
                         lora_event("no-lora", None, add_request()),
                     ],
+                    scheduler_heartbeat: None,
                 };
 
                 let events = tokio::time::timeout(Duration::from_secs(5), async {

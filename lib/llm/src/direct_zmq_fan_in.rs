@@ -31,15 +31,11 @@ pub(crate) enum ContinuityMode {
 pub(crate) enum FanInEvent {
     SourceStarted,
     SourceStopped,
-    /// Discovery explicitly removed this publisher incarnation.
-    SourceRemoved,
     Reconnect,
     Replacement,
     EnvelopeDecodeError,
     IdentityMismatch,
-    SequenceGap {
-        missing: u64,
-    },
+    SequenceGap { missing: u64 },
     OutOfOrder,
     ForcedAbort,
 }
@@ -277,7 +273,6 @@ async fn run_supervisor<H, O>(
                     if let Some(source) = sources.remove(&instance_id) {
                         stop_source(source, &observer).await;
                     }
-                    observe(&observer, instance_id, 0, FanInEvent::SourceRemoved);
                 }
                 Ok(DiscoveryEvent::Added(_)) | Ok(DiscoveryEvent::Removed(_)) => {}
                 Err(error) => {

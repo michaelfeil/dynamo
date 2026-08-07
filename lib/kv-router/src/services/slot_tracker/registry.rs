@@ -537,7 +537,6 @@ mod tests {
                 },
                 router_id,
                 lora_name: None,
-                publisher_id: None,
             },
         }
     }

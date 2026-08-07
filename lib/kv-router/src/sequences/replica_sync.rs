@@ -15,7 +15,7 @@ use super::multi_worker::{
 use super::prompt_registry::WorkerLoadSnapshot;
 use crate::protocols::{
     ActiveSequenceEvent, ActiveSequenceEventData, MAX_REPLICA_BATCH_DURATION,
-    MAX_REPLICA_BATCH_EVENTS, WorkerWithDpRank,
+    MAX_REPLICA_BATCH_EVENTS, SCHEDULER_HEARTBEAT_INTERVAL, WorkerWithDpRank,
 };
 
 #[derive(Default)]
@@ -53,51 +53,65 @@ impl ReplicaBatchEffects {
 impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
     /// Apply one decoded replica-sync batch and flush its deferred effects once.
     pub fn apply_replica_batch(&self, events: Vec<ActiveSequenceEvent>) {
-        self.apply_sourced_replica_batch(None, events);
+        self.apply_replica_batch_inner(events, false);
     }
 
-    /// Apply a decoded replica-sync batch attributed to one event publisher.
-    pub fn apply_replica_batch_from_source(
-        &self,
-        publisher_id: u64,
-        events: Vec<ActiveSequenceEvent>,
-    ) {
-        self.apply_sourced_replica_batch(Some(publisher_id), events);
+    pub fn apply_scheduler_replica_batch(&self, events: Vec<ActiveSequenceEvent>) {
+        self.apply_replica_batch_inner(events, true);
     }
 
-    fn apply_sourced_replica_batch(
-        &self,
-        publisher_id: Option<u64>,
-        events: Vec<ActiveSequenceEvent>,
-    ) {
+    fn apply_replica_batch_inner(&self, events: Vec<ActiveSequenceEvent>, track_scheduler: bool) {
         let mut effects = ReplicaBatchEffects::default();
-        for mut event in events {
-            event.publisher_id = publisher_id;
-            self.apply_replica_event(event, &mut effects);
+        for event in events {
+            self.apply_replica_event(event, track_scheduler, &mut effects);
         }
         self.flush_replica_batch_effects(&mut effects);
     }
 
-    /// Release scheduler state owned by a publisher that discovery has expired.
-    pub fn replica_source_removed(&self, publisher_id: u64) {
-        self.dead_replica_sources.insert(publisher_id);
+    pub fn scheduler_heartbeat(&self, scheduler_id: u64) {
+        self.scheduler_heartbeat_at(scheduler_id, Instant::now());
+    }
 
-        // Tombstone before scanning so a late AddRequest cannot race with eviction.
-        let request_ids = self.request_index.requests_for_replica_source(publisher_id);
+    pub(super) fn scheduler_heartbeat_at(&self, scheduler_id: u64, now: Instant) {
+        if scheduler_id != self.router_id {
+            self.request_index.scheduler_heartbeat(scheduler_id, now);
+        }
+    }
+
+    pub(super) fn expire_schedulers_at(&self, now: Instant) {
+        for (scheduler_id, request_ids) in self.request_index.expire_schedulers(now) {
+            self.expire_scheduler_requests(scheduler_id, request_ids, now);
+        }
+    }
+
+    fn expire_scheduler_requests(&self, scheduler_id: u64, request_ids: Vec<String>, now: Instant) {
         let mut effects = ReplicaBatchEffects::default();
-        let decay_now = Instant::now();
         for request_id in &request_ids {
-            self.apply_replica_free(request_id, decay_now, &mut effects);
+            self.apply_replica_free(request_id, now, &mut effects);
         }
         self.flush_replica_batch_effects(&mut effects);
 
         if !request_ids.is_empty() {
             tracing::warn!(
-                publisher_id,
+                scheduler_id,
                 evicted_requests = request_ids.len(),
-                "Evicted scheduler state owned by dead router replica publisher"
+                "Expired scheduler decisions owned by an unresponsive router replica"
             );
         }
+    }
+
+    pub fn start_scheduler_expiration(self: &Arc<Self>, cancel_token: CancellationToken) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SCHEDULER_HEARTBEAT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => return,
+                    now = interval.tick() => this.expire_schedulers_at(now),
+                }
+            }
+        });
     }
 
     /// Spawn a background task that subscribes to replica-sync events from peer routers
@@ -152,7 +166,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 let event = next_event
                     .take()
                     .expect("replica batch event must be present");
-                self.apply_replica_event(event, &mut effects);
+                self.apply_replica_event(event, false, &mut effects);
                 batch_events += 1;
 
                 if cancel_token.is_cancelled() {
@@ -194,21 +208,21 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         Ok(())
     }
 
-    fn apply_replica_event(&self, event: ActiveSequenceEvent, effects: &mut ReplicaBatchEffects) {
+    fn apply_replica_event(
+        &self,
+        event: ActiveSequenceEvent,
+        track_scheduler: bool,
+        effects: &mut ReplicaBatchEffects,
+    ) {
         let ActiveSequenceEvent {
             request_id,
             worker: event_worker,
             data,
             router_id,
             lora_name,
-            publisher_id,
         } = event;
 
         if router_id == self.router_id {
-            return;
-        }
-
-        if publisher_id.is_some_and(|id| self.dead_replica_sources.contains(&id)) {
             return;
         }
 
@@ -235,13 +249,8 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                     return;
                 };
 
-                self.request_index.set_request_from_replica_source(
-                    request_id.clone(),
-                    event_worker,
-                    lora_name,
-                    publisher_id,
-                );
-                let (expired_request_ids, load) = {
+                let indexed_request_id = request_id.clone();
+                let apply = || {
                     let slot = &table.slots[idx];
                     let mut seq = slot.sequences.write();
                     let outcome = seq.add_request_with_prefill_tracking(
@@ -261,18 +270,30 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                         );
                     (outcome.expired_request_ids, load)
                 };
+                let result = if track_scheduler {
+                    self.request_index.track_scheduler_request(
+                        indexed_request_id,
+                        event_worker,
+                        lora_name,
+                        router_id,
+                        decay_now,
+                        apply,
+                    )
+                } else {
+                    self.request_index.set_request_metadata(
+                        indexed_request_id,
+                        event_worker,
+                        lora_name,
+                    );
+                    Some(apply())
+                };
+                let Some((expired_request_ids, load)) = result else {
+                    return;
+                };
                 drop(table);
                 self.request_index
                     .remove_requests(expired_request_ids.iter());
 
-                // Close the only insertion race with replica_source_removed: if discovery
-                // expired this publisher while AddRequest was being applied, release it now.
-                if let Some(publisher_id) = publisher_id
-                    && self.dead_replica_sources.contains(&publisher_id)
-                {
-                    self.replica_source_removed(publisher_id);
-                    return;
-                }
                 effects.record_worker_load(event_worker, load, true);
                 effects.cleanup_prompt_trie = true;
             }

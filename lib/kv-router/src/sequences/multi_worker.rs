@@ -313,7 +313,6 @@ pub struct SequenceRequest {
 pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     pub(super) workers: RwLock<WorkerTable>,
     pub(super) request_index: RequestIndex,
-    pub(super) dead_replica_sources: dashmap::DashSet<u64>,
     pub(super) prompt_registry: PromptRegistry,
     block_size: usize,
     pub(super) router_id: u64,
@@ -457,7 +456,6 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         Self {
             workers: RwLock::new(workers),
             request_index: RequestIndex::default(),
-            dead_replica_sources: dashmap::DashSet::new(),
             prompt_registry,
             block_size,
             router_id,
@@ -779,7 +777,6 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             },
             router_id: self.router_id,
             lora_name: req.lora_name.clone(),
-            publisher_id: None,
         });
         self.add_request_local(req, decay_now, lazily_register_worker)?;
         if let Some(event) = event {
@@ -1289,7 +1286,6 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             data: event_data,
             router_id: self.router_id,
             lora_name,
-            publisher_id: None,
         });
         Ok(())
     }
@@ -1315,7 +1311,6 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             data: event_data,
             router_id: self.router_id,
             lora_name,
-            publisher_id: None,
         });
         Ok(())
     }
@@ -1728,7 +1723,6 @@ mod tests {
             },
             router_id: 99,
             lora_name: None,
-            publisher_id: None,
         }
     }
 
@@ -1742,7 +1736,6 @@ mod tests {
             data: ActiveSequenceEventData::Free,
             router_id: 99,
             lora_name: None,
-            publisher_id: None,
         }
     }
 
@@ -1756,7 +1749,6 @@ mod tests {
             data: ActiveSequenceEventData::MarkPrefillCompleted,
             router_id: 99,
             lora_name: None,
-            publisher_id: None,
         }
     }
 
@@ -2496,38 +2488,48 @@ mod tests {
     }
 
     #[test]
-    fn expired_replica_source_frees_owned_requests_and_rejects_late_events() {
+    fn scheduler_expiration_frees_owned_requests_and_rejects_late_events() {
         let worker_a = WorkerWithDpRank::new(1, 0);
         let worker_b = WorkerWithDpRank::new(2, 0);
         let (sequences, _) = make_recording_sequences(HashMap::from([
             (1_u64, (0_u32, 1_u32)),
             (2_u64, (0_u32, 1_u32)),
         ]));
-        let dead_publisher = 17;
+        let now = Instant::now();
+        let event = |request_id, worker, router_id, tokens| {
+            let mut event = replica_add(request_id, worker, tokens);
+            event.router_id = router_id;
+            event
+        };
 
-        sequences.apply_replica_batch_from_source(
-            dead_publisher,
-            vec![replica_add("dead", worker_a, vec![1, 2, 3])],
-        );
-        sequences.apply_replica_batch_from_source(
-            18,
-            vec![replica_add("live", worker_b, vec![4, 5, 6])],
-        );
+        sequences.apply_scheduler_replica_batch(vec![event("dead", worker_a, 17, vec![1, 2, 3])]);
+        sequences.apply_scheduler_replica_batch(vec![event("live", worker_b, 18, vec![4, 5, 6])]);
+        sequences.scheduler_heartbeat_at(18, now + Duration::from_secs(10));
 
-        sequences.replica_source_removed(dead_publisher);
+        sequences.expire_schedulers_at(now + Duration::from_secs(16));
 
         assert_eq!(active_request_count(&sequences, worker_a), 0);
         assert_eq!(active_request_count(&sequences, worker_b), 1);
         assert_eq!(sequences.remote_state_update_count(), 1);
 
-        sequences.apply_replica_batch_from_source(
-            dead_publisher,
-            vec![replica_add("late", worker_a, vec![7, 8, 9])],
-        );
+        sequences.apply_scheduler_replica_batch(vec![event("late", worker_a, 17, vec![7, 8, 9])]);
         assert_eq!(
             sequences.request_index.worker_for(&"late".to_string()),
             None
         );
+    }
+
+    #[test]
+    fn ordinary_replica_batches_do_not_expire_with_schedulers() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+        let mut event = replica_add("request", worker, vec![1, 2, 3]);
+        event.router_id = 17;
+
+        sequences.apply_replica_batch(vec![event]);
+        sequences.expire_schedulers_at(Instant::now() + Duration::from_secs(60));
+
+        assert_eq!(active_request_count(&sequences, worker), 1);
     }
 
     #[test]
@@ -2801,7 +2803,6 @@ mod tests {
                     },
                     router_id: 99,
                     lora_name: None,
-                    publisher_id: None,
                 }),
                 Ok(ActiveSequenceEvent {
                     request_id: "req-1".to_string(),
@@ -2809,7 +2810,6 @@ mod tests {
                     data: ActiveSequenceEventData::Free,
                     router_id: 99,
                     lora_name: None,
-                    publisher_id: None,
                 }),
             ]),
         };
@@ -2851,7 +2851,6 @@ mod tests {
                         },
                         router_id: 99,
                         lora_name: None,
-                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2871,7 +2870,6 @@ mod tests {
                         data: ActiveSequenceEventData::MarkPrefillCompleted,
                         router_id: 99,
                         lora_name: None,
-                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2896,7 +2894,6 @@ mod tests {
                         },
                         router_id: 99,
                         lora_name: None,
-                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2916,7 +2913,6 @@ mod tests {
                         data: ActiveSequenceEventData::Free,
                         router_id: 99,
                         lora_name: None,
-                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -2956,7 +2952,6 @@ mod tests {
                             },
                             router_id: 99,
                             lora_name: None,
-                            publisher_id: None,
                         }),
                         Ok(ActiveSequenceEvent {
                             request_id: later.clone(),
@@ -2969,7 +2964,6 @@ mod tests {
                             },
                             router_id: 99,
                             lora_name: None,
-                            publisher_id: None,
                         }),
                     ]),
                 },
@@ -2996,7 +2990,6 @@ mod tests {
                         data: ActiveSequenceEventData::Free,
                         router_id: 99,
                         lora_name: None,
-                        publisher_id: None,
                     })]),
                 },
                 CancellationToken::new(),
@@ -3035,7 +3028,6 @@ mod tests {
                 },
                 router_id: 99,
                 lora_name: None,
-                publisher_id: None,
             })]),
         };
 

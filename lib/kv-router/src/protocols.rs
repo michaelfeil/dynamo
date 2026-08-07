@@ -718,20 +718,21 @@ pub struct ActiveSequenceEvent {
     pub router_id: u64,
     #[serde(default)]
     pub lora_name: Option<String>,
-    /// Event-envelope publisher attribution populated locally by replica-sync subscribers.
-    #[serde(skip)]
-    pub publisher_id: Option<u64>,
 }
 
 /// Active-sequence lifecycle events carried in publisher-queue arrival order.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ActiveSequenceEventBatch {
     pub events: Vec<ActiveSequenceEvent>,
+    #[serde(default)]
+    pub scheduler_heartbeat: Option<u64>,
 }
 
 /// Shared cooperative batch limits for active-sequence replica sync.
 pub const MAX_REPLICA_BATCH_EVENTS: usize = 256;
 pub const MAX_REPLICA_BATCH_DURATION: Duration = Duration::from_millis(1);
+pub const SCHEDULER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub const SCHEDULER_EXPIRATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillLoadHint {
