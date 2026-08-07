@@ -1688,7 +1688,7 @@ mod tests {
             )
             .unwrap();
 
-        tokio::time::advance(Duration::from_secs(331)).await;
+        tokio::time::advance(Duration::from_secs(631)).await;
         sequences.force_expire_requests_across_all_workers();
 
         assert!(sequences.request_index.is_empty());
@@ -1717,7 +1717,7 @@ mod tests {
             )
             .unwrap();
 
-        tokio::time::advance(Duration::from_secs(331)).await;
+        tokio::time::advance(Duration::from_secs(631)).await;
 
         sequences
             .add_request(

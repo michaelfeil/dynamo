@@ -509,6 +509,7 @@ Source commits:
 - `729a81cd6` kv-router: log cleanup - mark_free info, remove pool utilization, simplify queue-full msg
 - `c9bf0c4ed` fix: Make router active replicas hot configurable (#251)
 - `a75d34383` feat(kv-router): floor router temperature and make B10 log throttle configurable
+- `ebf5d4d47` b10: bump router stale-request expiry (orphan timeout) from 5 to 10 minutes (#550)
 
 Purpose:
 
