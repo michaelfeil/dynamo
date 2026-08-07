@@ -23,6 +23,9 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
         let mut observation = WorkerObservationState::default();
 
         while let Ok(task) = event_receiver.recv() {
+            let Some(task) = task.resolve_prune() else {
+                continue;
+            };
             match task {
                 WorkerTask::Event(event) => {
                     let kind = EventKind::of(&event.event.data);
@@ -34,7 +37,7 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
                         c.inc(kind, result);
                     }
                 }
-                WorkerTask::EventWithAck { event, resp } => {
+                WorkerTask::EventWithAck { event, resp, prune } => {
                     let kind = EventKind::of(&event.event.data);
                     let result = self.apply_event(&mut lookup, event, counters.as_ref());
                     let applied = result.is_ok();
@@ -44,8 +47,12 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
                     if let Some(ref c) = counters {
                         c.inc(kind, result);
                     }
+                    if applied && let Some(prune) = prune {
+                        prune.apply();
+                    }
                     let _ = resp.send(applied);
                 }
+                WorkerTask::Prune { .. } => continue,
                 #[cfg(feature = "bench")]
                 WorkerTask::InstallObservation { writer, resp } => {
                     observation.install(writer, resp);

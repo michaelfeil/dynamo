@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize},
     },
     thread::JoinHandle,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -21,8 +22,8 @@ use super::{
     ObservedEnqueueReceipt, ThreadPoolObservationPlan, ThreadPoolObservationSnapshot,
 };
 use super::{
-    KvIndexerInterface, KvIndexerMetrics, KvRouterError, ShardSizeSnapshot, SyncIndexer,
-    WorkerLookupStats, WorkerTask, panic_payload_message,
+    KvIndexerInterface, KvIndexerMetrics, KvRouterError, PruneInsert, ShardSizeSnapshot,
+    SyncIndexer, WorkerLookupStats, WorkerTask, panic_payload_message,
 };
 use crate::indexer::pruning::{BlockEntry, PruneConfig, WorkerPruneManager};
 use crate::protocols::*;
@@ -681,15 +682,18 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         worker_assignment_count: &AtomicUsize,
         num_workers: usize,
         synthetic_event_id: &AtomicU64,
-        entries: Vec<BlockEntry>,
+        prune_manager: &WorkerPruneManager,
+        entries: Vec<(BlockEntry, tokio::time::Instant)>,
     ) {
-        let mut by_worker: BTreeMap<WorkerWithDpRank, BTreeSet<ExternalSequenceBlockHash>> =
-            BTreeMap::new();
-        for entry in entries {
-            by_worker.entry(entry.worker).or_default().insert(entry.key);
+        let mut by_worker =
+            BTreeMap::<WorkerWithDpRank, (BTreeSet<ExternalSequenceBlockHash>, Vec<_>)>::new();
+        for (entry, expiry) in entries {
+            let (hashes, entries) = by_worker.entry(entry.worker).or_default();
+            hashes.insert(entry.key);
+            entries.push((entry, expiry));
         }
 
-        for (worker, hashes) in by_worker {
+        for (worker, (hashes, entries)) in by_worker {
             let event_id = Self::next_synthetic_event_id(synthetic_event_id);
             let event = RouterEvent::new(
                 worker.worker_id,
@@ -707,7 +711,11 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
                 worker,
                 num_workers,
             );
-            if let Err(error) = worker_event_channels[thread_idx].send(WorkerTask::Event(event)) {
+            if let Err(error) = worker_event_channels[thread_idx].send(WorkerTask::Prune {
+                event,
+                entries,
+                manager: prune_manager.clone(),
+            }) {
                 tracing::warn!(
                     thread_idx,
                     ?error,
@@ -737,7 +745,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
                                 break;
                             }
                             loop {
-                                let entries = prune_manager.drain_pending_removes();
+                                let entries = prune_manager.drain_pending_expiries();
                                 if entries.is_empty() {
                                     break;
                                 }
@@ -747,6 +755,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
                                     &worker_assignment_count,
                                     num_workers,
                                     &synthetic_event_id,
+                                    &prune_manager,
                                     entries,
                                 );
                             }
@@ -779,6 +788,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         worker: WorkerWithDpRank,
         local_hashes: &[LocalBlockHash],
         sequence_hashes: &[SequenceHash],
+        ttl_override: Option<Duration>,
     ) -> Result<(), KvRouterError> {
         if local_hashes.len() != sequence_hashes.len() {
             tracing::warn!(
@@ -796,7 +806,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
 
         let event_id = Self::next_synthetic_event_id(&self.synthetic_event_id);
         let event = Self::stored_event_for_hashes(worker, local_hashes, sequence_hashes, event_id);
-        let prune_entries = Self::block_entries_for_hashes(worker, sequence_hashes);
+        let mut prune_entries = Some(Self::block_entries_for_hashes(worker, sequence_hashes));
         let thread_idx = Self::get_or_assign_thread_idx(
             &self.worker_assignments,
             &self.worker_assignment_count,
@@ -805,18 +815,27 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         );
 
         let (resp_tx, resp_rx) = oneshot::channel();
+        let prune = ttl_override.and_then(|ttl| {
+            prune_entries.take().map(|entries| PruneInsert {
+                manager: prune_manager.clone(),
+                worker,
+                entries,
+                ttl,
+            })
+        });
         self.worker_event_channels[thread_idx]
             .send(WorkerTask::EventWithAck {
                 event,
                 resp: resp_tx,
+                prune,
             })
             .map_err(|_| KvRouterError::IndexerOffline)?;
 
         let applied = resp_rx
             .await
             .map_err(|_| KvRouterError::IndexerDroppedRequest)?;
-        if applied {
-            prune_manager.insert_worker_block_entries(worker, prune_entries);
+        if applied && let Some(prune_entries) = prune_entries {
+            prune_manager.insert_worker_block_entries(worker, prune_entries, None);
         }
 
         Ok(())
@@ -827,8 +846,9 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         worker: WorkerWithDpRank,
         local_hashes: Vec<LocalBlockHash>,
         sequence_hashes: Vec<SequenceHash>,
+        ttl_override: Option<Duration>,
     ) -> Result<(), KvRouterError> {
-        self.record_routing_decision_hashes(worker, &local_hashes, &sequence_hashes)
+        self.record_routing_decision_hashes(worker, &local_hashes, &sequence_hashes, ttl_override)
             .await
     }
 
@@ -837,8 +857,9 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         worker: WorkerWithDpRank,
         local_hashes: &[LocalBlockHash],
         sequence_hashes: &[SequenceHash],
+        ttl_override: Option<Duration>,
     ) -> Result<(), KvRouterError> {
-        self.record_routing_decision_hashes(worker, local_hashes, sequence_hashes)
+        self.record_routing_decision_hashes(worker, local_hashes, sequence_hashes, ttl_override)
             .await
     }
 }
@@ -1140,6 +1161,7 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
         &self,
         tokens_with_hashes: &mut TokensWithHashes,
         worker: WorkerWithDpRank,
+        ttl_override: Option<Duration>,
     ) -> Result<(), KvRouterError> {
         tokens_with_hashes.get_or_compute_seq_hashes();
         let local_hashes = tokens_with_hashes
@@ -1148,7 +1170,7 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
         let sequence_hashes = tokens_with_hashes
             .seq_hashes()
             .expect("sequence hashes missing after computing sequence hashes");
-        self.record_routing_decision_hashes(worker, local_hashes, sequence_hashes)
+        self.record_routing_decision_hashes(worker, local_hashes, sequence_hashes, ttl_override)
             .await
     }
 
@@ -1157,18 +1179,19 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
         self.flush().await;
 
         if let Some(prune_manager) = &self.prune_manager {
-            let entries = prune_manager.drain_due_and_pending(tokio::time::Instant::now());
+            let entries = prune_manager.drain_due_expiries(tokio::time::Instant::now());
             Self::enqueue_prune_removes(
                 &self.worker_event_channels,
                 &self.worker_assignments,
                 &self.worker_assignment_count,
                 self.num_workers,
                 &self.synthetic_event_id,
+                prune_manager,
                 entries,
             );
             self.flush().await;
 
-            let entries = prune_manager.drain_pending_removes();
+            let entries = prune_manager.drain_pending_expiries();
             let has_entries = !entries.is_empty();
             Self::enqueue_prune_removes(
                 &self.worker_event_channels,
@@ -1176,6 +1199,7 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
                 &self.worker_assignment_count,
                 self.num_workers,
                 &self.synthetic_event_id,
+                prune_manager,
                 entries,
             );
             if has_entries {

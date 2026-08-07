@@ -572,9 +572,14 @@ mod tests {
                 ttl: Duration::from_secs(60),
             }),
         );
-        side.process_routing_decision_with_hashes(worker, block_hashes.clone(), sequence_hashes)
-            .await
-            .unwrap();
+        side.process_routing_decision_with_hashes(
+            worker,
+            block_hashes.clone(),
+            sequence_hashes,
+            None,
+        )
+        .await
+        .unwrap();
         let _ = side.flush().await;
 
         let indexer = Indexer::KvIndexer {

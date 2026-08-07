@@ -803,7 +803,7 @@ mod tests {
         let mut tokens_with_hashes = TokensWithHashes::new(tokens, 4);
 
         indexer
-            .process_routing_decision_for_request(&mut tokens_with_hashes, worker)
+            .process_routing_decision_for_request(&mut tokens_with_hashes, worker, None)
             .await
             .unwrap();
         flush_indexer(&indexer).await;

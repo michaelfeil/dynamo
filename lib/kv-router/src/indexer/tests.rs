@@ -346,7 +346,7 @@ async fn route_approx_tokens(
 ) {
     let mut tokens_with_hashes = TokensWithHashes::new(tokens.to_vec(), 4);
     index
-        .process_routing_decision_for_request(&mut tokens_with_hashes, worker)
+        .process_routing_decision_for_request(&mut tokens_with_hashes, worker, None)
         .await
         .unwrap();
     flush_and_settle(index).await;
@@ -1040,7 +1040,7 @@ mod interface_tests {
         let sequence_hashes = compute_seq_hash_for_block(&block_hashes);
 
         index
-            .process_routing_decision_with_hashes(worker, block_hashes, sequence_hashes)
+            .process_routing_decision_with_hashes(worker, block_hashes, sequence_hashes, None)
             .await
             .unwrap();
         flush_and_settle(&index).await;
@@ -1063,7 +1063,7 @@ mod interface_tests {
         let sequence_hashes = [1];
 
         let result = index
-            .process_routing_decision_hash_slices(worker, &local_hashes, &sequence_hashes)
+            .process_routing_decision_hash_slices(worker, &local_hashes, &sequence_hashes, None)
             .await;
 
         assert!(matches!(result, Err(KvRouterError::IndexerDroppedRequest)));
@@ -1085,6 +1085,32 @@ mod interface_tests {
 
         let scores = request_scores(index.as_ref(), &tokens).await;
         assert!(scores.scores.is_empty());
+    }
+
+    #[tokio::test]
+    #[apply(approx_indexer_template)]
+    async fn test_approx_routing_decision_ttl_override(variant: &str) {
+        let index = make_approx_indexer(variant, Duration::from_secs(60));
+        let tokens = vec![1, 2, 3, 4];
+        let worker = WorkerWithDpRank::new(7, 0);
+        let ttl = Duration::from_millis(25);
+        let mut tokens_with_hashes = TokensWithHashes::new(tokens.clone(), 4);
+
+        index
+            .process_routing_decision_for_request(&mut tokens_with_hashes, worker, Some(ttl))
+            .await
+            .unwrap();
+        assert_request_score(index.as_ref(), &tokens, worker, 1).await;
+
+        time::sleep(ttl + Duration::from_millis(125)).await;
+        flush_and_settle(index.as_ref()).await;
+
+        assert!(
+            request_scores(index.as_ref(), &tokens)
+                .await
+                .scores
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1162,6 +1188,7 @@ mod interface_tests {
             .process_routing_decision_for_request(
                 &mut tokens_with_hashes,
                 WorkerWithDpRank::new(7, 0),
+                None,
             )
             .await;
 
@@ -2368,7 +2395,7 @@ async fn test_routing_decision_assigns_first_seen_worker() {
     let sequence_hashes = compute_seq_hash_for_block(&local_hashes);
 
     index
-        .process_routing_decision_with_hashes(worker, local_hashes.clone(), sequence_hashes)
+        .process_routing_decision_with_hashes(worker, local_hashes.clone(), sequence_hashes, None)
         .await
         .unwrap();
     flush_and_settle(&index).await;

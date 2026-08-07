@@ -9,6 +9,7 @@ use dynamo_kv_router::{
     protocols::{LocalBlockHash, TokensWithHashes, WorkerWithDpRank},
 };
 use dynamo_tokens::SequenceHash;
+use std::time::Duration;
 
 use super::{Indexer, SideIndexer, remote::RemoteIndexer};
 
@@ -79,6 +80,7 @@ impl Indexer {
                     local_hashes,
                     sequence_hashes,
                 },
+                None,
             )
             .await
     }
@@ -89,7 +91,7 @@ impl Indexer {
         hashes: RoutingDecisionHashes,
     ) -> Result<(), KvRouterError> {
         self.recording_target()
-            .record_routing_hashes(worker, hashes)
+            .record_routing_hashes(worker, hashes, None)
             .await
     }
 
@@ -97,11 +99,12 @@ impl Indexer {
         &self,
         tokens_with_hashes: &mut TokensWithHashes,
         worker: WorkerWithDpRank,
+        ttl_override: Option<Duration>,
     ) -> Result<(), KvRouterError> {
         let target = self.recording_target();
         if let RouteRecordingTarget::PrimaryConcurrent(primary) = target {
             return primary
-                .process_routing_decision_for_request(tokens_with_hashes, worker)
+                .process_routing_decision_for_request(tokens_with_hashes, worker, ttl_override)
                 .await;
         }
         if matches!(target, RouteRecordingTarget::Disabled) {
@@ -117,6 +120,7 @@ impl Indexer {
                     local_hashes,
                     sequence_hashes,
                 },
+                ttl_override,
             )
             .await
     }
@@ -127,6 +131,7 @@ impl<'a> RouteRecordingTarget<'a> {
         self,
         worker: WorkerWithDpRank,
         hashes: RoutingDecisionHashes,
+        ttl_override: Option<Duration>,
     ) -> Result<(), KvRouterError> {
         match self {
             Self::Disabled => Ok(()),
@@ -136,6 +141,7 @@ impl<'a> RouteRecordingTarget<'a> {
                         worker,
                         hashes.local_hashes,
                         hashes.sequence_hashes,
+                        ttl_override,
                     )
                     .await
             }
@@ -145,6 +151,7 @@ impl<'a> RouteRecordingTarget<'a> {
                         worker,
                         &hashes.local_hashes,
                         &hashes.sequence_hashes,
+                        ttl_override,
                     )
                     .await
             }
@@ -155,7 +162,10 @@ impl<'a> RouteRecordingTarget<'a> {
                     tracing::warn!(error = %error, "Remote indexer write failed");
                     KvRouterError::IndexerDroppedRequest
                 }),
-            Self::SideOverlay(side) => side.process_routing_decision_hashes(worker, hashes).await,
+            Self::SideOverlay(side) => {
+                side.process_routing_decision_hashes(worker, hashes, ttl_override)
+                    .await
+            }
         }
     }
 }
