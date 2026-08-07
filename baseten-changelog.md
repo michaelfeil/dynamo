@@ -1168,6 +1168,8 @@ Owned `ChatCompletionRequestSystemMessage` (content optional, opaque `tools` pas
 
 The Responses API stream converter (`lib/llm/src/protocols/openai/responses/stream_converter.rs`) closes streamed function-call items on the choice's `finish_reason` (or stream end) instead of on the first argument delta that carries `id`+`name`, so `function_call_arguments.done` / `output_item.done` carry the fully concatenated arguments for backends that fragment arguments across chunks (GLM-5.2; stock Codex consumes only the done items) (#544).
 
+`/v1/responses` maps `finish_reason=length` to `status:"incomplete"` with `incomplete_details.reason="max_output_tokens"` (and `completed_at:null`), marking the truncated output item incomplete, on both the non-streaming and streaming paths; the stream ends with a `response.incomplete` terminal event instead of `response.completed`. Streamed reasoning is surfaced via the `response.reasoning_summary_part/text.*` lifecycle, gated on the request setting `reasoning.summary` (kept private otherwise); a reasoning item stays `completed` when the model produced an answer/tool call and is marked `incomplete` only when truncation landed mid-reasoning. Backport of upstream ai-dynamo #12182 (incomplete-on-truncation) and #12183 (streamed reasoning), rebased onto the finish_reason-gated tool-call close above (stacked on #544).
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,
