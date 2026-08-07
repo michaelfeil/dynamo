@@ -3,10 +3,13 @@
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use tokio::time::Instant;
 
 use super::single::RequestId;
 use crate::protocols::{SCHEDULER_EXPIRATION_TIMEOUT, WorkerWithDpRank};
+
+const SCHEDULER_TOMBSTONE_RETENTION: Duration = Duration::from_secs(600);
 
 #[derive(Debug)]
 struct SchedulerRequests {
@@ -15,6 +18,7 @@ struct SchedulerRequests {
     expired: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum SchedulerEvent {
     Untracked,
     Track,
@@ -160,10 +164,16 @@ impl RequestIndex {
         for mut scheduler in self.scheduler_requests.iter_mut() {
             if !scheduler.expired && scheduler.deadline <= now {
                 scheduler.expired = true;
+                scheduler.deadline = now + SCHEDULER_TOMBSTONE_RETENTION;
                 expired.push((*scheduler.key(), scheduler.requests.drain().collect()));
             }
         }
         expired
+    }
+
+    pub(super) fn prune_scheduler_tombstones(&self, now: Instant) {
+        self.scheduler_requests
+            .retain(|_, scheduler| !scheduler.expired || scheduler.deadline > now);
     }
 
     pub(super) fn remove_requests<'a>(&self, request_ids: impl IntoIterator<Item = &'a RequestId>) {

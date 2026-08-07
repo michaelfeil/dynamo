@@ -1046,6 +1046,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             }
         }
         drop(table);
+        self.request_index.prune_scheduler_tombstones(now);
         let duration = now.elapsed();
         tracing::debug!(
             duration = duration.as_secs_f64(),
