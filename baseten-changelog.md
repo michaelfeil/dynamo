@@ -1166,6 +1166,8 @@ Added `chat_template_args` (alias `chat_template_kwargs`) to `BasetenExt` so it 
 
 Owned `ChatCompletionRequestSystemMessage` (content optional, opaque `tools` passthrough) and added `partial: Option<bool>` on the owned assistant message so Moonshot Kimi K3 conformance traffic deserializes: K3 sends system messages carrying only a dynamic `tools` list (no `content`, which upstream rejects with 400 "missing field `content`") and assistant prefill turns marked `partial: true` (#496). Implemented in `lib/protocols/src/types/chat.rs` (owned struct + `partial` field) with `From` bridges in `impls.rs` and call-site updates in `lib/llm` (anthropic, responses) + tests; both fields forward opaquely to the worker. Drop once upstream `async-openai` relaxes `content` and accepts the `tools`/`partial` keys.
 
+The Responses API stream converter (`lib/llm/src/protocols/openai/responses/stream_converter.rs`) closes streamed function-call items on the choice's `finish_reason` (or stream end) instead of on the first argument delta that carries `id`+`name`, so `function_call_arguments.done` / `output_item.done` carry the fully concatenated arguments for backends that fragment arguments across chunks (GLM-5.2; stock Codex consumes only the done items) (#544).
+
 Validation:
 
 Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,

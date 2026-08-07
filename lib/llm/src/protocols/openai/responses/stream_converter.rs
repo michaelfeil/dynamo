@@ -60,8 +60,8 @@ struct FunctionCallState {
     accumulated_args: String,
     output_index: u32,
     started: bool,
-    /// Set when done/item_done events have already been emitted inline
-    /// (complete tool call detected mid-stream). Prevents duplicate in `emit_end_events()`.
+    /// Set when done/item_done events have already been emitted
+    /// (on `finish_reason`). Prevents duplicate in `emit_end_events()`.
     done: bool,
 }
 
@@ -339,72 +339,85 @@ impl ResponseStreamConverter {
                                 .accumulated_args
                                 .push_str(args);
                             let output_index = self.function_call_items[tc_index].output_index;
-                            let is_complete = tc.id.is_some()
-                                && func.name.is_some()
-                                && !self.function_call_items[tc_index].done;
 
-                            // Clone item_id once; reused by both args_delta and (if complete) done events.
                             let item_id = self.function_call_items[tc_index].item_id.clone();
                             let seq = self.next_seq();
                             let args_delta =
                                 ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
                                     ResponseFunctionCallArgumentsDeltaEvent {
                                         sequence_number: seq,
-                                        item_id: item_id.clone(),
+                                        item_id,
                                         output_index,
                                         delta: args.clone(),
                                     },
                                 );
                             events.push(self.make_sse_event(&args_delta));
-
-                            // Emit done + output_item.done immediately if the tool call
-                            // arrived complete in a single chunk (id + name + args all present).
-                            // Dynamo backends emit complete tool calls, so this fires on the
-                            // same chunk — no need to wait for finish_reason.
-                            if is_complete {
-                                self.function_call_items[tc_index].done = true;
-                                // Reuse item_id from above; capture remaining values before self.next_seq()
-                                let fc_item_id = item_id;
-                                let fc_call_id = self.function_call_items[tc_index].call_id.clone();
-                                let fc_name = self.function_call_items[tc_index].name.clone();
-                                let fc_args =
-                                    self.function_call_items[tc_index].accumulated_args.clone();
-                                let fc_output_index =
-                                    self.function_call_items[tc_index].output_index;
-
-                                let args_done =
-                                    ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
-                                        ResponseFunctionCallArgumentsDoneEvent {
-                                            sequence_number: self.next_seq(),
-                                            item_id: fc_item_id.clone(),
-                                            output_index: fc_output_index,
-                                            arguments: fc_args.clone(),
-                                            name: Some(fc_name.clone()),
-                                        },
-                                    );
-                                events.push(self.make_sse_event(&args_done));
-
-                                let item_done = ResponseStreamEvent::ResponseOutputItemDone(
-                                    ResponseOutputItemDoneEvent {
-                                        sequence_number: self.next_seq(),
-                                        output_index: fc_output_index,
-                                        item: OutputItem::FunctionCall(FunctionToolCall {
-                                            id: Some(fc_item_id),
-                                            call_id: fc_call_id,
-                                            namespace: None,
-                                            name: fc_name,
-                                            arguments: fc_args,
-                                            status: Some(OutputStatus::Completed),
-                                        }),
-                                    },
-                                );
-                                events.push(self.make_sse_event(&item_done));
-                            }
                         }
                     }
                 }
             }
+
+            // A finish_reason marks the end of the generation for this choice, so
+            // every open tool-call argument stream is complete. Close them here so
+            // done events carry the fully concatenated arguments. Backends that
+            // fragment arguments across chunks (with id+name only on the first
+            // fragment) make any earlier "looks complete" heuristic unsafe — done
+            // events must wait for finish_reason (or stream end, in
+            // `emit_end_events`).
+            if choice.finish_reason.is_some() {
+                for idx in 0..self.function_call_items.len() {
+                    events.extend(self.close_function_call(idx));
+                }
+            }
         }
+
+        events
+    }
+
+    /// Emit `function_call_arguments.done` + `output_item.done` for the function
+    /// call at `idx`, if it has started streaming and is not yet closed.
+    fn close_function_call(&mut self, idx: usize) -> Vec<Result<Event, anyhow::Error>> {
+        let mut events = Vec::new();
+        {
+            let fc = &self.function_call_items[idx];
+            if !fc.started || fc.done {
+                return events;
+            }
+        }
+        self.function_call_items[idx].done = true;
+        let fc = &self.function_call_items[idx];
+        let (item_id, call_id, fc_name, fc_args, output_index) = (
+            fc.item_id.clone(),
+            fc.call_id.clone(),
+            fc.name.clone(),
+            fc.accumulated_args.clone(),
+            fc.output_index,
+        );
+
+        let args_done = ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+            ResponseFunctionCallArgumentsDoneEvent {
+                sequence_number: self.next_seq(),
+                item_id: item_id.clone(),
+                output_index,
+                arguments: fc_args.clone(),
+                name: Some(fc_name.clone()),
+            },
+        );
+        events.push(self.make_sse_event(&args_done));
+
+        let item_done = ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+            sequence_number: self.next_seq(),
+            output_index,
+            item: OutputItem::FunctionCall(FunctionToolCall {
+                id: Some(item_id),
+                call_id,
+                namespace: None,
+                name: fc_name,
+                arguments: fc_args,
+                status: Some(OutputStatus::Completed),
+            }),
+        });
+        events.push(self.make_sse_event(&item_done));
 
         events
     }
@@ -458,47 +471,10 @@ impl ResponseStreamConverter {
             events.push(self.make_sse_event(&item_done));
         }
 
-        // Close any function call items not already done inline
-        let fc_data: Vec<_> = self
-            .function_call_items
-            .iter()
-            .filter(|fc| fc.started && !fc.done)
-            .map(|fc| {
-                (
-                    fc.item_id.clone(),
-                    fc.call_id.clone(),
-                    fc.name.clone(),
-                    fc.output_index,
-                    fc.accumulated_args.clone(),
-                )
-            })
-            .collect();
-        for (item_id, call_id, fc_name, output_index, accumulated_args) in fc_data {
-            let args_done = ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
-                ResponseFunctionCallArgumentsDoneEvent {
-                    sequence_number: self.next_seq(),
-                    item_id: item_id.clone(),
-                    output_index,
-                    arguments: accumulated_args.clone(),
-                    name: Some(fc_name.clone()),
-                },
-            );
-            events.push(self.make_sse_event(&args_done));
-
-            let item_done =
-                ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
-                    sequence_number: self.next_seq(),
-                    output_index,
-                    item: OutputItem::FunctionCall(FunctionToolCall {
-                        id: Some(item_id),
-                        call_id,
-                        namespace: None,
-                        name: fc_name,
-                        arguments: accumulated_args,
-                        status: Some(OutputStatus::Completed),
-                    }),
-                });
-            events.push(self.make_sse_event(&item_done));
+        // Close any function call items not already closed on finish_reason
+        // (e.g. streams that end without a finish_reason chunk).
+        for idx in 0..self.function_call_items.len() {
+            events.extend(self.close_function_call(idx));
         }
 
         // Build the final output vector from accumulated state
@@ -739,6 +715,37 @@ mod tests {
         }
     }
 
+    fn finish_chunk(
+        reason: dynamo_protocols::types::FinishReason,
+    ) -> NvCreateChatCompletionStreamResponse {
+        #[allow(deprecated)]
+        NvCreateChatCompletionStreamResponse {
+            inner: dynamo_protocols::types::CreateChatCompletionStreamResponse {
+                id: "chat-1".into(),
+                choices: vec![ChatChoiceStream {
+                    index: 0,
+                    delta: ChatCompletionStreamResponseDelta {
+                        content: None,
+                        function_call: None,
+                        tool_calls: None,
+                        role: None,
+                        refusal: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: Some(reason),
+                    logprobs: None,
+                }],
+                created: 0,
+                model: "test".into(),
+                service_tier: None,
+                system_fingerprint: None,
+                object: "chat.completion.chunk".into(),
+                usage: None,
+            },
+            nvext: None,
+        }
+    }
+
     fn text_chunk(text: &str) -> NvCreateChatCompletionStreamResponse {
         #[allow(deprecated)]
         NvCreateChatCompletionStreamResponse {
@@ -786,9 +793,30 @@ mod tests {
         events.iter().map(event_type).collect()
     }
 
-    /// Complete tool call emits function_call_arguments.done + output_item.done inline.
+    /// Extract the SSE `data:` JSON payload from a Result<Event, _>.
+    fn event_data(event: &Result<Event, anyhow::Error>) -> serde_json::Value {
+        let debug = format!("{:?}", event.as_ref().unwrap());
+        let start = debug.find("data: ").expect("event has data") + 6;
+        let rest = &debug[start..];
+        let end = rest.find("\\n").unwrap_or(rest.len());
+        // The debug output is a Rust string literal, so unescape it via serde.
+        let raw: String =
+            serde_json::from_str(&format!("\"{}\"", &rest[..end])).expect("unescape event data");
+        serde_json::from_str(&raw).expect("event data is JSON")
+    }
+
+    /// Collect (event_type, data) pairs.
+    fn typed_events(events: &[Result<Event, anyhow::Error>]) -> Vec<(String, serde_json::Value)> {
+        events
+            .iter()
+            .map(|e| (event_type(e), event_data(e)))
+            .collect()
+    }
+
+    /// Tool call done events fire on finish_reason with the full arguments,
+    /// and are not duplicated by the end events.
     #[test]
-    fn test_complete_tool_call_emits_done_inline() {
+    fn b10_tool_call_done_on_finish_reason() {
         let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
         let _ = conv.emit_start_events(); // consume start events
 
@@ -809,12 +837,24 @@ mod tests {
             "should emit args delta: {types:?}"
         );
         assert!(
-            types.contains(&"response.function_call_arguments.done".to_string()),
-            "should emit args done inline: {types:?}"
+            !types.contains(&"response.function_call_arguments.done".to_string()),
+            "done must wait for finish_reason: {types:?}"
         );
+
+        let finish_events = conv.process_chunk(&finish_chunk(
+            dynamo_protocols::types::FinishReason::ToolCalls,
+        ));
+        let finish_typed = typed_events(&finish_events);
+        let args_done = finish_typed
+            .iter()
+            .find(|(t, _)| t == "response.function_call_arguments.done")
+            .expect("args done on finish_reason");
+        assert_eq!(args_done.1["arguments"], "{\"city\":\"SF\"}");
         assert!(
-            types.contains(&"response.output_item.done".to_string()),
-            "should emit output_item.done inline: {types:?}"
+            finish_typed
+                .iter()
+                .any(|(t, _)| t == "response.output_item.done"),
+            "output_item.done on finish_reason"
         );
 
         // End events should NOT duplicate the done events
@@ -824,44 +864,146 @@ mod tests {
             "done should not be duplicated in end events: {end_types:?}"
         );
         assert!(
-            !end_types.contains(&"response.output_item.done".to_string())
-                || end_types
-                    .iter()
-                    .filter(|t| *t == "response.output_item.done")
-                    .count()
-                    == 0,
-            "output_item.done for the tool should not appear in end events"
+            !end_types.contains(&"response.output_item.done".to_string()),
+            "output_item.done for the tool should not appear in end events: {end_types:?}"
         );
     }
 
-    /// Multiple tool calls each get their own inline done events.
+    /// Regression test for GLM-style argument fragmentation: id + name arrive on
+    /// the first chunk together with only the first argument fragment, and the
+    /// rest of the arguments stream in later chunks. Done events must carry the
+    /// fully concatenated arguments, not just the first fragment.
     #[test]
-    fn test_multiple_tool_calls_each_emit_done_inline() {
+    fn b10_fragmented_args_done_carries_full_arguments() {
         let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
         let _ = conv.emit_start_events();
 
-        let events1 = conv.process_chunk(&tool_call_chunk(
+        let mut all_events = Vec::new();
+        all_events.extend(conv.process_chunk(&tool_call_chunk(
+            0,
+            Some("call-1"),
+            Some("shell"),
+            Some("{"),
+        )));
+        all_events.extend(conv.process_chunk(&tool_call_chunk(
+            0,
+            None,
+            None,
+            Some("\"command\":"),
+        )));
+        all_events.extend(conv.process_chunk(&tool_call_chunk(
+            0,
+            None,
+            None,
+            Some("[\"ls\",\"-la\"]}"),
+        )));
+
+        // No done events until finish_reason
+        let types = event_types(&all_events);
+        assert!(
+            !types.contains(&"response.function_call_arguments.done".to_string()),
+            "no done while args still streaming: {types:?}"
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|t| *t == "response.function_call_arguments.delta")
+                .count(),
+            3,
+            "each fragment is a delta: {types:?}"
+        );
+
+        let finish_events = conv.process_chunk(&finish_chunk(
+            dynamo_protocols::types::FinishReason::ToolCalls,
+        ));
+        let finish_typed = typed_events(&finish_events);
+
+        let full_args = "{\"command\":[\"ls\",\"-la\"]}";
+        let args_done = finish_typed
+            .iter()
+            .find(|(t, _)| t == "response.function_call_arguments.done")
+            .expect("args done present");
+        assert_eq!(args_done.1["arguments"], full_args);
+
+        let item_done = finish_typed
+            .iter()
+            .find(|(t, _)| t == "response.output_item.done")
+            .expect("item done present");
+        assert_eq!(item_done.1["item"]["arguments"], full_args);
+        assert_eq!(item_done.1["item"]["call_id"], "call-1");
+        assert_eq!(item_done.1["item"]["name"], "shell");
+
+        // The final response.completed output must also carry the full args.
+        let end_events = conv.emit_end_events();
+        let end_typed = typed_events(&end_events);
+        let completed = end_typed
+            .iter()
+            .find(|(t, _)| t == "response.completed")
+            .expect("completed present");
+        assert_eq!(completed.1["response"]["output"][0]["arguments"], full_args);
+    }
+
+    /// Streams that end without a finish_reason chunk still get exactly one
+    /// pair of done events, with full arguments, from the end events.
+    #[test]
+    fn b10_stream_end_without_finish_reason_closes_tool_call() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+
+        let _ = conv.process_chunk(&tool_call_chunk(
+            0,
+            Some("call-1"),
+            Some("shell"),
+            Some("{"),
+        ));
+        let _ = conv.process_chunk(&tool_call_chunk(0, None, None, Some("\"a\":1}")));
+
+        let end_typed = typed_events(&conv.emit_end_events());
+        let done_count = end_typed
+            .iter()
+            .filter(|(t, _)| t == "response.function_call_arguments.done")
+            .count();
+        assert_eq!(done_count, 1, "exactly one args done: {end_typed:?}");
+        let args_done = end_typed
+            .iter()
+            .find(|(t, _)| t == "response.function_call_arguments.done")
+            .unwrap();
+        assert_eq!(args_done.1["arguments"], "{\"a\":1}");
+        assert!(
+            end_typed.iter().any(|(t, _)| t == "response.completed"),
+            "completed present: {end_typed:?}"
+        );
+    }
+
+    /// Multiple tool calls are all closed on finish_reason.
+    #[test]
+    fn b10_multiple_tool_calls_closed_on_finish_reason() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+
+        let _ = conv.process_chunk(&tool_call_chunk(
             0,
             Some("call-1"),
             Some("get_weather"),
             Some("{\"city\":\"SF\"}"),
         ));
-        let types1 = event_types(&events1);
-        assert!(
-            types1.contains(&"response.function_call_arguments.done".to_string()),
-            "first tool call done inline: {types1:?}"
-        );
-
-        let events2 = conv.process_chunk(&tool_call_chunk(
+        let _ = conv.process_chunk(&tool_call_chunk(
             1,
             Some("call-2"),
             Some("get_time"),
             Some("{\"tz\":\"PST\"}"),
         ));
-        let types2 = event_types(&events2);
-        assert!(
-            types2.contains(&"response.function_call_arguments.done".to_string()),
-            "second tool call done inline: {types2:?}"
+
+        let finish_types = event_types(&conv.process_chunk(&finish_chunk(
+            dynamo_protocols::types::FinishReason::ToolCalls,
+        )));
+        assert_eq!(
+            finish_types
+                .iter()
+                .filter(|t| *t == "response.function_call_arguments.done")
+                .count(),
+            2,
+            "both tool calls closed on finish_reason: {finish_types:?}"
         );
 
         // End events should have no function call done events
@@ -922,12 +1064,20 @@ mod tests {
         ));
         let tool_types = event_types(&tool_events);
         assert!(
-            tool_types.contains(&"response.function_call_arguments.done".to_string()),
-            "tool call done inline after text: {tool_types:?}"
+            tool_types.contains(&"response.output_item.added".to_string()),
+            "tool call item added after text: {tool_types:?}"
+        );
+
+        let finish_types = event_types(&conv.process_chunk(&finish_chunk(
+            dynamo_protocols::types::FinishReason::ToolCalls,
+        )));
+        assert!(
+            finish_types.contains(&"response.function_call_arguments.done".to_string()),
+            "tool call done on finish_reason after text: {finish_types:?}"
         );
         assert!(
-            tool_types.contains(&"response.output_item.done".to_string()),
-            "output_item.done inline after text: {tool_types:?}"
+            finish_types.contains(&"response.output_item.done".to_string()),
+            "output_item.done on finish_reason after text: {finish_types:?}"
         );
     }
 
