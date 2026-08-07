@@ -2856,7 +2856,7 @@ mod tests {
         let sequences = ActiveSequencesMultiWorker::new_with_expiry_duration(
             NoopSequencePublisher,
             4,
-            HashMap::from([(1_u64, (0_u32, 1_u32))]),
+            HashMap::new(),
             true,
             0,
             "test",
@@ -2868,6 +2868,7 @@ mod tests {
             Duration::from_secs(35),
         )]);
         assert_eq!(active_request_count(&sequences, worker), 0);
+        assert_eq!(sequences.num_workers(), 0);
 
         sequences.apply_replica_batch(vec![delivered_after(
             replica_add("aged", worker, vec![1, 2, 3]),
@@ -2888,6 +2889,51 @@ mod tests {
         sequences.force_expire_requests_across_all_workers();
 
         assert_eq!(active_request_count(&sequences, worker), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_replica_free_does_not_backdate_newer_prefill() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let sequences = ActiveSequencesMultiWorker::new(
+            NoopSequencePublisher,
+            4,
+            HashMap::from([(1_u64, (0_u32, 1_u32))]),
+            true,
+            0,
+            "test",
+        );
+        let older = ActiveSequenceEvent {
+            request_id: "older".to_string(),
+            worker,
+            data: ActiveSequenceEventData::AddRequest {
+                token_sequence: Some(vec![1, 2, 3]),
+                track_prefill_tokens: true,
+                expected_output_tokens: None,
+                prefill_load_hint: modeled_hint(100, 10),
+            },
+            router_id: 99,
+            lora_name: None,
+            delivery_age: Duration::ZERO,
+        };
+        sequences.apply_replica_batch(vec![older]);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let mut newer = local_sequence_request("newer", worker);
+        newer.prefill_load_hint = modeled_hint(100, 10);
+        sequences.add_request(newer, Instant::now()).unwrap();
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        sequences.apply_replica_batch(vec![delivered_after(
+            replica_free("older", worker),
+            Duration::from_secs(4),
+        )]);
+
+        assert_eq!(
+            modeled_time_loads_by_worker(&sequences, Instant::now())
+                .get(&worker)
+                .copied(),
+            Some(Ok(10_000))
+        );
     }
 
     #[tokio::test(start_paused = true)]
