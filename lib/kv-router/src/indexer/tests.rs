@@ -1100,6 +1100,7 @@ mod interface_tests {
             .process_routing_decision_for_request(&mut tokens_with_hashes, worker, Some(ttl))
             .await
             .unwrap();
+        flush_and_settle(index.as_ref()).await;
         assert_request_score(index.as_ref(), &tokens, worker, 1).await;
 
         time::sleep(ttl + Duration::from_millis(125)).await;

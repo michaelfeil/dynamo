@@ -807,19 +807,19 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         );
 
         let (resp_tx, resp_rx) = oneshot::channel();
-        let enqueue = || {
-            self.worker_event_channels[thread_idx].send(WorkerTask::EventWithAck {
+        self.worker_event_channels[thread_idx]
+            .send(WorkerTask::EventWithAck {
                 event,
                 resp: resp_tx,
             })
-        };
-        prune_manager
-            .enqueue_and_insert_worker_block_entries(worker, prune_entries, ttl_override, enqueue)
             .map_err(|_| KvRouterError::IndexerOffline)?;
 
-        resp_rx
+        let applied = resp_rx
             .await
             .map_err(|_| KvRouterError::IndexerDroppedRequest)?;
+        if applied {
+            prune_manager.insert_worker_block_entries(worker, prune_entries, ttl_override);
+        }
 
         Ok(())
     }

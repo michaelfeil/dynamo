@@ -346,12 +346,17 @@ impl WorkerPruneManager {
         }
     }
 
-    pub fn insert_worker_block_entries(&self, worker: WorkerWithDpRank, entries: Vec<BlockEntry>) {
+    pub fn insert_worker_block_entries(
+        &self,
+        worker: WorkerWithDpRank,
+        entries: Vec<BlockEntry>,
+        ttl_override: Option<Duration>,
+    ) {
         if entries.is_empty() {
             return;
         }
 
-        if self.insert_worker_block_entries_at(worker, entries, Instant::now(), None) {
+        if self.insert_worker_block_entries_at(worker, entries, Instant::now(), ttl_override) {
             self.inner.bump_schedule();
         }
     }
@@ -376,35 +381,6 @@ impl WorkerPruneManager {
         };
 
         self.update_worker_expiry(worker, old_next, new_next)
-    }
-
-    pub(super) fn enqueue_and_insert_worker_block_entries<E>(
-        &self,
-        worker: WorkerWithDpRank,
-        entries: Vec<BlockEntry>,
-        ttl_override: Option<Duration>,
-        enqueue: impl FnOnce() -> Result<(), E>,
-    ) -> Result<(), E> {
-        if entries.is_empty() {
-            return enqueue();
-        }
-
-        let (old_next, new_next) = {
-            let state =
-                self.inner.workers.entry(worker).or_insert_with(|| {
-                    Mutex::new(WorkerPruneState::new(self.inner.config.clone()))
-                });
-            let mut state = state.lock().expect("worker prune state mutex poisoned");
-            enqueue()?;
-            let old_next = state.peek_next_valid_expiry();
-            state.insert_block_entries(entries, Instant::now(), ttl_override);
-            let new_next = state.peek_next_valid_expiry();
-            (old_next, new_next)
-        };
-        if self.update_worker_expiry(worker, old_next, new_next) {
-            self.inner.bump_schedule();
-        }
-        Ok(())
     }
 
     fn update_worker_expiry(
