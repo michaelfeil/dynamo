@@ -187,6 +187,7 @@ where
                 session_id.clone(),
                 expected_output_tokens,
                 pinned_worker,
+                None,
                 allowed_worker_ids,
                 routing_constraints,
             )
@@ -345,7 +346,7 @@ where
         if let Some(session_affinity) = session_affinity {
             probe_context.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity.clone());
         }
-        let pinned_worker = router
+        let preferred_worker = router
             .query_affinity_worker(&probe_context, RequestPhase::Prefill)
             .ok()
             .flatten();
@@ -365,7 +366,8 @@ where
                 policy_class,
                 session_id,
                 expected_output_tokens,
-                pinned_worker,
+                None,
+                preferred_worker,
                 allowed_worker_ids,
                 routing_constraints,
             )

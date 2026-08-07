@@ -48,6 +48,10 @@ fn is_cancelled(error: &Error) -> bool {
     match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[])
 }
 
+fn is_overloaded(error: &Error) -> bool {
+    match_error_chain(error.as_ref(), &[ErrorType::ResourceExhausted], &[])
+}
+
 fn invalidate_on_non_cancellation(operation: &mut Option<AffinityAcquire>, error: &Error) {
     if is_cancelled(error) {
         return;
@@ -166,7 +170,7 @@ where
         request: &SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
         is_query_only: bool,
-        affinity_worker: Option<WorkerWithDpRank>,
+        preferred_worker: Option<WorkerWithDpRank>,
     ) -> Result<WorkerSelection, Error> {
         let context_id = request.context().id().to_string();
         let policy_class = request.metadata().get("policy-class").cloned();
@@ -184,7 +188,7 @@ where
                 phase,
                 is_query_only,
                 SelectionOptions {
-                    affinity_worker,
+                    preferred_worker,
                     policy_class,
                     session_id,
                 },
@@ -225,13 +229,24 @@ where
         }
 
         let request_context = request.context();
-        let operation = affinity
+        let mut operation = affinity
             .acquire_with_context(&session_id, explicit, request_context.as_ref())
             .await?;
         let worker = operation.target().and_then(affinity_worker);
         match self.select_request(request, phase, false, worker).await {
-            Ok(selection) => Ok((selection, Some(operation))),
+            Ok(selection) => {
+                if let Some(target) = operation.target()
+                    && !affinity_target_matches_selection(target, &selection)
+                {
+                    operation.invalidate();
+                    operation = affinity
+                        .acquire_with_context(&session_id, None, request_context.as_ref())
+                        .await?;
+                }
+                Ok((selection, Some(operation)))
+            }
             Err(error) if is_cancelled(&error) => Err(error),
+            Err(error) if is_overloaded(&error) => Err(error),
             Err(_) if operation.target().is_some() && explicit.is_none() => {
                 operation.invalidate();
                 let retry = affinity
@@ -613,6 +628,11 @@ fn affinity_worker(target: AffinityTarget) -> Option<WorkerWithDpRank> {
     target
         .dp_rank
         .map(|rank| WorkerWithDpRank::new(target.worker_id, rank))
+}
+
+fn affinity_target_matches_selection(target: AffinityTarget, selection: &WorkerSelection) -> bool {
+    target.worker_id == selection.instance_id
+        && target.dp_rank.is_none_or(|rank| rank == selection.dp_rank)
 }
 
 /// A direct routing wrapper for `RouterMode::Direct`.
