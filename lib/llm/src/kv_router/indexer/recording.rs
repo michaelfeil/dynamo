@@ -72,6 +72,7 @@ impl Indexer {
         worker: WorkerWithDpRank,
         local_hashes: Vec<LocalBlockHash>,
         sequence_hashes: Vec<SequenceHash>,
+        ttl_override: Option<Duration>,
     ) -> Result<(), KvRouterError> {
         self.recording_target()
             .record_routing_hashes(
@@ -80,7 +81,7 @@ impl Indexer {
                     local_hashes,
                     sequence_hashes,
                 },
-                None,
+                ttl_override,
             )
             .await
     }
