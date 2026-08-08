@@ -26,8 +26,8 @@ use dynamo_kv_router::protocols::WorkerWithDpRank;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::{ConfigStore, EndpointId, ModelStagePolicy, RoutingRequirements};
-use crate::metrics::ResponseOutcome;
-use crate::router::GwpRouter;
+use crate::metrics::{GwpMetrics, ResponseOutcome};
+use crate::router::{GwpRouter, GwpRouterRegistry, OracleVersionId};
 use crate::session::{
     AffinityBinding, AffinityStore, mint_session_id, prompt_hash_session_id, request_session_id,
 };
@@ -62,10 +62,12 @@ struct RequestMetadata {
     downstream_authority: String,
     planned: WorkerWithDpRank,
     policy: ModelStagePolicy,
+    router: Arc<GwpRouter>,
     routed_at: tokio::time::Instant,
 }
 
 struct Booking {
+    router: Arc<GwpRouter>,
     decision: WorkerWithDpRank,
     tokens: Vec<u32>,
     cached_tokens: usize,
@@ -101,10 +103,10 @@ struct OptimisticTokenizationJob {
     rid: String,
     slot: Arc<RequestSlot>,
     model: String,
-    metric_model: String,
     request_path: String,
     body: serde_json::Value,
     pseudo_stride: usize,
+    metrics: GwpMetrics,
     permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -158,6 +160,7 @@ impl RequestMetadata {
         downstream_authority: String,
         planned: WorkerWithDpRank,
         policy: ModelStagePolicy,
+        router: Arc<GwpRouter>,
     ) -> Self {
         Self {
             sid,
@@ -166,6 +169,7 @@ impl RequestMetadata {
             downstream_authority,
             planned,
             policy,
+            router,
             routed_at: tokio::time::Instant::now(),
         }
     }
@@ -238,7 +242,7 @@ pub fn parse_routing_requirements(raw: Option<&str>) -> Result<RoutingRequiremen
 /// (everything inside is shared).
 #[derive(Clone)]
 pub struct GwpCore {
-    pub router: Arc<GwpRouter>,
+    pub router: Arc<GwpRouterRegistry>,
     pub affinity: Arc<dyn AffinityStore>,
     pub topology: TopologyStore,
     pub config: ConfigStore,
@@ -310,7 +314,7 @@ fn downstream_authority(endpoint: &RoutableEndpoint) -> String {
 
 impl GwpCore {
     pub fn new(
-        router: Arc<GwpRouter>,
+        router: Arc<GwpRouterRegistry>,
         affinity: Arc<dyn AffinityStore>,
         topology: TopologyStore,
         config: impl Into<ConfigStore>,
@@ -322,7 +326,7 @@ impl GwpCore {
     }
 
     pub fn with_tokenizers(
-        router: Arc<GwpRouter>,
+        router: Arc<GwpRouterRegistry>,
         affinity: Arc<dyn AffinityStore>,
         topology: TopologyStore,
         config: impl Into<ConfigStore>,
@@ -462,9 +466,9 @@ impl GwpCore {
     async fn abort_reserved_request(&self, rid: &str, slot: &Arc<RequestSlot>) {
         let mut state = slot.state.lock().await;
         if let Some(booking) = state.booking.take() {
-            self.router.free(&booking.accounting_rid).await;
+            booking.router.free(&booking.accounting_rid).await;
             if let Some(metadata) = state.metadata.as_ref() {
-                self.router.metrics().scheduler_request_finished(
+                metadata.router.metrics().scheduler_request_finished(
                     &metadata.endpoint_id,
                     booking.tokens.len(),
                     booking.cached_tokens,
@@ -512,18 +516,20 @@ impl GwpCore {
                 "model {requested_model:?} is not known to GWP routing"
             )));
         };
-        let model = canonical_model.clone();
+        let oracle_version_id = OracleVersionId::new(canonical_model.clone())
+            .map_err(|error| ScheduleError::Internal(error.to_string()))?;
+        let model = oracle_version_id.as_str().to_string();
+        let model_router = self
+            .router
+            .model_router(&oracle_version_id)
+            .ok_or_else(|| ScheduleError::Internal(format!("model {model} has no scheduler")))?;
+        let model_metrics = model_router.metrics().clone();
         let policy = topology
             .profile(binding)
             .ok_or_else(|| ScheduleError::Internal(format!("model {model} has no profile")))?
             .stages;
-        self.router
-            .metrics()
-            .record_model_stage(&model, "affinity", policy.affinity);
-        self.router
-            .metrics()
-            .record_model_stage(&model, "trie", policy.trie);
-        let metric_model = canonical_model.clone();
+        model_metrics.record_model_stage(&model, "affinity", policy.affinity);
+        model_metrics.record_model_stage(&model, "trie", policy.trie);
         let pseudo_stride = config.routing.pseudo_stride;
         let block_size = config.routing.block_size;
         let prompt_hash_fallback = config.session.prompt_hash_fallback.clone();
@@ -556,10 +562,10 @@ impl GwpCore {
             let tokens = self
                 .tokenize_owned(
                     model.clone(),
-                    metric_model.clone(),
                     request_path.clone(),
                     body.take().expect("request body available"),
                     pseudo_stride,
+                    model_metrics.clone(),
                     None,
                 )
                 .await?;
@@ -572,9 +578,7 @@ impl GwpCore {
                 None => (mint_session_id(), "minted"),
             }
         };
-        self.router
-            .metrics()
-            .record_session_identity(identity_source);
+        model_metrics.record_session_identity(identity_source);
 
         let affinity_backend = self.affinity.backend_name();
         let mut affinity_fallback = None;
@@ -583,15 +587,11 @@ impl GwpCore {
         } else {
             match self.affinity.peek_binding(&sid).await {
                 Ok(None) => {
-                    self.router
-                        .metrics()
-                        .record_affinity_lookup(affinity_backend, "miss");
+                    model_metrics.record_affinity_lookup(affinity_backend, "miss");
                     None
                 }
                 Ok(Some(binding)) if !topology.is_alive(binding.worker.worker_id) => {
-                    self.router
-                        .metrics()
-                        .record_affinity_lookup(affinity_backend, "worker_unavailable");
+                    model_metrics.record_affinity_lookup(affinity_backend, "worker_unavailable");
                     affinity_fallback = Some(("worker_unavailable", binding.endpoint_id));
                     None
                 }
@@ -600,22 +600,16 @@ impl GwpCore {
                         .as_ref()
                         .is_some_and(|allowed| !allowed.contains(&binding.worker.worker_id)) =>
                 {
-                    self.router
-                        .metrics()
-                        .record_affinity_lookup(affinity_backend, "ineligible");
+                    model_metrics.record_affinity_lookup(affinity_backend, "ineligible");
                     affinity_fallback = Some(("ineligible", binding.endpoint_id));
                     None
                 }
                 Ok(Some(binding)) => {
-                    self.router
-                        .metrics()
-                        .record_affinity_lookup(affinity_backend, "hit");
+                    model_metrics.record_affinity_lookup(affinity_backend, "hit");
                     Some(binding.worker)
                 }
                 Err(error) => {
-                    self.router
-                        .metrics()
-                        .record_affinity_lookup(affinity_backend, "backend_error");
+                    model_metrics.record_affinity_lookup(affinity_backend, "backend_error");
                     tracing::warn!(
                         %error,
                         backend = affinity_backend,
@@ -635,6 +629,7 @@ impl GwpCore {
                 authority.clone(),
                 worker,
                 policy,
+                model_router.clone(),
             );
 
             // Only identities known before tokenization can take this path.
@@ -648,27 +643,20 @@ impl GwpCore {
                     state.metadata = Some(metadata);
                     state.tokenization_pending = true;
                 }
-                self.router.metrics().optimistic_tokenization_started();
+                model_metrics.optimistic_tokenization_started();
                 self.spawn_optimistic_tokenization(OptimisticTokenizationJob {
                     rid: rid.to_string(),
                     slot,
                     model: model.clone(),
-                    metric_model,
                     request_path,
                     body: body.take().expect("stable-identity body available"),
                     pseudo_stride,
+                    metrics: model_metrics.clone(),
                     permit,
                 });
-                self.router.metrics().record_routing_decision(
-                    &endpoint_id,
-                    &model,
-                    &authority,
-                    true,
-                );
-                self.router
-                    .metrics()
-                    .record_session_routing_decision(identity_source, true);
-                self.router.metrics().observe_schedule(
+                model_metrics.record_routing_decision(&endpoint_id, &model, &authority, true);
+                model_metrics.record_session_routing_decision(identity_source, true);
+                model_metrics.observe_schedule(
                     "optimistic_affinity",
                     "success",
                     schedule_started.elapsed(),
@@ -684,9 +672,7 @@ impl GwpCore {
                 });
             }
             if stable_identity {
-                self.router
-                    .metrics()
-                    .record_optimistic_tokenization("saturated_fallback");
+                model_metrics.record_optimistic_tokenization("saturated_fallback");
             }
 
             let tokenization = match tokenization {
@@ -694,18 +680,17 @@ impl GwpCore {
                 None => {
                     self.tokenize_owned(
                         model.clone(),
-                        metric_model,
                         request_path,
                         body.take().expect("request body available"),
                         pseudo_stride,
+                        model_metrics.clone(),
                         None,
                     )
                     .await?
                 }
             };
             let tokens = tokenization.tokens;
-            let selection = self
-                .router
+            let selection = model_router
                 .book_pinned(rid, &tokens, worker, policy)
                 .await
                 .map_err(|error| ScheduleError::NoRoutableEndpoint(error.to_string()))?;
@@ -717,13 +702,9 @@ impl GwpCore {
                 ScheduledTokenLoad::new(tokens, selection.cached_tokens),
             )
             .await;
-            self.router
-                .metrics()
-                .record_routing_decision(&endpoint_id, &model, &authority, true);
-            self.router
-                .metrics()
-                .record_session_routing_decision(identity_source, true);
-            self.router.metrics().observe_schedule(
+            model_metrics.record_routing_decision(&endpoint_id, &model, &authority, true);
+            model_metrics.record_session_routing_decision(identity_source, true);
+            model_metrics.observe_schedule(
                 "synchronous_affinity",
                 "success",
                 schedule_started.elapsed(),
@@ -744,31 +725,30 @@ impl GwpCore {
             None => {
                 self.tokenize_owned(
                     model.clone(),
-                    metric_model,
                     request_path,
                     body.take().expect("request body available"),
                     pseudo_stride,
+                    model_metrics.clone(),
                     None,
                 )
                 .await?
             }
         };
         let tokens = tokenization.tokens;
-        let selection = self
-            .router
+        let selection = model_router
             .pick(rid, &tokens, allowed_worker_ids, policy)
             .await
             .map_err(|e| ScheduleError::NoRoutableEndpoint(e.to_string()))?;
         let (endpoint_id, endpoint) = match self.endpoint_for(&topology, selection.worker) {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                self.router.free(rid).await;
+                model_router.free(rid).await;
                 return Err(error);
             }
         };
         let authority = downstream_authority(&endpoint);
         if let Some((reason, previous_endpoint)) = affinity_fallback.as_ref() {
-            self.router.metrics().record_affinity_fallback_routing(
+            model_metrics.record_affinity_fallback_routing(
                 affinity_backend,
                 reason,
                 previous_endpoint.as_ref(),
@@ -784,23 +764,16 @@ impl GwpCore {
                 authority.clone(),
                 selection.worker,
                 policy,
+                model_router,
             ),
             rid.to_string(),
             selection.worker,
             ScheduledTokenLoad::new(tokens, selection.cached_tokens),
         )
         .await;
-        self.router
-            .metrics()
-            .record_routing_decision(&endpoint_id, &model, &authority, false);
-        self.router
-            .metrics()
-            .record_session_routing_decision(identity_source, false);
-        self.router.metrics().observe_schedule(
-            "scored_selection",
-            "success",
-            schedule_started.elapsed(),
-        );
+        model_metrics.record_routing_decision(&endpoint_id, &model, &authority, false);
+        model_metrics.record_session_routing_decision(identity_source, false);
+        model_metrics.observe_schedule("scored_selection", "success", schedule_started.elapsed());
         Ok(Scheduled {
             session_id: sid,
             model,
@@ -815,10 +788,10 @@ impl GwpCore {
     async fn tokenize_owned(
         &self,
         model: String,
-        metric_model: String,
         request_path: String,
         body: serde_json::Value,
         pseudo_stride: usize,
+        metrics: GwpMetrics,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<ApproxTokens, ScheduleError> {
         let permit = match permit {
@@ -839,6 +812,7 @@ impl GwpCore {
                 .forget();
         }
         let tokenizer_mode = tokenizers.mode_for(&model);
+        let metric_model = model.clone();
         let started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -847,7 +821,7 @@ impl GwpCore {
         .await;
         match result {
             Ok(Ok(tokenization)) => {
-                self.router.metrics().observe_tokenization(
+                metrics.observe_tokenization(
                     &metric_model,
                     tokenization.tier.mode(),
                     "success",
@@ -856,7 +830,7 @@ impl GwpCore {
                 Ok(tokenization)
             }
             Ok(Err(error)) => {
-                self.router.metrics().observe_tokenization(
+                metrics.observe_tokenization(
                     &metric_model,
                     tokenizer_mode,
                     "error",
@@ -865,7 +839,7 @@ impl GwpCore {
                 Err(error.into())
             }
             Err(error) => {
-                self.router.metrics().observe_tokenization(
+                metrics.observe_tokenization(
                     &metric_model,
                     tokenizer_mode,
                     "task_error",
@@ -882,10 +856,10 @@ impl GwpCore {
             let result = core
                 .tokenize_owned(
                     job.model,
-                    job.metric_model,
                     job.request_path,
                     job.body,
                     job.pseudo_stride,
+                    job.metrics,
                     Some(job.permit),
                 )
                 .await;
@@ -909,20 +883,25 @@ impl GwpCore {
             "scheduled"
         );
         let endpoint_id = metadata.endpoint_id.clone();
+        let metrics = metadata.router.metrics().clone();
         let total_tokens = load.tokens.len();
         let cached_tokens = load.cached_tokens;
         let mut state = slot.state.lock().await;
         state.metadata = Some(metadata);
         state.booking = Some(Booking {
+            router: state
+                .metadata
+                .as_ref()
+                .expect("metadata installed")
+                .router
+                .clone(),
             decision,
             tokens: load.tokens,
             cached_tokens,
             accounting_rid,
         });
         drop(state);
-        self.router
-            .metrics()
-            .scheduler_request_started(&endpoint_id, total_tokens, cached_tokens);
+        metrics.scheduler_request_started(&endpoint_id, total_tokens, cached_tokens);
     }
 
     async fn complete_optimistic_tokenization(
@@ -947,7 +926,8 @@ impl GwpCore {
             Ok(tokenization) => tokenization,
             Err(error) => {
                 tracing::warn!(rid, %error, "optimistic tokenization failed; request remains unbooked");
-                self.router
+                metadata
+                    .router
                     .metrics()
                     .optimistic_tokenization_finished("tokenization_error");
                 let remove = state.finished_at.is_some() && state.terminal_outcome_recorded;
@@ -963,7 +943,8 @@ impl GwpCore {
             .is_some_and(|response| response.status != 200)
         {
             tracing::debug!(rid, "upstream denied request before optimistic booking");
-            self.router
+            metadata
+                .router
                 .metrics()
                 .optimistic_tokenization_finished("denied_before_booking");
             let remove = state.terminal_outcome_recorded;
@@ -978,7 +959,8 @@ impl GwpCore {
             .is_some_and(|response| response.route_retired)
         {
             tracing::debug!(rid, "route retired before optimistic booking");
-            self.router
+            metadata
+                .router
                 .metrics()
                 .optimistic_tokenization_finished("retired_endpoint");
             let remove = state.finished_at.is_some() && state.terminal_outcome_recorded;
@@ -990,7 +972,8 @@ impl GwpCore {
         }
         if state.finished_at.is_some() {
             tracing::debug!(rid, "request finished before optimistic booking");
-            self.router
+            metadata
+                .router
                 .metrics()
                 .optimistic_tokenization_finished("finished_before_booking");
             let remove = state.terminal_outcome_recorded;
@@ -1006,7 +989,7 @@ impl GwpCore {
             .map(|response| response.confirmed)
             .unwrap_or(metadata.planned);
         let tokens = tokenization.tokens;
-        let selection = match self
+        let selection = match metadata
             .router
             .book_pinned(rid, &tokens, decision, metadata.policy)
             .await
@@ -1014,7 +997,8 @@ impl GwpCore {
             Ok(selection) => selection,
             Err(error) => {
                 tracing::warn!(rid, %error, "optimistic scheduler booking failed");
-                self.router
+                metadata
+                    .router
                     .metrics()
                     .optimistic_tokenization_finished("booking_error");
                 let remove = state.finished_at.is_some() && state.terminal_outcome_recorded;
@@ -1027,12 +1011,13 @@ impl GwpCore {
         };
         let cached_tokens = selection.cached_tokens;
         state.booking = Some(Booking {
+            router: metadata.router.clone(),
             decision: selection.worker,
             tokens,
             cached_tokens,
             accounting_rid: rid.to_string(),
         });
-        self.router.metrics().scheduler_request_started(
+        metadata.router.metrics().scheduler_request_started(
             &metadata.endpoint_id,
             state.booking.as_ref().unwrap().tokens.len(),
             cached_tokens,
@@ -1043,11 +1028,13 @@ impl GwpCore {
             .is_some_and(|response| response.status == 200)
         {
             let booking = state.booking.as_ref().expect("booking installed");
-            self.router
+            booking
+                .router
                 .mark_prefill_completed(&booking.accounting_rid)
                 .await;
             if metadata.policy.trie {
-                self.router
+                booking
+                    .router
                     .record_routing_decision(
                         &booking.accounting_rid,
                         &booking.tokens,
@@ -1056,7 +1043,8 @@ impl GwpCore {
                     .await;
             }
         }
-        self.router
+        metadata
+            .router
             .metrics()
             .optimistic_tokenization_finished("booked");
     }
@@ -1094,24 +1082,23 @@ impl GwpCore {
             tracing::warn!(rid, "response_started before scheduling produced metadata");
             return;
         };
+        let metrics = metadata.router.metrics().clone();
         if state.response.is_some() {
             tracing::debug!(rid, "duplicate response_started ignored");
             return;
         }
         if state.finished_at.is_some() {
-            self.router
-                .metrics()
-                .record_lifecycle_reconciliation("response_after_finish");
+            metrics.record_lifecycle_reconciliation("response_after_finish");
         }
 
-        self.router.metrics().record_upstream_response(
+        metrics.record_upstream_response(
             &metadata.endpoint_id,
             &metadata.model,
             &metadata.downstream_authority,
             status,
         );
         let outcome = ResponseOutcome::from_status(status);
-        self.router.metrics().observe_time_to_first_byte(
+        metrics.observe_time_to_first_byte(
             &metadata.endpoint_id,
             &metadata.model,
             &metadata.downstream_authority,
@@ -1122,9 +1109,7 @@ impl GwpCore {
         let topology = self.topology.load();
         let route_retired = status == 200 && topology.endpoint(&metadata.endpoint_id).is_none();
         if route_retired {
-            self.router
-                .metrics()
-                .record_lifecycle_reconciliation("retired_endpoint_response");
+            metrics.record_lifecycle_reconciliation("retired_endpoint_response");
         }
         let mut confirmed = metadata.planned;
         if status == 200 && !route_retired {
@@ -1171,15 +1156,15 @@ impl GwpCore {
         });
 
         if status != 200 {
-            self.router.metrics().record_denied(
+            metrics.record_denied(
                 &metadata.endpoint_id,
                 &metadata.model,
                 &metadata.downstream_authority,
                 status,
             );
             if let Some(booking) = state.booking.take() {
-                self.router.free(&booking.accounting_rid).await;
-                self.router.metrics().scheduler_request_finished(
+                booking.router.free(&booking.accounting_rid).await;
+                metrics.scheduler_request_finished(
                     &metadata.endpoint_id,
                     booking.tokens.len(),
                     booking.cached_tokens,
@@ -1197,8 +1182,8 @@ impl GwpCore {
             );
         } else if route_retired {
             if let Some(booking) = state.booking.take() {
-                self.router.free(&booking.accounting_rid).await;
-                self.router.metrics().scheduler_request_finished(
+                booking.router.free(&booking.accounting_rid).await;
+                metrics.scheduler_request_finished(
                     &metadata.endpoint_id,
                     booking.tokens.len(),
                     booking.cached_tokens,
@@ -1213,7 +1198,8 @@ impl GwpCore {
             let rebooked = confirmed != booking.decision;
             if rebooked {
                 let confirmed_rid = format!("{rid}:confirmed:{}", confirmed.worker_id);
-                self.router
+                booking
+                    .router
                     .rebook_request(
                         &booking.accounting_rid,
                         &confirmed_rid,
@@ -1228,7 +1214,7 @@ impl GwpCore {
                     actual_worker_id = confirmed.worker_id,
                     "re-booked request on downstream worker"
                 );
-                self.router.metrics().record_rebooked(
+                metrics.record_rebooked(
                     &metadata.endpoint_id,
                     &metadata.model,
                     &metadata.downstream_authority,
@@ -1236,11 +1222,13 @@ impl GwpCore {
                 booking.decision = confirmed;
                 booking.accounting_rid = confirmed_rid;
             }
-            self.router
+            booking
+                .router
                 .mark_prefill_completed(&booking.accounting_rid)
                 .await;
             if metadata.policy.trie {
-                self.router
+                booking
+                    .router
                     .record_routing_decision(
                         &booking.accounting_rid,
                         &booking.tokens,
@@ -1252,8 +1240,8 @@ impl GwpCore {
                 // RequestFinished arrived first. Preserve the lifecycle order
                 // at the scheduler: mark prefill/reconcile the actual worker
                 // above, then release the confirmed booking immediately.
-                self.router.free(&booking.accounting_rid).await;
-                self.router.metrics().scheduler_request_finished(
+                booking.router.free(&booking.accounting_rid).await;
+                metrics.scheduler_request_finished(
                     &metadata.endpoint_id,
                     booking.tokens.len(),
                     booking.cached_tokens,
@@ -1304,9 +1292,9 @@ impl GwpCore {
         state.finished_at = Some(tokio::time::Instant::now());
         let wait_for_response = state.response.is_none();
         if !wait_for_response && let Some(booking) = state.booking.take() {
-            self.router.free(&booking.accounting_rid).await;
+            booking.router.free(&booking.accounting_rid).await;
             if let Some(metadata) = state.metadata.as_ref() {
-                self.router.metrics().scheduler_request_finished(
+                metadata.router.metrics().scheduler_request_finished(
                     &metadata.endpoint_id,
                     booking.tokens.len(),
                     booking.cached_tokens,
@@ -1372,7 +1360,7 @@ impl GwpCore {
         let elapsed = finished_at
             .checked_duration_since(metadata.routed_at)
             .unwrap_or_default();
-        self.router.metrics().record_request_outcome(
+        metadata.router.metrics().record_request_outcome(
             &metadata.endpoint_id,
             &metadata.model,
             &metadata.downstream_authority,
@@ -1396,14 +1384,17 @@ impl GwpCore {
             tokio::time::sleep(TERMINAL_EVENT_GRACE).await;
             let mut state = slot.state.lock().await;
             if state.response.is_none() {
-                core.router
-                    .metrics()
+                state
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.router.metrics())
+                    .unwrap_or_else(|| core.router.metrics())
                     .record_lifecycle_reconciliation("response_missing_at_grace");
             }
             if let Some(booking) = state.booking.take() {
-                core.router.free(&booking.accounting_rid).await;
+                booking.router.free(&booking.accounting_rid).await;
                 if let Some(metadata) = state.metadata.as_ref() {
-                    core.router.metrics().scheduler_request_finished(
+                    metadata.router.metrics().scheduler_request_finished(
                         &metadata.endpoint_id,
                         booking.tokens.len(),
                         booking.cached_tokens,
@@ -1428,9 +1419,9 @@ impl GwpCore {
             .finished_at
             .get_or_insert_with(tokio::time::Instant::now);
         if let Some(booking) = state.booking.take() {
-            self.router.free(&booking.accounting_rid).await;
+            booking.router.free(&booking.accounting_rid).await;
             if let Some(metadata) = state.metadata.as_ref() {
-                self.router.metrics().scheduler_request_finished(
+                metadata.router.metrics().scheduler_request_finished(
                     &metadata.endpoint_id,
                     booking.tokens.len(),
                     booking.cached_tokens,
@@ -1478,9 +1469,9 @@ impl GwpCore {
                     let mut state = slot.state.lock().await;
                     state.finished_at.get_or_insert(now);
                     if let Some(booking) = state.booking.take() {
-                        router.free(&booking.accounting_rid).await;
+                        booking.router.free(&booking.accounting_rid).await;
                         if let Some(metadata) = state.metadata.as_ref() {
-                            router.metrics().scheduler_request_finished(
+                            metadata.router.metrics().scheduler_request_finished(
                                 &metadata.endpoint_id,
                                 booking.tokens.len(),
                                 booking.cached_tokens,
@@ -1490,7 +1481,7 @@ impl GwpCore {
                     if !state.terminal_outcome_recorded
                         && let Some(metadata) = state.metadata.as_ref()
                     {
-                        router.metrics().record_request_outcome(
+                        metadata.router.metrics().record_request_outcome(
                             &metadata.endpoint_id,
                             &metadata.model,
                             &metadata.downstream_authority,
@@ -1652,7 +1643,7 @@ mod tests {
     }
 
     /// A core wired by hand, as one reflector poll would.
-    async fn make_core(live: bool) -> (GwpCore, crate::router::WorkerConfigSender) {
+    async fn make_core(live: bool) -> (GwpCore, ()) {
         let config = GwpConfig {
             endpoints: BTreeMap::from([(
                 EndpointId(ENDPOINT.into()),
@@ -1674,14 +1665,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (router, workers_tx) = GwpRouter::new_process_local(
-            config.routing.block_size,
-            config.routing.approx_indexer_ttl_secs,
-        )
-        .await
-        .unwrap();
         let mut topology_workers = HashMap::new();
-        let mut configs = HashMap::new();
         if live {
             topology_workers.insert(
                 WORKER,
@@ -1691,13 +1675,21 @@ mod tests {
                     observed_load: None,
                 },
             );
-            configs.insert(WORKER, ModelRuntimeConfig::default());
         }
-        workers_tx.send(configs).unwrap();
+        let snapshot = TopologySnapshot::from_config(&config, topology_workers).unwrap();
+        let router = GwpRouterRegistry::new_process_local(
+            config.routing.block_size,
+            config.routing.approx_indexer_ttl_secs,
+        )
+        .await
+        .unwrap();
+        router
+            .reconcile_topology(&snapshot, &snapshot.workers.keys().copied().collect())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let topology =
-            TopologyStore::new(TopologySnapshot::from_config(&config, topology_workers).unwrap());
+        let topology = TopologyStore::new(snapshot);
 
         let core = GwpCore::new(
             router,
@@ -1705,10 +1697,10 @@ mod tests {
             topology,
             Arc::new(config),
         );
-        (core, workers_tx)
+        (core, ())
     }
 
-    async fn make_multi_model_core() -> (GwpCore, crate::router::WorkerConfigSender) {
+    async fn make_multi_model_core() -> (GwpCore, ()) {
         let endpoint = |host: &str| EndpointConfig {
             ingress_url: url::Url::parse(&format!("http://{host}/v1")).unwrap(),
             api_key: String::new(),
@@ -1736,11 +1728,10 @@ mod tests {
                 block_size: 4,
                 ..Default::default()
             },
+            served_alias_model_map: BTreeMap::from([("kimi-alias".into(), "kimi-k2".into())]),
             ..Default::default()
         };
-        let (router, workers_tx) = GwpRouter::new_process_local(4, 120).await.unwrap();
         let mut topology_workers = HashMap::new();
-        let mut configs = HashMap::new();
         for (offset, endpoint_id) in config.endpoints.keys().enumerate() {
             let worker = 100 + offset as u64;
             topology_workers.insert(
@@ -1751,19 +1742,22 @@ mod tests {
                     observed_load: None,
                 },
             );
-            configs.insert(worker, ModelRuntimeConfig::default());
         }
-        workers_tx.send(configs).unwrap();
+        let snapshot = TopologySnapshot::from_config(&config, topology_workers).unwrap();
+        let router = GwpRouterRegistry::new_process_local(4, 120).await.unwrap();
+        router
+            .reconcile_topology(&snapshot, &snapshot.workers.keys().copied().collect())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let topology =
-            TopologyStore::new(TopologySnapshot::from_config(&config, topology_workers).unwrap());
+        let topology = TopologyStore::new(snapshot);
         let core = GwpCore::new(
             router,
             Arc::new(InMemoryAffinityStore::new()),
             topology,
             config,
         );
-        (core, workers_tx)
+        (core, ())
     }
 
     fn add_endpoint_properties(core: &GwpCore) {
@@ -2285,7 +2279,10 @@ mod tests {
     #[tokio::test]
     async fn full_lifecycle_binds_then_sticks_then_frees() {
         let (core, _tx) = make_core(true).await;
+        let model = OracleVersionId::new("m").unwrap();
         core.router
+            .model_router(&model)
+            .expect("model router")
             .metrics()
             .replace_scheduler_live_workers(HashMap::from([(EndpointId(ENDPOINT.into()), 2)]));
 
@@ -2305,7 +2302,11 @@ mod tests {
             metric_value(
                 &active_metrics,
                 requests,
-                &["routed_endpoint=\"core-endpoint\"", "aggregation=\"total\""]
+                &[
+                    "dynamo_component=\"m\"",
+                    "routed_endpoint=\"core-endpoint\"",
+                    "aggregation=\"total\""
+                ]
             ),
             Some(1.0)
         );
@@ -2314,6 +2315,7 @@ mod tests {
                 &active_metrics,
                 requests,
                 &[
+                    "dynamo_component=\"m\"",
                     "routed_endpoint=\"core-endpoint\"",
                     "aggregation=\"per_live_worker\""
                 ]
@@ -2326,6 +2328,7 @@ mod tests {
                 &active_metrics,
                 tokens,
                 &[
+                    "dynamo_component=\"m\"",
                     "routed_endpoint=\"core-endpoint\"",
                     "cache_status=\"cached\"",
                     "aggregation=\"total\""
@@ -2338,6 +2341,7 @@ mod tests {
                 &active_metrics,
                 tokens,
                 &[
+                    "dynamo_component=\"m\"",
                     "routed_endpoint=\"core-endpoint\"",
                     "cache_status=\"uncached\"",
                     "aggregation=\"total\""
@@ -2358,7 +2362,11 @@ mod tests {
             metric_value(
                 &freed_metrics,
                 requests,
-                &["routed_endpoint=\"core-endpoint\"", "aggregation=\"total\""]
+                &[
+                    "dynamo_component=\"m\"",
+                    "routed_endpoint=\"core-endpoint\"",
+                    "aggregation=\"total\""
+                ]
             ),
             Some(0.0)
         );
@@ -2383,18 +2391,30 @@ mod tests {
         assert!(metric_has(
             &metrics,
             lookup,
-            &["backend=\"memory\"", "outcome=\"miss\""]
+            &[
+                "dynamo_component=\"m\"",
+                "backend=\"memory\"",
+                "outcome=\"miss\""
+            ]
         ));
         assert!(metric_has(
             &metrics,
             lookup,
-            &["backend=\"memory\"", "outcome=\"hit\""]
+            &[
+                "dynamo_component=\"m\"",
+                "backend=\"memory\"",
+                "outcome=\"hit\""
+            ]
         ));
         assert_eq!(
             metric_value(
                 &metrics,
                 "dynamo_component_gwp_session_routing_decisions_total",
-                &["source=\"minted\"", "sticky=\"false\""]
+                &[
+                    "dynamo_component=\"m\"",
+                    "source=\"minted\"",
+                    "sticky=\"false\""
+                ]
             ),
             Some(1.0)
         );
@@ -2402,7 +2422,11 @@ mod tests {
             metric_value(
                 &metrics,
                 "dynamo_component_gwp_session_routing_decisions_total",
-                &["source=\"header\"", "sticky=\"true\""]
+                &[
+                    "dynamo_component=\"m\"",
+                    "source=\"header\"",
+                    "sticky=\"true\""
+                ]
             ),
             Some(1.0)
         );
@@ -2991,6 +3015,48 @@ mod tests {
                 "cluster_result=\"different\""
             ]
         ));
+    }
+
+    #[tokio::test]
+    async fn model_schedulers_isolate_load_and_aliases_share_the_canonical_router() {
+        let (core, _tx) = make_multi_model_core().await;
+        let kimi = core
+            .schedule_for_test(
+                "kimi-isolated",
+                None,
+                CHAT_PATH,
+                &serde_json::json!({
+                    "model": "kimi-alias",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(kimi.model, "kimi-k2");
+
+        let kimi_id = OracleVersionId::new("kimi-k2").unwrap();
+        let glm_id = OracleVersionId::new("glm-4.7").unwrap();
+        let kimi_loads = core.router.potential_loads_for_model(&kimi_id, &[]).await;
+        assert_eq!(
+            kimi_loads
+                .iter()
+                .map(|load| load.active_requests)
+                .sum::<usize>(),
+            1
+        );
+        let glm_loads = core.router.potential_loads_for_model(&glm_id, &[]).await;
+        assert!(glm_loads.iter().all(|load| load.active_requests == 0));
+
+        core.response_started("kimi-isolated", Some(kimi.worker.worker_id), 200)
+            .await;
+        core.request_finished("kimi-isolated", "complete").await;
+        assert!(
+            core.router
+                .potential_loads_for_model(&kimi_id, &[])
+                .await
+                .iter()
+                .all(|load| load.active_requests == 0)
+        );
     }
 
     #[tokio::test]

@@ -16,6 +16,8 @@ use arc_swap::ArcSwap;
 use dynamo_kv_router::protocols::WorkerId;
 use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
 use parking_lot::Mutex;
+#[cfg(feature = "server")]
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::config::{
@@ -24,7 +26,7 @@ use crate::config::{
 };
 use crate::lifecycle::Lifecycle;
 use crate::metrics::GwpMetrics;
-use crate::router::{GwpRouter, ObservedLoadStore, ObservedWorkerLoad, WorkerConfigSender};
+use crate::router::{GwpRouterRegistry, ObservedLoadStore, ObservedWorkerLoad, WorkerConfigSender};
 
 /// Data-plane endpoint fields. Planner connection details are intentionally
 /// absent: they belong to the current topology producer, not routing state.
@@ -68,6 +70,19 @@ pub struct TopologyWorker {
     pub endpoint: EndpointId,
     pub runtime: ModelRuntimeConfig,
     pub observed_load: Option<ObservedWorkerLoad>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct OracleInfo {
+    oracle_version_id: String,
+    replicas: usize,
+}
+
+#[cfg(feature = "server")]
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct GwpInfo {
+    oracles: Vec<OracleInfo>,
 }
 
 /// Complete, immutable routing generation consumed by a scheduling call.
@@ -137,6 +152,7 @@ impl TopologySnapshot {
                 "model alias {alias} references unknown canonical model {canonical}"
             );
         }
+        let mut endpoint_models: HashMap<&EndpointId, &str> = HashMap::new();
         for (model, binding) in &self.models {
             anyhow::ensure!(
                 self.profiles.contains_key(&binding.profile),
@@ -149,6 +165,13 @@ impl TopologySnapshot {
                     "model {model} references unknown endpoint {}",
                     endpoint.0
                 );
+                if let Some(existing) = endpoint_models.insert(endpoint, model) {
+                    anyhow::ensure!(
+                        existing == model,
+                        "endpoint {} is shared by canonical models {existing} and {model}; model schedulers require distinct endpoint worker pools",
+                        endpoint.0
+                    );
+                }
             }
         }
         for (worker_id, worker) in &self.workers {
@@ -211,6 +234,25 @@ impl TopologySnapshot {
 
     pub fn is_alive(&self, worker_id: WorkerId) -> bool {
         self.workers.contains_key(&worker_id)
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn info(&self) -> GwpInfo {
+        let mut oracles: Vec<_> = self
+            .models
+            .iter()
+            .map(|(oracle_version_id, binding)| OracleInfo {
+                oracle_version_id: oracle_version_id.clone(),
+                replicas: self
+                    .workers
+                    .values()
+                    .filter(|worker| binding.endpoints.contains(&worker.endpoint))
+                    .count(),
+            })
+            .collect();
+        oracles
+            .sort_unstable_by(|left, right| left.oracle_version_id.cmp(&right.oracle_version_id));
+        GwpInfo { oracles }
     }
 
     fn worker_configs(&self) -> HashMap<WorkerId, ModelRuntimeConfig> {
@@ -298,9 +340,9 @@ pub type TopologyUpdateSender = mpsc::Sender<TopologyUpdate>;
 /// Validates and publishes source-neutral topology updates.
 pub struct TopologyController {
     store: TopologyStore,
-    workers_tx: WorkerConfigSender,
-    observed_loads: ObservedLoadStore,
-    load_anchor_router: Option<Arc<GwpRouter>>,
+    workers_tx: Option<WorkerConfigSender>,
+    observed_loads: Option<ObservedLoadStore>,
+    model_routers: Option<Arc<GwpRouterRegistry>>,
     lifecycle: Option<Lifecycle>,
     metrics: Option<GwpMetrics>,
 }
@@ -313,17 +355,23 @@ impl TopologyController {
     ) -> Self {
         Self {
             store,
-            workers_tx,
-            observed_loads,
-            load_anchor_router: None,
+            workers_tx: Some(workers_tx),
+            observed_loads: Some(observed_loads),
+            model_routers: None,
             lifecycle: None,
             metrics: None,
         }
     }
 
-    pub fn with_router(mut self, router: Arc<GwpRouter>) -> Self {
-        self.load_anchor_router = Some(router);
-        self
+    pub fn model_scoped(store: TopologyStore, routers: Arc<GwpRouterRegistry>) -> Self {
+        Self {
+            store,
+            workers_tx: None,
+            observed_loads: None,
+            model_routers: Some(routers),
+            lifecycle: None,
+            metrics: None,
+        }
     }
 
     pub fn with_lifecycle(mut self, lifecycle: Lifecycle) -> Self {
@@ -338,22 +386,21 @@ impl TopologyController {
 
     async fn publish(&self, update: TopologyUpdate) -> anyhow::Result<()> {
         update.snapshot.validate()?;
-        let worker_configs = update.snapshot.worker_configs();
-        let observed_loads = update.snapshot.observed_loads();
-        if let Some(router) = &self.load_anchor_router {
-            if let Err(error) = router
-                .replace_observed_loads(observed_loads.clone(), &update.refreshed_workers)
-                .await
-            {
-                tracing::warn!(%error, "failed to capture local load anchors; retaining existing anchors");
-                self.observed_loads.replace(observed_loads);
-            }
+        if let Some(routers) = &self.model_routers {
+            routers
+                .reconcile_topology(&update.snapshot, &update.refreshed_workers)
+                .await?;
         } else {
-            self.observed_loads.replace(observed_loads);
+            self.observed_loads
+                .as_ref()
+                .expect("legacy observed load store")
+                .replace(update.snapshot.observed_loads());
         }
-        self.workers_tx
-            .send(worker_configs)
-            .map_err(|_| anyhow::anyhow!("router worker feed closed"))?;
+        if let Some(workers_tx) = &self.workers_tx {
+            workers_tx
+                .send(update.snapshot.worker_configs())
+                .map_err(|_| anyhow::anyhow!("router worker feed closed"))?;
+        }
         if let Some(metrics) = &self.metrics {
             let mut per_endpoint: HashMap<EndpointId, usize> = update
                 .snapshot
@@ -370,7 +417,10 @@ impl TopologyController {
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.update_routing(update.snapshot.workers.len());
         }
-        self.store.replace(update.snapshot);
+        self.store.replace(update.snapshot.clone());
+        if let Some(routers) = &self.model_routers {
+            routers.retire_absent(&update.snapshot);
+        }
         Ok(())
     }
 
@@ -379,7 +429,11 @@ impl TopologyController {
             while let Some(update) = updates.recv().await {
                 if let Err(error) = self.publish(update).await {
                     tracing::error!(%error, "rejected topology update; retaining last valid snapshot");
-                    if self.workers_tx.is_closed() {
+                    if self
+                        .workers_tx
+                        .as_ref()
+                        .is_some_and(WorkerConfigSender::is_closed)
+                    {
                         return;
                     }
                 }
@@ -447,6 +501,74 @@ mod tests {
         assert_eq!(snapshot.worker_endpoint(7), Some(&EndpointId("a".into())));
     }
 
+    #[cfg(feature = "server")]
+    #[test]
+    fn info_lists_oracles_and_live_replica_counts() {
+        let mut config = config();
+        config.endpoints.insert(
+            EndpointId("b".into()),
+            EndpointConfig {
+                ingress_url: url::Url::parse("http://b.example/v1").unwrap(),
+                api_key: String::new(),
+                planner_url: url::Url::parse("http://planner-b.example/deep/health").unwrap(),
+                planner_api_key: None,
+                properties: Default::default(),
+            },
+        );
+        config.routes.push(ModelRoute {
+            models: vec!["empty-model".into()],
+            endpoints: vec![EndpointId("b".into())],
+        });
+        let snapshot = TopologySnapshot::from_config(
+            &config,
+            HashMap::from([
+                (
+                    7,
+                    TopologyWorker {
+                        endpoint: EndpointId("a".into()),
+                        runtime: ModelRuntimeConfig::default(),
+                        observed_load: None,
+                    },
+                ),
+                (
+                    8,
+                    TopologyWorker {
+                        endpoint: EndpointId("a".into()),
+                        runtime: ModelRuntimeConfig::default(),
+                        observed_load: None,
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let info = snapshot.info();
+        assert_eq!(
+            info,
+            GwpInfo {
+                oracles: vec![
+                    OracleInfo {
+                        oracle_version_id: "empty-model".into(),
+                        replicas: 0,
+                    },
+                    OracleInfo {
+                        oracle_version_id: "model".into(),
+                        replicas: 2,
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(info).unwrap(),
+            serde_json::json!({
+                "oracles": [
+                    {"oracle_version_id": "empty-model", "replicas": 0},
+                    {"oracle_version_id": "model", "replicas": 2}
+                ]
+            })
+        );
+    }
+
     #[test]
     fn rejects_worker_owned_by_unknown_endpoint() {
         let error = TopologySnapshot::from_config(
@@ -462,6 +584,17 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("unknown endpoint"));
+    }
+
+    #[test]
+    fn rejects_endpoint_worker_pool_shared_by_canonical_models() {
+        let mut config = config();
+        config.routes.push(ModelRoute {
+            models: vec!["other-model".into()],
+            endpoints: vec![EndpointId("a".into())],
+        });
+        let error = TopologySnapshot::from_config(&config, HashMap::new()).unwrap_err();
+        assert!(error.to_string().contains("shared by canonical models"));
     }
 
     #[test]

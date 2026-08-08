@@ -434,7 +434,7 @@ fn response_result(response: &CheckResponse) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -472,29 +472,29 @@ mod tests {
             },
             ..Default::default()
         };
-        let (router, workers_tx) = crate::router::GwpRouter::new_process_local(
+        let snapshot = TopologySnapshot::from_config(
+            &config,
+            HashMap::from([(
+                10,
+                TopologyWorker {
+                    endpoint,
+                    runtime: ModelRuntimeConfig::default(),
+                    observed_load: None,
+                },
+            )]),
+        )
+        .unwrap();
+        let router = crate::router::GwpRouterRegistry::new_process_local(
             config.routing.block_size,
             config.routing.approx_indexer_ttl_secs,
         )
         .await
         .unwrap();
-        let topology = TopologyStore::new(
-            TopologySnapshot::from_config(
-                &config,
-                HashMap::from([(
-                    10,
-                    TopologyWorker {
-                        endpoint,
-                        runtime: ModelRuntimeConfig::default(),
-                        observed_load: None,
-                    },
-                )]),
-            )
-            .unwrap(),
-        );
-        workers_tx
-            .send(HashMap::from([(10, ModelRuntimeConfig::default())]))
+        router
+            .reconcile_topology(&snapshot, &HashSet::from([10]))
+            .await
             .unwrap();
+        let topology = TopologyStore::new(snapshot);
         tokio::time::sleep(Duration::from_millis(100)).await;
         ControlState {
             core: GwpCore::new(

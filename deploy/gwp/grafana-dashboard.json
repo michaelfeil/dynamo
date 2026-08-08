@@ -94,7 +94,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
           "legendFormat": "{{routed_endpoint}}",
           "range": true,
           "refId": "A"
@@ -165,7 +165,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "100 * sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\",outcome=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])), 0.000000001)",
+          "expr": "100 * sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\",outcome=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])), 0.000000001)",
           "legendFormat": "success",
           "range": true,
           "refId": "A"
@@ -230,7 +230,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\",outcome=\"overloaded\"}[$__rate_interval]))",
+          "expr": "sum(rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\",outcome=\"overloaded\"}[$__rate_interval]))",
           "legendFormat": "overloaded",
           "range": true,
           "refId": "A"
@@ -291,7 +291,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\"})",
+          "expr": "sum(dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",aggregation=\"total\"})",
           "instant": false,
           "legendFormat": "in-flight",
           "range": true,
@@ -372,8 +372,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "max by (routed_endpoint) (dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\"})",
-          "legendFormat": "{{routed_endpoint}}",
+          "expr": "max by (dynamo_component, routed_endpoint) (dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\"})",
+          "legendFormat": "{{dynamo_component}} / {{routed_endpoint}}",
           "range": true,
           "refId": "A"
         }
@@ -465,7 +465,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
           "legendFormat": "{{routed_endpoint}}",
           "range": true,
           "refId": "A"
@@ -533,7 +533,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(dynamo_component_gwp_upstream_responses_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
           "legendFormat": "{{outcome}}",
           "range": true,
           "refId": "A"
@@ -601,7 +601,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (outcome, status) (rate(dynamo_component_gwp_denied_requests_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "expr": "sum by (outcome, status) (rate(dynamo_component_gwp_denied_requests_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
           "legendFormat": "{{outcome}} / {{status}}",
           "range": true,
           "refId": "A"
@@ -668,7 +668,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (sticky) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "expr": "sum by (sticky) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
           "legendFormat": "sticky={{sticky}}",
           "range": true,
           "refId": "A"
@@ -736,7 +736,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_rebooked_requests_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "expr": "sum by (routed_endpoint) (rate(dynamo_component_gwp_rebooked_requests_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
           "legendFormat": "{{routed_endpoint}}",
           "range": true,
           "refId": "A"
@@ -804,7 +804,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(dynamo_component_gwp_request_outcomes_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(dynamo_component_gwp_request_outcomes_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
           "legendFormat": "{{outcome}}",
           "range": true,
           "refId": "A"
@@ -885,21 +885,21 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dynamo_component_gwp_time_to_first_byte_seconds_bucket{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
@@ -967,21 +967,21 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "range": true,
           "refId": "B"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dynamo_component_gwp_request_duration_seconds_bucket{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
@@ -1062,8 +1062,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "max by (routed_endpoint) (dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\"})",
-          "legendFormat": "{{routed_endpoint}}",
+          "expr": "max by (dynamo_component, routed_endpoint) (dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\"})",
+          "legendFormat": "{{dynamo_component}} / {{routed_endpoint}}",
           "range": true,
           "refId": "A"
         }
@@ -1130,8 +1130,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (routed_endpoint) (dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\"})",
-          "legendFormat": "{{routed_endpoint}}",
+          "expr": "sum by (dynamo_component, routed_endpoint) (dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",aggregation=\"total\"})",
+          "legendFormat": "{{dynamo_component}} / {{routed_endpoint}}",
           "range": true,
           "refId": "A"
         }
@@ -1199,8 +1199,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (routed_endpoint) (dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"per_live_worker\"})",
-          "legendFormat": "{{routed_endpoint}}",
+          "expr": "sum by (dynamo_component, routed_endpoint) (dynamo_component_gwp_scheduler_inflight_requests{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",aggregation=\"per_live_worker\"})",
+          "legendFormat": "{{dynamo_component}} / {{routed_endpoint}}",
           "range": true,
           "refId": "A"
         }
@@ -1270,8 +1270,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (cache_status) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\",cache_status=~\"cached|uncached\"})",
-          "legendFormat": "{{cache_status}}",
+          "expr": "sum by (dynamo_component, cache_status) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",aggregation=\"total\",cache_status=~\"cached|uncached\"})",
+          "legendFormat": "{{dynamo_component}} / {{cache_status}}",
           "range": true,
           "refId": "A"
         }
@@ -1338,8 +1338,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (routed_endpoint, cache_status) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"per_live_worker\",cache_status=~\"cached|uncached\"})",
-          "legendFormat": "{{routed_endpoint}} / {{cache_status}}",
+          "expr": "sum by (dynamo_component, routed_endpoint, cache_status) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",aggregation=\"per_live_worker\",cache_status=~\"cached|uncached\"})",
+          "legendFormat": "{{dynamo_component}} / {{routed_endpoint}} / {{cache_status}}",
           "range": true,
           "refId": "A"
         }
@@ -1407,8 +1407,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (routed_endpoint) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",aggregation=\"total\",cache_status=\"cached\"})",
-          "legendFormat": "{{routed_endpoint}}",
+          "expr": "sum by (dynamo_component, routed_endpoint) (dynamo_component_gwp_scheduler_inflight_tokens{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",aggregation=\"total\",cache_status=\"cached\"})",
+          "legendFormat": "{{dynamo_component}} / {{routed_endpoint}}",
           "range": true,
           "refId": "A"
         }
@@ -2239,7 +2239,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (routed_endpoint, downstream_authority, sticky) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
+          "expr": "sum by (routed_endpoint, downstream_authority, sticky) (rate(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\",downstream_authority=~\"$authority\"}[$__rate_interval]))",
           "legendFormat": "{{routed_endpoint}} · {{downstream_authority}} · sticky={{sticky}}",
           "range": true,
           "refId": "A"
@@ -3600,6 +3600,38 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
+        "definition": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\"}, dynamo_component)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Oracle Version",
+        "multi": true,
+        "name": "oracle_version",
+        "options": [],
+        "query": {
+          "query": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\"}, dynamo_component)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
         "definition": "label_values(dynamo_component_gwp_scheduler_live_workers{namespace=~\"$namespace\"}, routed_endpoint)",
         "hide": 0,
         "includeAll": true,
@@ -3632,7 +3664,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\"}, model)",
+        "definition": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\"}, model)",
         "hide": 0,
         "includeAll": true,
         "label": "Model",
@@ -3640,7 +3672,7 @@
         "name": "model",
         "options": [],
         "query": {
-          "query": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\"}, model)",
+          "query": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\"}, model)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 1,
@@ -3664,7 +3696,7 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\"}, downstream_authority)",
+        "definition": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\"}, downstream_authority)",
         "hide": 0,
         "includeAll": true,
         "label": "Downstream Authority",
@@ -3672,7 +3704,7 @@
         "name": "authority",
         "options": [],
         "query": {
-          "query": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",routed_endpoint=~\"$endpoint\",model=~\"$model\"}, downstream_authority)",
+          "query": "label_values(dynamo_component_gwp_routing_decisions_total{namespace=~\"$namespace\",dynamo_component=~\"$oracle_version\",routed_endpoint=~\"$endpoint\",model=~\"$model\"}, downstream_authority)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 1,

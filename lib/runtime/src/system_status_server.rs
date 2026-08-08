@@ -186,6 +186,13 @@ pub async fn spawn_system_status_server(
             }),
         )
         .route(
+            "/info",
+            get({
+                let state = Arc::clone(&server_state);
+                move || registered_get_handler(state, "info")
+            }),
+        )
+        .route(
             "/engine/{*path}",
             any({
                 let state = Arc::clone(&server_state);
@@ -351,6 +358,24 @@ async fn metadata_handler(state: Arc<SystemStatusState>) -> impl IntoResponse {
                 "Failed to serialize metadata".to_string(),
             )
                 .into_response()
+        }
+    }
+}
+
+/// Invoke a registered, body-less system endpoint.
+async fn registered_get_handler(
+    state: Arc<SystemStatusState>,
+    route: &'static str,
+) -> impl IntoResponse {
+    let Some(callback) = state.drt().engine_routes().get(route) else {
+        return (StatusCode::NOT_FOUND, "Route not found").into_response();
+    };
+
+    match callback(json!({})).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => {
+            tracing::error!(%error, route, "registered system route failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Handler error").into_response()
         }
     }
 }
@@ -1103,7 +1128,15 @@ mod integration_tests {
                 (env_system::DYN_SYSTEM_STARTING_HEALTH_STATUS, Some("ready")),
             ],
             async {
-                let drt = Arc::new(create_test_drt_async().await);
+                let runtime = crate::Runtime::from_current().unwrap();
+                let drt = Arc::new(
+                    crate::DistributedRuntime::new(
+                        runtime,
+                        crate::distributed::DistributedConfig::process_local(),
+                    )
+                    .await
+                    .unwrap(),
+                );
 
                 // Get system status server info from DRT (instead of manually spawning)
                 let system_info = drt
@@ -1111,9 +1144,13 @@ mod integration_tests {
                     .expect("System status server should be started by DRT");
                 let addr = system_info.socket_addr;
                 let client = reqwest::Client::new();
+                let info_callback: crate::engine_routes::EngineRouteCallback =
+                    Arc::new(|_| Box::pin(async { Ok(json!({"oracles": []})) }));
+                drt.engine_routes().register("info", info_callback);
                 for (path, expect_200, expect_body) in [
                     ("/health", true, "ready"),
                     ("/live", true, "ready"),
+                    ("/info", true, "\"oracles\":[]"),
                     ("/someRandomPathNotFoundHere", false, "Route not found"),
                 ] {
                     println!("[test] Sending request to {}", path);

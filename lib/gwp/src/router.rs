@@ -7,11 +7,11 @@
 //! This is the critical-path reuse from the design doc (Decision 1), resolved
 //! more simply than the `MockDiscovery` sketch: `RuntimeConfigWatch` is just a
 //! `watch::Receiver<HashMap<WorkerId, ModelRuntimeConfig>>`, so the topology
-//! controller owns the matching `watch::Sender` and feeds complete worker
-//! snapshots directly. The worker feed remains local because every replica
-//! observes the same topology, while the `DistributedRuntime` uses etcd to
-//! discover peer GWP routers and ZMQ or NATS to exchange request lifecycle
-//! events.
+//! registry owns one sender and one `KvRouter` per canonical model and feeds
+//! each only its eligible workers. The feeds remain local because every
+//! replica observes the same topology, while one shared `DistributedRuntime`
+//! uses etcd to discover peer model routers and ZMQ or NATS to exchange
+//! model-scoped request lifecycle events.
 //!
 //! Config choices (see `gwp_kv_router_config`):
 //! - `use_kv_events: false` — the primary indexer is a local prune-TTL'd radix
@@ -30,9 +30,10 @@
 //!   over the configured event plane so every selector sees global GWP
 //!   in-flight load.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
 use dynamo_kv_router::protocols::{
     RoutingConstraints, TokensWithHashes, WorkerId, WorkerWithDpRank,
@@ -47,12 +48,14 @@ use dynamo_runtime::discovery::{
 };
 use dynamo_runtime::distributed::{DiscoveryBackend, DistributedConfig, RequestPlaneMode};
 use dynamo_runtime::metrics::MetricsHierarchy;
+use dynamo_runtime::slug::Slug;
 use dynamo_runtime::storage::kv;
 use dynamo_runtime::{DistributedRuntime, Runtime};
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::{
-    config::ModelStagePolicy,
+    config::{EndpointId, ModelStagePolicy},
     metrics::GwpMetrics,
     scoring::LocalLoadAnchor,
     worker_selector::{GwpWorkerSelector, SelectionPolicyStore},
@@ -116,6 +119,298 @@ fn gwp_distributed_config_for(event_transport_kind: EventTransportKind) -> Distr
     }
 }
 
+/// Canonical model identity used to select one isolated scheduler and event
+/// channel. Request aliases resolve to this ID before entering the registry.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct OracleVersionId(String);
+
+impl OracleVersionId {
+    pub fn new(value: impl Into<String>) -> anyhow::Result<Self> {
+        let value = value.into();
+        anyhow::ensure!(
+            !value.trim().is_empty(),
+            "oracle version ID must not be empty"
+        );
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn transport_key(&self) -> String {
+        if Slug::try_from(self.as_str()).is_ok() {
+            self.0.clone()
+        } else {
+            Slug::slugify_unique(self.as_str()).to_string()
+        }
+    }
+}
+
+impl std::fmt::Display for OracleVersionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Process-wide registry of independent schedulers, keyed by canonical model.
+/// Aliases are resolved by the topology before this boundary.
+pub struct GwpRouterRegistry {
+    routers: DashMap<OracleVersionId, Arc<GwpRouter>>,
+    /// Removed routers are quiesced and retained for safe reuse. `KvRouter`
+    /// cancellation is tied to the shared runtime, so dropping one model
+    /// router would also cancel its siblings until the underlying router
+    /// supports scoped shutdown.
+    dormant: DashMap<OracleVersionId, Arc<GwpRouter>>,
+    create_lock: tokio::sync::Mutex<()>,
+    drt: DistributedRuntime,
+    metrics: GwpMetrics,
+    block_size: u32,
+    approx_indexer_ttl_secs: u64,
+}
+
+impl GwpRouterRegistry {
+    pub async fn new(block_size: u32, approx_indexer_ttl_secs: u64) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_distributed_config(
+            block_size,
+            approx_indexer_ttl_secs,
+            gwp_distributed_config()?,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_process_local(
+        block_size: u32,
+        approx_indexer_ttl_secs: u64,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_distributed_config(
+            block_size,
+            approx_indexer_ttl_secs,
+            DistributedConfig::process_local(),
+        )
+        .await
+    }
+
+    async fn new_with_distributed_config(
+        block_size: u32,
+        approx_indexer_ttl_secs: u64,
+        distributed_config: DistributedConfig,
+    ) -> anyhow::Result<Arc<Self>> {
+        let runtime = Runtime::from_current()?;
+        let drt = DistributedRuntime::new(runtime, distributed_config).await?;
+        let namespace = drt.namespace("gwp")?;
+        let metrics_component = namespace.component("router")?;
+        register_global_metrics_with_component(&metrics_component);
+        let metrics = GwpMetrics::from_endpoint(&metrics_component.endpoint("egress"))?;
+        let registry = Arc::new(Self {
+            routers: DashMap::new(),
+            dormant: DashMap::new(),
+            create_lock: tokio::sync::Mutex::new(()),
+            drt,
+            metrics,
+            block_size,
+            approx_indexer_ttl_secs,
+        });
+        Ok(registry)
+    }
+
+    async fn ensure_model(
+        &self,
+        oracle_version_id: &OracleVersionId,
+    ) -> anyhow::Result<Arc<GwpRouter>> {
+        if let Some(registered) = self.routers.get(oracle_version_id) {
+            return Ok(registered.clone());
+        }
+        let _guard = self.create_lock.lock().await;
+        if let Some(registered) = self.routers.get(oracle_version_id) {
+            return Ok(registered.clone());
+        }
+        if let Some((_, router)) = self.dormant.remove(oracle_version_id) {
+            tracing::info!(%oracle_version_id, "reactivated dormant oracle-version router");
+            self.routers
+                .insert(oracle_version_id.clone(), router.clone());
+            return Ok(router);
+        }
+        let router = GwpRouter::new_for_model(
+            self.drt.clone(),
+            oracle_version_id.clone(),
+            self.block_size,
+            self.approx_indexer_ttl_secs,
+        )
+        .await?;
+        tracing::info!(
+            %oracle_version_id,
+            event_component = %oracle_version_id.transport_key(),
+            "created oracle-version router"
+        );
+        self.routers
+            .insert(oracle_version_id.clone(), router.clone());
+        Ok(router)
+    }
+
+    pub fn model_router(&self, oracle_version_id: &OracleVersionId) -> Option<Arc<GwpRouter>> {
+        self.routers
+            .get(oracle_version_id)
+            .map(|router| router.clone())
+    }
+
+    /// Create and feed every scheduler in a complete topology generation.
+    /// Removal happens only after the topology snapshot becomes visible so a
+    /// request can never observe an old route without its router.
+    pub async fn reconcile_topology(
+        &self,
+        topology: &crate::topology::TopologySnapshot,
+        refreshed_workers: &HashSet<WorkerId>,
+    ) -> anyhow::Result<()> {
+        for model in topology.models.keys() {
+            self.ensure_model(&OracleVersionId::new(model.clone())?)
+                .await?;
+        }
+
+        for model in topology.models.keys() {
+            let model = OracleVersionId::new(model.clone())?;
+            let router = self
+                .routers
+                .get(&model)
+                .expect("model router created during reconciliation")
+                .clone();
+            let eligible_endpoints = topology
+                .models
+                .get(model.as_str())
+                .map(|binding| &binding.endpoints)
+                .expect("topology model exists");
+            let workers: HashMap<_, _> = topology
+                .workers
+                .iter()
+                .filter(|(_, worker)| eligible_endpoints.contains(&worker.endpoint))
+                .map(|(worker_id, worker)| (*worker_id, worker.runtime.clone()))
+                .collect();
+            let loads: HashMap<_, _> = topology
+                .workers
+                .iter()
+                .filter(|(_, worker)| eligible_endpoints.contains(&worker.endpoint))
+                .filter_map(|(worker_id, worker)| {
+                    worker.observed_load.map(|load| (*worker_id, load))
+                })
+                .collect();
+            let refreshed: HashSet<_> = refreshed_workers
+                .iter()
+                .copied()
+                .filter(|worker_id| workers.contains_key(worker_id))
+                .collect();
+            router.replace_observed_loads(loads, &refreshed).await?;
+            router
+                .workers_tx
+                .send(workers)
+                .map_err(|_| anyhow::anyhow!("worker feed closed for oracle version {model}"))?;
+            let mut per_endpoint: HashMap<EndpointId, usize> = eligible_endpoints
+                .iter()
+                .cloned()
+                .map(|endpoint| (endpoint, 0))
+                .collect();
+            for worker in topology
+                .workers
+                .values()
+                .filter(|worker| eligible_endpoints.contains(&worker.endpoint))
+            {
+                *per_endpoint.entry(worker.endpoint.clone()).or_default() += 1;
+            }
+            router.metrics.replace_scheduler_live_workers(per_endpoint);
+        }
+        Ok(())
+    }
+
+    /// Stop admitting removed models after their topology disappears. The
+    /// router is quiesced and moved to a dormant cache; in-flight
+    /// lifecycle calls retain their `Arc` and can still release local state.
+    pub fn retire_absent(&self, topology: &crate::topology::TopologySnapshot) {
+        let active: HashSet<_> = topology
+            .models
+            .keys()
+            .filter_map(|model| OracleVersionId::new(model.clone()).ok())
+            .collect();
+        let removed: Vec<_> = self
+            .routers
+            .iter()
+            .filter(|router| !active.contains(router.key()))
+            .map(|router| router.key().clone())
+            .collect();
+        for oracle_version_id in removed {
+            if let Some((_, router)) = self.routers.remove(&oracle_version_id) {
+                let _ = router.workers_tx.send(HashMap::new());
+                router.observed_loads.replace(HashMap::new());
+                router
+                    .metrics
+                    .replace_scheduler_live_workers(HashMap::new());
+                tracing::info!(%oracle_version_id, "moved oracle-version router to dormant cache");
+                self.dormant.insert(oracle_version_id, router);
+            }
+        }
+    }
+
+    pub fn metrics(&self) -> &GwpMetrics {
+        &self.metrics
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn register_info_route(&self, topology: crate::topology::TopologyStore) {
+        let callback: dynamo_runtime::engine_routes::EngineRouteCallback = Arc::new(move |_| {
+            let topology = topology.clone();
+            Box::pin(async move { Ok(serde_json::to_value(topology.load().info())?) })
+        });
+        self.drt.engine_routes().register("info", callback);
+    }
+
+    pub fn prometheus_metrics(&self) -> anyhow::Result<String> {
+        self.drt.metrics().prometheus_expfmt()
+    }
+
+    pub async fn replica_peer_count(&self) -> anyhow::Result<usize> {
+        let own_instance_id = self.drt.connection_id();
+        let mut peers = HashSet::new();
+        let routers: Vec<_> = self.routers.iter().map(|router| router.clone()).collect();
+        for router in routers {
+            peers.extend(router.replica_peer_ids().await?);
+        }
+        peers.remove(&own_instance_id);
+        Ok(peers.len())
+    }
+
+    pub fn shutdown(&self) {
+        self.drt.shutdown();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn potential_loads(
+        &self,
+        tokens: &[u32],
+    ) -> Vec<dynamo_kv_router::scheduling::PotentialLoad> {
+        assert_eq!(self.routers.len(), 1, "test helper requires one model");
+        let model = self
+            .routers
+            .iter()
+            .next()
+            .expect("model router")
+            .key()
+            .clone();
+        self.potential_loads_for_model(&model, tokens).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn potential_loads_for_model(
+        &self,
+        oracle_version_id: &OracleVersionId,
+        tokens: &[u32],
+    ) -> Vec<dynamo_kv_router::scheduling::PotentialLoad> {
+        self.model_router(oracle_version_id)
+            .expect("model router")
+            .potential_loads(tokens)
+            .await
+    }
+}
+
 /// A `KvRouter` plus the pieces GWP needs to keep it alive, exposing only the
 /// narrow lifecycle the proxy uses (design doc "Approximate router lifecycle"):
 ///
@@ -129,52 +424,25 @@ pub struct GwpRouter {
     kv: KvRouter<GwpWorkerSelector>,
     observed_loads: ObservedLoadStore,
     selection_policies: SelectionPolicyStore,
-    metrics: GwpMetrics,
     block_size: u32,
+    component_name: String,
+    workers_tx: WorkerConfigSender,
+    metrics: GwpMetrics,
     /// Keeps the shared-discovery runtime (and its cancellation token, which
     /// the scheduler/indexer background tasks are children of) alive.
     _drt: DistributedRuntime,
 }
 
 impl GwpRouter {
-    /// Build the router and the worker feed. Must be called from within a
-    /// tokio runtime. The returned [`WorkerConfigSender`] is handed to the
-    /// topology controller; workers only become routable once a snapshot is sent.
-    pub async fn new(
+    async fn new_for_model(
+        drt: DistributedRuntime,
+        oracle_version_id: OracleVersionId,
         block_size: u32,
         approx_indexer_ttl_secs: u64,
-    ) -> anyhow::Result<(Arc<Self>, WorkerConfigSender)> {
-        Self::new_with_distributed_config(
-            block_size,
-            approx_indexer_ttl_secs,
-            gwp_distributed_config()?,
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn new_process_local(
-        block_size: u32,
-        approx_indexer_ttl_secs: u64,
-    ) -> anyhow::Result<(Arc<Self>, WorkerConfigSender)> {
-        Self::new_with_distributed_config(
-            block_size,
-            approx_indexer_ttl_secs,
-            DistributedConfig::process_local(),
-        )
-        .await
-    }
-
-    async fn new_with_distributed_config(
-        block_size: u32,
-        approx_indexer_ttl_secs: u64,
-        distributed_config: DistributedConfig,
-    ) -> anyhow::Result<(Arc<Self>, WorkerConfigSender)> {
-        let runtime = Runtime::from_current()?;
-        let drt = DistributedRuntime::new(runtime, distributed_config).await?;
+    ) -> anyhow::Result<Arc<Self>> {
         let namespace = drt.namespace("gwp")?;
-        let component = namespace.component("router")?;
-        register_global_metrics_with_component(&component);
+        let component_name = oracle_version_id.transport_key();
+        let component = namespace.component(&component_name)?;
         let endpoint = component.endpoint("egress");
         let metrics = GwpMetrics::from_endpoint(&endpoint)?;
         let client = endpoint.client().await?;
@@ -200,17 +468,16 @@ impl GwpRouter {
         )
         .await?;
 
-        Ok((
-            Arc::new(Self {
-                kv,
-                observed_loads,
-                selection_policies,
-                metrics,
-                block_size,
-                _drt: drt,
-            }),
-            tx,
-        ))
+        Ok(Arc::new(Self {
+            kv,
+            observed_loads,
+            selection_policies,
+            block_size,
+            component_name,
+            workers_tx: tx,
+            metrics,
+            _drt: drt,
+        }))
     }
 
     pub fn block_size(&self) -> u32 {
@@ -221,17 +488,10 @@ impl GwpRouter {
         &self.metrics
     }
 
-    pub fn prometheus_metrics(&self) -> anyhow::Result<String> {
-        self._drt.metrics().prometheus_expfmt()
-    }
-
-    /// Number of other GWP router publishers registered for replica-sync at
-    /// this instant. The readiness warm-up uses this startup snapshot.
-    pub async fn replica_peer_count(&self) -> anyhow::Result<usize> {
-        let own_instance_id = self._drt.connection_id();
+    async fn replica_peer_ids(&self) -> anyhow::Result<HashSet<u64>> {
         let query = DiscoveryQuery::EventChannels(EventChannelQuery::topic(
             "gwp",
-            "router",
+            self.component_name.clone(),
             ACTIVE_SEQUENCES_SUBJECT,
         ));
         let peers = self._drt.discovery().list(query).await?;
@@ -241,15 +501,7 @@ impl GwpRouter {
                 DiscoveryInstance::EventChannel { instance_id, .. } => Some(instance_id),
                 _ => None,
             })
-            .filter(|instance_id| *instance_id != own_instance_id)
-            .collect::<std::collections::HashSet<_>>()
-            .len())
-    }
-
-    /// Cancel background router tasks and immediately remove this replica's
-    /// discovery registrations instead of waiting for etcd lease expiry.
-    pub fn shutdown(&self) {
-        self._drt.shutdown();
+            .collect())
     }
 
     /// Replace the provider-observed baseline used by the selector. For workers
@@ -282,10 +534,6 @@ impl GwpRouter {
         }
         self.observed_loads.replace_refreshed(loads, &anchors);
         Ok(())
-    }
-
-    pub fn observed_load_store(&self) -> ObservedLoadStore {
-        self.observed_loads.clone()
     }
 
     /// Fall-through decision: score all live workers and provisionally
@@ -480,6 +728,41 @@ impl GwpRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModelTokenizationConfig;
+    use crate::topology::{ModelBinding, ProfileId, ResolvedModelProfile, TopologySnapshot};
+
+    fn topology(models: &[&str]) -> TopologySnapshot {
+        let mut snapshot = TopologySnapshot::default();
+        for model in models {
+            let profile = ProfileId((*model).to_string());
+            snapshot.models.insert(
+                (*model).to_string(),
+                ModelBinding {
+                    endpoints: HashSet::new(),
+                    profile: profile.clone(),
+                },
+            );
+            snapshot.profiles.insert(
+                profile,
+                ResolvedModelProfile {
+                    stages: ModelStagePolicy::default(),
+                    tokenization: ModelTokenizationConfig::Pseudo,
+                },
+            );
+        }
+        snapshot
+    }
+
+    async fn process_local_model_router(
+        block_size: u32,
+    ) -> (Arc<GwpRouterRegistry>, Arc<GwpRouter>, WorkerConfigSender) {
+        let registry = GwpRouterRegistry::new_process_local(block_size, 120)
+            .await
+            .expect("construct model router registry");
+        let model = OracleVersionId::new("model").expect("valid oracle version ID");
+        let router = registry.ensure_model(&model).await.expect("model router");
+        (registry, router.clone(), router.workers_tx.clone())
+    }
 
     #[test]
     fn production_runtime_uses_etcd_discovery_and_selected_event_plane() {
@@ -505,15 +788,67 @@ mod tests {
         assert!(gwp_kv_router_config(120).router_replica_sync);
     }
 
+    #[test]
+    fn model_event_components_are_safe_stable_and_collision_resistant() {
+        let transport_key = |value| OracleVersionId::new(value).unwrap().transport_key();
+        assert_eq!(transport_key("composer-2-5"), "composer-2-5");
+        let slash = transport_key("org/model-v1");
+        assert_eq!(slash, transport_key("org/model-v1"));
+        assert!(
+            slash
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        );
+        assert_ne!(slash, transport_key("org.model-v1"));
+        assert_ne!(transport_key("Model"), transport_key("model"));
+    }
+
+    #[tokio::test]
+    async fn registry_starts_empty_and_reconciles_active_and_dormant_models() {
+        let registry = GwpRouterRegistry::new_process_local(4, 120)
+            .await
+            .expect("construct empty registry");
+        assert!(registry.routers.is_empty());
+        assert!(registry.dormant.is_empty());
+
+        let both = topology(&["alpha", "beta"]);
+        registry
+            .reconcile_topology(&both, &HashSet::new())
+            .await
+            .expect("create configured routers");
+        assert_eq!(registry.routers.len(), 2);
+
+        let beta_id = OracleVersionId::new("beta").unwrap();
+        let beta = registry.model_router(&beta_id).expect("beta router");
+        let alpha_only = topology(&["alpha"]);
+        registry
+            .reconcile_topology(&alpha_only, &HashSet::new())
+            .await
+            .expect("reconcile surviving router");
+        registry.retire_absent(&alpha_only);
+        assert_eq!(registry.routers.len(), 1);
+        assert_eq!(registry.dormant.len(), 1);
+        assert!(beta.workers_tx.borrow().is_empty());
+
+        registry
+            .reconcile_topology(&both, &HashSet::new())
+            .await
+            .expect("reactivate removed router");
+        assert!(Arc::ptr_eq(
+            &beta,
+            &registry.model_router(&beta_id).expect("reactivated beta")
+        ));
+        assert_eq!(registry.routers.len(), 2);
+        assert!(registry.dormant.is_empty());
+    }
+
     /// The de-risk test from the design doc: a `KvRouter` constructed with no
     /// etcd and no NATS, fed workers through a bare watch channel, must route,
     /// prefer warm prefixes, and run the full slot lifecycle.
     #[tokio::test]
     async fn kv_router_without_etcd_or_nats() {
         let block_size = 4;
-        let (router, tx) = GwpRouter::new_process_local(block_size, 120)
-            .await
-            .expect("construct GwpRouter");
+        let (_registry, router, tx) = process_local_model_router(block_size).await;
 
         // Reflector-style feed: two planner-observed workers appear.
         let mut workers = HashMap::new();
@@ -567,9 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn trie_disabled_ignores_warm_overlap_but_keeps_scheduler_load_tracking() {
-        let (router, tx) = GwpRouter::new_process_local(4, 120)
-            .await
-            .expect("construct GwpRouter");
+        let (_registry, router, tx) = process_local_model_router(4).await;
         tx.send(HashMap::from([(1u64, ModelRuntimeConfig::default())]))
             .expect("feed worker");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -612,9 +945,7 @@ mod tests {
     /// `skip_initial_worker_wait=false` requirement.
     #[tokio::test]
     async fn workers_fed_after_construction_are_routable() {
-        let (router, tx) = GwpRouter::new_process_local(4, 120)
-            .await
-            .expect("construct GwpRouter");
+        let (_registry, router, tx) = process_local_model_router(4).await;
 
         let mut workers = HashMap::new();
         workers.insert(7u64, ModelRuntimeConfig::default());

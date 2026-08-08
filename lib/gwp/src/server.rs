@@ -47,11 +47,15 @@ async fn build_inner(
 ) -> anyhow::Result<BuiltServer> {
     let initial = config.load();
     let tokenizers = crate::tokens::TokenizerRegistry::from_config(&initial)?;
-    let (router, workers_tx) = crate::router::GwpRouter::new(
+    let initial_topology = TopologySnapshot::from_config(&initial, Default::default())?;
+    let router = crate::router::GwpRouterRegistry::new(
         initial.routing.block_size,
         initial.routing.approx_indexer_ttl_secs,
     )
     .await?;
+    router
+        .reconcile_topology(&initial_topology, &Default::default())
+        .await?;
     let peer_replicas = router.replica_peer_count().await?;
     let lifecycle = Lifecycle::starting(
         peer_replicas,
@@ -65,13 +69,12 @@ async fn build_inner(
         );
     }
 
-    let topology = TopologyStore::new(TopologySnapshot::from_config(&initial, Default::default())?);
+    let topology = TopologyStore::new(initial_topology);
+    router.register_info_route(topology.clone());
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(TOPOLOGY_UPDATE_BUFFER);
-    let controller =
-        TopologyController::new(topology.clone(), workers_tx, router.observed_load_store())
-            .with_metrics(router.metrics().clone())
-            .with_router(router.clone())
-            .with_lifecycle(lifecycle.clone());
+    let controller = TopologyController::model_scoped(topology.clone(), router.clone())
+        .with_metrics(router.metrics().clone())
+        .with_lifecycle(lifecycle.clone());
     let mut controller_handle = controller.spawn(updates_rx);
     let mut reflector_handle = Reflector::new(config.clone(), updates_tx)
         .with_metrics(router.metrics().clone())

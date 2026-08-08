@@ -78,6 +78,8 @@ each publisher advertises its own pod address through etcd.
 The checked-in ConfigMap defaults to direct ZMQ. Set its `event-plane` value to
 `nats` to move replica lifecycle events to NATS Core pub-sub; etcd remains the
 membership/discovery plane in either mode. The request plane remains TCP.
+Each canonical routable model owns an independent scheduler and event channel;
+aliases resolve to the canonical model before selecting that channel.
 
 The rolling update keeps one replica available. Readiness waits for an initial
 topology with at least one routable worker and for replica warm-up; an individual

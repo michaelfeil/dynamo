@@ -20,10 +20,11 @@ stream.
 Today the Dynamo KV Router picks the best *worker within a single deployment*
 using prefix-overlap scoring against a radix-tree indexer populated by KV
 events. The Global Workload Plane consumes an immutable topology snapshot and
-feeds its workers into one router, provisionally picks a worker, then returns
-that worker's owning endpoint authority to Envoy. The current topology producer
-combines configured routes/endpoints with every endpoint planner's worker and
-load observations. The selected
+maintains one isolated router/scheduler per canonical `oracle_version_id`. It
+feeds each router only that oracle version's workers, provisionally picks a
+worker, then returns that worker's owning endpoint authority to Envoy. The
+current topology producer combines configured routes/endpoints with every
+endpoint planner's worker and load observations. The selected
 endpoint's own router remains responsible for the final internal-worker
 choice. GWP reconciles that provisional booking from the worker ID returned in
 the response. GWP is deployed as its own crate / component with multiple
@@ -35,7 +36,8 @@ background truth-keeper:
 
 The mental model for when a session sticks vs. falls through:
 
-- **Stick** — honor the session iff `(session→worker binding exists in etcd)
+- **Stick** — honor the session iff `(session→worker binding exists in the
+  configured affinity store)
   AND (that worker and its endpoint are still alive and serve the requested
   model)` in one topology snapshot. Route directly to that worker's
   endpoint; do not re-run `find_best_match` for the provisional decision.
@@ -46,13 +48,13 @@ The mental model for when a session sticks vs. falls through:
   approximate-tokenize, filter by model, `find_best_match`, and map the
   provisional worker to an endpoint.
 
-Crucially, the approximate router **is** touched on a sticky hit. A stick
-skips `find_best_match`, but still runs the configured per-model tokenizer so
-it can `add_request` the bound worker into the scheduler's in-flight load
-before returning the gRPC scheduling decision. The scheduler load is thus kept
-honest on both paths; the planner poll (Decision 4) remains the real load
-source and corrects it within ~1s. Prefix ownership is recorded only after
-`ResponseStarted`, when the actual worker is known.
+On a sticky hit, the optimistic-affinity path can return the bound worker
+without waiting for tokenization when a tokenization permit is available. It
+then tokenizes and books the request into that oracle version's scheduler in a
+background task. If no permit is available, the same work is performed
+synchronously before returning. The planner poll (Decision 4) remains the real
+load source and corrects local accounting within ~1s. Prefix ownership is
+recorded only after `ResponseStarted`, when the actual worker is known.
 
 Both paths drive the scheduler lifecycle off **Envoy's stream events**:
 `mark_prefill_completed` on `ResponseStarted` (first SSE response headers),
@@ -77,10 +79,11 @@ the locally hosted `KvRouter` compare workers across endpoints while preserving
 the endpoint-level egress control boundary.
 
 A note on the resulting "two places" tradeoff: the routing decision now lives in
-both etcd (for fast cross-turn stickiness) and the approximate router (for
-load modeling, block level awareness routing). This is deliberate — etcd answers
-"where did this session go last, and is that endpoint alive?" with a sub-ms
-serializable read; the approximate router answers "given load and prefix
+both the configured affinity store (Redis in production) and the approximate
+router (for load modeling, block level awareness routing). This is deliberate —
+the affinity store answers
+"where did this session go last, and is that endpoint alive?" with a fast
+shared-store read; the approximate router answers "given load and prefix
 overlap, where *should* a new request go?". They are kept in sync via the
 lifecycle interface below.
 
@@ -130,12 +133,13 @@ Client ───────────────► Envoy ──────
 5. Envoy proxies the original request to that authority.
 6. When the first SSE response arrives, Envoy observes
    `status: 200`, required `x-baseten-dyn-worker-id: 42`, other response headers,
-   and
-   reports back with an empty POST whose metadata is entirely in headers:
+   and asynchronously reports it with a unary gRPC lifecycle call:
    ```
-   x-gwp-request-id: <request id>
-   x-gwp-actual-worker-id: 42       # required on successful responses
-   x-gwp-status: 200
+   ResponseStarted {
+     request_id: <request id>,
+     actual_worker_id: 42,          # required on successful responses
+     status: 200
+   }
    ```
 7. The router reconciles and advances its worker lifecycle:
    - if worker 42 differs from the provisional worker, free the provisional
@@ -145,10 +149,12 @@ Client ───────────────► Envoy ──────
    - active decode accounting begins
    - on success, record prefix ownership and bind the session to worker 42
 8. When the SSE stream closes, resets, times out, or the client disconnects,
-   Envoy sends an empty POST:
+   Envoy sends another unary gRPC lifecycle call:
    ```
-   x-gwp-request-id: <request id>
-   x-gwp-finish-reason: complete    # reset | timeout | client_disconnect
+   RequestFinished {
+     request_id: <request id>,
+     reason: complete               # reset | timeout | client_disconnect
+   }
    ```
 9. The router releases the request's scheduler slot (`free`) and drops its
    in-flight state.
@@ -160,7 +166,7 @@ header hygiene:
 
 ```
 ext_authz Check   → buffer the body, schedule through gRPC, and install route headers
-request headers  → retain the upstream allowlist and capture scheduling metadata
+request headers  → strip GWP-internal routing headers and capture scheduling metadata
 response headers → observe status + worker ID, enqueue ResponseStarted, and
                    inject x-session-id / x-routed-endpoint
 onLog()           → enqueue RequestFinished after the stream terminates
@@ -191,7 +197,7 @@ booking; `RequestFinished` frees the current accounting request ID.
   lifecycle calls for one request must hit the same router replica. Each Envoy
   instance uses a persistent connection to one router replica (sidecar or 1:1
   pairing), which gives this for free. Cross-replica in-flight state is future
-  work (session *affinity* is already cross-replica via etcd).
+  work (session *affinity* is already cross-replica via the configured store).
 - **Lost `RequestFinished`:** if Envoy crashes or the event is dropped, the
   slot would leak. A janitor sweeps in-flight entries older than a generous
   bound (default 600s) and `free`s them; `ActiveSequencesMultiWorker`'s
@@ -267,7 +273,9 @@ config rather than a derived convention.
    through to the approximate router. Stickiness is a fast bypass for the
    *decision*, not a bias inside scoring.
 3. **Multi-replica, stateless-safe** — any replica can schedule any *session*
-   (bindings live in etcd, not process memory). Per-request in-flight state is
+   (bindings live in a shared Redis or etcd store, not process memory).
+   Production uses Redis for affinity and reserves etcd for router-replica
+   discovery. Per-request in-flight state is
    replica-local; Envoy pins one request's lifecycle events to the replica
    that scheduled it.
 4. **Reuse, don't fork** — drive selection through the existing
@@ -280,11 +288,12 @@ config rather than a derived convention.
    real tokenizer and without real KV events, so it can run anywhere.
 7. **Graceful degradation** — affinity read errors become misses and failed
    affinity writes are dropped, so requests continue through normal routing
-   without replica-local session truth. Already-connected ZMQ peers continue
-   exchanging events; startup and new-peer discovery still require etcd. If an
+   without replica-local session truth. Replica events use ZMQ by default or
+   NATS Core when `DYN_EVENT_PLANE=nats`; discovery still requires etcd. If an
    endpoint's planner stops answering, hold that endpoint's
    last-known-good through a grace window (other endpoints unaffected); if the
-   router is down, Envoy fails open to a default endpoint.
+   router is down, Envoy fails closed rather than bypassing model and routing
+   constraints.
 8. **Data plane owned by Envoy** — TLS, pooling, backpressure, retries, and
    SSE streaming stay in Envoy; GWP never proxies response bytes in
    production.
@@ -355,20 +364,21 @@ ownership table providing the routable authority.
 | GWP action                         | `KvRouter` call                | When |
 |------------------------------------|--------------------------------|------|
 | Register sequence (scheduler) — fall-through | `find_best_match(update_states=true)` | schedule, fall-through only; do NOT also `add_request` (double-count) |
-| Register sequence (scheduler) — stick | `add_request(request_id, tokens, …, bound)` | schedule, sticky hit only; same per-model tokens as fall-through |
+| Register sequence (scheduler) — stick | `add_request(request_id, tokens, …, bound)` | sticky hit only; optimistically in the background when permitted, otherwise during schedule |
 | Correct provisional booking       | `free(provisional_id)` then `add_request(confirmed_id, ..., actual)` | ResponseStarted, when actual differs |
 | Populate indexer                  | `record_routing_decision(tokens_with_hashes, actual)` | ResponseStarted, on success |
 | Mark prefill done                 | `mark_prefill_completed(accounting_id)` | ResponseStarted, after correction |
-| Confirm worker affinity           | etcd `put(sid, actual, ttl)` | ResponseStarted, on success status |
+| Confirm worker affinity           | affinity-store `put(sid, actual, ttl)` | ResponseStarted, on success status |
 | Release scheduler slot            | `free(accounting_id)`         | RequestFinished |
 
 Two consequences follow:
 
-1. **The decision is in two places with the same identity.** etcd holds the
-   confirmed worker binding; the scheduler holds worker in-flight load for
-   new-session scheduling.
+1. **The decision is in two places with the same identity.** The configured
+   affinity store holds the confirmed worker binding; the scheduler holds
+   worker in-flight load for new-session scheduling.
 2. **Sticks avoid scoring.** A stick bypasses `find_best_match`; it pays only
-   the configured tokenizer plus in-process `add_request`. The planner poll
+   the affinity lookup synchronously when optimistic accounting is available;
+   tokenization and `add_request` then run in the background. The planner poll
    remains the baseline remote load source. Response correction
    keeps locally observed lifecycle load honest between polls.
 
@@ -408,14 +418,15 @@ periodic force-expiry.
             │            External router (GWP, N replicas)           │
             │                                                        │
  Envoy ────▶│  ┌──────────┐   ┌─────────────┐   ┌──────────────┐    │
- gRPC       │  │ Tonic    │──▶│  session    │──▶│  approximate │    │
- control    │  │ services │   │  resolver   │   │  router      │    │
- calls      │  │          │   │   (etcd)    │   │  (KvRouter + │    │
-            │  │          │   │             │   │  approx      │    │
-            │  │ schedule │   │             │   │  indexer +   │    │
-            │  │ started  │   └─────────────┘   │  selector)   │    │
-            │  │ finished │                     └──────▲───────┘    │
-            │  └──────────┘   ┌─────────────┐   ┌──────┴───────┐    │
+ gRPC       │  │ Tonic    │──▶│  session    │──▶│ per-oracle   │    │
+ control    │  │ services │   │  resolver   │   │ router       │    │
+ calls      │  │          │   │ (Redis or   │   │ registry     │    │
+            │  │          │   │   etcd)     │   │ (KvRouter +  │    │
+            │  │ schedule │   │             │   │  approx      │    │
+            │  │ started  │   └─────────────┘   │  indexer +   │    │
+            │  │ finished │                     │  selector)   │    │
+            │  └──────────┘                     └──────▲───────┘    │
+            │                 ┌─────────────┐   ┌──────┴───────┐    │
             │                 │  current    │──▶│  topology    │    │
             │                 │  producer   │   │  controller  │    │
             │                 │ (reflector) │   │ + snapshots  │    │
@@ -435,9 +446,13 @@ periodic force-expiry.
 - **session resolver** — implements GWP's async `AffinityStore` trait with an
   operator-selected etcd or Redis backend. `InMemoryAffinityStore` is compiled
   only for tests. The store holds the last confirmed planner `WorkerId`.
-- **approximate router** — a `KvRouter<Sel>` using etcd discovery and the ZMQ
-  event plane. `router_replica_sync=true` shares add/prefill/free lifecycle
-  events across GWP replicas, so each selector sees global GWP in-flight load.
+- **router registry** — dynamically maintains one `KvRouter<Sel>` per canonical
+  `oracle_version_id`, isolating scheduler state and active-sequence events
+  between routable models. Routers absent from the latest topology are retired.
+  The registry uses etcd discovery and either the default ZMQ event plane or
+  NATS Core selected by `DYN_EVENT_PLANE`. `router_replica_sync=true` shares
+  add/prefill/free lifecycle events across GWP replicas, so each selector sees
+  global GWP in-flight load for its oracle version.
   `use_kv_events=false` retains a replica-local prune-TTL'd radix indexer
   populated by `record_routing_decision`; worker configs arrive through a
   plain `watch` channel owned by the topology controller.
@@ -446,6 +461,10 @@ periodic force-expiry.
   same generation out to the router worker feed, observed-load fusion,
   readiness, and metrics. Structurally invalid updates retain the last valid
   generation.
+- **readiness** — after warmup, GWP becomes ready when the reconciled topology
+  contains at least one live worker anywhere. A configured model with zero
+  workers does not make the whole multi-model GWP deployment unready; requests
+  for that model still fail routing normally.
 - **current topology producer (reflector)** — background task. Reads a ConfigMap (path from
   `DYN_GWP_CONFIG_PATH`, default `/configs/gwp.yaml`) with separate
   `endpoints`, `routes`, `session`, and `routing` sections. Every 1s it polls
@@ -461,7 +480,9 @@ periodic force-expiry.
   model catalog because a downstream `/v1/models` response may be unavailable
   or expose internal IDs instead of client-facing aliases. Every routable
   model names its endpoint candidates explicitly. GWP does not depend on or
-  expose a `/v1/models` control-plane diagnostic.
+  expose a `/v1/models` control-plane diagnostic. The system port does expose
+  `/info`, listing each loaded `oracle_version_id` and its current live replica
+  count; credentials and planner URLs are not included.
 - **authority mapping** — the chosen `WorkerId` maps through the request's
   immutable topology snapshot to its endpoint and `ingress_url`; GWP returns
   that URL's host:port and configured
@@ -498,12 +519,13 @@ served_alias_model_map:
   glm-4.7-preview: glm-4.7
 
 session:
-  ttl_secs: 300
+  ttl_secs: 1800
   prompt_hash_fallback:
     token_position: 100000
   backend:
-    type: etcd
-    endpoints: [http://127.0.0.1:2379]
+    type: redis
+    url: redis://redis.gwp.svc.cluster.local:6379/
+    key_prefix: "gwp:affinity:"
 
 routing:
   pseudo_stride: 4
@@ -565,23 +587,26 @@ long as the current provider continues to advertise that worker.
    b. sid = first_known_session_header(headers) ?? body["user"]
             ?? four_hash_prompt_prefix_at_configured_cutoff
             ?? mint base10-<uuid>
-   c. tokens = tokenize_for_model(model, body) // real when opted in, else pseudo
+   c. select the isolated router/scheduler for canonical model (oracle_version_id)
    d. eligible = live workers whose endpoints satisfy every routing dimension,
                  serve the model, and belong to its configured route
    e. bound = affinity.peek(sid)            // last confirmed worker, may be None
    f. if bound.is_some_and(|w| eligible.contains(w)):    // STICK
           decision = bound                   // no find_best_match
+          tokens = tokenize_for_model(model, body)
+                   // Optimistic path may return first, then do this in background.
           kv_router.add_request(rid, tokens, bound)      // scheduler load, keyed by rid
           sticky = true
       else:                                  // UNSTICK or new session
+          tokens = tokenize_for_model(model, body)
           decision = kv_router.find_best_match(
               tokens, context_id=rid, update_states=true, eligible)
           sticky = false                     // scheduler already updated; no separate add_request
-   f. endpoint = endpoint_table.endpoint_of(decision)
-   g. inflight[rid] = {
+   g. endpoint = endpoint_table.endpoint_of(decision)
+   h. inflight[rid] = {
           sid, decision, endpoint.id, tokens, accounting_rid: rid
       }
-   h. return ext-authz header mutations for authority, endpoint, session, and stickiness
+   i. return ext-authz header mutations for authority, endpoint, session, and stickiness
 4. Envoy proxies the request to `authority` (TLS/pooling/retries in Envoy)
 5. Envoy encodeHeaders (first SSE response):
    inject x-session-id / x-routed-endpoint into the client response,
@@ -641,21 +666,22 @@ the local etcd-backed discovery plane. Remote clusters are not in local etcd.
 **Decision:** Option 4 for endpoint configuration, combined with shared router
 lifecycle synchronization. Remote endpoints are not registered in discovery;
 each replica feeds provider-observed worker IDs and endpoint ownership locally.
-The GWP routers themselves use etcd discovery and ZMQ events so
-`router_replica_sync` can mirror active-sequence load across replicas without a
-NATS dependency.
+The GWP router registry uses etcd discovery and a configurable event plane so
+`router_replica_sync` can mirror each oracle version's active-sequence load
+across replicas. `DYN_EVENT_PLANE` selects `zmq` (the default) or `nats`.
 
 **Implementation notes (hard-won):**
 - `skip_initial_worker_wait` **must stay false**: it doubles as "watch worker
   configs" in `KvScheduler::start` (`scheduler.rs:94`); true freezes the worker
   set at construction, breaking the reflector feed. With
   `DYN_ROUTER_MIN_INITIAL_WORKERS` unset the constructor does not block.
-- `router_snapshot_threshold: None` (snapshots need the NATS object store),
+- `router_snapshot_threshold: None`,
   `router_queue_threshold: None` (no queueing at the routing tier),
-  `router_replica_sync: true` (add/prefill/free events over ZMQ).
+  `router_replica_sync: true` (add/prefill/free events over the selected event
+  plane).
 - Discovery uses the standard `ETCD_ENDPOINTS` and etcd authentication
-  environment variables. The transport is fixed to ZMQ in GWP's runtime
-  definition.
+  environment variables. `DYN_EVENT_PLANE=nats` uses NATS Core pub-sub;
+  otherwise GWP uses direct ZMQ.
 
 **Consequences:** GWP runs its own `KvRouter` view of workers across remote
 deployments. It still routes only to ingress endpoints; intra-deployment
@@ -666,7 +692,8 @@ corrects the provisional GWP worker choice.
 
 **Context:** GWP's async `AffinityStore` trait has a test-only
 `InMemoryAffinityStore`. Production affinity requires a shared backend. The
-target scale is ~100 QPS with a ~300s TTL (~30k live bindings steady-state).
+production currently uses Redis with a 1800s TTL. The backend remains
+selectable for other deployments.
 
 **Options Considered:**
 1. *etcd* — already in the stack as the discovery plane (`KVStoreDiscovery`,
@@ -690,9 +717,9 @@ must initialize successfully. At runtime, read errors are affinity misses and
 failed writes are logged and dropped; normal routing continues without
 creating divergent replica-local bindings.
 
-**Scale envelope:** etcd remains suitable for the initial envelope. Redis is
-the preferred option when affinity write volume should be isolated from
-discovery or grows beyond the desired etcd budget.
+**Scale envelope:** Redis is required for production affinity so affinity
+traffic remains isolated from etcd discovery. The etcd implementation remains
+available for smaller or non-production deployments.
 
 **etcd usage rules (what keeps it cheap):**
 - **Leases expire, never keepalive.** Grant a lease with the TTL, write the
@@ -1073,14 +1100,16 @@ requests in one session get distinct IDs and never collide. At
 ## Performance Considerations
 
 - **Schedule callout** (the only on-path hop): one local RTT Envoy→router.
-  Stick: etcd `peek` (serializable/local read, sub-ms) + in-memory liveness
-  check + configured per-model tokenization + in-process `add_request`.
-  Pseudo mode is µs-scale; real mode is expected to dominate this path.
+  Stick: affinity-store `peek` + in-memory liveness check. With an available
+  tokenization permit, optimistic affinity returns the decision before
+  tokenization and `add_request`, which continue in the background; permit
+  saturation falls back to synchronous accounting. Pseudo mode is µs-scale;
+  real mode is expected to dominate the synchronous path.
   Fall-through adds one indexer query + selector pass (sub-ms). Measure the
   model bundles in production before setting a universal p99 target.
 - **`ResponseStarted` / `RequestFinished`**: fire-and-forget off the data
-  path; the etcd lease-`put` (raft ~5–15ms p99) rides on `ResponseStarted`
-  and never delays the client stream.
+  path; the affinity `put` rides on `ResponseStarted` and never delays the
+  client stream.
 - **In-flight table**: one small entry per active request (tokens ≈ bytes/4 of
   the prompt), dropped at `RequestFinished`; janitor bounds leakage at 600s.
 - **Reflector cost**: one planner poll/s per endpoint. Bounded by planner
@@ -1088,10 +1117,10 @@ requests in one session get distinct IDs and never collide. At
 - **Memory**: the approx indexer holds per-worker block hashes with a TTL
   (`PruneConfig::ttl`, default 120s). With pseudo-tokenization the hash space
   is small, so the radix tree stays compact.
-- **Bottleneck**: etcd read on every schedule. Mitigated by serializable
-  (local) reads for `peek`; the stick path does only a `peek` (no lease
-  write). At ~100 QPS / 300s TTL (~30k bindings) this is comfortable; measure
-  etcd before expanding beyond the documented scale envelope.
+- **Affinity cost**: one store read per affinity-enabled schedule. Production
+  Redis keeps this traffic separate from etcd discovery; the stick path does
+  only a `peek` and never refreshes TTL. Monitor Redis latency and key count at
+  the configured 1800s retention.
 
 ## Future Work
 
@@ -1120,7 +1149,7 @@ requests in one session get distinct IDs and never collide. At
 - `AffinityStore` trait (llm, sync ancestor of GWP's async trait):
   `lib/llm/src/kv_router/sticky/router.rs:45`
 - `runtime_config_watch` (worker join): `lib/llm/src/discovery/runtime_configs.rs:24`
-- `DistributedConfig`, etcd discovery, and ZMQ event plane:
+- `DistributedConfig`, etcd discovery, and ZMQ/NATS event planes:
   `lib/runtime/src/distributed.rs`, `lib/runtime/src/transports/event_plane/`
 - `basetenkenizer`: configured real-tokenizer implementation in
   `lib/gwp/src/tokens.rs`
