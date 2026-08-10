@@ -112,11 +112,43 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
             }
         }
 
-        // Convert tools
-        let tools = req.tools.as_ref().map(|t| convert_anthropic_tools(t));
+        // Convert tools. Server tools (web_search etc., no input_schema) are
+        // filtered out, so the converted list can be empty even though the
+        // request declared `tools`.
+        let tools = match req.tools.as_ref().map(|t| convert_anthropic_tools(t)) {
+            Some(converted) if converted.is_empty() => None,
+            other => other,
+        };
 
-        // Convert tool_choice
-        let tool_choice = req.tool_choice.as_ref().map(convert_anthropic_tool_choice);
+        // Convert tool_choice. A tool_choice with no surviving tools — or one
+        // naming a filtered server tool — would be rejected downstream
+        // ("When using `tool_choice`, `tools` must be set"); Claude Code hits
+        // this on Baseten backends when its WebSearch server tool is declared
+        // alone. Degrade so the model can answer in text instead of the
+        // client surfacing an API error mid-turn.
+        let tool_choice = match (
+            &tools,
+            req.tool_choice.as_ref().map(convert_anthropic_tool_choice),
+        ) {
+            (None, Some(_)) => {
+                tracing::debug!(
+                    "Dropping tool_choice: no declared tool survived conversion (server tools are not forwarded)"
+                );
+                None
+            }
+            (Some(tools), Some(ChatCompletionToolChoiceOption::Named(named)))
+                if !tools
+                    .iter()
+                    .any(|tool| tool.function.name == named.function.name) =>
+            {
+                tracing::debug!(
+                    tool = %named.function.name,
+                    "tool_choice names a tool that was not forwarded; degrading to auto"
+                );
+                Some(ChatCompletionToolChoiceOption::Auto)
+            }
+            (_, tool_choice) => tool_choice,
+        };
 
         // Convert stop_sequences -> stop
         let stop = req
@@ -940,6 +972,109 @@ mod tests {
         let tools = chat_req.inner.tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "get_weather");
+        assert!(matches!(
+            chat_req.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Auto)
+        ));
+    }
+
+    /// Claude Code declares its WebSearch server tool (no input_schema) and a
+    /// tool_choice; server tools are filtered during conversion, and a
+    /// tool_choice without tools is rejected downstream with
+    /// 400 "When using `tool_choice`, `tools` must be set". Both must be
+    /// dropped so the model can answer in text.
+    #[test]
+    fn test_server_tools_only_drops_tools_and_tool_choice() {
+        let req = AnthropicCreateMessageRequest {
+            model: "test-model".into(),
+            max_tokens: 100,
+            messages: vec![AnthropicMessage {
+                role: AnthropicRole::User,
+                content: AnthropicMessageContent::Text {
+                    content: "Search the web".into(),
+                },
+            }],
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            metadata: None,
+            tools: Some(vec![AnthropicTool {
+                name: "web_search".into(),
+                tool_type: Some("web_search_20250305".into()),
+                description: None,
+                input_schema: None,
+                cache_control: None,
+            }]),
+            tool_choice: Some(AnthropicToolChoice::Simple(AnthropicToolChoiceSimple {
+                choice_type: AnthropicToolChoiceMode::Any,
+                disable_parallel_tool_use: None,
+            })),
+            cache_control: None,
+            thinking: None,
+            service_tier: None,
+            container: None,
+            output_config: None,
+        };
+
+        let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        assert!(chat_req.inner.tools.is_none());
+        assert!(chat_req.inner.tool_choice.is_none());
+    }
+
+    /// A named tool_choice pointing at a filtered server tool degrades to
+    /// auto when function tools remain, instead of naming a tool the worker
+    /// never saw.
+    #[test]
+    fn test_named_choice_for_filtered_tool_degrades_to_auto() {
+        let req = AnthropicCreateMessageRequest {
+            model: "test-model".into(),
+            max_tokens: 100,
+            messages: vec![AnthropicMessage {
+                role: AnthropicRole::User,
+                content: AnthropicMessageContent::Text {
+                    content: "Search the web".into(),
+                },
+            }],
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            metadata: None,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "web_search".into(),
+                    tool_type: Some("web_search_20250305".into()),
+                    description: None,
+                    input_schema: None,
+                    cache_control: None,
+                },
+                AnthropicTool {
+                    name: "get_weather".into(),
+                    tool_type: None,
+                    description: None,
+                    input_schema: Some(serde_json::json!({"type": "object"})),
+                    cache_control: None,
+                },
+            ]),
+            tool_choice: Some(AnthropicToolChoice::Named(AnthropicToolChoiceNamed {
+                choice_type: AnthropicToolChoiceMode::Tool,
+                name: "web_search".into(),
+                disable_parallel_tool_use: None,
+            })),
+            cache_control: None,
+            thinking: None,
+            service_tier: None,
+            container: None,
+            output_config: None,
+        };
+
+        let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
+        assert_eq!(chat_req.inner.tools.as_ref().unwrap().len(), 1);
         assert!(matches!(
             chat_req.inner.tool_choice,
             Some(ChatCompletionToolChoiceOption::Auto)
