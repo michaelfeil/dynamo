@@ -328,6 +328,8 @@ impl ToolResultContent {
                 .into_iter()
                 .filter_map(|b| match b {
                     ToolResultContentBlock::Text { text } => Some(text),
+                    ToolResultContentBlock::Document(doc) => doc.text(),
+                    ToolResultContentBlock::SearchResult(result) => result.text(),
                     ToolResultContentBlock::Image { .. } | ToolResultContentBlock::Other(_) => None,
                 })
                 .collect::<Vec<_>>()
@@ -337,7 +339,8 @@ impl ToolResultContent {
 }
 
 /// A content block within a `tool_result.content` array.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolResultContentBlock {
     Text {
         text: String,
@@ -348,28 +351,104 @@ pub enum ToolResultContentBlock {
     Image {
         source: AnthropicImageSource,
     },
+    /// Document block inside a tool result (citations / RAG patterns).
+    Document(DocumentBlock),
+    /// Search-result block inside a tool result.
+    SearchResult(SearchResultBlock),
     /// Catch-all for other non-text blocks in tool results.
+    #[serde(untagged)]
     Other(serde_json::Value),
 }
 
-impl Serialize for ToolResultContentBlock {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+/// A `document` block: a titled document with a typed source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentBlock {
+    pub source: DocumentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl DocumentBlock {
+    /// Text representation of the document, if its source carries one.
+    pub fn text(&self) -> Option<String> {
+        self.source.text()
+    }
+}
+
+/// The source payload of a `document` block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DocumentSource {
+    /// Plain-text document.
+    Text {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+        data: String,
+    },
+    /// Document composed of nested content blocks.
+    Content {
+        content: Vec<ToolResultContentBlock>,
+    },
+    /// Base64-encoded binary document (e.g. PDF). No text representation.
+    Base64 { media_type: String, data: String },
+    /// Document referenced by URL. No text representation.
+    Url { url: String },
+}
+
+impl DocumentSource {
+    /// Text representation of the source, if it carries one.
+    pub fn text(&self) -> Option<String> {
         match self {
-            Self::Text { text } => serde_json::json!({
-                "type": "text",
-                "text": text,
-            })
-            .serialize(serializer),
-            Self::Image { source } => serde_json::json!({
-                "type": "image",
-                "source": source,
-            })
-            .serialize(serializer),
-            Self::Other(value) => value.serialize(serializer),
+            DocumentSource::Text { data, .. } => Some(data.clone()),
+            DocumentSource::Content { content } => concat_text_blocks(content),
+            DocumentSource::Base64 { .. } | DocumentSource::Url { .. } => None,
         }
+    }
+}
+
+/// A `search_result` block: a search hit with text content and citation
+/// metadata. Fields Anthropic requires are still optional here so that a
+/// partial block degrades to "no text" rather than failing the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResultBlock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub content: Vec<ToolResultContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl SearchResultBlock {
+    /// Text representation of the search result's content, if any.
+    pub fn text(&self) -> Option<String> {
+        concat_text_blocks(&self.content)
+    }
+}
+
+/// Concatenate the text blocks in a nested content array.
+fn concat_text_blocks(blocks: &[ToolResultContentBlock]) -> Option<String> {
+    let texts: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ToolResultContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.concat())
     }
 }
 
@@ -399,6 +478,21 @@ impl<'de> Deserialize<'de> for ToolResultContentBlock {
                     })?;
                 Ok(Self::Image { source })
             }
+            // Typed blocks with a graceful fallback: a document/search_result
+            // whose shape we don't understand degrades to Other (skipped by
+            // conversions) rather than failing the whole request.
+            Some("document") => Ok(
+                match serde_json::from_value::<DocumentBlock>(value.clone()) {
+                    Ok(doc) => Self::Document(doc),
+                    Err(_) => Self::Other(value),
+                },
+            ),
+            Some("search_result") => Ok(
+                match serde_json::from_value::<SearchResultBlock>(value.clone()) {
+                    Ok(result) => Self::SearchResult(result),
+                    Err(_) => Self::Other(value),
+                },
+            ),
             None => match value.get("text").and_then(|value| value.as_str()) {
                 Some(text) => Ok(Self::Text {
                     text: text.to_string(),
@@ -920,6 +1014,12 @@ fn estimate_block_len(block: &AnthropicContentBlock) -> usize {
                     .map(|b| match b {
                         ToolResultContentBlock::Text { text } => text.len(),
                         ToolResultContentBlock::Image { .. } => 256, // rough estimate for image metadata
+                        ToolResultContentBlock::Document(doc) => {
+                            doc.text().map(|t| t.len()).unwrap_or(256)
+                        }
+                        ToolResultContentBlock::SearchResult(result) => {
+                            result.text().map(|t| t.len()).unwrap_or(0)
+                        }
                         ToolResultContentBlock::Other(v) => v.to_string().len(),
                     })
                     .sum(),
@@ -941,7 +1041,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_result_blocks_preserve_image_and_reject_document() {
+    fn tool_result_blocks_parse_typed_and_round_trip() {
         let input = serde_json::json!([
             {"type": "text", "text": "Screenshot captured"},
             {
@@ -959,7 +1059,14 @@ mod tests {
                     "media_type": "application/pdf",
                     "data": "aGVsbG8="
                 }
-            }
+            },
+            {
+                "type": "search_result",
+                "source": "https://example.com",
+                "title": "Example",
+                "content": [{"type": "text", "text": "hit"}]
+            },
+            {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"}
         ]);
         let content: ToolResultContent = serde_json::from_value(input.clone()).unwrap();
 
@@ -967,11 +1074,26 @@ mod tests {
             panic!("expected content blocks");
         };
         assert!(matches!(blocks[1], ToolResultContentBlock::Image { .. }));
-        assert!(matches!(blocks[2], ToolResultContentBlock::Other(_)));
+        assert!(matches!(
+            &blocks[2],
+            ToolResultContentBlock::Document(DocumentBlock {
+                source: DocumentSource::Base64 { .. },
+                ..
+            })
+        ));
+        assert!(matches!(blocks[3], ToolResultContentBlock::SearchResult(_)));
+        assert!(matches!(blocks[4], ToolResultContentBlock::Other(_)));
         assert_eq!(serde_json::to_value(content).unwrap(), input);
 
         let legacy: ToolResultContentBlock =
             serde_json::from_value(serde_json::json!({"text": "legacy"})).unwrap();
         assert!(matches!(legacy, ToolResultContentBlock::Text { .. }));
+
+        // A document whose source shape is unknown degrades to Other and
+        // round-trips byte-identically.
+        let odd = serde_json::json!({"type": "document", "source": {"type": "mystery"}});
+        let block: ToolResultContentBlock = serde_json::from_value(odd.clone()).unwrap();
+        assert!(matches!(block, ToolResultContentBlock::Other(_)));
+        assert_eq!(serde_json::to_value(block).unwrap(), odd);
     }
 }

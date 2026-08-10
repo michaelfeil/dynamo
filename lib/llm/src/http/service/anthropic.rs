@@ -277,10 +277,12 @@ async fn anthropic_messages(
 
     // Convert Anthropic request -> UnifiedRequest -> Chat Completion request
     let unified_request: UnifiedRequest = orig_request.try_into().map_err(|e: anyhow::Error| {
+        // The error goes in the message body, not only a structured field:
+        // the customer-log pipeline stores just the message, and structured
+        // fields are dropped.
         tracing::error!(
             request_id,
-            error = %e,
-            "Failed to convert AnthropicCreateMessageRequest to UnifiedRequest",
+            "Failed to convert AnthropicCreateMessageRequest to UnifiedRequest: {e}",
         );
         anthropic_error(
             StatusCode::BAD_REQUEST,

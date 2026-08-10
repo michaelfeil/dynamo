@@ -305,42 +305,133 @@ fn convert_tool_result_content(
         ToolResultContent::Blocks(blocks) => blocks,
     };
 
-    if blocks
-        .iter()
-        .any(|block| matches!(block, ToolResultContentBlock::Other(_)))
-    {
-        anyhow::bail!(
-            "unsupported Anthropic tool_result content block; only text and image are supported"
-        );
+    // Normalize each block to text or image. The Anthropic API accepts more
+    // block types in tool_result content than the OpenAI tool message can
+    // carry: `document` and `search_result` blocks have their text payloads
+    // extracted, and blocks with no text payload are coerced to a compact
+    // text stand-in (small unknown blocks pass through as JSON; oversized
+    // payloads become a one-line placeholder) — failing the whole request
+    // over one block breaks agent frameworks, and dropping blocks outright
+    // loses pointers the model needs (e.g. Claude Code ToolSearch
+    // `tool_reference` results).
+    enum NormalizedPart<'a> {
+        Text(String),
+        Image(&'a AnthropicImageSource),
     }
-
-    if !blocks
-        .iter()
-        .any(|b| matches!(b, ToolResultContentBlock::Image { .. }))
-    {
-        // No images: join text blocks into a single string (previous behavior).
-        return Ok(ChatCompletionRequestToolMessageContent::Text(
-            content.clone().into_text(),
-        ));
-    }
-
-    let mut parts: Vec<ChatCompletionRequestToolMessageContentPart> = Vec::new();
+    let mut normalized: Vec<NormalizedPart> = Vec::new();
     for block in blocks {
         match block {
             ToolResultContentBlock::Text { text } => {
-                parts.push(ChatCompletionRequestToolMessageContentPart::Text(
-                    ChatCompletionRequestMessageContentPartText { text: text.clone() },
-                ));
+                normalized.push(NormalizedPart::Text(text.clone()));
             }
             ToolResultContentBlock::Image { source } => {
+                normalized.push(NormalizedPart::Image(source));
+            }
+            ToolResultContentBlock::Document(doc) => {
+                let text = doc.text().unwrap_or_else(|| document_placeholder(doc));
+                normalized.push(NormalizedPart::Text(text));
+            }
+            ToolResultContentBlock::SearchResult(result) => {
+                let text = result
+                    .text()
+                    .unwrap_or_else(|| search_result_placeholder(result));
+                normalized.push(NormalizedPart::Text(text));
+            }
+            ToolResultContentBlock::Other(value) => {
+                normalized.push(NormalizedPart::Text(coerce_unknown_block(value)));
+            }
+        }
+    }
+
+    if !normalized
+        .iter()
+        .any(|p| matches!(p, NormalizedPart::Image(_)))
+    {
+        // No images: join text blocks into a single string (previous behavior).
+        let text: String = normalized
+            .into_iter()
+            .map(|p| match p {
+                NormalizedPart::Text(text) => text,
+                NormalizedPart::Image(_) => unreachable!("no image parts"),
+            })
+            .collect();
+        return Ok(ChatCompletionRequestToolMessageContent::Text(text));
+    }
+
+    let mut parts: Vec<ChatCompletionRequestToolMessageContentPart> = Vec::new();
+    for part in normalized {
+        match part {
+            NormalizedPart::Text(text) => {
+                parts.push(ChatCompletionRequestToolMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText { text },
+                ));
+            }
+            NormalizedPart::Image(source) => {
                 parts.push(ChatCompletionRequestToolMessageContentPart::ImageUrl(
                     image_url_part(source)?,
                 ));
             }
-            ToolResultContentBlock::Other(_) => unreachable!("validated above"),
         }
     }
     Ok(ChatCompletionRequestToolMessageContent::Array(parts))
+}
+
+/// Ceiling for passing an unknown no-text block through as raw JSON.
+/// Above this the block becomes a one-line placeholder so oversized payloads
+/// (e.g. base64 documents) can't balloon the prompt.
+const UNKNOWN_BLOCK_JSON_LIMIT: usize = 1024;
+
+/// Coerce an unknown tool_result block to a text stand-in: small blocks pass
+/// through as compact JSON — preserving pointers the model needs, like
+/// Claude Code ToolSearch `tool_reference` results — and oversized ones
+/// become a placeholder naming the type.
+fn coerce_unknown_block(value: &serde_json::Value) -> String {
+    let block_type = value
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("<missing>");
+    let json = value.to_string();
+    if json.len() <= UNKNOWN_BLOCK_JSON_LIMIT {
+        tracing::debug!(
+            "coercing unknown Anthropic tool_result content block to JSON text: type={block_type}"
+        );
+        json
+    } else {
+        tracing::warn!(
+            "omitting oversized Anthropic tool_result content block: type={block_type} bytes={}",
+            json.len()
+        );
+        format!(
+            "[unsupported {block_type} tool_result block omitted ({} bytes)]",
+            json.len()
+        )
+    }
+}
+
+/// Placeholder for `document` blocks whose source carries no text payload
+/// (base64 binaries, URL references) — keeps the title/URL pointer visible
+/// to the model instead of dropping the block.
+fn document_placeholder(doc: &DocumentBlock) -> String {
+    let title = doc.title.as_deref().unwrap_or("untitled");
+    match &doc.source {
+        DocumentSource::Url { url } => format!("[document \"{title}\": {url}]"),
+        DocumentSource::Base64 { media_type, data } => format!(
+            "[document \"{title}\" omitted: {media_type}, {} bytes base64]",
+            data.len()
+        ),
+        // Text / Content sources always have a text representation.
+        _ => format!("[document \"{title}\"]"),
+    }
+}
+
+/// Placeholder for `search_result` blocks with no text content — keeps the
+/// source/title pointer visible to the model.
+fn search_result_placeholder(result: &SearchResultBlock) -> String {
+    let title = result.title.as_deref().unwrap_or("untitled");
+    match result.source.as_deref() {
+        Some(source) => format!("[search result \"{title}\": {source}]"),
+        None => format!("[search result \"{title}\"]"),
+    }
 }
 
 /// Flush accumulated user content parts into a user message.
@@ -1616,18 +1707,130 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_tool_result_other_block_is_rejected() {
-        let content = ToolResultContent::Blocks(vec![ToolResultContentBlock::Other(
-            serde_json::json!({"type": "document"}),
-        )]);
+    /// Deserialize a `tool_result.content` payload the way the endpoint does
+    /// and run it through the conversion.
+    fn convert_tool_result_json(
+        content: serde_json::Value,
+    ) -> Result<ChatCompletionRequestToolMessageContent, anyhow::Error> {
+        let content: ToolResultContent = serde_json::from_value(content).unwrap();
+        convert_tool_result_content(&content)
+    }
 
-        let error = convert_tool_result_content(&content).unwrap_err();
+    fn expect_text(content: serde_json::Value) -> String {
+        match convert_tool_result_json(content).unwrap() {
+            ChatCompletionRequestToolMessageContent::Text(text) => text,
+            other => panic!("expected Text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_tool_reference_blocks_coerced_to_json_text() {
+        // Verbatim Claude Code ToolSearch result: content is entirely
+        // tool_reference blocks. Must not fail the request; small unknown
+        // blocks pass through as JSON text so the model keeps the pointers.
+        let text = expect_text(serde_json::json!([
+            {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"},
+            {"type": "tool_reference", "tool_name": "mcp__slack__read_channel"},
+        ]));
+        assert!(text.contains("mcp__slack__read_thread"), "text: {text}");
+        assert!(text.contains("mcp__slack__read_channel"), "text: {text}");
+        assert!(text.contains("tool_reference"), "text: {text}");
+    }
+
+    #[test]
+    fn test_tool_result_oversized_unknown_block_becomes_placeholder() {
+        // Unknown blocks above the JSON pass-through limit must not balloon
+        // the prompt: replaced by a one-line placeholder naming the type.
+        let big = "x".repeat(2 * UNKNOWN_BLOCK_JSON_LIMIT);
+        let text = expect_text(serde_json::json!([
+            {"type": "mystery_blob", "payload": big},
+        ]));
         assert!(
-            error
-                .to_string()
-                .contains("only text and image are supported")
+            text.starts_with("[unsupported mystery_blob"),
+            "text: {text}"
         );
+        assert!(text.len() < 200, "placeholder should be short: {text}");
+    }
+
+    #[test]
+    fn test_tool_result_base64_document_becomes_placeholder() {
+        // A base64 document has no text representation: replaced by a short
+        // placeholder, the surrounding text blocks survive, and the request
+        // does not fail.
+        let text = expect_text(serde_json::json!([
+            {"type": "text", "text": "before "},
+            {
+                "type": "document",
+                "title": "report",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": "aGVsbG8="},
+            },
+            {"type": "text", "text": " after"},
+        ]));
+        assert!(text.starts_with("before "), "text: {text}");
+        assert!(text.ends_with(" after"), "text: {text}");
+        assert!(
+            text.contains("[document \"report\" omitted: application/pdf"),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_url_document_keeps_url_pointer() {
+        let text = expect_text(serde_json::json!([{
+            "type": "document",
+            "title": "spec",
+            "source": {"type": "url", "url": "https://example.com/spec.pdf"},
+        }]));
+        assert_eq!(text, "[document \"spec\": https://example.com/spec.pdf]");
+    }
+
+    #[test]
+    fn test_tool_result_text_document_is_flattened() {
+        let text = expect_text(serde_json::json!([{
+            "type": "document",
+            "title": "notes",
+            "source": {"type": "text", "media_type": "text/plain", "data": "doc body"},
+        }]));
+        assert_eq!(text, "doc body");
+    }
+
+    #[test]
+    fn test_tool_result_content_document_is_flattened() {
+        let text = expect_text(serde_json::json!([{
+            "type": "document",
+            "source": {"type": "content", "content": [
+                {"type": "text", "text": "part one "},
+                {"type": "text", "text": "part two"},
+            ]},
+        }]));
+        assert_eq!(text, "part one part two");
+    }
+
+    #[test]
+    fn test_tool_result_search_result_is_flattened() {
+        let text = expect_text(serde_json::json!([
+            {
+                "type": "search_result",
+                "source": "https://example.com/doc",
+                "title": "Example",
+                "content": [{"type": "text", "text": "search hit text"}],
+                "citations": {"enabled": true},
+            },
+            {"type": "text", "text": " and trailing text"},
+        ]));
+        assert_eq!(text, "search hit text and trailing text");
+    }
+
+    #[test]
+    fn test_tool_result_malformed_document_is_coerced_not_rejected() {
+        // A document whose shape we don't understand degrades to a coerced
+        // unknown block (JSON text), never a request-level error.
+        let text = expect_text(serde_json::json!([
+            {"type": "document", "source": {"type": "mystery"}},
+            {"type": "text", "text": "still here"},
+        ]));
+        assert!(text.ends_with("still here"), "text: {text}");
+        assert!(text.contains("mystery"), "text: {text}");
     }
 
     #[test]
