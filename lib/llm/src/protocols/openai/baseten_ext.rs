@@ -269,6 +269,13 @@ pub struct BasetenExt {
     )]
     #[builder(default, setter(strip_option))]
     pub chat_template_args: Option<HashMap<String, serde_json::Value>>,
+
+    /// Per-request overrides consumed ONLY by the CPU mocker backend (e.g.
+    /// `speedup_ratio` / `decode_speedup_ratio` for replay timing). GPU
+    /// engines ignore this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub mocker_config: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl BasetenExt {
@@ -286,6 +293,7 @@ impl BasetenExt {
             && self.reasoning.is_none()
             && self.thinking_token_budget.is_none()
             && self.chat_template_args.is_none()
+            && self.mocker_config.is_none()
     }
 
     pub fn validate_request(&self) -> anyhow::Result<()> {
@@ -403,6 +411,42 @@ mod tests {
         // Omitted -> None (worker/BIS-config default may still apply).
         let empty: BasetenExt = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.thinking_token_budget, None);
+    }
+
+    #[test]
+    fn test_mocker_config_round_trips_through_serde() {
+        let json = r#"{"mocker_config":{"speedup_ratio":2.0}}"#;
+        let parsed: BasetenExt = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.mocker_config,
+            Some(HashMap::from([(
+                "speedup_ratio".to_string(),
+                serde_json::json!(2.0)
+            )]))
+        );
+
+        // Omitted -> None, and stays off the wire on serialize.
+        let empty: BasetenExt = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.mocker_config, None);
+        assert!(
+            !serde_json::to_string(&empty)
+                .unwrap()
+                .contains("mocker_config")
+        );
+    }
+
+    #[test]
+    fn test_mocker_config_makes_ext_non_empty() {
+        let ext = BasetenExt {
+            mocker_config: Some(HashMap::from([(
+                "speedup_ratio".to_string(),
+                serde_json::json!(2.0),
+            )])),
+            ..Default::default()
+        };
+        // A request carrying only mocker_config must not be treated as empty,
+        // or the flattened field's skip_serializing_if would drop it.
+        assert!(!ext.is_empty());
     }
 
     #[test]

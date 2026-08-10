@@ -1175,6 +1175,14 @@ The `reasoning_effort` field on chat completion requests is normalized through a
 
 The request-side assistant message accepts `reasoning` as a serde alias for `reasoning_content`, so prior-turn reasoning sent under either wire name (OpenRouter/newer-vLLM `reasoning` or DeepSeek/vLLM-legacy `reasoning_content`) deserializes into the canonical field and re-renders into the chat template.
 
+`BasetenExt.mocker_config` per-request passthrough field: a free-form
+`Option<HashMap<String, Value>>` for per-request overrides consumed only by
+the CPU mocker backend (e.g. speedup ratios for replay timing); GPU engines
+ignore it. Serde-optional (omitted when `None`) and counted by `is_empty()` so
+a request carrying only this key isn't dropped by the flattened field's
+`skip_serializing_if`. Wire format only; preprocessor forwarding and mocker
+consumption land separately. Baseten-specific; not upstreamable.
+
 Added `chat_template_args` (alias `chat_template_kwargs`) to `BasetenExt` so it is available on all request paths that flatten `BasetenExt` — including `/v1/chat/completions` and `/v1/responses`. The `TryFrom<NvCreateResponse>` conversion now forwards `baseten_ext.chat_template_args` instead of hard-coding `None`, so callers of `/v1/responses` can pass a custom chat-template context through to the worker.
 
 Owned `ChatCompletionRequestSystemMessage` (content optional, opaque `tools` passthrough) and added `partial: Option<bool>` on the owned assistant message so Moonshot Kimi K3 conformance traffic deserializes: K3 sends system messages carrying only a dynamic `tools` list (no `content`, which upstream rejects with 400 "missing field `content`") and assistant prefill turns marked `partial: true` (#496). Implemented in `lib/protocols/src/types/chat.rs` (owned struct + `partial` field) with `From` bridges in `impls.rs` and call-site updates in `lib/llm` (anthropic, responses) + tests; both fields forward opaquely to the worker. Drop once upstream `async-openai` relaxes `content` and accepts the `tools`/`partial` keys.
