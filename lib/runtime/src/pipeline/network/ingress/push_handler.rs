@@ -225,10 +225,28 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
                 m.response_bytes.inc_by(resp_bytes.len() as u64);
             }
             if (publisher.send(resp_bytes.into()).await).is_err() {
-                tracing::error!(
-                    "Failed to publish complete final for stream {}",
-                    context.id()
-                );
+                // Mirror the data-path classification above: a stopped/killed
+                // context means the peer tore the response transport down
+                // deliberately (client disconnect, or an upstream early break
+                // such as a stop-word tool-call cutoff with
+                // parallel_tool_calls=false). `handle_writer` exits on
+                // `stopped()`/`killed()` without draining `bytes_rx`, so the
+                // final frame is undeliverable by construction — routine, not
+                // an error. The receiver treats "stream closed while stopped"
+                // as a clean end.
+                if context.is_stopped() {
+                    tracing::debug!(
+                        "Failed to publish complete final for stream {} (context cancelled)",
+                        context.id()
+                    );
+                } else {
+                    tracing::error!(
+                        "Failed to publish complete final for stream {}",
+                        context.id()
+                    );
+                }
+                // Account errors in all cases, including cancellation,
+                // matching the data-path counter semantics above.
                 if let Some(m) = self.metrics() {
                     m.error_counter
                         .with_label_values(&[work_handler::error_types::PUBLISH_FINAL])

@@ -393,6 +393,18 @@ fault-injection handling. It defaults off so transient transport/backend
 failures do not quarantine remotes unless explicitly enabled; Baseten avoids
 calling `report_instance_down` by default.
 
+The worker ingress's terminal `complete_final` publish failure is classified
+like the mid-stream data-path failure: when the request context is already
+stopped/killed (client disconnect, or an upstream early break such as the
+stop-word tool-call cutoff under `parallel_tool_calls=false`), the failed
+final send logs at DEBUG instead of ERROR — the peer dropped the receiver and
+`handle_writer` exits without draining, so the final frame is undeliverable
+by construction and the receiver already treats "stream closed while stopped"
+as a clean end. Genuine transport failures (context still live) keep the
+ERROR. The `PUBLISH_FINAL` error counter stays unconditional for dashboard
+continuity. Observed at ~1/min on tool-call-heavy Kimi serving as pure log
+noise; likely upstreamable.
+
 ## PATCH-003: NATS, JetStream, and Discovery Compatibility
 
 Status: `redesign`
