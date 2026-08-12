@@ -179,6 +179,7 @@ Source commits:
 - `1309b86da` feat(container): stamp dynamo version into image (#215)
 - `0e3ac0d0e` ci: add dispatchable BIS Dynamo Image Push workflow (#252)
 - `b76d509d2` container: skip stale vllm hotfix on newer versions
+- `7a6c0cb81` chore(container): bump bundled NATS to v2.14.4 and etcd to v3.7.1 (CVE remediation; server pins only, client crates unchanged)
 
 Purpose:
 

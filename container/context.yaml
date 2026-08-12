@@ -24,8 +24,8 @@ dynamo:
   planner_runtime_image_tag: 3.12-v4.0.3
   python_version: "3.12"
 
-  nats_version: v2.10.28
-  etcd_version: v3.5.30
+  nats_version: v2.14.4
+  etcd_version: v3.7.1
 
   nixl_ref: 0.10.1
   nixl_ucx_ref: v1.20.x
