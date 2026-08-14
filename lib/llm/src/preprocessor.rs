@@ -63,6 +63,7 @@ use crate::protocols::{
     common::{OutputOptionsProvider, SamplingOptionsProvider, StopConditionsProvider},
     openai::{
         DeltaGeneratorExt,
+        baseten_ext::BasetenExtProvider,
         chat_completions::{
             NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse, jail::JailedStream,
         },
@@ -522,6 +523,7 @@ impl OpenAIPreprocessor {
             + SamplingOptionsProvider
             + StopConditionsProvider
             + OutputOptionsProvider
+            + BasetenExtProvider
             + NvExtProvider,
     >(
         &self,
@@ -539,6 +541,7 @@ impl OpenAIPreprocessor {
             + SamplingOptionsProvider
             + StopConditionsProvider
             + OutputOptionsProvider
+            + BasetenExtProvider
             + NvExtProvider,
     >(
         &self,
@@ -625,6 +628,7 @@ impl OpenAIPreprocessor {
             + SamplingOptionsProvider
             + StopConditionsProvider
             + OutputOptionsProvider
+            + BasetenExtProvider
             + NvExtProvider,
     >(
         &self,
@@ -673,6 +677,7 @@ impl OpenAIPreprocessor {
         builder.annotations(request.annotations().unwrap_or_default());
         builder.mdc_sum(Some(self.mdcsum.clone()));
         let lora_name = self.lora_name.clone();
+        let allowed_worker_ids = request.get_allowed_worker_ids().cloned();
 
         // Extract routing hints from nvext if present
         if let Some(nvext) = request.nvext() {
@@ -694,16 +699,17 @@ impl OpenAIPreprocessor {
                 }),
                 priority: hints.and_then(|h| h.priority),
                 lora_name,
-                allowed_worker_ids: None,
+                allowed_worker_ids,
                 session_control: nvext.session_control.clone(),
                 routing_constraints: nvext.routing_constraints.clone(),
             };
             builder.routing(Some(routing));
-        } else if lora_name.is_some() {
-            // Ensure routing hints exist when we have LoRA,
+        } else if lora_name.is_some() || allowed_worker_ids.is_some() {
+            // Ensure routing hints exist for Baseten worker filtering or LoRA,
             // even when nvext is absent.
             builder.routing(Some(RoutingHints {
                 lora_name,
+                allowed_worker_ids,
                 ..Default::default()
             }));
         }

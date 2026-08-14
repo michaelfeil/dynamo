@@ -552,6 +552,7 @@ fn router_request_new_defaults_minimal_wire() {
     // defaults are skipped on the wire
     assert!(value["block_mm_infos"].is_nil());
     assert!(value["routing_constraints"].is_nil());
+    assert!(value["allowed_worker_ids"].is_nil());
     assert!(value["priority_jump"].is_nil());
     assert!(value["priority_load_shed_percent"].is_nil());
     assert!(value["do_not_queue"].is_nil());
@@ -579,6 +580,7 @@ fn router_request_new_priority_fields_round_trip() {
         tokens: vec![1, 2, 3],
         block_mm_infos: None,
         routing_constraints: RoutingConstraints::default(),
+        allowed_worker_ids: None,
         priority_jump: 0.5,
         priority_load_shed_percent: 10,
         do_not_queue: true,
@@ -612,6 +614,26 @@ fn router_request_new_priority_fields_round_trip() {
 }
 
 #[test]
+fn router_request_new_allowed_worker_ids_round_trip() {
+    let req = RouterRequestNew {
+        tokens: vec![1, 2, 3],
+        allowed_worker_ids: Some(std::collections::HashSet::from([7, 42])),
+        ..Default::default()
+    };
+    let value = req.into_routing_request_value().expect("build ok");
+
+    match round_trip_wire(&value) {
+        RouterRequest::New {
+            allowed_worker_ids, ..
+        } => assert_eq!(
+            allowed_worker_ids,
+            Some(std::collections::HashSet::from([7, 42]))
+        ),
+        _ => panic!("expected New"),
+    }
+}
+
+#[test]
 fn router_request_new_block_mm_infos_carried() {
     let infos: Vec<Option<BlockExtraInfo>> = serde_json::from_value(
         serde_json::json!([{"mm_objects": [{"mm_hash": 22, "offsets": [[0, 1]]}]}]),
@@ -621,6 +643,7 @@ fn router_request_new_block_mm_infos_carried() {
         tokens: vec![1, 2, 3],
         block_mm_infos: Some(infos),
         routing_constraints: RoutingConstraints::default(),
+        allowed_worker_ids: None,
         priority_jump: 0.0,
         priority_load_shed_percent: 0,
         do_not_queue: false,
@@ -651,6 +674,7 @@ fn router_request_new_routing_constraints_non_default_round_trip() {
         tokens: vec![1],
         block_mm_infos: None,
         routing_constraints: rc,
+        allowed_worker_ids: None,
         priority_jump: 0.0,
         priority_load_shed_percent: 0,
         do_not_queue: false,

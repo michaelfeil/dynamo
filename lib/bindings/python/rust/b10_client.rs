@@ -139,8 +139,8 @@ impl RouterWorkerCoordinator {
     /// Route a KV-router `new` request, then generate on the routed worker.
     ///
     /// `routing_kwargs` is a [`PyRouterRequestNew`] pyclass -- the REQUIRED,
-    /// single source of truth for the six `RouterRequest::New` wire-body fields
-    /// (`tokens`, `block_mm_infos`, `routing_constraints`, `priority_jump`,
+    /// single source of truth for the seven `RouterRequest::New` wire-body fields
+    /// (`tokens`, `block_mm_infos`, `routing_constraints`, `allowed_worker_ids`, `priority_jump`,
     /// `priority_load_shed_percent`, `do_not_queue`). The first-class `tokens`
     /// and `block_mm_infos` arguments are GONE; both live on the pyclass.
     /// `worker_args` is the body sent to the worker for generation; on a
@@ -246,6 +246,7 @@ impl RouterWorkerCoordinator {
         let block_mm_infos_py: Option<PyObject> = borrowed.block_mm_infos.clone();
         let routing_constraints_py: Option<Py<PyRoutingConstraints>> =
             borrowed.routing_constraints.clone();
+        let allowed_worker_ids = borrowed.allowed_worker_ids.clone();
         let priority_jump: f64 = borrowed.priority_jump;
         let priority_load_shed_percent: u8 = borrowed.priority_load_shed_percent;
         let do_not_queue: bool = borrowed.do_not_queue;
@@ -311,6 +312,7 @@ impl RouterWorkerCoordinator {
             tokens,
             block_mm_infos: block_mm_infos_typed.clone(),
             routing_constraints: routing_constraints_wire,
+            allowed_worker_ids,
             priority_jump,
             priority_load_shed_percent,
             do_not_queue,

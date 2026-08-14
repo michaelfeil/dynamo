@@ -539,6 +539,8 @@ pub enum RouterRequest {
         block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
         #[serde(default, skip_serializing_if = "RoutingConstraints::is_empty")]
         routing_constraints: RoutingConstraints,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_worker_ids: Option<HashSet<WorkerId>>,
         #[serde(default, skip_serializing_if = "is_default_priority_jump")]
         priority_jump: f64,
         #[serde(default, skip_serializing_if = "is_default_priority_load_shed_percent")]
@@ -573,6 +575,7 @@ impl Default for RouterRequest {
             tokens: TokenBlob::default(),
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
+            allowed_worker_ids: None,
             priority_jump: 0.0,
             priority_load_shed_percent: 0,
             do_not_queue: false,
@@ -1276,6 +1279,7 @@ mod token_blob_tests {
             tokens: tokens.into(),
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
+            allowed_worker_ids: None,
             priority_jump: 0.0,
             priority_load_shed_percent: 0,
             do_not_queue: false,
@@ -1638,6 +1642,7 @@ mod tests {
             tokens: vec![1, 2, 3].into(),
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
+            allowed_worker_ids: None,
             priority_jump: 5.0,
             priority_load_shed_percent: 0,
             do_not_queue: false,
@@ -1666,6 +1671,7 @@ mod tests {
             tokens: vec![1, 2, 3].into(),
             block_mm_infos: None,
             routing_constraints: RoutingConstraints::default(),
+            allowed_worker_ids: None,
             priority_jump: 5.0,
             priority_load_shed_percent: 10,
             do_not_queue: false,

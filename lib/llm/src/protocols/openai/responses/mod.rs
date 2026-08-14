@@ -766,7 +766,10 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
                 ..Default::default()
             },
             common: Default::default(),
-            baseten_ext: Default::default(),
+            baseten_ext: BasetenExt {
+                allowed_worker_ids: resp.baseten_ext.allowed_worker_ids,
+                ..Default::default()
+            },
             nvext: resp.nvext,
             chat_template_args: resp.baseten_ext.chat_template_args,
             media_io_kwargs: None,

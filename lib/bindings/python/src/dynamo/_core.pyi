@@ -484,7 +484,7 @@ class RouterWorkerPhase:
 
 class PyRouterRequestNew:
     """
-    Typed carrier of the six ``RouterRequest::New`` wire-body fields (minus the
+    Typed carrier of the seven ``RouterRequest::New`` wire-body fields (minus the
     ``method`` tag, supplied by the coordinator), sent as the REQUIRED
     ``routing_kwargs`` argument to
     :meth:`RouterWorkerCoordinator.route_and_worker`. This is the single source
@@ -503,6 +503,7 @@ class PyRouterRequestNew:
 
     block_mm_infos: Optional[Any]
     routing_constraints: Optional[RoutingConstraints]
+    allowed_worker_ids: Optional[Set[int]]
     priority_jump: float
     priority_load_shed_percent: int
     do_not_queue: bool
@@ -517,6 +518,7 @@ class PyRouterRequestNew:
         tokens: TokenIds,
         block_mm_infos: Optional[Any] = None,
         routing_constraints: Optional[RoutingConstraints] = None,
+        allowed_worker_ids: Optional[Set[int]] = None,
         priority_jump: float = 0.0,
         priority_load_shed_percent: int = 0,
         do_not_queue: bool = False,
@@ -567,9 +569,10 @@ class RouterWorkerCoordinator:
         Route a KV-router ``new`` request, then generate on the routed worker.
 
         ``routing_kwargs`` is a :class:`PyRouterRequestNew` — the REQUIRED,
-        single source of truth for the six ``RouterRequest::New`` wire-body
+        single source of truth for the seven ``RouterRequest::New`` wire-body
         fields (``tokens``, ``block_mm_infos``, ``routing_constraints``,
-        ``priority_jump``, ``priority_load_shed_percent``, ``do_not_queue``).
+        ``allowed_worker_ids``, ``priority_jump``,
+        ``priority_load_shed_percent``, ``do_not_queue``).
         The first-class ``tokens`` and ``block_mm_infos`` arguments are GONE;
         both live on the pyclass now. ``worker_args`` is the body sent to the
         worker for generation; on a successful route the decoded

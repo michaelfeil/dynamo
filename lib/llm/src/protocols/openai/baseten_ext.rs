@@ -2,7 +2,7 @@
 // Codex/claude: Please merge file - if possible, as is, in future forks e.g. dyn1.3/1.4 etc.
 // Do not depend on other dynamo crates to avoid circular dependencies.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use derive_builder::Builder;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -212,6 +212,11 @@ fn validate_cache_control_ranges(ranges: &[CacheControlRange]) -> anyhow::Result
 
 #[derive(ToSchema, Serialize, Deserialize, Builder, Validate, Debug, Clone, Default)]
 pub struct BasetenExt {
+    /// Restrict routing to this set of worker IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub allowed_worker_ids: Option<HashSet<u64>>,
+
     /// Baseten prompt cache-control ranges.
     #[serde(
         default,
@@ -284,7 +289,8 @@ impl BasetenExt {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.cache_control.is_none()
+        self.allowed_worker_ids.is_none()
+            && self.cache_control.is_none()
             && self.decode_cache_control.is_none()
             && self.baseten.is_none()
             && self.dynamic_temperature.is_none()
@@ -326,6 +332,11 @@ pub fn validate_request_fields(baseten_ext: &BasetenExt) -> anyhow::Result<()> {
 
 pub trait BasetenExtProvider {
     fn baseten_ext(&self) -> Option<&BasetenExt>;
+
+    fn get_allowed_worker_ids(&self) -> Option<&HashSet<u64>> {
+        self.baseten_ext()
+            .and_then(|ext| ext.allowed_worker_ids.as_ref())
+    }
 
     fn get_cache_control(&self) -> Option<&[CacheControlRange]> {
         self.baseten_ext()
@@ -370,6 +381,7 @@ mod tests {
     #[test]
     fn test_baseten_ext_builder_default() {
         let baseten_ext = BasetenExt::builder().build().unwrap();
+        assert_eq!(baseten_ext.allowed_worker_ids, None);
         assert_eq!(baseten_ext.cache_control, None);
         assert_eq!(baseten_ext.decode_cache_control, None);
         assert_eq!(baseten_ext.baseten, None);
@@ -395,6 +407,17 @@ mod tests {
         let reserialized = serde_json::to_string(&parsed).unwrap();
         let reparsed: BasetenExt = serde_json::from_str(&reserialized).unwrap();
         assert_eq!(reparsed.reasoning, parsed.reasoning);
+    }
+
+    #[test]
+    fn test_allowed_worker_ids_round_trip() {
+        let parsed: BasetenExt = serde_json::from_str(r#"{"allowed_worker_ids":[42,7]}"#).unwrap();
+        assert_eq!(parsed.allowed_worker_ids, Some(HashSet::from([7, 42])));
+        assert!(!parsed.is_empty());
+
+        let reparsed: BasetenExt =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(reparsed.allowed_worker_ids, parsed.allowed_worker_ids);
     }
 
     #[test]

@@ -1186,6 +1186,10 @@ consumption land separately. Baseten-specific; not upstreamable.
 
 Added `chat_template_args` (alias `chat_template_kwargs`) to `BasetenExt` so it is available on all request paths that flatten `BasetenExt` — including `/v1/chat/completions` and `/v1/responses`. The `TryFrom<NvCreateResponse>` conversion now forwards `baseten_ext.chat_template_args` instead of hard-coding `None`, so callers of `/v1/responses` can pass a custom chat-template context through to the worker.
 
+Added optional `BasetenExt.allowed_worker_ids` filtering through `RoutingHints`
+and `RouterRequest::New`, with the same `Set[int]` input exposed by the B10
+Python client. Omission preserves existing routing behavior.
+
 Owned `ChatCompletionRequestSystemMessage` (content optional, opaque `tools` passthrough) and added `partial: Option<bool>` on the owned assistant message so Moonshot Kimi K3 conformance traffic deserializes: K3 sends system messages carrying only a dynamic `tools` list (no `content`, which upstream rejects with 400 "missing field `content`") and assistant prefill turns marked `partial: true` (#496). Implemented in `lib/protocols/src/types/chat.rs` (owned struct + `partial` field) with `From` bridges in `impls.rs` and call-site updates in `lib/llm` (anthropic, responses) + tests; both fields forward opaquely to the worker. Drop once upstream `async-openai` relaxes `content` and accepts the `tools`/`partial` keys.
 
 The Anthropic `/v1/messages` request conversion drops `tool_choice` when no declared tool survives tool conversion (server tools like `web_search` have no `input_schema` and are filtered), and degrades a named `tool_choice` pointing at a filtered tool to `auto` when function tools remain. Previously the inconsistent converted request hit the worker's `400 "When using tool_choice, tools must be set"` — Claude Code on Baseten backends triggered this whenever its WebSearch server tool was invoked, surfacing an API error mid-turn instead of a text answer.

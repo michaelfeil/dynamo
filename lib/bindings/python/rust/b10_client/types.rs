@@ -24,6 +24,7 @@ use anyhow::Result;
 use dynamo_kv_router::protocols::{BlockExtraInfo, RouterRequest, RoutingConstraints};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +44,7 @@ pub(super) struct RouterRequestNew {
     pub(super) tokens: Vec<u32>,
     pub(super) block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
     pub(super) routing_constraints: RoutingConstraints,
+    pub(super) allowed_worker_ids: Option<HashSet<u64>>,
     pub(super) priority_jump: f64,
     pub(super) priority_load_shed_percent: u8,
     pub(super) do_not_queue: bool,
@@ -58,6 +60,7 @@ impl From<RouterRequestNew> for RouterRequest {
             tokens: req.tokens.into(),
             block_mm_infos: req.block_mm_infos,
             routing_constraints: req.routing_constraints,
+            allowed_worker_ids: req.allowed_worker_ids,
             priority_jump: req.priority_jump,
             priority_load_shed_percent: req.priority_load_shed_percent,
             do_not_queue: req.do_not_queue,
@@ -259,7 +262,7 @@ mod router_worker_phase_tests {
     }
 }
 
-/// Python-side carrier of the six [`RouterRequest::New`] wire-body fields
+/// Python-side carrier of the seven [`RouterRequest::New`] wire-body fields
 /// (minus the `method` tag, supplied by the coordinator). Sent as the
 /// REQUIRED `routing_kwargs` argument to
 /// [`super::RouterWorkerCoordinator::route_and_worker`]; it is the single source of
@@ -290,6 +293,8 @@ pub(crate) struct PyRouterRequestNew {
     #[pyo3(get, set)]
     pub(super) routing_constraints: Option<Py<PyRoutingConstraints>>,
     #[pyo3(get, set)]
+    pub(super) allowed_worker_ids: Option<HashSet<u64>>,
+    #[pyo3(get, set)]
     pub(super) priority_jump: f64,
     #[pyo3(get, set)]
     pub(super) priority_load_shed_percent: u8,
@@ -304,6 +309,7 @@ impl PyRouterRequestNew {
         tokens,
         block_mm_infos = None,
         routing_constraints = None,
+        allowed_worker_ids = None,
         priority_jump = 0.0,
         priority_load_shed_percent = 0,
         do_not_queue = false,
@@ -312,6 +318,7 @@ impl PyRouterRequestNew {
         tokens: &Bound<'_, PyAny>,
         block_mm_infos: Option<PyObject>,
         routing_constraints: Option<Py<PyRoutingConstraints>>,
+        allowed_worker_ids: Option<HashSet<u64>>,
         priority_jump: f64,
         priority_load_shed_percent: u8,
         do_not_queue: bool,
@@ -320,6 +327,7 @@ impl PyRouterRequestNew {
             tokens: extract_list_or_numpy_u32(tokens)?,
             block_mm_infos,
             routing_constraints,
+            allowed_worker_ids,
             priority_jump,
             priority_load_shed_percent,
             do_not_queue,

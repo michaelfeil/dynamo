@@ -45,6 +45,7 @@ use crate::protocols::openai::common_ext::{CommonExt, CommonExtProvider};
 use crate::protocols::openai::nvext::{NvExt, NvExtProvider};
 use crate::protocols::openai::{
     OpenAIOutputOptionsProvider, OpenAISamplingOptionsProvider, OpenAIStopConditionsProvider,
+    baseten_ext::{BasetenExt, BasetenExtProvider},
 };
 
 use dynamo_protocols::types::responses::{IncludeEnum, Reasoning, Truncation};
@@ -283,6 +284,12 @@ impl NvExtProvider for UnifiedRequest {
 
     fn raw_prompt(&self) -> Option<String> {
         None
+    }
+}
+
+impl BasetenExtProvider for UnifiedRequest {
+    fn baseten_ext(&self) -> Option<&BasetenExt> {
+        (!self.inner.baseten_ext.is_empty()).then_some(&self.inner.baseten_ext)
     }
 }
 
@@ -617,6 +624,7 @@ mod tests {
             "reasoning": {
                 "effort": "medium"
             },
+            "allowed_worker_ids": [7, 42],
             "include": ["message.output_text.logprobs"]
         });
         let req: NvCreateResponse = serde_json::from_value(json).unwrap();
@@ -630,6 +638,10 @@ mod tests {
         assert!(ctx.reasoning.is_some());
         assert!(ctx.include.is_some());
         assert_eq!(ctx.include.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            unified.inner.baseten_ext.allowed_worker_ids,
+            Some(std::collections::HashSet::from([7, 42]))
+        );
 
         // Verify it still works as a preprocessor input
         assert_eq!(unified.model(), "gpt-4o");

@@ -1093,6 +1093,7 @@ where
                 tokens,
                 block_mm_infos,
                 routing_constraints,
+                allowed_worker_ids,
                 priority_jump,
                 priority_load_shed_percent,
                 do_not_queue,
@@ -1111,7 +1112,7 @@ where
                     do_not_queue,
                     None,
                     None,
-                    None,
+                    allowed_worker_ids,
                     routing_constraints,
                 ));
                 let outcome = tokio::select! {
