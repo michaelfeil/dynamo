@@ -43,8 +43,11 @@
 //!
 //! See also: `docs/observability/metrics.md` (Router Metrics section).
 
-use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex, OnceLock},
+};
 
 use dynamo_runtime::component::Component;
 use dynamo_runtime::metrics::MetricsHierarchy;
@@ -921,6 +924,75 @@ impl RouterRequestMetrics {
 pub struct RemoteIndexerMetrics {
     pub query_failures_total: prometheus::IntCounter,
     pub write_failures_total: prometheus::IntCounter,
+}
+
+/// Affinity decision counters for the standalone [`crate::kv_router::KvRouter`].
+pub struct StandaloneAffinityMetrics {
+    pub worker_selection_requests_total: IntCounter,
+    pub session_affinity_requests_total: IntCounter,
+    pub session_affinity_matches_total: IntCounter,
+    pub session_affinity_preferred_worker_selected_total: IntCounter,
+}
+
+type StandaloneAffinityMetricsKey = (u64, String, String);
+
+static STANDALONE_AFFINITY_METRICS: LazyLock<
+    Mutex<HashMap<StandaloneAffinityMetricsKey, Arc<StandaloneAffinityMetrics>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+impl StandaloneAffinityMetrics {
+    pub fn from_component(component: &Component) -> Arc<Self> {
+        let instance_id = component.drt().discovery().instance_id();
+        let key = (
+            instance_id,
+            component.namespace().name(),
+            component.name().to_string(),
+        );
+        let mut cache = STANDALONE_AFFINITY_METRICS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(metrics) = cache.get(&key) {
+            return metrics.clone();
+        }
+        let router_id = instance_id.to_string();
+        let extra_labels: &[(&str, &str)] = &[(labels::ROUTER_ID, &router_id)];
+        let metrics = component.metrics();
+
+        let affinity_metrics = Arc::new(Self {
+            worker_selection_requests_total: metrics
+                .create_intcounter(
+                    router::WORKER_SELECTION_REQUESTS_TOTAL,
+                    "Total number of standalone KV router worker-selection requests",
+                    extra_labels,
+                )
+                .expect("failed to create router_worker_selection_requests_total"),
+            session_affinity_requests_total: metrics
+                .create_intcounter(
+                    router::SESSION_AFFINITY_REQUESTS_TOTAL,
+                    "Total number of standalone KV router requests carrying a session-affinity ID",
+                    extra_labels,
+                )
+                .expect("failed to create router_session_affinity_requests_total"),
+            session_affinity_matches_total: metrics
+                .create_intcounter(
+                    router::SESSION_AFFINITY_MATCHES_TOTAL,
+                    "Total number of session-affinity IDs that resolved to an existing worker preference",
+                    extra_labels,
+                )
+                .expect("failed to create router_session_affinity_matches_total"),
+            session_affinity_preferred_worker_selected_total: metrics
+                .create_intcounter(
+                    router::SESSION_AFFINITY_PREFERRED_WORKER_SELECTED_TOTAL,
+                    "Total number of affinity matches ultimately routed to their preferred worker and DP rank",
+                    extra_labels,
+                )
+                .expect(
+                    "failed to create router_session_affinity_preferred_worker_selected_total",
+                ),
+        });
+        cache.insert(key, affinity_metrics.clone());
+        affinity_metrics
+    }
 }
 
 static REMOTE_INDEXER_METRICS: OnceLock<Arc<RemoteIndexerMetrics>> = OnceLock::new();

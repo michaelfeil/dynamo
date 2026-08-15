@@ -35,6 +35,7 @@ pub mod preprocessor;
 pub mod protocols;
 pub mod recorder;
 pub mod request_template;
+pub mod session_affinity;
 pub mod telemetry;
 pub use dynamo_tokenizers as tokenizers;
 pub use dynamo_tokenizers::{file_json_field, log_json_err};

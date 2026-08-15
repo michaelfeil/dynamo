@@ -60,8 +60,14 @@ def start_router(
     kv_router_config: Optional["KvRouterConfig"] = None,
     kv_router_metrics_port: int = 9091,
     algo_selector: Literal["Default", "B10"] = "B10",
+    router_config: Optional["RouterConfig"] = None,
 ) -> None:
-    """Starts the B10 KV router. This function does not return."""
+    """Starts the B10 KV router. This function does not return.
+
+    When supplied, ``router_config`` is the source of the KV configuration,
+    selector, and soft session-affinity TTL. It takes precedence over the
+    legacy ``kv_router_config`` and ``algo_selector`` arguments.
+    """
     ...
 
 async def parse_tool_calls_batch(
@@ -2050,6 +2056,7 @@ class RouterConfig:
         python_worker_selector: Optional[
             Callable[[Dict[int, Any], "PySchedulingRequest"], "PyWorkerSelectionResult"]
         ] = None,
+        session_affinity_ttl_secs: Optional[int] = None,
     ) -> None:
         """
         Create a RouterConfig.
@@ -2061,6 +2068,8 @@ class RouterConfig:
             active_prefill_tokens_threshold: Literal token count threshold for prefill busy detection
             active_prefill_tokens_threshold_frac: Fraction of max_num_batched_tokens for busy detection
             enforce_disagg: Strictly enforce disaggregated mode, failing requests if no prefill workers are available
+            session_affinity_ttl_secs: Soft session-affinity idle TTL for the B10 selector;
+                None disables affinity.
             algo_selector: Worker selector for KV routing ("Default", "B10", or "Python")
             python_worker_selector: Callable used when algo_selector="Python"; it receives
                 workers and a PySchedulingRequest and must return PyWorkerSelectionResult

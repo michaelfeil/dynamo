@@ -263,6 +263,7 @@ mod tests {
             lora_name: None,
             expected_output_tokens: None,
             pinned_worker: None,
+            preferred_worker: None,
             allowed_worker_ids: None,
             routing_constraints: RoutingConstraints::default(),
             router_config_override: None,

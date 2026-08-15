@@ -178,6 +178,7 @@ impl PendingRequest {
             do_not_queue: false,
             expected_output_tokens: self.expected_output_tokens,
             pinned_worker: None,
+            preferred_worker: None,
             allowed_worker_ids: None,
             routing_constraints: RoutingConstraints::default(),
             shared_cache_hits: None,

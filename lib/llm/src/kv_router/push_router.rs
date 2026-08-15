@@ -346,6 +346,7 @@ impl KvPushRouter {
                 args.do_not_queue,
                 args.expected_output_tokens,
                 args.pinned_worker,
+                None,
                 args.allowed_worker_ids,
                 args.routing_constraints,
             )

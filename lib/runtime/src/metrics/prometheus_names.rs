@@ -576,6 +576,19 @@ pub mod router {
     /// Total number of requests processed by the router
     pub const REQUESTS_TOTAL: &str = "router_requests_total";
 
+    /// Total number of standalone KV router worker-selection requests
+    pub const WORKER_SELECTION_REQUESTS_TOTAL: &str = "router_worker_selection_requests_total";
+
+    /// Total number of standalone KV router requests carrying a session-affinity ID
+    pub const SESSION_AFFINITY_REQUESTS_TOTAL: &str = "router_session_affinity_requests_total";
+
+    /// Total number of session-affinity IDs that resolved to an existing worker preference
+    pub const SESSION_AFFINITY_MATCHES_TOTAL: &str = "router_session_affinity_matches_total";
+
+    /// Total number of affinity matches ultimately routed to their preferred worker and DP rank
+    pub const SESSION_AFFINITY_PREFERRED_WORKER_SELECTED_TOTAL: &str =
+        "router_session_affinity_preferred_worker_selected_total";
+
     /// Total number of remote indexer overlap queries that failed
     pub const REMOTE_INDEXER_QUERY_FAILURES_TOTAL: &str =
         "router_remote_indexer_query_failures_total";

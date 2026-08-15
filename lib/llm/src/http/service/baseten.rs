@@ -15,6 +15,38 @@ pub const X_BASETEN_DYN_WORKER_ID_HEADER: &str = "x-baseten-dyn-worker-id";
 pub const X_BASETEN_DYN_PREFILL_WORKER_ID_HEADER: &str = "x-baseten-dyn-prefill-worker-id";
 pub const X_BASETEN_DYN_PREFILL_DP_RANK_HEADER: &str = "x-baseten-dyn-prefill-dp-rank";
 pub const X_BASETEN_DYN_DECODE_DP_RANK_HEADER: &str = "x-baseten-dyn-decode-dp-rank";
+const BASETEN_PREFERRED_SESSION_AFFINITY_HEADERS: &[&str] = &[
+    "x-baseten-session-id",
+    "x-baseten-session",
+    "x-dynamo-session-id",
+    "x-session-id",
+    "x-session-affinity",
+    "session-id",
+    "x-claude-code-session-id",
+    "x-parent-session-id",
+    "x-claude-code-agent-id",
+    "x-claude-code-parent-agent-id",
+];
+
+pub(crate) fn baseten_preferred_session_affinity_from_headers(headers: &HeaderMap) -> Option<&str> {
+    BASETEN_PREFERRED_SESSION_AFFINITY_HEADERS
+        .iter()
+        .find_map(|name| nonempty_header(headers, name))
+}
+
+pub(crate) fn baseten_session_affinity_from_request(
+    headers: &HeaderMap,
+    body_session_id: Option<&str>,
+) -> Option<String> {
+    baseten_preferred_session_affinity_from_headers(headers)
+        .map(str::to_owned)
+        .or_else(|| {
+            body_session_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerResponseMetadata {
@@ -241,6 +273,7 @@ fn parse_customer_request_context(headers: &HeaderMap) -> CustomerRequestContext
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::common::extensions::session_affinity_from_headers;
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
         use axum::http::HeaderName;
@@ -267,6 +300,41 @@ mod tests {
         assert_eq!(
             get_or_create_context_id(&headers),
             "my-org--abc123--mv-789--ray-1:chatcmpl-abc"
+        );
+    }
+
+    #[test]
+    fn session_header_aliases_and_precedence() {
+        let pairs = BASETEN_PREFERRED_SESSION_AFFINITY_HEADERS
+            .iter()
+            .map(|name| (*name, *name))
+            .collect::<Vec<_>>();
+        let mut headers = headers_with(&pairs);
+        for expected in BASETEN_PREFERRED_SESSION_AFFINITY_HEADERS {
+            assert_eq!(
+                baseten_preferred_session_affinity_from_headers(&headers),
+                Some(*expected)
+            );
+            headers.remove(*expected);
+        }
+        assert!(session_affinity_from_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn session_body_fallback_is_normalized_and_headers_win() {
+        assert_eq!(
+            baseten_session_affinity_from_request(&HeaderMap::new(), Some(" body-session ")),
+            Some("body-session".to_string())
+        );
+        assert_eq!(
+            baseten_session_affinity_from_request(&HeaderMap::new(), Some("  ")),
+            None
+        );
+
+        let headers = headers_with(&[("x-baseten-session-id", "header-session")]);
+        assert_eq!(
+            baseten_session_affinity_from_request(&headers, Some("body-session")),
+            Some("header-session".to_string())
         );
     }
 

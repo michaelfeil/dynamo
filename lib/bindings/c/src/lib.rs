@@ -558,6 +558,7 @@ impl RouterHandles {
                 false,
                 None,
                 None,
+                None,
                 allowed_worker_ids,
                 routing_constraints,
             )

@@ -42,6 +42,7 @@ use crate::protocols::anthropic::types::{
     AnthropicErrorBody, AnthropicErrorResponse, SystemContent,
     chat_completion_to_anthropic_response,
 };
+use crate::protocols::common::extensions::insert_session_affinity;
 use crate::protocols::openai::chat_completions::{
     NvCreateChatCompletionResponse, NvCreateChatCompletionStreamResponse,
     aggregator::ChatCompletionAggregator,
@@ -52,7 +53,8 @@ use crate::types::Annotated;
 
 // Re-use helpers from sibling modules under service/.
 use super::baseten::{
-    attach_worker_response_headers, get_or_create_context_id, take_worker_response_metadata,
+    attach_worker_response_headers, baseten_session_affinity_from_request,
+    get_or_create_context_id, take_worker_response_metadata,
 };
 use super::metadata::extract_metadata_from_http;
 use super::openai::get_body_limit;
@@ -191,7 +193,16 @@ async fn handler_anthropic_messages(
             &err.to_string(),
         )
     })?;
-    let request = Context::with_id_and_metadata(request, context_id, metadata);
+    let user_id = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let mut request = Context::with_id_and_metadata(request, context_id, metadata);
+    if let Some(session_id) = baseten_session_affinity_from_request(&headers, user_id.as_deref()) {
+        insert_session_affinity(&mut request, session_id);
+    }
     let context = request.context();
 
     // Create connection handles

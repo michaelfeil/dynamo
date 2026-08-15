@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::Result;
+use dashmap::DashMap;
 use dynamo_kv_router::{
     KvSchedulerError, PrefillLoadEstimator, SharedKvCache,
     config::{KvRouterConfig, RouterConfigOverride, min_initial_workers_from_env},
@@ -24,7 +25,7 @@ use dynamo_kv_router::{
     scheduling::OverloadedWorkerProvider,
 };
 use dynamo_runtime::{
-    component::{Client, Endpoint},
+    component::{Client, Component, Endpoint},
     discovery::DiscoveryQuery,
     error::{DynamoError, ErrorType},
     pipeline::{
@@ -38,6 +39,14 @@ use dynamo_runtime::{
 use futures::stream;
 use tracing::Instrument;
 use validator::Validate;
+
+use crate::{
+    protocols::common::extensions::session_affinity_from_context,
+    session_affinity::{
+        AffinityAcquire, AffinityCoordinator, AffinityLease, AffinityTarget,
+        create_affinity_coordinator,
+    },
+};
 
 // Re-export from dynamo-kv-router crate
 pub use dynamo_kv_router::approx;
@@ -279,6 +288,9 @@ where
     /// queries it in parallel with the indexer and factors shared hits into scoring.
     shared_cache: Option<Box<dyn SharedKvCache>>,
     b10_potential_loads_cache: B10PotentialLoadsCache,
+    affinity: Option<AffinityCoordinator>,
+    affinity_leases: DashMap<String, AffinityLease>,
+    affinity_metrics: Arc<metrics::StandaloneAffinityMetrics>,
 }
 
 impl<Sel> KvRouter<Sel>
@@ -298,10 +310,14 @@ where
         model_name: Option<String>,
         is_eagle: bool,
         shared_cache: Option<Box<dyn SharedKvCache>>,
+        metrics_component: Option<&Component>,
     ) -> Result<Self> {
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate()?;
         let component = endpoint.component();
+        let affinity_metrics = metrics::StandaloneAffinityMetrics::from_component(
+            metrics_component.unwrap_or(component),
+        );
         let cancellation_token = component.drt().primary_token();
         let min_initial_workers = min_initial_workers_from_env()?;
         let dynamic_disable_snapshots = Arc::new(AtomicBool::new(false));
@@ -401,7 +417,26 @@ where
             dynamic_disable_snapshots,
             shared_cache,
             b10_potential_loads_cache: B10PotentialLoadsCache::default(),
+            affinity: None,
+            affinity_leases: DashMap::new(),
+            affinity_metrics,
         })
+    }
+
+    /// Enable context-based session affinity and replica synchronization when
+    /// a TTL is configured. `None` leaves affinity disabled.
+    pub async fn with_session_affinity_ttl(
+        mut self,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<Self> {
+        self.affinity = create_affinity_coordinator(ttl, self.client.clone()).await?;
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    fn with_session_affinity_coordinator(mut self, affinity: AffinityCoordinator) -> Self {
+        self.affinity = Some(affinity);
+        self
     }
 
     /// Get a reference to the client used by this KvRouter
@@ -488,6 +523,7 @@ where
         do_not_queue: bool,
         expected_output_tokens: Option<u32>,
         pinned_worker: Option<WorkerWithDpRank>,
+        preferred_worker: Option<WorkerWithDpRank>,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
     ) -> anyhow::Result<FindBestMatchOutcome> {
@@ -583,6 +619,7 @@ where
                 do_not_queue,
                 expected_output_tokens,
                 pinned_worker,
+                preferred_worker,
                 allowed_worker_ids,
                 routing_constraints,
                 shared_cache_hits,
@@ -684,6 +721,7 @@ where
                 do_not_queue,
                 expected_output_tokens,
                 None,
+                None,
                 allowed_worker_ids,
                 routing_constraints,
             )
@@ -764,6 +802,7 @@ where
     }
 
     pub async fn free(&self, request_id: &str) -> Result<(), SequenceError> {
+        self.affinity_leases.remove(request_id);
         self.scheduler.free(request_id).await
     }
 
@@ -1098,7 +1137,39 @@ where
                 priority_load_shed_percent,
                 do_not_queue,
             } => {
+                self.affinity_metrics.worker_selection_requests_total.inc();
                 let request_context = ctx.context();
+                let session_affinity_id =
+                    session_affinity_from_context(&ctx).map_err(anyhow::Error::msg)?;
+                if session_affinity_id.is_some() {
+                    self.affinity_metrics.session_affinity_requests_total.inc();
+                }
+                let mut affinity_operation: Option<AffinityAcquire> =
+                    if let (Some(affinity), Some(session_id)) =
+                        (self.affinity.as_ref(), session_affinity_id.as_ref())
+                    {
+                        Some(
+                            affinity
+                                .acquire_with_context(session_id, None, request_context.as_ref())
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+                let preferred_worker = affinity_operation.as_ref().and_then(|operation| {
+                    operation.target().and_then(|target| {
+                        target
+                            .dp_rank
+                            .or_else(|| self.unique_dp_rank_for_worker(target.worker_id))
+                            .map(|dp_rank| WorkerWithDpRank::new(target.worker_id, dp_rank))
+                    })
+                });
+                if affinity_operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.target().is_some())
+                {
+                    self.affinity_metrics.session_affinity_matches_total.inc();
+                }
                 let mut schedule = Box::pin(self.find_best_match_details(
                     Some(&context_id),
                     &tokens,
@@ -1112,6 +1183,7 @@ where
                     do_not_queue,
                     None,
                     None,
+                    preferred_worker,
                     allowed_worker_ids,
                     routing_constraints,
                 ));
@@ -1125,6 +1197,10 @@ where
                 drop(schedule);
 
                 let Some(outcome) = outcome else {
+                    // Dropping a bound lease preserves the binding; dropping an
+                    // initialization rolls it back. Cancellation should not
+                    // evict an otherwise healthy soft preference.
+                    drop(affinity_operation.take());
                     if let Err(error) = self.free(&context_id).await {
                         tracing::warn!(
                             request_id = %context_id,
@@ -1141,23 +1217,49 @@ where
                         best_overlap_blocks,
                         dp_strict_rank,
                         ..
-                    }) => RouterResponse::New {
-                        worker_id: worker.worker_id,
-                        dp_rank: worker.dp_rank,
-                        overlap_blocks,
-                        best_overlap_blocks,
-                        dp_strict_rank,
-                    },
+                    }) => {
+                        if preferred_worker == Some(worker) {
+                            self.affinity_metrics
+                                .session_affinity_preferred_worker_selected_total
+                                .inc();
+                        }
+                        if let Some(operation) = affinity_operation.take() {
+                            let selected_target = AffinityTarget {
+                                worker_id: worker.worker_id,
+                                dp_rank: Some(worker.dp_rank),
+                            };
+                            if let Some(lease) = operation.complete_selection(selected_target)? {
+                                self.affinity_leases.insert(context_id.clone(), lease);
+                            }
+                        }
+                        RouterResponse::New {
+                            worker_id: worker.worker_id,
+                            dp_rank: worker.dp_rank,
+                            overlap_blocks,
+                            best_overlap_blocks,
+                            dp_strict_rank,
+                        }
+                    }
                     Ok(FindBestMatchOutcome::Backpressure {
                         reason,
                         queued_isl_tokens,
                         max_queued_isl_tokens,
-                    }) => RouterResponse::Backpressure {
-                        reason,
-                        queued_isl_tokens,
-                        max_queued_isl_tokens,
-                    },
-                    Err(error) => return Err(error),
+                    }) => {
+                        // Transient overload/backpressure is not evidence that
+                        // the affinity target is stale.
+                        drop(affinity_operation.take());
+                        RouterResponse::Backpressure {
+                            reason,
+                            queued_isl_tokens,
+                            max_queued_isl_tokens,
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(operation) = affinity_operation.take() {
+                            operation.invalidate();
+                        }
+                        return Err(error);
+                    }
                 }
             }
             RouterRequest::MarkPrefill { request_id } => {
@@ -1245,6 +1347,7 @@ mod tests {
 
     use crate::kv_router::scheduler::KvSchedulerError;
     use crate::local_model::runtime_config::ModelRuntimeConfig;
+    use crate::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY;
 
     #[test]
     fn weighted_cache_hit_estimates_include_lower_tiers() {
@@ -1350,6 +1453,32 @@ mod tests {
         }
     }
 
+    struct PreferredWorkerRecordingSelector {
+        seen: Arc<std::sync::Mutex<Vec<Option<WorkerWithDpRank>>>>,
+        selected_worker: WorkerWithDpRank,
+    }
+
+    impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig>
+        for PreferredWorkerRecordingSelector
+    {
+        fn select_worker(
+            &self,
+            _workers: &HashMap<WorkerId, ModelRuntimeConfig>,
+            request: &dynamo_kv_router::scheduling::SchedulingRequest,
+            _eligibility: dynamo_kv_router::scheduling::RoutingEligibility<'_>,
+            block_size: u32,
+        ) -> Result<dynamo_kv_router::protocols::WorkerSelectionResult, KvSchedulerError> {
+            self.seen.lock().unwrap().push(request.preferred_worker);
+            Ok(dynamo_kv_router::protocols::WorkerSelectionResult {
+                worker: self.selected_worker,
+                required_blocks: request.isl_tokens.div_ceil(block_size as usize) as u64,
+                effective_overlap_blocks: 0.0,
+                cached_tokens: 0,
+                dp_strict_rank: false,
+            })
+        }
+    }
+
     async fn make_test_component(name: &str) -> dynamo_runtime::component::Component {
         let runtime = Runtime::from_current().unwrap();
         let drt = DistributedRuntime::new(runtime, DistributedConfig::process_local())
@@ -1401,9 +1530,67 @@ mod tests {
             None,
             false,
             shared_cache,
+            None,
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn standalone_router_uses_context_session_affinity_as_soft_preference() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let selected_worker = WorkerWithDpRank::from_worker_id(0);
+        let router = make_test_router(
+            PreferredWorkerRecordingSelector {
+                seen: seen.clone(),
+                selected_worker,
+            },
+            None,
+        )
+        .await
+        .with_session_affinity_coordinator(
+            AffinityCoordinator::new(std::time::Duration::from_secs(300)).unwrap(),
+        );
+
+        for request_id in ["first", "second"] {
+            let mut request = dynamo_runtime::pipeline::Context::with_id_and_metadata(
+                RouterRequest::default(),
+                request_id.to_string(),
+                Default::default(),
+            );
+            request.insert_metadata(SESSION_AFFINITY_CONTEXT_KEY, "shared-session");
+            router.generate(request).await.unwrap();
+            assert!(router.affinity_leases.contains_key(request_id));
+            router.free(request_id).await.unwrap();
+            assert!(!router.affinity_leases.contains_key(request_id));
+        }
+
+        assert_eq!(*seen.lock().unwrap(), vec![None, Some(selected_worker)]);
+        assert_eq!(
+            router
+                .affinity_metrics
+                .worker_selection_requests_total
+                .get(),
+            2
+        );
+        assert_eq!(
+            router
+                .affinity_metrics
+                .session_affinity_requests_total
+                .get(),
+            2
+        );
+        assert_eq!(
+            router.affinity_metrics.session_affinity_matches_total.get(),
+            1
+        );
+        assert_eq!(
+            router
+                .affinity_metrics
+                .session_affinity_preferred_worker_selected_total
+                .get(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1541,6 +1728,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 RoutingConstraints::default(),
             )
             .await
@@ -1591,6 +1779,7 @@ mod tests {
                 0.0,
                 0,
                 false,
+                None,
                 None,
                 None,
                 None,

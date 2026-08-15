@@ -120,6 +120,7 @@ impl B10Scorer {
             lora_name: request.lora_name.clone(),
             expected_output_tokens: request.expected_output_tokens,
             pinned_worker: request.pinned_worker,
+            preferred_worker: request.preferred_worker,
             allowed_worker_ids: request.allowed_worker_ids.clone(),
             routing_constraints: request.routing_constraints.clone(),
             router_config_override: request.router_config_override.clone(),

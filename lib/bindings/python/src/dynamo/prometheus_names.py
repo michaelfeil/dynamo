@@ -329,6 +329,16 @@ class router:
 
     # Total number of requests processed by the router
     REQUESTS_TOTAL = "router_requests_total"
+    # Total number of standalone KV router worker-selection requests
+    WORKER_SELECTION_REQUESTS_TOTAL = "router_worker_selection_requests_total"
+    # Total number of standalone KV router requests carrying a session-affinity ID
+    SESSION_AFFINITY_REQUESTS_TOTAL = "router_session_affinity_requests_total"
+    # Total number of session-affinity IDs that resolved to an existing worker preference
+    SESSION_AFFINITY_MATCHES_TOTAL = "router_session_affinity_matches_total"
+    # Total number of affinity matches ultimately routed to their preferred worker and DP rank
+    SESSION_AFFINITY_PREFERRED_WORKER_SELECTED_TOTAL = (
+        "router_session_affinity_preferred_worker_selected_total"
+    )
     # Total number of remote indexer overlap queries that failed
     REMOTE_INDEXER_QUERY_FAILURES_TOTAL = "router_remote_indexer_query_failures_total"
     # Total number of remote indexer routing-decision writes that failed

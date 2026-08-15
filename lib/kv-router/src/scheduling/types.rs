@@ -113,6 +113,9 @@ pub struct SchedulingRequest {
 
     // Routing constraints and request-level config.
     pub pinned_worker: Option<WorkerWithDpRank>,
+    /// A worker preferred by session affinity. Unlike `pinned_worker`, this is
+    /// ignored when the worker is unavailable, overloaded, or otherwise ineligible.
+    pub preferred_worker: Option<WorkerWithDpRank>,
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
     pub routing_constraints: RoutingConstraints,
     pub router_config_override: Option<RouterConfigOverride>,

@@ -760,6 +760,7 @@ impl ModelManager {
             model_name,
             is_eagle,
             shared_cache,
+            None,
         )
         .await?;
         Ok(Arc::new(chooser))

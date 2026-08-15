@@ -381,6 +381,7 @@ impl PrefillRouter {
                         do_not_queue,
                         None,
                         None,
+                        None,
                         allowed_worker_ids,
                         routing_constraints,
                     )

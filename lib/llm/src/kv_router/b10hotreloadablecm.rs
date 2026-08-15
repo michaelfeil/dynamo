@@ -65,6 +65,8 @@ struct B10RoutingConfigOverride {
     router_active_replicas: Option<usize>,
     router_cache_miss_weight: Option<f64>,
     router_cache_miss_min_isl: Option<usize>,
+    #[serde(alias = "router_session_affinity_discount")]
+    router_session_affinity_score_multiplier: Option<f64>,
     router_residency_eviction_cost: Option<f64>,
     router_residency_half_life: Option<f64>,
     router_queue_threshold: Option<Option<f64>>,
@@ -114,6 +116,14 @@ pub struct B10RoutingConfig {
 
     #[serde(default = "default_router_cache_miss_min_isl")]
     pub router_cache_miss_min_isl: usize,
+
+    /// Multiplier applied to the score when a worker is an affinity cache hit.
+    /// Lower values prefer the matched worker more strongly; 1.0 disables affinity weighting.
+    #[serde(
+        default = "default_router_session_affinity_score_multiplier",
+        alias = "router_session_affinity_discount"
+    )]
+    pub router_session_affinity_score_multiplier: f64,
 
     #[serde(default = "default_router_residency_eviction_cost")]
     pub router_residency_eviction_cost: f64,
@@ -173,6 +183,9 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_cache_miss_min_isl {
             self.router_cache_miss_min_isl = value;
         }
+        if let Some(value) = overrides.router_session_affinity_score_multiplier {
+            self.router_session_affinity_score_multiplier = value;
+        }
         if let Some(value) = overrides.router_residency_eviction_cost {
             self.router_residency_eviction_cost = value;
         }
@@ -207,6 +220,8 @@ impl Default for B10RoutingConfig {
             router_active_replicas: default_router_active_replicas(),
             router_cache_miss_weight: default_router_cache_miss_weight(),
             router_cache_miss_min_isl: default_router_cache_miss_min_isl(),
+            router_session_affinity_score_multiplier:
+                default_router_session_affinity_score_multiplier(),
             router_residency_eviction_cost: default_router_residency_eviction_cost(),
             router_residency_half_life: default_router_residency_half_life(),
             router_queue_threshold: None,
@@ -310,6 +325,14 @@ fn default_router_cache_miss_min_isl() -> usize {
         .and_then(|s| s.parse().ok())
         // a new worker coming up does not have the system prompt. If a isl is only 512 tokens, its around system prompt.
         .unwrap_or(4096)
+}
+
+fn default_router_session_affinity_score_multiplier() -> f64 {
+    std::env::var("B10_KV_ROUTER_SESSION_AFFINITY_SCORE_MULTIPLIER")
+        .or_else(|_| std::env::var("B10_KV_ROUTER_SESSION_AFFINITY_DISCOUNT"))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.5)
 }
 
 fn default_router_residency_eviction_cost() -> f64 {
@@ -652,10 +675,13 @@ impl HotReloadableConfig {
 
         if log_no_changes() {
             tracing::info!(
-                "Loaded config from {:?}: prefill_discount={}, decode_discount={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}, engine_metrics_total_kv_blocks_override={:?}, router_queue_threshold_decode_tokens={:?}",
+                "Loaded config from {:?}: prefill_discount={}, decode_discount={}, session_affinity_score_multiplier={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}, engine_metrics_total_kv_blocks_override={:?}, router_queue_threshold_decode_tokens={:?}",
                 path,
                 unified_config.routing.router_prefill_token_discount,
                 unified_config.routing.router_decode_token_discount,
+                unified_config
+                    .routing
+                    .router_session_affinity_score_multiplier,
                 unified_config.routing.router_temperature,
                 unified_config.routing.router_active_request_dp_blend,
                 unified_config.routing.router_residency_eviction_cost,
@@ -832,6 +858,12 @@ mod tests {
         assert_eq!(unified_config.routing.router_prefill_token_discount, 0.35);
         assert_eq!(unified_config.routing.router_decode_token_discount, 0.8);
         assert_eq!(
+            unified_config
+                .routing
+                .router_session_affinity_score_multiplier,
+            0.5
+        );
+        assert_eq!(
             unified_config.routing.router_active_request_dp_blend,
             2.0 / 3.0
         );
@@ -860,6 +892,7 @@ b10_routing_config:
   router_temperature: 0.15
   router_overlap_score_weight: 3.5
   router_active_request_dp_blend: 0.2
+  router_session_affinity_score_multiplier: 0.4
   router_queue_threshold: 0.25
   router_active_replicas: 2
 tensor_parallel_size: 8
@@ -873,6 +906,7 @@ override_args:
       router_temperature: 0.99
       router_overlap_score_weight: 1.0
       router_active_request_dp_blend: 0.75
+      router_session_affinity_discount: 0.25
       router_queue_threshold: 0
       router_active_replicas: 3
 "#;
@@ -891,6 +925,10 @@ override_args:
         assert_eq!(config.routing.router_temperature, 0.99);
         assert_eq!(config.routing.router_overlap_score_weight, 1.0);
         assert_eq!(config.routing.router_active_request_dp_blend, 0.75);
+        assert_eq!(
+            config.routing.router_session_affinity_score_multiplier,
+            0.25
+        );
         assert_eq!(config.routing.router_queue_threshold, Some(0.0));
         assert_eq!(config.router_active_replicas, 3);
         // Check runtime config and computed data_parallel_size

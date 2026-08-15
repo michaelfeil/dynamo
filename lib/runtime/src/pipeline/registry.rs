@@ -63,15 +63,23 @@ impl Registry {
 
     /// Retrieve a shared object from the registry by key and type.
     pub fn get_shared<V: Send + Sync + 'static>(&self, key: &str) -> Result<Arc<V>, String> {
-        match self.shared_storage.get(key) {
-            Some(boxed) => boxed.clone().downcast::<V>().map_err(|_| {
-                format!(
-                    "Failed to downcast to the requested type for shared key: {}",
-                    key
-                )
-            }),
-            None => Err(format!("Shared key not found: {}", key)),
-        }
+        self.get_shared_optional(key)?
+            .ok_or_else(|| format!("Shared key not found: {}", key))
+    }
+
+    pub fn get_shared_optional<V: Send + Sync + 'static>(
+        &self,
+        key: &str,
+    ) -> Result<Option<Arc<V>>, String> {
+        let Some(boxed) = self.shared_storage.get(key) else {
+            return Ok(None);
+        };
+        boxed.clone().downcast::<V>().map(Some).map_err(|_| {
+            format!(
+                "Failed to downcast to the requested type for shared key: {}",
+                key
+            )
+        })
     }
 
     /// Check if a unique object exists in the registry by key.

@@ -326,6 +326,9 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         let decode_block_weight = hot_reloadable_config.routing.router_decode_block_weight;
         let cache_miss_weight = hot_reloadable_config.routing.router_cache_miss_weight;
         let cache_miss_min_isl = hot_reloadable_config.routing.router_cache_miss_min_isl;
+        let session_affinity_score_multiplier = hot_reloadable_config
+            .routing
+            .router_session_affinity_score_multiplier;
         let active_request_weight = hot_reloadable_config.routing.router_active_request_weight;
         let active_request_dp_blend = hot_reloadable_config.routing.router_active_request_dp_blend;
         let residency_eviction_cost_weight =
@@ -425,15 +428,22 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                 .routing_constraints
                 .preferred_taint_multiplier(config.taints())
                 .unwrap_or(1.0);
-            let weighted_logit = (score.logit + 1.0) * preferred_taint_multiplier;
+            let session_affinity_multiplier = if request.preferred_worker == Some(worker) {
+                session_affinity_score_multiplier
+            } else {
+                1.0
+            };
+            let weighted_logit =
+                (score.logit + 1.0) * preferred_taint_multiplier * session_affinity_multiplier;
             if verbose {
                 tracing::info!(
-                    "worker_id={} dp={:?} logit={:.3} (base={:.3} * ptm={:.3}) | ow={:.2}*ppf={:.2} + dbw={:.2}*db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
+                    "worker_id={} dp={:?} logit={:.3} (base={:.3} * ptm={:.3} * affinity={:.3}) | ow={:.2}*ppf={:.2} + dbw={:.2}*db={:.2} + arw={:.2}*ar={:.2}(dpb={:.2}) + cmw={:.2}*cm={} + rec={:.3} + islp={:.3}",
                     worker.worker_id,
                     worker.dp_rank,
                     weighted_logit,
                     score.logit,
                     preferred_taint_multiplier,
+                    session_affinity_multiplier,
                     overlap_weight,
                     score.potential_prefill_block,
                     score.decode_block_weight,
@@ -521,6 +531,7 @@ mod tests {
             do_not_queue: false,
             expected_output_tokens: None,
             pinned_worker: None,
+            preferred_worker: None,
             allowed_worker_ids: None,
             routing_constraints: dynamo_kv_router::protocols::RoutingConstraints::default(),
             shared_cache_hits: None,
@@ -715,6 +726,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.worker, WorkerWithDpRank::new(20, 0));
+    }
+
+    #[test]
+    fn session_affinity_halves_score_for_exact_worker_and_dp_rank() {
+        let selector = B10WorkerSelector::new();
+        let worker_rank_0 = WorkerWithDpRank::new(10, 0);
+        let worker_rank_1 = WorkerWithDpRank::new(10, 1);
+        let workers = HashMap::from([(10, test_worker_config(0, 2))]);
+        let mut request = base_request(128);
+        request.router_config_override = Some(RouterConfigOverride {
+            prefill_load_scale: Some(1.0),
+            router_temperature: Some(0.0),
+            ..Default::default()
+        });
+        request.prefill_tokens.insert(worker_rank_0, 640);
+        request.prefill_tokens.insert(worker_rank_1, 384);
+        request.preferred_worker = Some(worker_rank_0);
+
+        let result = selector
+            .select_worker(&workers, &request, request.eligibility(), 64)
+            .unwrap();
+
+        assert_eq!(result.worker, worker_rank_0);
     }
 
     #[test]

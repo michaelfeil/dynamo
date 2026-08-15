@@ -559,6 +559,27 @@ the production policy where it is already wired through B10.
 
 v1.2 implementation note:
 
+This branch implements only the session-affinity subset needed by the standalone
+Baseten B10 router: header-based affinity through `X-Dynamo-Session-ID`,
+synchronization between router replicas, and soft affinity scoring in B10.
+Generic push and prefill routers are unchanged. The existing body-level
+`nvext.session_control` implementation is not part of this port and remains
+unchanged. The subset is ported where the upstream code applies cleanly and
+reimplemented where the v1.2 architecture differs, based on these three PRs:
+[header-based session affinity #10875](https://github.com/ai-dynamo/dynamo/pull/10875),
+[session-affinity replica synchronization #11750](https://github.com/ai-dynamo/dynamo/pull/11750),
+and [soft session-affinity preference #12804](https://github.com/ai-dynamo/dynamo/pull/12804).
+The resulting interface is opt-in for standalone Python router consumers through
+`start_router(router_config=RouterConfig(..., session_affinity_ttl_secs=...))`;
+omitting the TTL disables affinity. The TTL remains owned by the outer
+`RouterConfig`, matching upstream.
+When enabled, the exact affinity `(worker_id, dp_rank)` receives a `0.5` B10
+score multiplier while remaining subject to normal eligibility and overload
+checks.
+There is no hard/soft mode flag in this backport: setting the TTL enables soft
+header-based affinity, while omitting it disables the feature. A later Dynamo
+version may provide a superset of this interface without changing that behavior.
+
 Followed v1.1 for `router_queue_threshold` hot reload, adapted to the target's
 new actor-based router queue instead of copying the old `RwLock` queue shape.
 The B10 config map now accepts root and override-group `router_queue_threshold`

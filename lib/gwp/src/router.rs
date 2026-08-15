@@ -465,6 +465,7 @@ impl GwpRouter {
             None,
             false,
             None,
+            None,
         )
         .await?;
 
@@ -613,6 +614,7 @@ impl GwpRouter {
                 0.0,
                 0,
                 false,
+                None,
                 None,
                 None,
                 allowed_worker_ids,

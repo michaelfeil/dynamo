@@ -100,6 +100,8 @@ pub struct RouterConfig {
     /// Load threshold configuration for overload detection
     pub load_threshold_config: LoadThresholdConfig,
     pub enforce_disagg: bool,
+    #[serde(default)]
+    pub session_affinity_ttl_secs: Option<u64>,
 }
 
 impl RouterConfig {
@@ -110,6 +112,7 @@ impl RouterConfig {
             router_selector: RouterSelector::Default,
             load_threshold_config: LoadThresholdConfig::default(),
             enforce_disagg: false,
+            session_affinity_ttl_secs: None,
         }
     }
 
@@ -125,6 +128,11 @@ impl RouterConfig {
 
     pub fn with_router_selector(mut self, selector: RouterSelector) -> Self {
         self.router_selector = selector;
+        self
+    }
+
+    pub fn with_session_affinity_ttl_secs(mut self, ttl_secs: u64) -> Self {
+        self.session_affinity_ttl_secs = Some(ttl_secs);
         self
     }
 }

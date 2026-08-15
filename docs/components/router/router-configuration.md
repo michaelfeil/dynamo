@@ -101,14 +101,39 @@ Do not combine this setting with `--no-router-kv-events`, including when the app
 To implement KV event publishing for custom inference engines, see [KV Event Publishing for Custom Engines](../../integrations/kv-events-custom-engines.md).
 For details on per-request agent hints (`priority`, `osl`, `speculative_prefill`), see [NVIDIA Request Extensions (`nvext`)](../frontend/nvext.md#agent-hints).
 
-### Session Control and Sticky Routing
+### Header-Based Session Affinity
 
-When a request carries `nvext.session_control`, the KV router can activate two session-related components:
+Header-based session affinity is opt-in through the standalone Python B10
+router's `RouterConfig(..., session_affinity_ttl_secs=...)` setting. Send the
+same `X-Dynamo-Session-ID` header on each request; omitting the TTL disables
+affinity. The router records the first selected `(worker_id, dp_rank)`, refreshes
+its idle TTL, and synchronizes the binding between router replicas over the event
+plane. Replica updates are best effort and are accepted only when the referenced
+worker is visible to the receiving replica.
 
-- **StickySessionRouter**: Maintains an in-memory `session_id -> (worker_id, dp_rank)` affinity map with sliding-window TTL. `action: "bind"` creates router-only affinity without backend engine RPCs. Subsequent requests with the same `session_id` are routed to the pinned worker/rank, bypassing KV overlap scoring.
+In the standalone Baseten B10 router, the binding is a soft preference: the B10
+selector applies a `0.5` score multiplier to the exact bound worker/rank, while
+normal eligibility, overload, and routing constraints remain authoritative. If
+another worker wins, the stale binding is invalidated and a later request may
+establish a new one. Generic push and prefill routers are unaffected.
+
+This implementation follows upstream [header-based session affinity
+#10875](https://github.com/ai-dynamo/dynamo/pull/10875), [replica synchronization
+#11750](https://github.com/ai-dynamo/dynamo/pull/11750), and [soft affinity
+#12804](https://github.com/ai-dynamo/dynamo/pull/12804). This backport is an
+intentional subset: it requires the explicit `X-Dynamo-Session-ID` header and
+does not expose the upstream hard/soft mode switch.
+
+The existing v1.2 `nvext.session_control` implementation is not part of this
+backport and remains unchanged. It separately provides:
+
+- **StickySessionRouter**: Maintains an in-memory `session_id -> (worker_id, dp_rank)` affinity map with the request's session timeout. `action: "bind"` creates router-only affinity without backend engine RPCs.
 - **AgentController**: Sends session lifecycle RPCs (`open_session`, `close_session`) to the worker's `session_control` endpoint when `action` is `"open"` or `"close"`. The event-plane client is lazily initialized on the first lifecycle request.
 
-These activate automatically with `--router-mode kv` -- no additional flags are needed. Requests without `session_control` are unaffected and follow the standard KV-aware routing path. Router-only sticky routing only requires `action: "bind"`; engine-backed session lifecycle currently requires the SGLang backend with `--enable-streaming-session`. See [SGLang for Agentic Workloads -- Session Control](../../backends/sglang/agents.md#session-control-for-subagent-kv-isolation-experimental) for details.
+Requests without either `X-Dynamo-Session-ID` or `session_control` are unaffected.
+Engine-backed session lifecycle currently requires the SGLang backend with
+`--enable-streaming-session`. See [SGLang for Agentic Workloads -- Session
+Control](../../backends/sglang/agents.md#session-control-for-subagent-kv-isolation-experimental).
 
 ## Tuning Guidelines
 

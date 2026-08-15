@@ -46,9 +46,13 @@ use super::{
 };
 use crate::engines::ValidateRequest;
 use crate::http::service::baseten::{
-    attach_worker_response_headers, take_worker_response_metadata,
+    attach_worker_response_headers, baseten_session_affinity_from_request,
+    take_worker_response_metadata,
 };
 use crate::preprocessor::PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY;
+use crate::protocols::common::extensions::{
+    SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, insert_session_affinity,
+};
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::nvext::apply_header_routing_overrides;
 use crate::protocols::openai::{
@@ -419,10 +423,24 @@ fn context_from_headers<T: Send + Sync + 'static>(
     context_id: String,
     headers: &HeaderMap,
 ) -> Result<Context<T>, ErrorResponse> {
+    context_from_headers_with_body_session(request, context_id, headers, None)
+}
+
+fn context_from_headers_with_body_session<T: Send + Sync + 'static>(
+    request: T,
+    context_id: String,
+    headers: &HeaderMap,
+    body_session_id: Option<String>,
+) -> Result<Context<T>, ErrorResponse> {
     let metadata = extract_metadata_from_http(headers)
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
     let mut request = Context::with_id_and_metadata(request, context_id, metadata);
     attach_x_request_id(&mut request, headers);
+    if let Some(session_id) =
+        baseten_session_affinity_from_request(headers, body_session_id.as_deref())
+    {
+        insert_session_affinity(&mut request, session_id);
+    }
     Ok(request)
 }
 
@@ -430,6 +448,13 @@ fn copy_x_request_id<T: Send + Sync + 'static, U: Send + Sync + 'static>(
     source: &Context<T>,
     target: &mut Context<U>,
 ) {
+    if let Ok(session_affinity) = source.get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY) {
+        target.insert(
+            SESSION_AFFINITY_CONTEXT_KEY,
+            session_affinity.as_ref().clone(),
+        );
+    }
+
     if !crate::agents::trace::is_enabled() {
         return;
     }
@@ -500,7 +525,8 @@ async fn handler_completions(
         endpoint: Endpoint::Completions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, context_id, &headers)?;
+    let user = request.inner.user.clone();
+    let request = context_from_headers_with_body_session(request, context_id, &headers, user)?;
     let context = request.context();
 
     // create the connection handles
@@ -1087,7 +1113,8 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, context_id, &headers)?;
+    let user = request.inner.user.clone();
+    let request = context_from_headers_with_body_session(request, context_id, &headers, user)?;
     let context = request.context();
 
     // create the connection handles

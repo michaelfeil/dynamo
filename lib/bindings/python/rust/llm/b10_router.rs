@@ -20,19 +20,19 @@
 //! production deployments only use `B10`, and upstream's selector trait
 //! handles DP fan-out internally.
 
+use anyhow::Result;
+use pyo3::prelude::*;
+use rand::Rng;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::Result;
-use pyo3::prelude::*;
-use rand::Rng;
-
 use dynamo_kv_router::config::KvRouterConfig;
 use dynamo_kv_router::indexer::KvIndexerMetrics;
 use dynamo_kv_router::selector::WorkerSelector;
 use dynamo_llm::b10_health::{register_runtime_cancel_token, set_health};
+use dynamo_llm::entrypoint::{RouterConfig as RsRouterConfig, RouterSelector as RsRouterSelector};
 use dynamo_llm::kv_router::{
     KvRouter,
     b10_worker_selector::B10WorkerSelector,
@@ -46,16 +46,68 @@ use dynamo_runtime::{
     component::Component,
     config::{self, environment_names::logging::otlp as env_otlp},
     metrics::MetricsHierarchy,
+    pipeline::RouterMode,
     pipeline::network::Ingress,
 };
 
-use super::entrypoint::KvRouterConfig as PyKvRouterConfig;
+use super::entrypoint::{KvRouterConfig as PyKvRouterConfig, RouterConfig as PyRouterConfig};
 
 const MAX_WAIT_SECONDS: u64 = 10 * 365 * 24 * 3600; // 10 years
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AlgoSelector {
     Default,
     B10,
+}
+
+struct ResolvedRouterConfig {
+    kv_router_config: KvRouterConfig,
+    algo_selector: AlgoSelector,
+    session_affinity_ttl_secs: Option<u64>,
+}
+
+fn resolve_router_config(
+    router_config: Option<RsRouterConfig>,
+    legacy_kv_router_config: Option<KvRouterConfig>,
+    legacy_algo_selector: &str,
+) -> Result<ResolvedRouterConfig, String> {
+    if let Some(router_config) = router_config {
+        if router_config.router_mode != RouterMode::KV {
+            return Err("start_router router_config.mode must be RouterMode.KV".to_string());
+        }
+        let algo_selector = match router_config.router_selector {
+            RsRouterSelector::Default => AlgoSelector::Default,
+            RsRouterSelector::B10 => AlgoSelector::B10,
+            RsRouterSelector::Custom(_) => {
+                return Err(
+                    "start_router router_config does not support the Python selector".to_string(),
+                );
+            }
+        };
+        if router_config.session_affinity_ttl_secs.is_some() && algo_selector != AlgoSelector::B10 {
+            return Err("start_router session affinity requires the B10 selector".to_string());
+        }
+        return Ok(ResolvedRouterConfig {
+            kv_router_config: router_config.kv_router_config,
+            algo_selector,
+            session_affinity_ttl_secs: router_config.session_affinity_ttl_secs,
+        });
+    }
+
+    let algo_selector = match legacy_algo_selector {
+        "Default" => AlgoSelector::Default,
+        "B10" => AlgoSelector::B10,
+        other => {
+            return Err(format!(
+                "Invalid algo_selector: {other} (expected 'Default' or 'B10')"
+            ));
+        }
+    };
+    Ok(ResolvedRouterConfig {
+        kv_router_config: legacy_kv_router_config.unwrap_or_default(),
+        algo_selector,
+        session_affinity_ttl_secs: None,
+    })
 }
 
 struct Args {
@@ -68,6 +120,7 @@ struct Args {
     kv_router_config: KvRouterConfig,
     kv_router_metrics_port: u16,
     algo_selector: AlgoSelector,
+    session_affinity_ttl_secs: Option<u64>,
 }
 
 /// Simple HTTP server for serving /metrics for a component.
@@ -245,6 +298,12 @@ where
             None,
             false,
             None,
+            Some(&component_router),
+        )
+        .await?
+        .with_session_affinity_ttl(
+            args.session_affinity_ttl_secs
+                .map(std::time::Duration::from_secs),
         )
         .await?,
     );
@@ -417,6 +476,7 @@ async fn get_active_components(component: &Component) -> Option<usize> {
     kv_router_config=None,
     kv_router_metrics_port=9091,
     algo_selector="B10".to_string(),
+    router_config=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn start_router(
@@ -430,6 +490,7 @@ pub fn start_router(
     kv_router_config: Option<PyKvRouterConfig>,
     kv_router_metrics_port: u16,
     algo_selector: String,
+    router_config: Option<PyRouterConfig>,
 ) -> PyResult<()> {
     if max_active_routers.is_some() {
         let warning = "start_router(max_active_routers=...) is deprecated and has no effect; set router_active_replicas in the router config map instead";
@@ -438,20 +499,12 @@ pub fn start_router(
     }
 
     py.allow_threads(|| {
-        let kv_router_config = kv_router_config
-            .map(|config| config.inner())
-            .unwrap_or_default();
-
-        let algo_selector = match algo_selector.as_str() {
-            "Default" => AlgoSelector::Default,
-            "B10" => AlgoSelector::B10,
-            other => {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Invalid algo_selector: {} (expected 'Default' or 'B10')",
-                    other
-                )));
-            }
-        };
+        let resolved = resolve_router_config(
+            router_config.map(Into::into),
+            kv_router_config.map(|config| config.inner()),
+            &algo_selector,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
         let args = Args {
             namespace,
@@ -459,9 +512,10 @@ pub fn start_router(
             router_component_name,
             block_size,
             max_wait_seconds,
-            kv_router_config,
+            kv_router_config: resolved.kv_router_config,
             kv_router_metrics_port,
-            algo_selector,
+            algo_selector: resolved.algo_selector,
+            session_affinity_ttl_secs: resolved.session_affinity_ttl_secs,
         };
 
         set_log_no_changes(true);
@@ -496,4 +550,44 @@ pub fn start_router(
             .execute(move |rt| async move { app(rt, args).await })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outer_router_config_supplies_standalone_affinity_ttl() {
+        let router_config = RsRouterConfig::new(RouterMode::KV, KvRouterConfig::default())
+            .with_router_selector(RsRouterSelector::B10)
+            .with_session_affinity_ttl_secs(300);
+
+        let resolved = resolve_router_config(Some(router_config), None, "Default").unwrap();
+
+        assert_eq!(resolved.algo_selector, AlgoSelector::B10);
+        assert_eq!(resolved.session_affinity_ttl_secs, Some(300));
+    }
+
+    #[test]
+    fn legacy_start_router_arguments_leave_affinity_disabled() {
+        let resolved = resolve_router_config(None, None, "B10").unwrap();
+
+        assert_eq!(resolved.algo_selector, AlgoSelector::B10);
+        assert_eq!(resolved.session_affinity_ttl_secs, None);
+    }
+
+    #[test]
+    fn standalone_affinity_rejects_non_b10_selector() {
+        let router_config = RsRouterConfig::new(RouterMode::KV, KvRouterConfig::default())
+            .with_session_affinity_ttl_secs(300);
+
+        let error = resolve_router_config(Some(router_config), None, "B10")
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error,
+            "start_router session affinity requires the B10 selector"
+        );
+    }
 }
