@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use dynamo_protocols::types::responses::{
     AssistantRole, FunctionCallOutput, FunctionToolCall, IncludeEnum, IncompleteDetails,
     InputContent, InputItem, InputOutputMessageContent, InputParam, InputRole, InputTokenDetails,
-    Instructions, Item, MessageItem, OutputItem, OutputMessage, OutputMessageContent, OutputStatus,
-    OutputTextContent, OutputTokenDetails, PromptCacheRetention, Reasoning, ReasoningItem,
-    Response, ResponseTextParam, ResponseUsage, Role as ResponseRole, ServiceTier, Status,
-    SummaryPart, SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions,
-    ToolChoiceParam, Truncation,
+    Instructions, Item, MessageItem, NamespaceToolParamTool, OutputItem, OutputMessage,
+    OutputMessageContent, OutputStatus, OutputTextContent, OutputTokenDetails,
+    PromptCacheRetention, Reasoning, ReasoningItem, Response, ResponseTextParam, ResponseUsage,
+    Role as ResponseRole, ServiceTier, Status, SummaryPart, SummaryTextContent,
+    TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam, Truncation,
 };
 use dynamo_protocols::types::{
     ChatCompletionMessageToolCall, ChatCompletionNamedToolChoice,
@@ -493,11 +493,19 @@ fn convert_input_items_to_messages(
                     }
                 },
                 Item::FunctionCall(fc) => {
+                    // Replayed namespaced calls render under the same mangled
+                    // name the tool was declared with across the chat bridge,
+                    // so the model sees its history named consistently with
+                    // the tool list.
+                    let name = match fc.namespace.as_deref() {
+                        Some(namespace) => namespaced_chat_tool_name(namespace, &fc.name),
+                        None => fc.name.clone(),
+                    };
                     pending.push_tool_call(ChatCompletionMessageToolCall {
                         id: fc.call_id.clone(),
                         r#type: FunctionType::Function,
                         function: dynamo_protocols::types::FunctionCall {
-                            name: fc.name.clone(),
+                            name,
                             arguments: fc.arguments.clone(),
                         },
                     });
@@ -615,22 +623,93 @@ fn convert_input_items_to_messages(
 }
 
 /// Convert Responses API Tool to ChatCompletionTool.
+///
+/// Namespace groups (`{"type": "namespace"}`, sent by clients like codex for
+/// MCP/app tool groupings) are flattened into their member function tools
+/// under `{namespace}__{name}` — the chat-completions bridge has no
+/// namespace concept, and names may overlap between groups, so members get
+/// collision-proof flat names and `resolve_tool_identity` maps emitted calls
+/// back to the wire (name, namespace) pair.
 fn convert_tools(tools: &[Tool]) -> Vec<ChatCompletionTool> {
+    fn function_tool(
+        name: &str,
+        description: Option<&str>,
+        parameters: Option<&serde_json::Value>,
+        strict: Option<bool>,
+    ) -> ChatCompletionTool {
+        ChatCompletionTool {
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionObject {
+                name: name.to_string(),
+                description: description.map(str::to_string),
+                parameters: parameters.cloned(),
+                strict,
+            },
+        }
+    }
+
     tools
         .iter()
-        .filter_map(|tool| match tool {
-            Tool::Function(f) => Some(ChatCompletionTool {
-                r#type: ChatCompletionToolType::Function,
-                function: FunctionObject {
-                    name: f.name.clone(),
-                    description: f.description.clone(),
-                    parameters: f.parameters.clone(),
-                    strict: f.strict,
-                },
-            }),
-            _ => None, // Only function tools are forwarded to chat completions
+        .flat_map(|tool| match tool {
+            Tool::Function(f) => vec![function_tool(
+                &f.name,
+                f.description.as_deref(),
+                f.parameters.as_ref(),
+                f.strict,
+            )],
+            Tool::Namespace(ns) => ns
+                .tools
+                .iter()
+                .filter_map(|member| match member {
+                    NamespaceToolParamTool::Function(f) => Some(function_tool(
+                        &namespaced_chat_tool_name(&ns.name, &f.name),
+                        f.description.as_deref(),
+                        f.parameters.as_ref(),
+                        f.strict,
+                    )),
+                    // Freeform/grammar custom tools cannot cross the chat
+                    // bridge (no constrained-decoding contract for them).
+                    NamespaceToolParamTool::Custom(_) => None,
+                })
+                .collect(),
+            _ => vec![], // Other hosted tool kinds are not forwarded to chat completions
         })
         .collect()
+}
+
+/// The flat name a namespaced tool is declared under across the chat bridge.
+///
+/// Namespaces exist so tool names can overlap between groups; a bare-name
+/// flattening would collide. The worker/model sees `{namespace}__{name}` and
+/// `resolve_tool_identity` maps emitted calls back to the wire pair.
+fn namespaced_chat_tool_name(namespace: &str, name: &str) -> String {
+    format!("{namespace}__{name}")
+}
+
+/// Map a model-emitted (chat-bridge) tool name back to the wire identity —
+/// `(name, namespace)` — using the request's declared tools. Codex dispatches
+/// tool calls on the exact (name, namespace) pair with no fallback, so
+/// emitted function_call items must echo the declaring group's namespace and
+/// the member's original name. Exact-match lookup against the declarations;
+/// no string parsing, so member names containing `__` stay unambiguous.
+pub(super) fn resolve_tool_identity(
+    tools: Option<&[Tool]>,
+    chat_name: &str,
+) -> (String, Option<String>) {
+    for tool in tools.unwrap_or_default() {
+        if let Tool::Namespace(ns) = tool {
+            for member in &ns.tools {
+                let member_name = match member {
+                    NamespaceToolParamTool::Function(f) => &f.name,
+                    NamespaceToolParamTool::Custom(c) => &c.name,
+                };
+                if chat_name == namespaced_chat_tool_name(&ns.name, member_name) {
+                    return (member_name.clone(), Some(ns.name.clone()));
+                }
+            }
+        }
+    }
+    (chat_name.to_string(), None)
 }
 
 /// Convert Responses API ToolChoiceParam to ChatCompletionToolChoiceOption.
@@ -728,8 +807,22 @@ impl TryFrom<NvCreateResponse> for NvCreateChatCompletionRequest {
             .map(|t| convert_tools(t))
             .filter(|t: &Vec<_>| !t.is_empty());
 
-        // Convert tool_choice if present
-        let tool_choice = resp.inner.tool_choice.as_ref().map(convert_tool_choice);
+        // Convert tool_choice if present. Without surviving tools (hosted
+        // tool kinds are filtered; codex also sends tool_choice with an
+        // empty tools list on auxiliary turns like auto-compaction) a
+        // forwarded tool_choice trips the worker's "When using tool_choice,
+        // tools must be set" rejection — killing a long codex session at
+        // the moment it tries to compact. Drop it instead.
+        let tool_choice = if tools.is_some() {
+            resp.inner.tool_choice.as_ref().map(convert_tool_choice)
+        } else {
+            if resp.inner.tool_choice.is_some() {
+                tracing::debug!(
+                    "Dropping tool_choice: no declared tool survived conversion to chat completions"
+                );
+            }
+            None
+        };
 
         // Determine stream setting: respect caller's preference, default to true for aggregation
         let stream = resp.inner.stream.or(Some(true));
@@ -939,11 +1032,11 @@ fn make_text_message(id: String, text: String) -> OutputItem {
 }
 
 /// Build a function call output item with generated IDs.
-fn make_function_call(name: String, arguments: String) -> OutputItem {
+fn make_function_call(name: String, arguments: String, namespace: Option<String>) -> OutputItem {
     OutputItem::FunctionCall(FunctionToolCall {
         arguments,
         call_id: format!("call_{}", Uuid::new_v4().simple()),
-        namespace: None,
+        namespace,
         name,
         id: Some(format!("fc_{}", Uuid::new_v4().simple())),
         status: Some(OutputStatus::Completed),
@@ -973,11 +1066,13 @@ pub fn chat_completion_to_response(
         // Handle structured tool calls
         if let Some(tool_calls) = choice.message.tool_calls {
             for tc in &tool_calls {
+                let (name, namespace) =
+                    resolve_tool_identity(params.tools.as_deref(), &tc.function.name);
                 output.push(OutputItem::FunctionCall(FunctionToolCall {
                     arguments: tc.function.arguments.clone(),
                     call_id: tc.id.clone(),
-                    namespace: None,
-                    name: tc.function.name.clone(),
+                    namespace,
+                    name,
                     id: Some(format!("fc_{}", Uuid::new_v4().simple())),
                     status: Some(OutputStatus::Completed),
                 }));
@@ -1018,7 +1113,8 @@ pub fn chat_completion_to_response(
             let parsed_calls = parse_tool_call_text(&content_text);
             if !parsed_calls.is_empty() {
                 for (name, arguments) in parsed_calls {
-                    output.push(make_function_call(name, arguments));
+                    let (name, namespace) = resolve_tool_identity(params.tools.as_deref(), &name);
+                    output.push(make_function_call(name, arguments, namespace));
                 }
                 let remaining = strip_tool_call_text(&content_text);
                 if !remaining.trim().is_empty() {
@@ -1173,6 +1269,128 @@ mod tests {
 
     use super::*;
     use crate::types::openai::chat_completions::NvCreateChatCompletionResponse;
+    use dynamo_protocols::types::responses::{FunctionToolParam, NamespaceToolParam};
+
+    /// tool_choice with no surviving tools (codex sends this on auxiliary
+    /// turns like auto-compaction; hosted tool kinds are also filtered) must
+    /// be dropped — forwarding it trips the worker's "When using
+    /// tool_choice, tools must be set" rejection mid-session.
+    #[test]
+    fn tool_choice_without_surviving_tools_is_dropped() {
+        let mut resp = make_response_with_input("hello");
+        resp.inner.tool_choice = Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
+        resp.inner.tools = None;
+        let chat_req: NvCreateChatCompletionRequest = resp.try_into().unwrap();
+        assert!(chat_req.inner.tools.is_none());
+        assert!(chat_req.inner.tool_choice.is_none());
+
+        // With a surviving function tool, tool_choice is forwarded.
+        let mut resp = make_response_with_input("hello");
+        resp.inner.tool_choice = Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto));
+        resp.inner.tools = Some(vec![Tool::Function(FunctionTool {
+            name: "get_weather".into(),
+            parameters: None,
+            strict: None,
+            description: None,
+            defer_loading: None,
+        })]);
+        let chat_req: NvCreateChatCompletionRequest = resp.try_into().unwrap();
+        assert!(chat_req.inner.tools.is_some());
+        assert!(matches!(
+            chat_req.inner.tool_choice,
+            Some(ChatCompletionToolChoiceOption::Auto)
+        ));
+    }
+
+    #[test]
+    fn namespace_tool_group_flattens_and_maps() {
+        let tools = vec![
+            Tool::Function(FunctionTool {
+                name: "shell".into(),
+                parameters: None,
+                strict: None,
+                description: None,
+                defer_loading: None,
+            }),
+            Tool::Namespace(NamespaceToolParam {
+                name: "mcp__codex_apps__gmail".into(),
+                description: "Gmail tools".into(),
+                tools: vec![NamespaceToolParamTool::Function(FunctionToolParam {
+                    name: "get_recent_emails".into(),
+                    description: Some("List recent emails".into()),
+                    ..Default::default()
+                })],
+            }),
+        ];
+
+        // The worker sees a flat function list; namespace members are mangled
+        // so names can overlap between groups.
+        let chat_tools = convert_tools(&tools);
+        let names: Vec<&str> = chat_tools
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["shell", "mcp__codex_apps__gmail__get_recent_emails"]
+        );
+
+        // Emitted calls map back to the wire (name, namespace) pair.
+        assert_eq!(
+            resolve_tool_identity(Some(&tools), "mcp__codex_apps__gmail__get_recent_emails"),
+            (
+                "get_recent_emails".to_string(),
+                Some("mcp__codex_apps__gmail".to_string())
+            )
+        );
+        assert_eq!(
+            resolve_tool_identity(Some(&tools), "shell"),
+            ("shell".to_string(), None)
+        );
+        assert_eq!(
+            resolve_tool_identity(None, "anything"),
+            ("anything".to_string(), None)
+        );
+    }
+
+    /// The point of namespaces: the same tool name in two groups must stay
+    /// two distinct, individually-callable tools.
+    #[test]
+    fn overlapping_tool_names_across_namespaces_stay_distinct() {
+        let member = |name: &str| {
+            NamespaceToolParamTool::Function(FunctionToolParam {
+                name: name.into(),
+                ..Default::default()
+            })
+        };
+        let tools = vec![
+            Tool::Namespace(NamespaceToolParam {
+                name: "gmail".into(),
+                description: "Gmail".into(),
+                tools: vec![member("search")],
+            }),
+            Tool::Namespace(NamespaceToolParam {
+                name: "drive".into(),
+                description: "Drive".into(),
+                tools: vec![member("search")],
+            }),
+        ];
+
+        let names: Vec<String> = convert_tools(&tools)
+            .into_iter()
+            .map(|t| t.function.name)
+            .collect();
+        assert_eq!(names, vec!["gmail__search", "drive__search"]);
+
+        assert_eq!(
+            resolve_tool_identity(Some(&tools), "gmail__search"),
+            ("search".to_string(), Some("gmail".to_string()))
+        );
+        assert_eq!(
+            resolve_tool_identity(Some(&tools), "drive__search"),
+            ("search".to_string(), Some("drive".to_string()))
+        );
+    }
 
     fn make_response_with_input(text: &str) -> NvCreateResponse {
         NvCreateResponse {

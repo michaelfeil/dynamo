@@ -1988,7 +1988,9 @@ async fn responses(
         // Streaming path: convert chat completion stream chunks to Responses API SSE events.
         // The engine yields Annotated<NvCreateChatCompletionStreamResponse>. We extract the
         // inner stream response data and convert it to Responses API events.
-        use crate::protocols::openai::responses::stream_converter::ResponseStreamConverter;
+        use crate::protocols::openai::responses::stream_converter::{
+            BackendError, ResponseStreamConverter,
+        };
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut converter = match responses_ctx {
@@ -2002,10 +2004,14 @@ async fn responses(
         let converter = std::sync::Arc::new(std::sync::Mutex::new(converter));
         let converter_end = converter.clone();
 
-        // Track whether the backend sent an error event during the stream.
+        // Track whether the backend sent an error event during the stream,
+        // and its detail (message + status) so the terminal event can carry
+        // it instead of a bare empty `response.failed`.
         // Shared between event_stream (writer) and done_stream (reader).
         let saw_error = std::sync::Arc::new(AtomicBool::new(false));
         let saw_error_end = saw_error.clone();
+        let backend_error = std::sync::Arc::new(std::sync::Mutex::new(None::<BackendError>));
+        let backend_error_end = backend_error.clone();
 
         let mut http_queue_guard = Some(http_queue_guard);
 
@@ -2021,12 +2027,22 @@ async fn responses(
             .filter_map(move |annotated_chunk| {
                 let converter = converter.clone();
                 let saw_error = saw_error.clone();
+                let backend_error = backend_error.clone();
                 async move {
                     // Check for backend error before extracting data.
                     // Error events have data: None and event: Some("error").
                     if annotated_chunk.data.is_none() {
                         if annotated_chunk.event.as_deref() == Some("error") {
                             saw_error.store(true, Ordering::Release);
+                            if let Some((message, status)) =
+                                extract_backend_error_if_present(&annotated_chunk)
+                            {
+                                *backend_error.lock().expect("backend error lock poisoned") =
+                                    Some(BackendError {
+                                        message,
+                                        http_status: status.as_u16(),
+                                    });
+                            }
                         }
                         return None;
                     }
@@ -2044,7 +2060,11 @@ async fn responses(
         let done_stream = stream::once(async move {
             let mut conv = converter_end.lock().expect("converter lock poisoned");
             let end_events = if saw_error_end.load(Ordering::Acquire) {
-                conv.emit_error_events()
+                let error = backend_error_end
+                    .lock()
+                    .expect("backend error lock poisoned")
+                    .take();
+                conv.emit_error_events(error)
             } else {
                 conv.emit_end_events()
             };

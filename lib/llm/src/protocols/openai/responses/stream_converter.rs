@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::response::sse::Event;
 use dynamo_protocols::types::responses::{
-    AssistantRole, FunctionToolCall, IncompleteDetails, InputTokenDetails, Instructions,
-    OutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputStatus,
+    AssistantRole, ErrorObject, FunctionToolCall, IncompleteDetails, InputTokenDetails,
+    Instructions, OutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputStatus,
     OutputTextContent, OutputTokenDetails, ReasoningItem, Response, ResponseCompletedEvent,
     ResponseContentPartAddedEvent, ResponseContentPartDoneEvent, ResponseCreatedEvent,
     ResponseFailedEvent, ResponseFunctionCallArgumentsDeltaEvent,
@@ -117,6 +117,15 @@ impl ResponseStreamConverter {
         let seq = self.sequence_number;
         self.sequence_number += 1;
         seq
+    }
+
+    /// Wire identity — (name, namespace) — for a model-emitted tool name.
+    /// Namespace members are declared to the worker under mangled
+    /// `{namespace}__{name}` flat names (names may overlap between groups);
+    /// emitted function_call items must carry the member's original name and
+    /// its group's namespace, since codex dispatches on the exact pair.
+    fn resolve_tool_identity(&self, chat_name: &str) -> (String, Option<String>) {
+        super::resolve_tool_identity(self.params.tools.as_deref(), chat_name)
     }
 
     fn make_response(&self, status: Status, output: Vec<OutputItem>) -> Response {
@@ -401,6 +410,7 @@ impl ResponseStreamConverter {
                                 let fc_name = self.function_call_items[tc_index].name.clone();
                                 let output_index = self.function_call_items[tc_index].output_index;
                                 let seq = self.next_seq();
+                                let (wire_name, namespace) = self.resolve_tool_identity(&fc_name);
                                 let item_added = ResponseStreamEvent::ResponseOutputItemAdded(
                                     ResponseOutputItemAddedEvent {
                                         sequence_number: seq,
@@ -408,8 +418,8 @@ impl ResponseStreamConverter {
                                         item: OutputItem::FunctionCall(FunctionToolCall {
                                             id: Some(item_id),
                                             call_id,
-                                            namespace: None,
-                                            name: fc_name,
+                                            namespace,
+                                            name: wire_name,
                                             arguments: String::new(),
                                             status: Some(OutputStatus::InProgress),
                                         }),
@@ -479,13 +489,14 @@ impl ResponseStreamConverter {
             fc.output_index,
         );
 
+        let (wire_name, namespace) = self.resolve_tool_identity(&fc_name);
         let args_done = ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
             ResponseFunctionCallArgumentsDoneEvent {
                 sequence_number: self.next_seq(),
                 item_id: item_id.clone(),
                 output_index,
                 arguments: fc_args.clone(),
-                name: Some(fc_name.clone()),
+                name: Some(wire_name.clone()),
             },
         );
         events.push(self.make_sse_event(&args_done));
@@ -496,8 +507,8 @@ impl ResponseStreamConverter {
             item: OutputItem::FunctionCall(FunctionToolCall {
                 id: Some(item_id),
                 call_id,
-                namespace: None,
-                name: fc_name,
+                namespace,
+                name: wire_name,
                 arguments: fc_args,
                 status: Some(output_status),
             }),
@@ -580,7 +591,10 @@ impl ResponseStreamConverter {
     }
 
     fn completed_output(&self) -> Vec<OutputItem> {
-        let output_status = self.output_status();
+        self.collect_output(self.output_status())
+    }
+
+    fn collect_output(&self, output_status: OutputStatus) -> Vec<OutputItem> {
         let mut output = Vec::new();
         if self.reasoning_started {
             output.push((
@@ -614,13 +628,14 @@ impl ResponseStreamConverter {
         }
         for function_call in &self.function_call_items {
             if function_call.started {
+                let (wire_name, namespace) = self.resolve_tool_identity(&function_call.name);
                 output.push((
                     function_call.output_index,
                     OutputItem::FunctionCall(FunctionToolCall {
                         id: Some(function_call.item_id.clone()),
                         call_id: function_call.call_id.clone(),
-                        namespace: None,
-                        name: function_call.name.clone(),
+                        namespace,
+                        name: wire_name,
                         arguments: function_call.accumulated_args.clone(),
                         status: Some(output_status),
                     }),
@@ -725,16 +740,79 @@ impl ResponseStreamConverter {
     }
 
     /// Emit error events when the stream ends due to a backend error.
-    pub fn emit_error_events(&mut self) -> Vec<Result<Event, anyhow::Error>> {
+    ///
+    /// A truncation-shaped backend error is a `length` finish the worker
+    /// mispresented as a failure (legacy chat processors raise "Tool calls
+    /// cutoff by max_tokens." instead of finishing the turn); surface the
+    /// spec-correct incomplete shape so clients keep the partial tool call.
+    /// Genuine failures keep `response.failed`, but carry the error detail
+    /// and whatever output had streamed instead of an empty response.
+    pub fn emit_error_events(
+        &mut self,
+        error: Option<BackendError>,
+    ) -> Vec<Result<Event, anyhow::Error>> {
+        if error.as_ref().is_some_and(BackendError::is_truncation) {
+            self.output_limit_reached = true;
+            return self.emit_end_events();
+        }
+
         let mut events = Vec::new();
+
+        let output = self.collect_output(OutputStatus::Incomplete);
+        let mut response = self.make_response(Status::Failed, output);
+        response.error = Some(match error {
+            Some(error) => ErrorObject {
+                code: if error.http_status == 429 {
+                    "rate_limit_exceeded".to_string()
+                } else if error.is_context_overflow() {
+                    // The exact string OpenAI clients classify on: codex, for
+                    // one, matches `error.code == "context_length_exceeded"`
+                    // verbatim and presents its clean out-of-context-room
+                    // handling instead of a raw failure dump.
+                    "context_length_exceeded".to_string()
+                } else {
+                    "server_error".to_string()
+                },
+                message: error.message,
+            },
+            None => ErrorObject {
+                code: "server_error".to_string(),
+                message: "The model backend returned an error before the response completed."
+                    .to_string(),
+            },
+        });
 
         let failed = ResponseStreamEvent::ResponseFailed(ResponseFailedEvent {
             sequence_number: self.next_seq(),
-            response: self.make_response(Status::Failed, vec![]),
+            response,
         });
         events.push(self.make_sse_event(&failed));
 
         events
+    }
+}
+
+/// Backend error detail captured from an `event: error` annotation mid-stream.
+#[derive(Debug, Clone)]
+pub struct BackendError {
+    pub message: String,
+    pub http_status: u16,
+}
+
+impl BackendError {
+    fn is_truncation(&self) -> bool {
+        self.message
+            .to_ascii_lowercase()
+            .contains("cutoff by max_tokens")
+    }
+
+    /// Prompt-overflow rejections: the Baseten chat processor's
+    /// "Input length N exceeds the maximum allowed input length of M tokens."
+    /// and the OpenAI-style "maximum context length" phrasing.
+    fn is_context_overflow(&self) -> bool {
+        let message = self.message.to_ascii_lowercase();
+        message.contains("exceeds the maximum allowed input length")
+            || message.contains("maximum context length")
     }
 }
 
@@ -1742,5 +1820,216 @@ mod tests {
 
         let response = conv.make_response(Status::Completed, vec![]);
         assert_eq!(response.parallel_tool_calls, Some(false));
+    }
+
+    /// A legacy chat processor raises "Tool calls cutoff by max_tokens."
+    /// instead of finishing the turn with `finish_reason=length`, which
+    /// arrives here as a backend error with no length finish ever seen.
+    /// It must be presented as spec-correct truncation — done events with
+    /// the partial args, item status `incomplete`, terminal
+    /// `response.incomplete` with reason `max_output_tokens` — and never
+    /// as `response.failed`.
+    #[test]
+    fn b10_backend_cutoff_error_presented_as_incomplete() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+        let _ = conv.process_chunk(&tool_call_chunk(
+            0,
+            Some("call-1"),
+            Some("run_command"),
+            Some("{\"cmd\":\"ls -"),
+        ));
+
+        let events = conv.emit_error_events(Some(BackendError {
+            message: "Tool calls cutoff by max_tokens.".to_string(),
+            http_status: 400,
+        }));
+        let types = event_types(&events);
+
+        assert!(
+            !types.contains(&"response.failed".to_string()),
+            "cutoff must not surface as failure: {types:?}"
+        );
+        assert!(
+            types.contains(&"response.function_call_arguments.done".to_string()),
+            "args.done with partial args: {types:?}"
+        );
+        assert!(
+            types.contains(&"response.output_item.done".to_string()),
+            "output_item.done for the truncated call: {types:?}"
+        );
+        assert_eq!(
+            types.last().map(String::as_str),
+            Some("response.incomplete")
+        );
+
+        let (_, terminal) = typed_events(&events).pop().unwrap();
+        let response = &terminal["response"];
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        let output = response["output"].as_array().unwrap();
+        assert!(!output.is_empty(), "partial output preserved");
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["status"], "incomplete");
+        assert_eq!(output[0]["arguments"], "{\"cmd\":\"ls -");
+    }
+
+    /// A genuine backend failure keeps `response.failed`, but the terminal
+    /// response must carry the error detail and any partial output instead
+    /// of `output: []` with `error: null`.
+    #[test]
+    fn b10_backend_error_carries_detail_and_partial_output() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+        let _ = conv.process_chunk(&text_chunk("partial answer"));
+
+        let events = conv.emit_error_events(Some(BackendError {
+            message: "engine worker crashed".to_string(),
+            http_status: 500,
+        }));
+        let typed = typed_events(&events);
+        assert_eq!(typed.len(), 1);
+        let (event_type, data) = &typed[0];
+        assert_eq!(event_type, "response.failed");
+
+        let response = &data["response"];
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["error"]["code"], "server_error");
+        assert_eq!(response["error"]["message"], "engine worker crashed");
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output[0]["status"], "incomplete");
+        assert_eq!(output[0]["content"][0]["text"], "partial answer");
+    }
+
+    /// A tool declared inside a `{"type": "namespace"}` group must have its
+    /// namespace echoed on every emitted function_call item — codex
+    /// dispatches on the exact (name, namespace) pair with no fallback, so
+    /// a stripped namespace makes the call undispatchable client-side.
+    #[test]
+    fn b10_namespaced_tool_call_echoes_namespace() {
+        use dynamo_protocols::types::responses::{
+            FunctionToolParam, NamespaceToolParam, NamespaceToolParamTool, Tool,
+        };
+
+        let params = ResponseParams {
+            tools: Some(vec![Tool::Namespace(NamespaceToolParam {
+                name: "mcp__codex_apps__gmail".into(),
+                description: "Gmail tools".into(),
+                tools: vec![NamespaceToolParamTool::Function(FunctionToolParam {
+                    name: "get_recent_emails".into(),
+                    ..Default::default()
+                })],
+            })]),
+            ..Default::default()
+        };
+        let mut conv = ResponseStreamConverter::new("test-model".into(), params);
+        let _ = conv.emit_start_events();
+        // The worker was given the mangled flat name (namespaces exist so
+        // member names can overlap between groups), so that is what the
+        // model emits; the wire items carry the original (name, namespace).
+        let events = conv.process_chunk(&tool_call_chunk(
+            0,
+            Some("call-1"),
+            Some("mcp__codex_apps__gmail__get_recent_emails"),
+            Some("{}"),
+        ));
+        let added = typed_events(&events)
+            .into_iter()
+            .find(|(t, _)| t == "response.output_item.added")
+            .expect("item added");
+        assert_eq!(added.1["item"]["namespace"], "mcp__codex_apps__gmail");
+        assert_eq!(added.1["item"]["name"], "get_recent_emails");
+
+        let finish_events = conv.process_chunk(&finish_chunk(FinishReason::ToolCalls));
+        let typed = typed_events(&finish_events);
+        let done = typed
+            .iter()
+            .find(|(t, _)| t == "response.output_item.done")
+            .expect("item done");
+        assert_eq!(done.1["item"]["namespace"], "mcp__codex_apps__gmail");
+        assert_eq!(done.1["item"]["name"], "get_recent_emails");
+        let args_done = typed
+            .iter()
+            .find(|(t, _)| t == "response.function_call_arguments.done")
+            .expect("args done");
+        assert_eq!(args_done.1["name"], "get_recent_emails");
+
+        let response = conv.make_response(Status::Completed, conv.completed_output());
+        let OutputItem::FunctionCall(call) = &response.output[0] else {
+            panic!("expected function call output");
+        };
+        assert_eq!(call.namespace.as_deref(), Some("mcp__codex_apps__gmail"));
+        assert_eq!(call.name, "get_recent_emails");
+    }
+
+    /// Plain function tools (no namespace group) keep namespace absent.
+    #[test]
+    fn b10_plain_tool_call_has_no_namespace() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+        let _ = conv.process_chunk(&tool_call_chunk(
+            0,
+            Some("call-1"),
+            Some("get_weather"),
+            Some("{}"),
+        ));
+        let finish_events = conv.process_chunk(&finish_chunk(FinishReason::ToolCalls));
+        let done = typed_events(&finish_events)
+            .into_iter()
+            .find(|(t, _)| t == "response.output_item.done")
+            .expect("item done");
+        assert!(done.1["item"]["namespace"].is_null());
+    }
+
+    /// Prompt-overflow backend errors must carry the exact code string
+    /// OpenAI clients classify on. Codex matches
+    /// `response.error.code == "context_length_exceeded"` verbatim (its only
+    /// context-overflow detector) and presents its out-of-context-room
+    /// handling; anything else surfaces as a raw non-retryable failure.
+    #[test]
+    fn b10_prompt_overflow_error_carries_openai_code() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+
+        let events = conv.emit_error_events(Some(BackendError {
+            message:
+                "Input length 345123 exceeds the maximum allowed input length of 131040 tokens."
+                    .to_string(),
+            http_status: 400,
+        }));
+        let typed = typed_events(&events);
+        assert_eq!(typed.len(), 1);
+        let (event_type, data) = &typed[0];
+        assert_eq!(event_type, "response.failed");
+        assert_eq!(data["response"]["error"]["code"], "context_length_exceeded");
+        assert!(
+            data["response"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("exceeds the maximum allowed input length")
+        );
+    }
+
+    /// Even with no captured detail, `response.failed` must populate `error`
+    /// rather than emit the spec-violating `error: null`.
+    #[test]
+    fn b10_backend_error_without_detail_still_populates_error() {
+        let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
+        let _ = conv.emit_start_events();
+
+        let events = conv.emit_error_events(None);
+        let typed = typed_events(&events);
+        assert_eq!(typed.len(), 1);
+        let (event_type, data) = &typed[0];
+        assert_eq!(event_type, "response.failed");
+        assert_eq!(data["response"]["error"]["code"], "server_error");
+        assert!(
+            data["response"]["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty())
+        );
     }
 }
