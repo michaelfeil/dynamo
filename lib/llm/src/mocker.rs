@@ -28,6 +28,7 @@ use dynamo_mocker::engine::create_engine;
 use dynamo_mocker::scheduler::SchedulerHandle;
 use dynamo_mocker::services::bootstrap::{BootstrapServer, connect_to_prefill};
 use dynamo_mocker::services::zmq_events::ZmqKvEventSink;
+use dynamo_protocols::types::{CompletionUsage, PromptTokensDetails};
 use dynamo_runtime::DistributedRuntime;
 use dynamo_runtime::metrics::MetricsHierarchy;
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -68,6 +69,29 @@ impl KvCacheEventSink for KvEventSinkAdapter {
         self.0
             .publish_with_storage_tier(event, storage_tier)
             .map_err(|e| anyhow::anyhow!("Failed to send KV event: {}", e))
+    }
+}
+
+/// Cumulative usage snapshot carrying the scheduler's admission cache truth
+/// in `prompt_tokens_details.cached_tokens`.
+fn usage_with_cached_tokens(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_tokens: usize,
+) -> CompletionUsage {
+    // Saturate rather than panic on pathological token counts.
+    fn to_u32(value: usize) -> u32 {
+        value.try_into().unwrap_or(u32::MAX)
+    }
+    CompletionUsage {
+        prompt_tokens: to_u32(prompt_tokens),
+        completion_tokens: to_u32(completion_tokens),
+        total_tokens: to_u32(prompt_tokens.saturating_add(completion_tokens)),
+        prompt_tokens_details: Some(PromptTokensDetails {
+            audio_tokens: None,
+            cached_tokens: Some(to_u32(cached_tokens)),
+        }),
+        completion_tokens_details: None,
     }
 }
 
@@ -538,6 +562,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
         }
 
         // Convert PreprocessedRequest to DirectRequest for scheduler
+        let prompt_tokens_count = request.token_ids.len();
         let direct_request = DirectRequest {
             tokens: request.token_ids.clone(),
             max_output_tokens,
@@ -605,6 +630,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
             }
 
             let mut token_count = 0;
+            let mut cached_prefix_tokens: Option<usize> = None;
             let think_len = reasoning
                 .as_ref()
                 .map(|cfg| cfg.num_thinking_tokens(max_output_tokens))
@@ -618,6 +644,10 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                             break;
                         };
 
+                        if let Some(cached) = signal.cached_tokens {
+                            cached_prefix_tokens = Some(cached);
+                        }
+
                         // Generate a token (with thinking boundaries if configured)
                         let token_id = if token_count == 0 && think_len > 0 {
                             reasoning.as_ref().unwrap().start_thinking_token_id
@@ -628,9 +658,14 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                         };
                         token_count += 1;
 
+                        // The first chunk carries the admission cache truth; the
+                        // final chunk repeats cumulative totals (OpenAI convention).
                         let output = LLMEngineOutput {
                             token_ids: vec![token_id],
                             disaggregated_params: is_prefill.then(|| serde_json::json!("dummy")),
+                            completion_usage: signal.cached_tokens.map(|cached| {
+                                usage_with_cached_tokens(prompt_tokens_count, token_count, cached)
+                            }),
                             ..Default::default()
                         };
 
@@ -660,7 +695,11 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                                 server.complete_room(room_id);
                             }
 
-                            if stream_tx.send(LLMEngineOutput::length()).is_err() {
+                            let mut final_output = LLMEngineOutput::length();
+                            final_output.completion_usage = cached_prefix_tokens.map(|cached| {
+                                usage_with_cached_tokens(prompt_tokens_count, token_count, cached)
+                            });
+                            if stream_tx.send(final_output).is_err() {
                                 tracing::error!("Output stream receiver closed.");
                                 break;
                             }
@@ -768,4 +807,180 @@ pub async fn make_mocker_engine(
         AnnotatedMockEngine::new(MockEngine::new(args), distributed_runtime, endpoint_id);
 
     Ok(Arc::new(annotated_engine))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+    use dynamo_mocker::common::protocols::WorkerType;
+    use std::collections::BTreeMap;
+
+    /// Build a prefill engine with a wired scheduler channel and return its
+    /// output stream plus the per-request signal sender, so tests can drive
+    /// the relay directly without a live runtime.
+    async fn wired_prefill_stream(
+        uuid: Uuid,
+    ) -> (
+        ManyOut<LLMEngineOutput>,
+        mpsc::UnboundedSender<OutputSignal>,
+    ) {
+        let args = MockEngineArgs::builder()
+            .worker_type(WorkerType::Prefill)
+            .block_size(4)
+            .num_gpu_blocks(64)
+            .max_num_batched_tokens(Some(64))
+            .speedup_ratio(1000.0)
+            .build()
+            .unwrap();
+        let engine = MockEngine::new(args);
+
+        // Wire the scheduler input channel so `generate` can submit the request
+        // without a live runtime; the test drives the output signals directly.
+        let (direct_tx, _direct_rx) = mpsc::unbounded_channel::<DirectRequest>();
+        engine.request_senders.set(vec![direct_tx]).unwrap();
+
+        let request = PreprocessedRequest::builder()
+            .model("mock".to_string())
+            .token_ids(vec![1, 2, 3])
+            .stop_conditions(StopConditions {
+                max_tokens: Some(1),
+                ..Default::default()
+            })
+            .sampling_options(SamplingOptions::default())
+            .output_options(OutputOptions::default())
+            .build()
+            .unwrap();
+
+        let stream = engine
+            .generate(SingleIn::with_id_and_metadata(
+                request,
+                uuid.to_string(),
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap();
+        let signal_tx = engine
+            .active_requests
+            .get(&uuid)
+            .expect("generate must register the request channel")
+            .value()
+            .clone();
+        (stream, signal_tx)
+    }
+
+    /// The relay is the user-facing half of the feature: the scheduler's admission
+    /// cache truth (`OutputSignal.cached_tokens`) must ride the first stream chunk
+    /// and repeat cumulative totals on the final length chunk (OpenAI convention).
+    /// A request that completes on its first signal exercises both chunks.
+    #[tokio::test]
+    async fn first_and_final_chunk_carry_admission_cache_truth() {
+        let uuid = Uuid::from_u128(100);
+        let (mut stream, signal_tx) = wired_prefill_stream(uuid).await;
+
+        // The request's only signal: a completed prefill with 0 cached tokens.
+        signal_tx
+            .send(OutputSignal {
+                uuid,
+                completed: true,
+                handoff_delay_ms: None,
+                cached_tokens: Some(0),
+            })
+            .unwrap();
+
+        // First chunk carries the admission cache truth.
+        let first = stream.next().await.unwrap();
+        assert_eq!(first.token_ids.len(), 1);
+        assert_eq!(
+            first.completion_usage,
+            Some(CompletionUsage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                total_tokens: 4,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    audio_tokens: None,
+                    cached_tokens: Some(0),
+                }),
+                completion_tokens_details: None,
+            })
+        );
+
+        // Final chunk repeats cumulative totals.
+        let mut expected_finish = LLMEngineOutput::length();
+        expected_finish.completion_usage = Some(CompletionUsage {
+            prompt_tokens: 3,
+            completion_tokens: 1,
+            total_tokens: 4,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                audio_tokens: None,
+                cached_tokens: Some(0),
+            }),
+            completion_tokens_details: None,
+        });
+        assert_eq!(stream.next().await.unwrap(), expected_finish);
+        assert!(stream.next().await.is_none());
+    }
+
+    /// Multi-signal stream: the first chunk carries the admission cache truth,
+    /// later chunks carry none, and the final chunk repeats cumulative totals
+    /// from the stored value — not the current signal's, which is None.
+    #[tokio::test]
+    async fn final_chunk_repeats_cumulative_totals_across_signals() {
+        let uuid = Uuid::from_u128(101);
+        let (mut stream, signal_tx) = wired_prefill_stream(uuid).await;
+
+        // First signal: admission cache truth, request still decoding.
+        signal_tx
+            .send(OutputSignal {
+                uuid,
+                completed: false,
+                handoff_delay_ms: None,
+                cached_tokens: Some(8),
+            })
+            .unwrap();
+        // Terminal signal: no cache truth, request complete.
+        signal_tx
+            .send(OutputSignal {
+                uuid,
+                completed: true,
+                handoff_delay_ms: None,
+                cached_tokens: None,
+            })
+            .unwrap();
+
+        // First chunk carries the admission cache truth.
+        let first = stream.next().await.unwrap();
+        assert_eq!(
+            first.completion_usage,
+            Some(CompletionUsage {
+                prompt_tokens: 3,
+                completion_tokens: 1,
+                total_tokens: 4,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    audio_tokens: None,
+                    cached_tokens: Some(8),
+                }),
+                completion_tokens_details: None,
+            })
+        );
+
+        // Intermediate chunk: later signals carry no cache truth.
+        let middle = stream.next().await.unwrap();
+        assert_eq!(middle.completion_usage, None);
+
+        // Final chunk repeats cumulative totals from the stored value.
+        let mut expected_finish = LLMEngineOutput::length();
+        expected_finish.completion_usage = Some(CompletionUsage {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                audio_tokens: None,
+                cached_tokens: Some(8),
+            }),
+            completion_tokens_details: None,
+        });
+        assert_eq!(stream.next().await.unwrap(), expected_finish);
+        assert!(stream.next().await.is_none());
+    }
 }

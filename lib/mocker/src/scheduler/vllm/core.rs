@@ -43,6 +43,24 @@ pub(crate) struct VllmRequestState {
     pub(crate) status: RequestStatus,
     pub(crate) num_computed_tokens: usize,
     pub(crate) num_preemptions: usize,
+    /// Prefix tokens found cached at first admission (set once: a preempted
+    /// request re-probes against a cache warmed by its own blocks, which
+    /// would inflate the value).
+    pub(crate) cached_prefix_tokens: Option<usize>,
+    /// Whether the admission cache truth was already attached to a signal.
+    pub(crate) cached_tokens_signaled: bool,
+}
+
+impl VllmRequestState {
+    /// Admission cache truth rides the request's first signal only.
+    fn take_cached_tokens_for_signal(&mut self) -> Option<usize> {
+        if self.cached_tokens_signaled {
+            None
+        } else {
+            self.cached_tokens_signaled = true;
+            self.cached_prefix_tokens
+        }
+    }
 }
 
 #[derive(Default)]
@@ -342,6 +360,8 @@ impl VllmCore {
                 status: RequestStatus::Waiting,
                 num_computed_tokens: 0,
                 num_preemptions: 0,
+                cached_prefix_tokens: None,
+                cached_tokens_signaled: false,
             },
         );
         self.state.push_waiting(uuid);
@@ -968,6 +988,12 @@ impl VllmCore {
         *token_budget = token_budget.saturating_sub(tokens_used);
 
         let admission = if from_waiting {
+            self.state
+                .requests
+                .get_mut(&uuid)
+                .unwrap_or_else(|| panic!("schedule_request: {uuid} removed mid-pass (admission)"))
+                .cached_prefix_tokens
+                .get_or_insert(cached_prefix_tokens);
             Some(AdmissionEvent {
                 uuid,
                 reused_input_tokens: cached_prefix_tokens,
@@ -1064,27 +1090,26 @@ impl VllmCore {
             if let Some(collector) = collector.as_deref_mut() {
                 collector.on_token(uuid, decode_end_ms);
             }
-            if let Some(request) = self.state.requests.get(&uuid) {
-                debug_assert_vllm_request_progress(uuid, request);
-                let handoff_delay_ms = compute_prefill_handoff_delay_ms(
-                    self.args.worker_type,
-                    completed,
-                    request.sequence.num_input_tokens(),
-                    self.args.kv_transfer_bandwidth,
-                    self.args.kv_bytes_per_token,
-                );
-                output_signals.push(OutputSignal {
-                    uuid,
-                    completed,
-                    handoff_delay_ms,
-                });
-            } else {
-                output_signals.push(OutputSignal {
-                    uuid,
-                    completed,
-                    handoff_delay_ms: None,
-                });
-            }
+            let (handoff_delay_ms, cached_tokens) = match self.state.requests.get_mut(&uuid) {
+                Some(request) => {
+                    debug_assert_vllm_request_progress(uuid, request);
+                    let handoff_delay_ms = compute_prefill_handoff_delay_ms(
+                        self.args.worker_type,
+                        completed,
+                        request.sequence.num_input_tokens(),
+                        self.args.kv_transfer_bandwidth,
+                        self.args.kv_bytes_per_token,
+                    );
+                    (handoff_delay_ms, request.take_cached_tokens_for_signal())
+                }
+                None => (None, None),
+            };
+            output_signals.push(OutputSignal {
+                uuid,
+                completed,
+                handoff_delay_ms,
+                cached_tokens,
+            });
             if completed {
                 self.state.complete(&uuid);
                 running_changed = true;

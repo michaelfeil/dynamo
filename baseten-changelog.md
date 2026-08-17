@@ -1992,6 +1992,46 @@ and may understate under fractional busy mode (>16 workers); counters are
 absent until first event (no zero-series materialization — use
 `or vector(0)`).
 
+## PATCH-020: Mocker admission cache truth reporting (port of upstream #12711)
+
+Status: `upstream-sync`
+
+Source commits:
+
+- Current PR: feat(mocker): report admission cache truth as first-chunk completion_usage
+
+Purpose:
+
+Port of upstream `ai-dynamo/dynamo#12711` (feat(mocker): report admission cache
+truth as first-chunk completion_usage). The vLLM-mode mocker scheduler computes
+each request's admission-time cached-prefix tokens (`PrefillCost.cached_tokens`,
+post-eviction truth) but never reported it: every stream chunk carried
+`completion_usage: None`, so cache-hit surfaces fell back to the KV router's
+radix estimate. This change carries the scheduler's truth out on the stream:
+
+- `OutputSignal` gains `cached_tokens: Option<usize>` (serde default +
+  skip-if-none, so serialized replay artifacts stay compatible), set once on the
+  request's first output signal via `VllmRequestState::take_cached_tokens_for_signal`
+  (a preempted request re-probing a cache warmed by its own blocks keeps the
+  original count).
+- Captured in `schedule_request` alongside `AdmissionEvent.reused_input_tokens`
+  from the same local, so on first admission the two never disagree.
+- `lib/llm/src/mocker.rs` relays it as `LLMEngineOutput.completion_usage` on the
+  first chunk and repeats cumulative totals on the final chunk (OpenAI streaming
+  convention). sglang mode reports `None` explicitly.
+
+Replay notes:
+
+Port of upstream `ai-dynamo/dynamo#12711` (open upstream as of this writing);
+drop this patch when rebasing onto any release that contains it. Field names,
+helper names, and semantics mirror the upstream PR verbatim so the upgrade
+merges cleanly; only the surrounding v1.2.0 structure differs (no `rejected`
+field on `OutputSignal`, no `already_complete` emission path). The fork's
+relay test is a new `lib/llm/src/mocker.rs` `mod tests` that drives
+`MockEngine::generate` directly with a wired scheduler channel (upstream
+modified its existing test module instead); expect a merge conflict there and
+reconcile the two shapes.
+
 ## GWP Control Plane (global-routing)
 
 Status: `keep` — Baseten-specific control plane; not upstream.

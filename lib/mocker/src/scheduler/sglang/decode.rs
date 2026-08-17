@@ -193,6 +193,7 @@ pub(super) fn simulate_decode_step(
                 config.kv_transfer_bandwidth,
                 config.kv_bytes_per_token,
             ),
+            cached_tokens: None,
         });
 
         if is_complete {

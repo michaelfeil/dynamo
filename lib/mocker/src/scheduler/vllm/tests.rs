@@ -12,8 +12,8 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use crate::common::protocols::{
-    DirectRequest, FpmPublisher, KvCacheEventSink, KvEventPublishers, MockEngineArgs, OutputSignal,
-    PreemptionMode, RawKvEvent, RawKvEventSink,
+    DirectRequest, EngineType, FpmPublisher, KvCacheEventSink, KvEventPublishers, MockEngineArgs,
+    OutputSignal, PreemptionMode, RawKvEvent, RawKvEventSink,
 };
 use crate::common::sequence::ActiveSequence;
 use crate::scheduler::RouterEventVisibility;
@@ -71,6 +71,7 @@ fn router_args() -> MockEngineArgs {
 
 mod core_behavior {
     use super::*;
+    use crate::scheduler::AdmissionEvent;
 
     #[test]
     fn test_unified_pass_keeps_partial_prefill_in_running() {
@@ -269,6 +270,7 @@ mod core_behavior {
 
         assert!(signal.completed);
         assert_eq!(signal.handoff_delay_ms, Some(8.0));
+        assert_eq!(signal.cached_tokens, Some(0));
     }
 
     #[test]
@@ -386,6 +388,8 @@ mod core_behavior {
                 status: RequestStatus::Running,
                 num_computed_tokens: 9,
                 num_preemptions: 1,
+                cached_prefix_tokens: None,
+                cached_tokens_signaled: false,
             },
         );
 
@@ -420,6 +424,196 @@ mod core_behavior {
         assert!(core.state.waiting.is_empty());
         assert!(core.state.running.is_empty());
         assert_eq!(core.kv_manager.num_active_blocks(), 0);
+    }
+
+    fn assert_cache_truth_rides_first_signal_only(signals: &[OutputSignal]) {
+        assert!(
+            signals[1..]
+                .iter()
+                .all(|signal| signal.cached_tokens.is_none()),
+            "cache truth must ride the first signal only"
+        );
+    }
+
+    #[test]
+    fn test_first_signal_carries_admission_cache_truth() {
+        let args = MockEngineArgs::builder()
+            .engine_type(EngineType::Vllm)
+            .block_size(4)
+            .num_gpu_blocks(16)
+            .max_num_batched_tokens(Some(16))
+            .max_num_seqs(Some(3))
+            .enable_chunked_prefill(true)
+            .enable_prefix_caching(true)
+            .speedup_ratio(0.0)
+            .build()
+            .unwrap();
+        let mut core = VllmCore::new(args);
+        // 9 tokens = two full blocks (cacheable) + one partial.
+        let tokens: Vec<u32> = (0..9).collect();
+
+        fn drive_to_completion(
+            core: &mut VllmCore,
+            uuid: Uuid,
+        ) -> (Vec<OutputSignal>, Option<AdmissionEvent>) {
+            let mut collector = crate::replay::TraceCollector::default();
+            let mut signals = Vec::new();
+            let mut admission = None;
+            for step in 0..100 {
+                let pass = core.execute_pass(&mut collector, step as f64);
+                if admission.is_none() {
+                    admission = pass
+                        .admissions
+                        .iter()
+                        .find(|admission| admission.uuid == uuid)
+                        .cloned();
+                }
+                signals.extend(
+                    pass.output_signals
+                        .iter()
+                        .filter(|signal| signal.uuid == uuid)
+                        .cloned(),
+                );
+                if signals.iter().any(|signal| signal.completed) {
+                    return (signals, admission);
+                }
+            }
+            panic!("request {uuid} never completed");
+        }
+
+        let cold = Uuid::from_u128(90);
+        core.receive(DirectRequest {
+            tokens: tokens.clone(),
+            max_output_tokens: 3,
+            uuid: Some(cold),
+            dp_rank: 0,
+            arrival_timestamp_ms: None,
+        });
+        let (cold_signals, cold_admission) = drive_to_completion(&mut core, cold);
+        assert_eq!(
+            cold_signals[0].cached_tokens,
+            Some(0),
+            "cold request must report zero admission cache hits"
+        );
+        assert_cache_truth_rides_first_signal_only(&cold_signals);
+        assert_eq!(
+            cold_admission.unwrap().reused_input_tokens,
+            cold_signals[0].cached_tokens.unwrap()
+        );
+
+        let warm = Uuid::from_u128(91);
+        core.receive(DirectRequest {
+            tokens: tokens.clone(),
+            max_output_tokens: 3,
+            uuid: Some(warm),
+            dp_rank: 0,
+            arrival_timestamp_ms: None,
+        });
+        let (warm_signals, warm_admission) = drive_to_completion(&mut core, warm);
+        assert_eq!(
+            warm_signals[0].cached_tokens,
+            Some(8),
+            "repeat of the same prompt must report its two full blocks as admission cache hits"
+        );
+        assert_cache_truth_rides_first_signal_only(&warm_signals);
+        assert_eq!(
+            warm_admission.unwrap().reused_input_tokens,
+            warm_signals[0].cached_tokens.unwrap()
+        );
+    }
+
+    #[test]
+    fn test_preempted_request_keeps_original_admission_cache_truth() {
+        let args = MockEngineArgs::builder()
+            .engine_type(EngineType::Vllm)
+            .block_size(4)
+            .num_gpu_blocks(6)
+            .max_num_batched_tokens(Some(16))
+            .max_num_seqs(Some(2))
+            .enable_chunked_prefill(true)
+            .enable_prefix_caching(true)
+            .preemption_mode(PreemptionMode::Lifo)
+            .speedup_ratio(0.0)
+            .build()
+            .unwrap();
+        let mut core = VllmCore::new(args);
+        let mut collector = crate::replay::TraceCollector::default();
+        let mut now_ms = 0.0;
+
+        // Warm one block so the victim's first admission sees a genuine hit.
+        let warm = Uuid::from_u128(70);
+        core.receive(DirectRequest {
+            tokens: (0..4).collect(),
+            max_output_tokens: 1,
+            uuid: Some(warm),
+            dp_rank: 0,
+            arrival_timestamp_ms: None,
+        });
+        for _ in 0..8 {
+            let pass = core.execute_pass(&mut collector, now_ms);
+            now_ms = pass.end_ms.max(now_ms + 1.0);
+            if core.state.requests.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            core.state.requests.is_empty(),
+            "warm request never completed"
+        );
+
+        // The filler is admitted first; the victim (warm prefix + unique tail) is
+        // newest, so Lifo preempts it under KV pressure before its first output.
+        let filler = Uuid::from_u128(71);
+        let victim = Uuid::from_u128(72);
+        core.receive(DirectRequest {
+            tokens: (100..108).collect(),
+            max_output_tokens: 8,
+            uuid: Some(filler),
+            dp_rank: 0,
+            arrival_timestamp_ms: None,
+        });
+        core.receive(DirectRequest {
+            tokens: (0..4).chain(200..212).collect(),
+            max_output_tokens: 4,
+            uuid: Some(victim),
+            dp_rank: 0,
+            arrival_timestamp_ms: None,
+        });
+
+        let mut victim_signals = Vec::new();
+        let mut preempted = false;
+        for _ in 0..64 {
+            let pass = core.execute_pass(&mut collector, now_ms);
+            now_ms = pass.end_ms.max(now_ms + 1.0);
+            victim_signals.extend(
+                pass.output_signals
+                    .iter()
+                    .filter(|signal| signal.uuid == victim)
+                    .cloned(),
+            );
+            if !preempted && pass.mocker_metrics.vllm_preemptions_total > 0 {
+                preempted = true;
+                assert!(
+                    victim_signals.is_empty(),
+                    "victim must be preempted before its first output"
+                );
+                assert_eq!(core.state.requests.get(&victim).unwrap().num_preemptions, 1);
+            }
+            if victim_signals.iter().any(|signal| signal.completed) {
+                break;
+            }
+        }
+        assert!(preempted, "victim was never preempted");
+        assert!(
+            victim_signals.iter().any(|signal| signal.completed),
+            "victim never completed after readmission"
+        );
+        assert_eq!(
+            victim_signals[0].cached_tokens,
+            Some(4),
+            "first signal must retain the original admission count, not a post-preemption re-probe"
+        );
+        assert_cache_truth_rides_first_signal_only(&victim_signals);
     }
 }
 
