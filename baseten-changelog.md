@@ -2040,6 +2040,16 @@ relay test is a new `lib/llm/src/mocker.rs` `mod tests` that drives
 modified its existing test module instead); expect a merge conflict there and
 reconcile the two shapes.
 
+Additional upstream mocker sync:
+
+- Backports `ai-dynamo/dynamo#13483` at `d63567331a5fc4fbf3d3c1c51990684362429e47`.
+  ZMQ KV-event batches use named MessagePack encoding so optional `medium` and
+  `group_idx` fields cannot shift under positional encoding. The v1.2 sink
+  serializes batches inline, so the backport adds a small encoding helper while
+  preserving the upstream router-wire regression coverage for device stored,
+  device removed, and host-pinned stored events. Drop this adaptation when the
+  fork advances to an upstream release containing #13483.
+
 ## GWP Control Plane (global-routing)
 
 Status: `keep` — Baseten-specific control plane; not upstream.
