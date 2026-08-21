@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,36 @@ class AicSession:
             tp_size,
         )
 
+        # Compile the model operation graph once. Live mocker decode changes the
+        # context length on almost every scheduler step; the Python op walk turns
+        # each new shape into a millisecond-scale database query. The compiled
+        # engine returns the same prediction through a single Rust dispatch.
+        self._engine = self._build_compiled_engine()
+
+    def _build_compiled_engine(self):
+        if os.environ.get("DYNAMO_AIC_DISABLE_COMPILED_ENGINE"):
+            logger.info(
+                "AIC compiled-engine path disabled via env; using Python op walk"
+            )
+            return None
+        try:
+            from aiconfigurator_core.sdk.rust_engine_step import _cached_engine_handle
+        except Exception as exc:
+            logger.info(
+                "AIC compiled-engine path unavailable (%s); using Python op walk",
+                exc,
+            )
+            return None
+        try:
+            engine = _cached_engine_handle(self._model, self._database)
+            logger.info("AIC compiled-engine path active")
+            return engine
+        except Exception as exc:
+            logger.warning(
+                "AIC compiled-engine build failed (%s); using Python op walk", exc
+            )
+            return None
+
     def _predict_context_latency(
         self, batch_size: int, effective_isl: int, prefix: int
     ) -> float:
@@ -180,10 +211,18 @@ class AicSession:
         self, batch_size: int, effective_isl: int, prefix: int
     ) -> float:
         """Predict prefill latency in ms from uncached tokens and cached prefix."""
+        if self._engine is not None:
+            # The compiled engine accepts the full input length and subtracts the
+            # prefix internally. The scheduler passes the already-effective ISL.
+            return self._engine.predict_prefill_latency(
+                batch_size, effective_isl + prefix, prefix
+            )
         return self._predict_context_latency(batch_size, effective_isl, prefix)
 
     def predict_decode(self, batch_size: int, isl: int, osl: int) -> float:
         """Predict decode (generation) latency in ms."""
+        if self._engine is not None:
+            return self._engine.predict_decode_latency(batch_size, isl, osl)
         return self._predict_generation_latency(batch_size, isl, osl)
 
     def estimate_num_gpu_blocks(

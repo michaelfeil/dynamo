@@ -2060,6 +2060,13 @@ Additional upstream mocker sync:
   preserving the upstream router-wire regression coverage for device stored,
   device removed, and host-pinned stored events. Drop this adaptation when the
   fork advances to an upstream release containing #13483.
+- Backports the compiled AIC `EngineHandle` prediction path present in upstream
+  commit `7645809841d5b8bb0225bbf351f917883bb0f9bd`. The v1.2 wrapper previously
+  walked Python model operations and queried the performance database for each
+  changing scheduler context. The backport compiles the model once, dispatches
+  prefill and decode predictions to the Rust handle, and retains the Python path
+  as a compatibility fallback with an operational opt-out. Drop this adaptation
+  when the fork advances to a release containing the upstream implementation.
 
 ## GWP Control Plane (global-routing)
 
