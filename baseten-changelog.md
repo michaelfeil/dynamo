@@ -1319,6 +1319,10 @@ Also expose `b10_health.register_runtime(runtime)` so Python-owned runtime
 startup paths can attach the same runtime cancellation token that the Rust B10
 router registers automatically.
 
+OpenAI and Anthropic HTTP contexts stamp `dynamo.request_start` as Unix epoch
+milliseconds. Python `Context.get_milliseconds_since_request_start()` exposes
+the elapsed time.
+
 v1.2 b10_client portability note:
 
 The fork-carried `lib/bindings/python/rust/b10_client/` module exposes the

@@ -13,7 +13,7 @@
 use dynamo_llm::http::service::baseten::{RoutingMetadataKey, WorkerResponseMetadata};
 use dynamo_runtime::logging::DistributedTraceContext;
 pub use dynamo_runtime::pipeline::AsyncEngineContext;
-use dynamo_runtime::pipeline::context::Controller;
+use dynamo_runtime::pipeline::context::{Controller, REQUEST_START_METADATA_KEY};
 use opentelemetry::global::BoxedSpan;
 use opentelemetry::trace::{Span as OtelSpan, Status, TraceContextExt, Tracer};
 use opentelemetry::{KeyValue, global};
@@ -21,6 +21,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -335,6 +336,37 @@ impl Context {
 
     fn id(&self) -> &str {
         self.inner.id()
+    }
+
+    fn get_milliseconds_since_request_start(&self) -> PyResult<Option<u64>> {
+        let request_start = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(REQUEST_START_METADATA_KEY)
+            .cloned();
+        let Some(request_start) = request_start else {
+            return Ok(None);
+        };
+        let request_start_ms = request_start.parse::<u64>().map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid {REQUEST_START_METADATA_KEY} metadata value {request_start:?}: {err}"
+            ))
+        })?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "system clock is before the Unix epoch: {err}"
+                ))
+            })?
+            .as_millis();
+        let now_ms = u64::try_from(now_ms).map_err(|err| {
+            pyo3::exceptions::PyOverflowError::new_err(format!(
+                "current Unix time does not fit in milliseconds: {err}"
+            ))
+        })?;
+        Ok(Some(now_ms.saturating_sub(request_start_ms)))
     }
 
     fn async_killed_or_stopped<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {

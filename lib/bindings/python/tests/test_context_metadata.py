@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import time
+
 import pytest
 
 from dynamo._core import Context
@@ -41,3 +43,11 @@ def test_context_metadata_setter_replaces_mapping():
 
     assert "tenant" not in ctx.metadata
     assert dict(ctx.metadata.items()) == {"region": "us-east"}
+
+
+def test_milliseconds_since_request_start():
+    request_start_ms = int(time.time() * 1000) - 100
+    ctx = Context(id="req-1", metadata={"dynamo.request_start": str(request_start_ms)})
+
+    assert ctx.get_milliseconds_since_request_start() >= 100
+    assert Context(id="req-2").get_milliseconds_since_request_start() is None

@@ -1050,6 +1050,10 @@ class Context:
         """
         ...
 
+    def get_milliseconds_since_request_start(self) -> Optional[int]:
+        """Milliseconds elapsed since the OpenAI frontend created the request context."""
+        ...
+
     def async_killed_or_stopped(self) -> asyncio.Future[bool]:
         """
         Asynchronously wait until the context is killed or stopped.

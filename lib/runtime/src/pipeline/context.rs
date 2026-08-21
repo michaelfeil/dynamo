@@ -4,12 +4,25 @@
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use super::{AsyncEngineContext, AsyncEngineContextProvider, Data};
 use crate::engine::AsyncEngineController;
 use async_trait::async_trait;
 
 use super::registry::Registry;
+
+/// Unix epoch milliseconds when the HTTP frontend created the request context.
+pub const REQUEST_START_METADATA_KEY: &str = "dynamo.request_start";
+
+pub fn stamp_request_start(metadata: &mut BTreeMap<String, String>) -> Result<(), SystemTimeError> {
+    let request_start_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    metadata.insert(
+        REQUEST_START_METADATA_KEY.to_string(),
+        request_start_ms.to_string(),
+    );
+    Ok(())
+}
 
 pub struct Context<T: Data> {
     current: T,

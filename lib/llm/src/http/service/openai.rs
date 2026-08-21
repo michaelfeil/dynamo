@@ -25,7 +25,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use dynamo_runtime::config::environment_names::llm as env_llm;
 use dynamo_runtime::{
-    pipeline::{AsyncEngineContextProvider, Context},
+    pipeline::{AsyncEngineContextProvider, Context, context::stamp_request_start},
     protocols::annotated::AnnotationsProvider,
 };
 use futures::{StreamExt, stream};
@@ -432,8 +432,13 @@ fn context_from_headers_with_body_session<T: Send + Sync + 'static>(
     headers: &HeaderMap,
     body_session_id: Option<String>,
 ) -> Result<Context<T>, ErrorResponse> {
-    let metadata = extract_metadata_from_http(headers)
+    let mut metadata = extract_metadata_from_http(headers)
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
+    stamp_request_start(&mut metadata).map_err(|err| {
+        ErrorMessage::internal_server_error(&format!(
+            "system clock is before the Unix epoch: {err}"
+        ))
+    })?;
     let mut request = Context::with_id_and_metadata(request, context_id, metadata);
     attach_x_request_id(&mut request, headers);
     if let Some(session_id) =
@@ -2955,6 +2960,7 @@ mod tests {
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
         CreateCompletionRequest,
     };
+    use dynamo_runtime::pipeline::context::REQUEST_START_METADATA_KEY;
 
     const BACKUP_ERROR_MESSAGE: &str = "Failed to generate completions";
 
@@ -2979,6 +2985,31 @@ mod tests {
             nvext: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_context_from_headers_stamps_request_start() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-dynamo-meta-dynamo.request_start", "0".parse().unwrap());
+        let before_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let context = context_from_headers((), "request-1".to_string(), &headers).unwrap();
+
+        let after_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let request_start_ms = context
+            .metadata()
+            .get(REQUEST_START_METADATA_KEY)
+            .unwrap()
+            .parse::<u128>()
+            .unwrap();
+        assert!(request_start_ms >= before_ms);
+        assert!(request_start_ms <= after_ms);
     }
 
     #[test]

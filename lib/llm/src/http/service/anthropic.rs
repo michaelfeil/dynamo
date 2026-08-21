@@ -25,7 +25,7 @@ use axum::{
     routing::{get, post},
 };
 use dynamo_runtime::config::{env_is_truthy, environment_names::llm as env_llm};
-use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context};
+use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context, context::stamp_request_start};
 use futures::{StreamExt, stream};
 use tracing::Instrument;
 
@@ -186,11 +186,18 @@ async fn handler_anthropic_messages(
         endpoint: Endpoint::AnthropicMessages.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let metadata = extract_metadata_from_http(&headers).map_err(|err| {
+    let mut metadata = extract_metadata_from_http(&headers).map_err(|err| {
         anthropic_error(
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             "invalid_request_error",
             &err.to_string(),
+        )
+    })?;
+    stamp_request_start(&mut metadata).map_err(|err| {
+        anthropic_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            &format!("system clock is before the Unix epoch: {err}"),
         )
     })?;
     let user_id = request
