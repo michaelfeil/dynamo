@@ -251,14 +251,16 @@ impl EndpointConfigBuilder {
         };
 
         if let Err(e) = discovery.register(discovery_spec).await {
+            // Log full error chain to surface root cause (e.g. expired lease)
             tracing::error!(
                 %endpoint_id,
-                error = %e,
+                error = %format!("{:#}", e),
                 "Unable to register service for discovery"
             );
             endpoint_shutdown_token.cancel();
             anyhow::bail!(
-                "Unable to register service for discovery. Check discovery service status"
+                "Unable to register service for discovery. Check discovery service status: {:#}",
+                e
             );
         }
 
