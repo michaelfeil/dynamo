@@ -181,6 +181,7 @@ Source commits:
 - `b76d509d2` container: skip stale vllm hotfix on newer versions
 - `7a6c0cb81` chore(container): bump bundled NATS to v2.14.4 and etcd to v3.7.1 (CVE remediation; server pins only, client crates unchanged)
 - Current PR: build(mocker): enable KVBM offload in runtime wheel
+- Current PR: build: upgrade NIXL stack to 1.4.0
 
 Purpose:
 
@@ -216,6 +217,12 @@ The image tag resolver now also uses `.version-base` as the first fallback when
 the checkout has no merged semver tag or release branch. This keeps v1.2 branch
 builds on `v1.2.x.dev.<sha>-<suffix>` instead of falling back to
 `v0.0.1.dev.<sha>-<suffix>`.
+
+The runtime image now builds NIXL 1.4.0 with UCX 1.22 and replaces TRT-LLM's
+bundled NIXL and UCX libraries as one stack. Rust and Python bindings use the
+same NIXL version across framework variants. KVBM workers explicitly create
+the UCX backend before registering device memory, since POSIX does not support
+NIXL 1.4 `VRAM_SEG` registrations.
 
 A required `Baseten Changelog Check` GitHub Actions workflow now runs on every
 PR targeting `main-v1.2.0` and fails if `baseten-changelog.md` is not modified.

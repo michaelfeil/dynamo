@@ -640,6 +640,33 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     cd /workspace/nixl && \
     uv build . --wheel --out-dir /opt/dynamo/dist/nixl --python $PYTHON_VERSION
 
+{% if framework == "dynamo" and cuda_version == "12.9" %}
+# The framework-neutral Dynamo image is the wheel source for downstream CUDA
+# runtimes. Its native stack is built against CUDA 12.9, but TRT-LLM consumers
+# run CUDA 13 and must not resolve or install NIXL from the network themselves.
+# Export the matching Python binding and metadata wheel. The native binding is
+# downloaded because this builder runs CUDA 12.9; the metadata wheel is pure
+# Python and is rebuilt with the correct CUDA 13 dependency. Keep it in a
+# subdirectory so the CUDA 12 runtime continues to install its own metadata.
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=shared \
+    set -eux; \
+    NIXL_VERSION="${NIXL_REF#v}"; \
+    uvx --python "${VIRTUAL_ENV}/bin/python" --from pip pip download \
+        --no-deps \
+        --only-binary=:all: \
+        --dest /opt/dynamo/dist/nixl \
+        "nixl-cu13==${NIXL_VERSION}"; \
+    test "$(find /opt/dynamo/dist/nixl -maxdepth 1 -name 'nixl_cu13-*.whl' | wc -l)" -eq 1; \
+    cp -a /workspace/nixl/build/src/bindings/python/nixl-meta /tmp/nixl-meta-cu13; \
+    sed -i "s/^dependencies = \[\"nixl-cu12==${NIXL_VERSION}\"\]$/dependencies = [\"nixl-cu13==${NIXL_VERSION}\"]/" \
+        /tmp/nixl-meta-cu13/pyproject.toml; \
+    mkdir -p /opt/dynamo/dist/nixl/cu13; \
+    uv build --wheel --out-dir /opt/dynamo/dist/nixl/cu13 /tmp/nixl-meta-cu13; \
+    test "$(find /opt/dynamo/dist/nixl/cu13 -maxdepth 1 -name 'nixl-*-py3-none-any.whl' | wc -l)" -eq 1; \
+    unzip -p /opt/dynamo/dist/nixl/cu13/nixl-*-py3-none-any.whl '*/METADATA' \
+        | grep -Fx "Requires-Dist: nixl-cu13==${NIXL_VERSION}"
+{% endif %}
+
 {% if target != "local-dev" %}
 # Copy source code (order matters for layer caching)
 COPY .cargo/ /opt/dynamo/.cargo/

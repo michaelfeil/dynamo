@@ -27,8 +27,8 @@ dynamo:
   nats_version: v2.14.4
   etcd_version: v3.7.1
 
-  nixl_ref: 0.10.1
-  nixl_ucx_ref: v1.20.x
+  nixl_ref: v1.4.0
+  nixl_ucx_ref: v1.22.0
   nixl_gdrcopy_ref: v2.5.2
   nixl_ucx_efa_ref: 9d2b88a1f67faf9876f267658bd077b379b8bb76
   nixl_libfabric_repo: https://github.com/ofiwg/libfabric.git
@@ -68,7 +68,7 @@ vllm:
     runtime_image_tag: v0.21.0
   flashinf_ref: v0.6.8.post1
   vllm_omni_ref: "v0.21.0rc1"
-  nixl_ref: v1.1.0
+  nixl_ref: v1.4.0
   max_jobs: "10"
   enable_media_ffmpeg: "false"
   enable_gpu_memory_service: "true"
@@ -93,7 +93,7 @@ sglang:
   # (see templates/dev.Dockerfile). Runtime stays on the upstream lmsysorg/sglang
   # NIXL Python stack — its wheel COPY is narrowed to ai_dynamo*.whl so the SDK
   # build doesn't leak into the runtime image.
-  nixl_ref: 0.10.1
+  nixl_ref: v1.4.0
   enable_media_ffmpeg: "true"
   enable_gpu_memory_service: "true"
   enable_kvbm: "false"
@@ -104,7 +104,7 @@ trtllm:
     runtime_image: nvcr.io/nvidia/tensorrt-llm/release
     base_image_tag: 26.02-cuda13.1-devel-ubuntu24.04
     runtime_image_tag: e691725bb
-  nixl_ref: 0.10.1
+  nixl_ref: v1.4.0
   enable_media_ffmpeg: "false"
   enable_gpu_memory_service: "true"
   enable_kvbm: "true"

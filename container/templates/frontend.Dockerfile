@@ -41,6 +41,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
 FROM ${FRONTEND_IMAGE} AS frontend
 
 ARG PYTHON_VERSION
+ARG CUDA_MAJOR
 # Cache apt downloads; sharing=locked avoids apt/dpkg races with concurrent builds.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update -y \
@@ -126,7 +127,8 @@ RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sh
     uv pip install \
     /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
     /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
-    /opt/dynamo/wheelhouse/nixl/nixl*.whl && \
+    /opt/dynamo/wheelhouse/nixl/nixl-*-py3-none-any.whl \
+    /opt/dynamo/wheelhouse/nixl/nixl_cu${CUDA_MAJOR}-*.whl && \
     if [ "$ENABLE_GPU_MEMORY_SERVICE" = "true" ]; then \
         GMS_WHEEL=$(ls /opt/dynamo/wheelhouse/gpu_memory_service*.whl 2>/dev/null | head -1); \
         if [ -z "$GMS_WHEEL" ]; then \

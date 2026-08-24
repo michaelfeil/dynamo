@@ -36,23 +36,35 @@ FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS runtime_full
 FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS runtime
 {% endif %}
 
+# TRT-LLM ships its own NIXL/UCX stack. Replace it as one unit so Python,
+# nixl-sys, and TRT-LLM cannot load two incompatible UCX copies.
+RUN rm -rf \
+    /opt/nvidia/nvda_nixl \
+    /usr/local/ucx \
+    /usr/local/lib/python3.12/dist-packages/nixl* \
+    /usr/local/lib/python3.12/dist-packages/.nixl* \
+    /usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/nixl \
+    /usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/ucx
+COPY --from=wheel_builder /opt/nvidia/nvda_nixl/ /opt/nvidia/nvda_nixl/
+COPY --from=wheel_builder /usr/local/ucx/ /usr/local/ucx/
+RUN sed -i \
+    's|^export KVBM_NIXL_LIB_DIR=.*|export KVBM_NIXL_LIB_DIR=/opt/nvidia/nvda_nixl/lib64|' \
+    /etc/shinit_v2
+
 ARG ENABLE_KVBM
 ARG ENABLE_GPU_MEMORY_SERVICE
 ARG TARGETARCH
 
 # DYNAMO_HOME points at /workspace so bundled TRT-LLM scripts that reference
-# $DYNAMO_HOME/examples/... resolve. LD_PRELOAD/NIXL_PLUGIN_DIR are a workaround
-# for ai-dynamo/nixl#1668: nixl-cu13's bundled UCX 1.20.0 hangs in
-# `uct_md_query_tl_resources` (md_resources realloc loop, >1 GiB) when two NIXL
-# agents init on the same host. Force-load TRT-LLM's bundled libnixl 0.9.0
-# (uses system UCX, no bug). LD_PRELOAD is the only lever: nixl-cu13's
-# _bindings.so has DT_RPATH which beats LD_LIBRARY_PATH. Drop the two NIXL
-# vars when the upstream issue is fixed.
+# $DYNAMO_HOME/examples/... resolve.
 ENV DYNAMO_HOME=/workspace \
     HOME=/home/dynamo \
     PATH=/usr/local/bin/etcd:${PATH} \
-    LD_PRELOAD=/opt/dynamo/libstdc++.so.6:/usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/nixl/libnixl.so \
-    NIXL_PLUGIN_DIR=/usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/nixl/plugins
+    NIXL_PREFIX=/opt/nvidia/nvda_nixl \
+    NIXL_LIB_DIR=/opt/nvidia/nvda_nixl/lib64 \
+    NIXL_PLUGIN_DIR=/opt/nvidia/nvda_nixl/lib64/plugins \
+    UCX_MODULE_DIR=/usr/local/ucx/lib/ucx \
+    LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib64:/opt/nvidia/nvda_nixl/lib64/plugins:/usr/local/ucx/lib:/usr/local/ucx/lib/ucx:${LD_LIBRARY_PATH}
 
 WORKDIR /workspace
 
@@ -70,7 +82,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         openssh-server \
         librdmacm1 \
         rdma-core && \
-    test -f /usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/nixl/libnixl.so && \
+    test -f "${NIXL_LIB_DIR}/libnixl.so" && \
     test -d "${NIXL_PLUGIN_DIR}" && \
     ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
     printf '%s\n' \
@@ -93,7 +105,8 @@ COPY --from=dynamo_base_export / /
 # (otherwise pytest collects broken tutorial test files), and create the
 # Dynamo venv on non-dev. --system-site-packages keeps upstream's solve
 # importable since system Python is PEP 668 externally-managed.
-RUN userdel -r ubuntu > /dev/null 2>&1 || true \
+RUN cd / \
+    && userdel -r ubuntu > /dev/null 2>&1 || true \
     && useradd -m -s /bin/bash -g 0 dynamo \
     && [ `id -u dynamo` -eq 1000 ] \
     && mkdir -p /home/dynamo/.cache /opt/dynamo \
@@ -115,6 +128,8 @@ ENV VIRTUAL_ENV=/opt/dynamo/venv \
 # the wheels on disk because tests/dependencies/test_kvbm_imports.py greps
 # this path and runs in dev-derived test images.
 COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
+COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/nixl/nixl_cu13-1.4.0-*.whl /opt/dynamo/wheelhouse/nixl/
+COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /workspace/nixl/build/src/bindings/python/nixl-meta/nixl-1.4.0-*.whl /opt/dynamo/wheelhouse/nixl/
 
 {% if target not in ("dev", "local-dev") %}
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
@@ -131,6 +146,12 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     # directive that keeps the GPL-encumbered prebuilt ffmpeg off disk; IMAGEIO_FFMPEG_EXE
     # below points imageio at the in-tree LGPL CLI.
     uv pip install --no-deps --requirement /tmp/requirements.trtllm.txt && \
+    uv pip install --no-deps \
+        /opt/dynamo/wheelhouse/nixl/nixl_cu13-1.4.0-*.whl \
+        /opt/dynamo/wheelhouse/nixl/nixl-1.4.0-*.whl && \
+    # The extension wheel duplicates the same native libraries built above.
+    # Let its RUNPATH fall through to the canonical /opt installation instead.
+    rm -rf /opt/dynamo/venv/lib/python3.12/site-packages/.nixl_cu13.mesonpy.libs && \
     \
     if [ "${ENABLE_KVBM}" = "true" ]; then \
         KVBM_WHEEL=$(ls /opt/dynamo/wheelhouse/kvbm*.whl 2>/dev/null | head -1); \
@@ -144,6 +165,8 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
         GMS_WHEEL=$(ls /opt/dynamo/wheelhouse/gpu_memory_service*.whl 2>/dev/null | head -1); \
         if [ -n "$GMS_WHEEL" ]; then uv pip install --no-deps "$GMS_WHEEL"; fi; \
     fi
+
+ENV LD_PRELOAD=/opt/dynamo/libstdc++.so.6
 {% endif %}
 
 # Copy the in-tree LGPL ffmpeg from wheel_builder. The TRT-LLM diffusion handler
@@ -189,7 +212,16 @@ FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS runtime
 # Whiteout paths runtime_full removed — COPY can't represent deletions, so
 # without this, upstream's /workspace, /home/ubuntu, and single-file
 # /usr/local/bin/etcd would leak alongside our content.
-RUN rm -rf /workspace /home/ubuntu /usr/local/bin/etcd
+RUN rm -rf \
+    /workspace \
+    /home/ubuntu \
+    /usr/local/bin/etcd \
+    /opt/nvidia/nvda_nixl \
+    /usr/local/ucx \
+    /usr/local/lib/python3.12/dist-packages/nixl* \
+    /usr/local/lib/python3.12/dist-packages/.nixl* \
+    /usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/nixl \
+    /usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/ucx
 COPY --from=runtime_full / /
 
 # Mirrors runtime_full's ENV — must stay in sync. Re-declaration is required
@@ -199,8 +231,12 @@ ENV DYNAMO_HOME=/workspace \
     VIRTUAL_ENV=/opt/dynamo/venv \
     PATH=/opt/dynamo/venv/bin:/usr/local/bin/etcd:${PATH} \
     IMAGEIO_FFMPEG_EXE=/usr/local/bin/ffmpeg \
-    LD_PRELOAD=/opt/dynamo/libstdc++.so.6:/usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/nixl/libnixl.so \
-    NIXL_PLUGIN_DIR=/usr/local/lib/python3.12/dist-packages/tensorrt_llm/libs/nixl/plugins
+    LD_PRELOAD=/opt/dynamo/libstdc++.so.6 \
+    NIXL_PREFIX=/opt/nvidia/nvda_nixl \
+    NIXL_LIB_DIR=/opt/nvidia/nvda_nixl/lib64 \
+    NIXL_PLUGIN_DIR=/opt/nvidia/nvda_nixl/lib64/plugins \
+    UCX_MODULE_DIR=/usr/local/ucx/lib/ucx \
+    LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib64:/opt/nvidia/nvda_nixl/lib64/plugins:/usr/local/ucx/lib:/usr/local/ucx/lib/ucx:${LD_LIBRARY_PATH}
 
 WORKDIR /workspace
 

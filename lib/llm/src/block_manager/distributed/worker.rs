@@ -93,11 +93,17 @@ pub fn load_and_validate_tensors(
 
 fn build_agent(worker_id: usize, use_gds: bool) -> anyhow::Result<NixlAgent> {
     let agent = NixlAgent::new(&format!("kvbm-worker-{}", worker_id))?;
+    let (_, ucx_params) = agent.get_plugin_params("UCX")?;
+    agent.create_backend("UCX", &ucx_params)?;
     if use_gds {
         let (_, gds_params) = agent.get_plugin_params("GDS_MT")?;
         agent.create_backend("GDS_MT", &gds_params)?;
     }
-    let (_, posix_params) = agent.get_plugin_params("POSIX")?;
+    let (_, mut posix_params) = agent.get_plugin_params("POSIX")?;
+    // NIXL's CUDA wheel build does not include Linux AIO, so NIXL 1.4 otherwise
+    // selects io_uring by default. Use its POSIX AIO implementation, which is
+    // compatible with the standard container security profile.
+    posix_params.set("use_posix_aio", "true")?;
     agent.create_backend("POSIX", &posix_params)?;
 
     Ok(agent)

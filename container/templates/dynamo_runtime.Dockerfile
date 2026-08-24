@@ -10,6 +10,7 @@
 FROM dynamo_base AS runtime
 
 ARG PYTHON_VERSION
+ARG CUDA_MAJOR
 
 # Create dynamo user with group 0 for OpenShift compatibility
 RUN userdel -r ubuntu > /dev/null 2>&1 || true \
@@ -161,7 +162,8 @@ RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tm
         --constraint /tmp/requirements.common.txt \
         --constraint /tmp/requirements.planner.txt \
         --constraint /tmp/requirements.frontend.txt \
-        /opt/dynamo/wheelhouse/nixl/nixl*.whl
+        /opt/dynamo/wheelhouse/nixl/nixl-*-py3-none-any.whl \
+        /opt/dynamo/wheelhouse/nixl/nixl_cu${CUDA_MAJOR}-*.whl
 
 # ===========================================================================
 # Source-DEPENDENT layers (rebuilt when dynamo source / wheels change)
