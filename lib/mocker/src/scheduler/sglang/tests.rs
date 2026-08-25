@@ -966,6 +966,7 @@ mod forward_pass_metrics {
 
         let mut collector = crate::replay::TraceCollector::default();
         let pass = core.execute_pass(&mut collector, 0.0);
+        let metrics = pass.mocker_metrics.clone();
         let fpm = pass.fpm.expect("FPM should be present");
 
         assert_eq!(fpm.num_prefill_requests, 1);
@@ -976,6 +977,8 @@ mod forward_pass_metrics {
         // In SGLang, after prefill the request immediately joins running and
         // participates in the decode step of the same pass.
         assert_eq!(fpm.num_decode_requests, 1);
+        assert_eq!(metrics.num_ctx_tokens, fpm.sum_prefill_tokens);
+        assert_eq!(metrics.num_gen_tokens, u64::from(fpm.num_decode_requests));
         assert_eq!(fpm.num_queued_prefill, 0);
         assert_eq!(fpm.num_queued_decode, 0);
         assert!(fpm.wall_time_secs > 0.0);

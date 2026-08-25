@@ -25,7 +25,7 @@ use dynamo_mocker::common::protocols::{
 };
 use dynamo_mocker::common::utils::sleep_precise;
 use dynamo_mocker::engine::create_engine;
-use dynamo_mocker::scheduler::SchedulerHandle;
+use dynamo_mocker::scheduler::{MockerMetrics, SchedulerHandle};
 use dynamo_mocker::services::bootstrap::{BootstrapServer, connect_to_prefill};
 use dynamo_mocker::services::zmq_events::ZmqKvEventSink;
 use dynamo_protocols::types::{CompletionUsage, PromptTokensDetails};
@@ -50,6 +50,9 @@ use uuid::Uuid;
 use self::metrics::NativeMockerMetrics;
 
 pub const MOCKER_COMPONENT: &str = "mocker";
+
+pub type SchedulerMetricsCallback =
+    Arc<dyn Fn(MockerMetrics) -> anyhow::Result<()> + Send + Sync + 'static>;
 
 /// Wrapper to adapt KvEventPublisher to the KvCacheEventSink trait
 struct KvEventSinkAdapter(KvEventPublisher);
@@ -110,6 +113,7 @@ pub struct MockEngine {
     /// Bootstrap server for prefill workers in disaggregated mode
     bootstrap_server: Arc<OnceCell<Arc<BootstrapServer>>>,
     native_metrics: Arc<NativeMockerMetrics>,
+    metrics_callback: Option<SchedulerMetricsCallback>,
     /// Keep schedulers alive so their CancelGuards don't fire prematurely.
     _schedulers: OnceCell<Vec<Box<dyn SchedulerHandle>>>,
     /// Forward pass metrics publisher (kept alive for the engine lifetime).
@@ -160,6 +164,13 @@ impl AsyncEngine<SingleIn<serde_json::Value>, ManyOut<Annotated<serde_json::Valu
 impl MockEngine {
     /// Create a new MockEngine with the given parameters
     pub fn new(engine_args: MockEngineArgs) -> Self {
+        Self::new_with_metrics_callback(engine_args, None)
+    }
+
+    pub fn new_with_metrics_callback(
+        engine_args: MockEngineArgs,
+        metrics_callback: Option<SchedulerMetricsCallback>,
+    ) -> Self {
         let native_metrics = NativeMockerMetrics::new(engine_args.engine_type, engine_args.dp_size)
             .expect("mocker native metrics collectors should be valid");
         Self {
@@ -170,6 +181,7 @@ impl MockEngine {
             unset_dp_rank_counter: AtomicU32::new(0),
             bootstrap_server: Arc::new(OnceCell::new()),
             native_metrics,
+            metrics_callback,
             _schedulers: OnceCell::new(),
             _fpm_publisher: OnceCell::new(),
         }
@@ -183,7 +195,7 @@ impl MockEngine {
         self.unset_dp_rank_counter.fetch_add(1, Ordering::Relaxed) % self.engine_args.dp_size
     }
 
-    pub async fn start(&self, component: Component) -> Result<()> {
+    pub async fn start(&self, component: Component, metrics_component: Component) -> Result<()> {
         // Use primary_token() instead of child_token() so the mocker continues running
         // during graceful shutdown (Phase 1/2) and only stops in Phase 3.
         // child_token() is a child of endpoint_shutdown_token which is cancelled in Phase 1.
@@ -222,9 +234,9 @@ impl MockEngine {
         };
 
         // Create FPM publisher upfront and get per-dp-rank sink handles.
-        let worker_id = component.drt().connection_id().to_string();
+        let worker_id = metrics_component.drt().connection_id().to_string();
         let fpm_sinks = match crate::fpm_publisher::FpmDirectPublisher::new(
-            component.clone(),
+            metrics_component.clone(),
             worker_id,
             self.engine_args.dp_size,
         )
@@ -248,8 +260,9 @@ impl MockEngine {
 
         Self::start_metrics_publishing(
             &schedulers,
-            component.clone(),
+            metrics_component,
             self.native_metrics.clone(),
+            self.metrics_callback.clone(),
             cancel_token.clone(),
         )
         .await?;
@@ -458,6 +471,7 @@ impl MockEngine {
         schedulers: &[Box<dyn SchedulerHandle>],
         component: Component,
         native_metrics: Arc<NativeMockerMetrics>,
+        metrics_callback: Option<SchedulerMetricsCallback>,
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let metrics_publisher = Arc::new(WorkerMetricsPublisher::new()?);
@@ -465,10 +479,25 @@ impl MockEngine {
         if let Err(e) = metrics_publisher.create_endpoint(component).await {
             tracing::error!("Metrics endpoint failed: {e}");
         }
+
+        // Match vLLM and TRT-LLM: advertise each rank at zero load before the
+        // first scheduler iteration so the router can select an idle worker.
+        for scheduler in schedulers {
+            let metrics_rx = scheduler.metrics_receiver();
+            let metrics = metrics_rx.borrow().clone();
+            if let Err(e) = metrics_publisher.publish(Some(metrics.dp_rank), None, Some(0)) {
+                tracing::warn!(
+                    "Failed to publish initial metrics for DP rank {}: {e}",
+                    metrics.dp_rank
+                );
+            }
+        }
+
         for scheduler in schedulers.iter() {
             let mut metrics_rx = scheduler.metrics_receiver();
             let publisher = metrics_publisher.clone();
             let native_metrics = native_metrics.clone();
+            let metrics_callback = metrics_callback.clone();
             let cancel_token = cancel_token.clone();
 
             tokio::spawn(async move {
@@ -495,6 +524,26 @@ impl MockEngine {
                                     gpu_cache_usage_perc = metrics.gpu_cache_usage_perc,
                                     "published mocker load metrics"
                                 );
+                            }
+
+                            if let Some(callback) = metrics_callback.as_ref() {
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    callback(metrics.clone())
+                                })) {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(
+                                            dp_rank = metrics.dp_rank,
+                                            "Failed to publish mocker scheduler metrics: {e}"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        tracing::error!(
+                                            dp_rank = metrics.dp_rank,
+                                            "Mocker scheduler metrics callback panicked"
+                                        );
+                                    }
+                                }
                             }
                         }
                         _ = cancel_token.cancelled() => {
@@ -738,6 +787,7 @@ impl AnnotatedMockEngine {
         inner: MockEngine,
         distributed_runtime: DistributedRuntime,
         endpoint_id: dynamo_runtime::protocols::EndpointId,
+        metrics_component: Component,
     ) -> Self {
         let inner = Arc::new(inner);
         let inner_clone = inner.clone();
@@ -768,7 +818,7 @@ impl AnnotatedMockEngine {
             };
 
             tracing::debug!("Component service is now available, starting mocker engine");
-            if let Err(e) = inner_clone.start(component).await {
+            if let Err(e) = inner_clone.start(component, metrics_component).await {
                 tracing::error!("Failed to start mocker engine: {e}");
             }
         });
@@ -800,11 +850,20 @@ pub async fn make_mocker_engine(
     distributed_runtime: DistributedRuntime,
     endpoint_id: dynamo_runtime::protocols::EndpointId,
     args: MockEngineArgs,
+    metrics_endpoint_id: dynamo_runtime::protocols::EndpointId,
+    metrics_callback: Option<SchedulerMetricsCallback>,
 ) -> Result<ExecutionContext, Error> {
     // Create the mocker engine
     tracing::info!("Creating mocker engine with config: {args:?}");
-    let annotated_engine =
-        AnnotatedMockEngine::new(MockEngine::new(args), distributed_runtime, endpoint_id);
+    let metrics_component = distributed_runtime
+        .namespace(&metrics_endpoint_id.namespace)?
+        .component(&metrics_endpoint_id.component)?;
+    let annotated_engine = AnnotatedMockEngine::new(
+        MockEngine::new_with_metrics_callback(args, metrics_callback),
+        distributed_runtime,
+        endpoint_id,
+        metrics_component,
+    );
 
     Ok(Arc::new(annotated_engine))
 }

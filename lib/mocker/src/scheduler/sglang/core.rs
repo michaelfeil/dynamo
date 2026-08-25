@@ -222,6 +222,17 @@ impl SglangCore {
 
         debug_assert_sglang_scheduler_state(&self.waiting, &self.running, self.config.block_size);
         let active_decode_blocks = self.active_kv_blocks();
+        let mocker_metrics = MockerMetrics::from_parts(
+            self.dp_rank,
+            active_decode_blocks,
+            self.config.total_kv_tokens.div_ceil(self.config.block_size) as u64,
+            self.running.len() as u64,
+            self.waiting.len() as u64,
+            0,
+            sglang_cache_hit_tokens,
+            sglang_cache_total_tokens,
+        )
+        .with_iteration_tokens(&fpm);
         EnginePassResult {
             end_ms: decode.end_ms,
             completed_requests: decode
@@ -231,16 +242,7 @@ impl SglangCore {
                 .count(),
             output_signals: decode.output_signals,
             admissions: admit.admissions,
-            mocker_metrics: MockerMetrics::from_parts(
-                self.dp_rank,
-                active_decode_blocks,
-                self.config.total_kv_tokens.div_ceil(self.config.block_size) as u64,
-                self.running.len() as u64,
-                self.waiting.len() as u64,
-                0,
-                sglang_cache_hit_tokens,
-                sglang_cache_total_tokens,
-            ),
+            mocker_metrics,
             router_event_visibility: RouterEventVisibility::PassEnd,
             kv_events: self
                 .kv_event_buffer

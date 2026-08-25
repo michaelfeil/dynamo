@@ -917,6 +917,8 @@ Source commits:
 - `ce3a100d8` cargo fmt
 - `24c048a47` fix(dynamo): Make OTel log exporter opt-in to prevent BatchLogProcessor errors (#157)
 - `316432aa1` fix(dynamo): Fall back to OTEL_EXPORTER_OTLP_ENDPOINT for trace export (#171)
+- `7f7bdd3b4` fix(mocker): publish planner load metrics
+- `290dc296a` refactor(mocker): scope planner metrics to engine args
 
 Purpose:
 
@@ -957,6 +959,13 @@ OTel until a Tokio runtime exists, and the B10 router creates a Rust `Worker`
 directly instead of constructing a Python `DistributedRuntime`. Initializing
 logging after `Worker::from_settings()` preserves Rust `tracing` startup logs
 and OTLP trace export for router/distributed startup.
+
+The mocker runtime publishes ActiveLoad and forward-pass metrics under the
+externally visible worker component, matching the vLLM and TRT-LLM worker
+identity used by routers and planners. Its scheduler snapshots also expose
+running and waiting requests, KV block usage, and per-iteration token counts to
+the Python metrics callback so Baseten's planner receives the same detailed
+worker-load schema from mocker deployments as it does from real engines.
 
 Worker-based KV recovery now has a lightweight `RecoveryProcessLogger` that
 reports aggregate restore progress, recovered event counts, and the final

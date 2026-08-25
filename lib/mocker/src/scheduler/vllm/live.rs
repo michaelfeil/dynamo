@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::protocols::{
-    DirectRequest, FpmPublisher, KvEventPublishers, MockEngineArgs, OutputSignal,
+    DirectRequest, ForwardPassSnapshot, FpmPublisher, KvEventPublishers, MockEngineArgs,
+    OutputSignal,
 };
 use crate::common::utils::sleep_until_precise;
 use crate::scheduler::{
@@ -26,6 +27,8 @@ pub struct MockerMetrics {
     pub gpu_cache_usage_perc: f64,
     pub running_requests: u64,
     pub waiting_requests: u64,
+    pub num_ctx_tokens: u64,
+    pub num_gen_tokens: u64,
     pub vllm_preemptions_total: u64,
     pub sglang_cache_hit_tokens: u64,
     pub sglang_cache_total_tokens: u64,
@@ -63,10 +66,22 @@ impl MockerMetrics {
             gpu_cache_usage_perc,
             running_requests,
             waiting_requests,
+            num_ctx_tokens: 0,
+            num_gen_tokens: 0,
             vllm_preemptions_total,
             sglang_cache_hit_tokens,
             sglang_cache_total_tokens,
         }
+    }
+
+    pub(crate) fn with_iteration_tokens(self, fpm: &ForwardPassSnapshot) -> Self {
+        self.with_iteration_token_counts(fpm.sum_prefill_tokens, u64::from(fpm.num_decode_requests))
+    }
+
+    fn with_iteration_token_counts(mut self, num_ctx_tokens: u64, num_gen_tokens: u64) -> Self {
+        self.num_ctx_tokens = num_ctx_tokens;
+        self.num_gen_tokens = num_gen_tokens;
+        self
     }
 }
 
@@ -168,6 +183,7 @@ impl Scheduler {
                 let iteration_start = Instant::now();
                 let now_ms = scheduler_start.elapsed().as_secs_f64() * 1000.0;
                 let pass = core.execute_pass_internal(None, now_ms, admission_tx.as_ref());
+                let iteration_metrics = pass.mocker_metrics.clone();
                 let total_time =
                     std::time::Duration::from_secs_f64((pass.end_ms - now_ms).max(0.0) / 1000.0);
                 if let Some(fpm) = pass.fpm {
@@ -187,7 +203,11 @@ impl Scheduler {
                 flush_output_signals(&mut core, &output_tx, pass.output_signals);
                 publish_deferred_kv_events(&kv_event_publishers, deferred_kv_events.drain());
                 publish_deferred_fpm(&fpm_publisher, deferred_fpm.drain());
-                let _ = metrics_tx.send(core.mocker_metrics());
+                let metrics = core.mocker_metrics().with_iteration_token_counts(
+                    iteration_metrics.num_ctx_tokens,
+                    iteration_metrics.num_gen_tokens,
+                );
+                let _ = metrics_tx.send(metrics);
             }
         });
 

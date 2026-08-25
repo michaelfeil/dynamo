@@ -758,21 +758,36 @@ async fn select_engine(
             }
         }
         EngineType::Mocker => {
-            let mut mocker_args = if let Some(mocker_engine_args) = args.mocker_engine_args {
-                mocker_engine_args.inner()
+            let endpoint = local_model.endpoint_id().clone();
+            let (mut mocker_args, metrics_endpoint_id, metrics_callback) = if let Some(
+                mocker_engine_args,
+            ) =
+                args.mocker_engine_args
+            {
+                let metrics_endpoint_id = mocker_engine_args
+                    .metrics_endpoint_id()
+                    .unwrap_or_else(|| endpoint.clone());
+                let metrics_callback = mocker_engine_args.metrics_callback();
+                (
+                    mocker_engine_args.inner(),
+                    metrics_endpoint_id,
+                    metrics_callback,
+                )
             } else if let Some(extra_args_path) = args.extra_engine_args {
-                RsMockEngineArgs::from_json_file(&extra_args_path).map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to load mocker args from {:?}: {}",
-                        extra_args_path,
-                        e
-                    )
-                })?
+                let mocker_args =
+                    RsMockEngineArgs::from_json_file(&extra_args_path).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to load mocker args from {:?}: {}",
+                            extra_args_path,
+                            e
+                        )
+                    })?;
+                (mocker_args, endpoint.clone(), None)
             } else {
                 tracing::warn!(
                     "No extra_engine_args specified for mocker engine. Using default mocker args."
                 );
-                RsMockEngineArgs::default()
+                (RsMockEngineArgs::default(), endpoint.clone(), None)
             };
 
             // If aic_backend is set, create Python AIC callback and override perf_model
@@ -820,10 +835,14 @@ async fn select_engine(
                 }
             }
 
-            let endpoint = local_model.endpoint_id().clone();
-
-            let engine =
-                make_mocker_engine(distributed_runtime.inner, endpoint, mocker_args).await?;
+            let engine = make_mocker_engine(
+                distributed_runtime.inner,
+                endpoint,
+                mocker_args,
+                metrics_endpoint_id,
+                metrics_callback,
+            )
+            .await?;
 
             RsEngineConfig::InProcessTokens {
                 engine,

@@ -2493,6 +2493,8 @@ class MockEngineArgs:
         enable_g4_storage: bool = False,
         bandwidth_g2_to_g4_gbps: Optional[float] = None,
         bandwidth_g4_to_g2_gbps: Optional[float] = None,
+        metrics_endpoint: Optional[Endpoint] = None,
+        metrics_callback: Optional[Callable[[Dict[str, int]], None]] = None,
     ) -> None:
         ...
 

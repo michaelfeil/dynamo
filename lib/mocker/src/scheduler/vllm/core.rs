@@ -749,13 +749,14 @@ impl VllmCore {
         }
 
         let fpm = self.compute_fpm(&scheduled, (end_ms - now_ms) / 1000.0);
+        let mocker_metrics = self.mocker_metrics().with_iteration_tokens(&fpm);
         debug_assert_vllm_scheduler_state(&self.state);
         EnginePassResult {
             end_ms,
             completed_requests: requests_before.saturating_sub(self.state.requests.len()),
             output_signals,
             admissions,
-            mocker_metrics: self.mocker_metrics(),
+            mocker_metrics,
             router_event_visibility: RouterEventVisibility::PassStart,
             kv_events: self
                 .kv_event_buffer
