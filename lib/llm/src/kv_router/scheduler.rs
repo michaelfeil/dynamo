@@ -355,12 +355,14 @@ where
         isl_tokens: usize,
         effective_cached_tokens: HashMap<dynamo_kv_router::protocols::WorkerWithDpRank, usize>,
         track_prefill_tokens: bool,
+        apply_discounts: bool,
     ) -> Vec<PotentialLoad> {
         self.inner.get_potential_loads(
             token_seq,
             isl_tokens,
             effective_cached_tokens,
             track_prefill_tokens,
+            apply_discounts,
         )
     }
 

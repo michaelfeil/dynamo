@@ -411,12 +411,18 @@ where
             .add_output_block(&request_id.to_string(), decay_fraction)
     }
 
+    /// `apply_discounts` must be `false` for telemetry readers (the
+    /// planner's `potential_loads` RPC) so reported loads are raw token and
+    /// block counts, and `true` for readers that need consistency with the
+    /// placement projection (e.g. GWP local-load anchors, which are
+    /// subtracted from discounted placement-path locals).
     pub fn get_potential_loads(
         &self,
         token_seq: Option<Vec<SequenceHash>>,
         isl_tokens: usize,
         effective_cached_tokens: HashMap<WorkerWithDpRank, usize>,
         track_prefill_tokens: bool,
+        apply_discounts: bool,
     ) -> Vec<PotentialLoad> {
         let decay_now = Instant::now();
         let prefill_token_deltas = if track_prefill_tokens {
@@ -440,6 +446,7 @@ where
             token_seq.as_deref(),
             &prefill_token_deltas,
             decay_now,
+            apply_discounts,
         );
 
         let active_requests = self.slots.active_request_counts();
@@ -1263,7 +1270,7 @@ mod tests {
 
         let prefill_token_deltas = PrefillTokenDeltas::uniform(128);
         let (decode_blocks, prefill_tokens) =
-            slots.potential_blocks_and_tokens(Some(&token_seq), &prefill_token_deltas);
+            slots.potential_blocks_and_tokens(Some(&token_seq), &prefill_token_deltas, false);
         let mut expected: Vec<_> = decode_blocks
             .keys()
             .map(|worker| PotentialLoad {
@@ -1276,7 +1283,8 @@ mod tests {
             .collect();
         expected.sort_by_key(|load| (load.worker_id, load.dp_rank));
 
-        let mut actual = scheduler.get_potential_loads(Some(token_seq), 128, HashMap::new(), true);
+        let mut actual =
+            scheduler.get_potential_loads(Some(token_seq), 128, HashMap::new(), true, false);
         actual.sort_by_key(|load| (load.worker_id, load.dp_rank));
 
         assert_eq!(actual.len(), expected.len());
@@ -1338,7 +1346,7 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(6)).await;
 
-        let loads = scheduler.get_potential_loads(None, 0, HashMap::new(), true);
+        let loads = scheduler.get_potential_loads(None, 0, HashMap::new(), true, false);
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].potential_prefill_tokens, 40);
         assert_eq!(loads[0].active_requests, 1);
@@ -1352,7 +1360,7 @@ mod tests {
             make_scheduler(HashMap::new(), None, false, None);
 
         scheduler.register_workers(&HashSet::from([42]));
-        let loads = scheduler.get_potential_loads(None, 64, HashMap::new(), true);
+        let loads = scheduler.get_potential_loads(None, 64, HashMap::new(), true, false);
 
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].worker_id, 42);
@@ -1369,7 +1377,7 @@ mod tests {
 
         assert_eq!(
             scheduler
-                .get_potential_loads(None, 64, HashMap::new(), true,)
+                .get_potential_loads(None, 64, HashMap::new(), true, false)
                 .len(),
             1
         );
@@ -1388,7 +1396,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if scheduler
-                    .get_potential_loads(None, 64, HashMap::new(), true)
+                    .get_potential_loads(None, 64, HashMap::new(), true, false)
                     .len()
                     == 3
                 {
@@ -1439,7 +1447,7 @@ mod tests {
             .await
             .unwrap();
 
-        let loads = scheduler.get_potential_loads(None, 64, HashMap::new(), false);
+        let loads = scheduler.get_potential_loads(None, 64, HashMap::new(), false, false);
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].potential_prefill_tokens, 64);
         assert_eq!(loads[0].active_requests, 1);

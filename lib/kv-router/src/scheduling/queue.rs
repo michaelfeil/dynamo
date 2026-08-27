@@ -884,6 +884,7 @@ impl<
             request.token_seq.as_deref(),
             &request.prefill_token_deltas(),
             decay_now,
+            true,
         );
         request.decode_blocks = decode_blocks;
         request.prefill_tokens = prefill_tokens;

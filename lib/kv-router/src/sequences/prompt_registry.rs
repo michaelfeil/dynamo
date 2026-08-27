@@ -105,6 +105,7 @@ impl PromptRegistry {
         matched_depth: &FxHashMap<WorkerWithDpRank, usize>,
         prefill_token_deltas: &PrefillTokenDeltas,
         decay_now: Instant,
+        (prefill_discount, decode_discount): (f64, f64),
     ) -> (
         FxHashMap<WorkerWithDpRank, usize>,
         FxHashMap<WorkerWithDpRank, usize>,
@@ -114,7 +115,6 @@ impl PromptRegistry {
         let mut potential_tokens =
             FxHashMap::with_capacity_and_hasher(self.loads.len(), FxBuildHasher);
 
-        let (prefill_discount, decode_discount) = super::token_load_discounts();
         for entry in &self.loads {
             let worker = *entry.key();
             let load = *entry.value();
@@ -136,15 +136,26 @@ impl PromptRegistry {
         (potential_blocks, potential_tokens)
     }
 
+    /// `apply_discounts` selects between the two consumers of this projection:
+    /// placement scoring passes `true` so existing worker load is discounted
+    /// (per `router_prefill_token_discount` / `router_decode_token_discount`)
+    /// and the incoming request dominates the decision; telemetry readers
+    /// (the planner's `potential_loads` RPC) pass `false` to get raw counts.
     pub(super) fn potential_blocks_and_tokens(
         &self,
         token_sequence: Option<&[SequenceHash]>,
         prefill_token_deltas: &PrefillTokenDeltas,
         decay_now: Instant,
+        apply_discounts: bool,
     ) -> (
         FxHashMap<WorkerWithDpRank, usize>,
         FxHashMap<WorkerWithDpRank, usize>,
     ) {
+        let discounts = if apply_discounts {
+            super::token_load_discounts()
+        } else {
+            (1.0, 1.0)
+        };
         let query_len = token_sequence.map_or(0, |query| query.len());
         let matched_depth = self.membership.compute_overlap_depths(token_sequence);
         self.project_loads_from_membership(
@@ -152,6 +163,7 @@ impl PromptRegistry {
             &matched_depth,
             prefill_token_deltas,
             decay_now,
+            discounts,
         )
     }
 
@@ -378,6 +390,7 @@ mod tests {
             Some(&full_prompt),
             &PrefillTokenDeltas::none(),
             decay_now,
+            true,
         );
 
         assert_eq!(actual, expected);
@@ -413,9 +426,47 @@ mod tests {
             Some(&[1, 2, 3]),
             &PrefillTokenDeltas::none(),
             now,
+            true,
         );
         assert_eq!(actual.0.get(&worker).copied(), Some(5));
         assert_eq!(actual.1.get(&worker).copied(), Some(9));
+    }
+
+    #[test]
+    fn b10_discounts_apply_to_existing_load_only_and_telemetry_path_is_raw() {
+        let worker = worker(1, 0);
+        let registry = PromptRegistry::new([worker]);
+        let lookup = lookup();
+        let now = Instant::now();
+        let anchored_since = now.checked_sub(Duration::from_secs(3)).unwrap_or(now);
+
+        // active_blocks = 5, active_tokens(now) = 9 (see test above).
+        registry.apply_membership_delta_and_load(
+            worker,
+            &lookup,
+            store(None, &[1, 2, 3]),
+            anchored_load_snapshot(5, 12, 10, Some(Duration::from_secs(10)), anchored_since),
+        );
+
+        let deltas = PrefillTokenDeltas::uniform(4);
+        let no_overlap = FxHashMap::default();
+
+        // Placement projection: only the existing load is discounted; the
+        // incoming request's blocks/tokens keep full weight.
+        let (blocks, tokens) =
+            registry.project_loads_from_membership(2, &no_overlap, &deltas, now, (0.25, 0.5));
+        // blocks: 5 * 0.5 = 2 (as usize) + 2 new
+        assert_eq!(blocks.get(&worker).copied(), Some(4));
+        // tokens: 9 * 0.25 = 2 (as usize) + 4 added
+        assert_eq!(tokens.get(&worker).copied(), Some(6));
+
+        // Telemetry projection (planner potential_loads RPC passes
+        // apply_discounts = false): raw counts regardless of configured
+        // discounts.
+        let (blocks, tokens) =
+            registry.potential_blocks_and_tokens(Some(&[7, 8]), &deltas, now, false);
+        assert_eq!(blocks.get(&worker).copied(), Some(5 + 2));
+        assert_eq!(tokens.get(&worker).copied(), Some(9 + 4));
     }
 
     #[test]
@@ -459,6 +510,7 @@ mod tests {
             Some(&[1, 2, 3]),
             &PrefillTokenDeltas::none(),
             Instant::now(),
+            true,
         );
         assert_eq!(actual.0.get(&worker_b).copied(), Some(3));
     }
@@ -501,6 +553,7 @@ mod tests {
             Some(&[1, 2, 3]),
             &PrefillTokenDeltas::none(),
             decay_now,
+            true,
         );
 
         assert_eq!(actual, expected);

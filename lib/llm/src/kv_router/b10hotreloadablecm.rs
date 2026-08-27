@@ -550,6 +550,22 @@ impl HotReloadableConfig {
             (UnifiedConfig::default(), PathBuf::from(DEFAULT_CONFIG_PATH))
         };
 
+        // load_config() publishes these to the scheduler's atomics only on a
+        // successful file load. Publish for the initial config regardless of
+        // source, so a missing/invalid config file doesn't leave the
+        // scheduler running at the atomics' static init (discounts 1.0)
+        // while get_config() reports the serde defaults.
+        dynamo_kv_router::sequences::set_token_load_discounts(
+            initial_config.routing.router_prefill_token_discount,
+            initial_config.routing.router_decode_token_discount,
+        );
+        dynamo_kv_router::scheduling::queue::set_router_queue_threshold_decode_tokens(
+            initial_config
+                .routing
+                .router_queue_threshold_decode_tokens
+                .unwrap_or(0),
+        );
+
         Self {
             config: Arc::new(RwLock::new(initial_config)),
             config_path,

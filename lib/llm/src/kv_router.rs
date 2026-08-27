@@ -938,13 +938,19 @@ where
         ))
     }
 
-    /// Get potential prefill and decode loads for all workers
+    /// Get potential prefill and decode loads for all workers.
+    ///
+    /// `apply_discounts: false` returns raw token/block counts (telemetry:
+    /// the planner's `potential_loads` RPC and Python readers). `true`
+    /// applies the placement discounts, for readers that must stay
+    /// consistent with the worker-selection projection (GWP anchors).
     pub async fn get_potential_loads(
         &self,
         tokens: &[u32],
         router_config_override: Option<&RouterConfigOverride>,
         block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
         lora_name: Option<&str>,
+        apply_discounts: bool,
     ) -> Result<Vec<PotentialLoad>> {
         let isl_tokens = tokens.len();
         let hash_options = BlockHashOptions {
@@ -972,6 +978,7 @@ where
             isl_tokens,
             cache_hit_estimates.cached_tokens,
             track_prefill_tokens,
+            apply_discounts,
         ))
     }
 
@@ -1300,8 +1307,10 @@ where
                 // Same overlap-aware pipeline as main-v1.0.0; block_mm_infos
                 // (when provided) is forwarded so MM-conditioned hashes drive
                 // the overlap-aware cache-hit estimates.
+                // Planner autoscaling telemetry: raw counts; the placement
+                // discounts must not distort this signal.
                 let loads = self
-                    .get_potential_loads(&tokens, None, block_mm_infos.as_deref(), None)
+                    .get_potential_loads(&tokens, None, block_mm_infos.as_deref(), None, false)
                     .await?;
                 let response = RouterResponse::PotentialLoads {
                     loads,

@@ -550,6 +550,7 @@ impl OfflineReplayRouter {
             request.token_seq.as_deref(),
             &prefill_token_deltas,
             decay_now,
+            true,
         );
         let scheduling_request =
             request.scheduling_request(self.block_size as usize, decode_blocks, prefill_tokens);

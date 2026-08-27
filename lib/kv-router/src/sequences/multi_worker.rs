@@ -716,18 +716,29 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         &self,
         token_sequence: Option<&[SequenceHash]>,
         prefill_token_deltas: &PrefillTokenDeltas,
+        apply_discounts: bool,
     ) -> (
         FxHashMap<WorkerWithDpRank, usize>,
         FxHashMap<WorkerWithDpRank, usize>,
     ) {
-        self.potential_blocks_and_tokens_at(token_sequence, prefill_token_deltas, Instant::now())
+        self.potential_blocks_and_tokens_at(
+            token_sequence,
+            prefill_token_deltas,
+            Instant::now(),
+            apply_discounts,
+        )
     }
 
+    /// `apply_discounts` must be `true` on the placement path (worker
+    /// selection wants existing load discounted so the incoming request
+    /// dominates) and `false` on telemetry paths such as the planner's
+    /// `potential_loads` RPC, which need undistorted token/block counts.
     pub fn potential_blocks_and_tokens_at(
         &self,
         token_sequence: Option<&[SequenceHash]>,
         prefill_token_deltas: &PrefillTokenDeltas,
         decay_now: Instant,
+        apply_discounts: bool,
     ) -> (
         FxHashMap<WorkerWithDpRank, usize>,
         FxHashMap<WorkerWithDpRank, usize>,
@@ -742,6 +753,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             token_sequence,
             prefill_token_deltas,
             decay_now,
+            apply_discounts,
         );
 
         #[cfg(feature = "bench")]
@@ -1489,6 +1501,7 @@ mod tests {
             Some(&prompt),
             &prefill_token_deltas,
             decay_now,
+            true,
         );
 
         assert_eq!(actual.0, expected.0);
@@ -1521,6 +1534,7 @@ mod tests {
             Some(&[1, 2, 3, 5]),
             &PrefillTokenDeltas::none(),
             decay_now,
+            true,
         );
 
         assert_eq!(potential_blocks.get(&worker).copied(), Some(6));
@@ -1579,6 +1593,7 @@ mod tests {
             Some(&base_prompt),
             &PrefillTokenDeltas::none(),
             decay_now,
+            true,
         );
 
         assert_eq!(actual.0, expected.0);
@@ -1641,6 +1656,7 @@ mod tests {
             Some(&prompt_b),
             &PrefillTokenDeltas::none(),
             decay_now,
+            true,
         );
         assert_eq!(actual, expected);
         assert_eq!(actual.0.get(&worker_a).copied(), Some(4));
@@ -1658,6 +1674,7 @@ mod tests {
             Some(&prompt_b),
             &PrefillTokenDeltas::none(),
             decay_now,
+            true,
         );
         assert_eq!(actual_after_free, expected_after_free);
         assert_eq!(actual_after_free.0.get(&worker_a).copied(), Some(4));
@@ -1748,6 +1765,7 @@ mod tests {
             Some(&[1, 2, 3]),
             &PrefillTokenDeltas::none(),
             Instant::now(),
+            true,
         );
         assert_eq!(actual, expected);
     }
@@ -1952,8 +1970,12 @@ mod tests {
         let active_tokens = sequences.active_tokens(decay_now);
         assert_eq!(active_tokens.get(&worker).copied(), Some(50));
 
-        let (_, potential_tokens) =
-            sequences.potential_blocks_and_tokens_at(None, &PrefillTokenDeltas::none(), decay_now);
+        let (_, potential_tokens) = sequences.potential_blocks_and_tokens_at(
+            None,
+            &PrefillTokenDeltas::none(),
+            decay_now,
+            true,
+        );
         assert_eq!(potential_tokens.get(&worker).copied(), Some(50));
 
         assert!(

@@ -301,6 +301,7 @@ impl KvReplayRouter {
             isl_tokens,
             std::collections::HashMap::new(),
             track_prefill_tokens,
+            false,
         )
     }
 }

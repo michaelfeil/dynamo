@@ -518,7 +518,12 @@ impl GwpRouter {
             self.observed_loads.replace(loads);
             return Ok(());
         }
-        let local = self.kv.get_potential_loads(&[], None, None, None).await?;
+        // Discounted, deliberately: these anchors are subtracted from
+        // placement-path locals (which apply the discounts) in fuse_load.
+        let local = self
+            .kv
+            .get_potential_loads(&[], None, None, None, true)
+            .await?;
         let mut anchors: HashMap<_, _> = refreshed_workers
             .iter()
             .copied()
@@ -721,7 +726,7 @@ impl GwpRouter {
         tokens: &[u32],
     ) -> Vec<dynamo_kv_router::scheduling::PotentialLoad> {
         self.kv
-            .get_potential_loads(tokens, None, None, None)
+            .get_potential_loads(tokens, None, None, None, true)
             .await
             .expect("query potential loads")
     }

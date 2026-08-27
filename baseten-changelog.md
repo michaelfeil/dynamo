@@ -683,6 +683,21 @@ worker load is discounted by the hot-reloadable B10 prefill/decode factors.
 The discount acts only on the current load, not potential load. Potential load
 is more important because it is about to be added.
 
+The discounting is scoped to the placement projection only. The projection
+threads an `apply_discounts` flag (restoring the v1.0-era carve-out from
+`2d78ce32b` that the scheduling-framework rewrite dropped): the queue admit
+path passes `true`, while the `PotentialLoads` RPC and the Python
+`get_potential_loads` binding pass `false` and report raw token/block counts.
+This matters because the planner's autoscaling signal reads that RPC; with the
+discount applied it was understated by the configured factor (5x at the shipped
+`0.2`). One deliberate exception: GWP local-load anchors are captured with
+`apply_discounts=true` because `fuse_load` subtracts them from discounted
+placement-path locals, so both sides must be measured the same way. Relatedly,
+`HotReloadableConfig::new` publishes the initial config's discounts and queue
+threshold to the scheduler atomics even when the config file is missing or
+invalid; previously the atomics stayed at their `1.0` static init on the
+default-config path while `get_config()` reported the serde defaults.
+
 Heuristic and selector parity note:
 
 - `softmax_sample` accepts any worker-logit map that can be iterated as

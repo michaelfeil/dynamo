@@ -1272,6 +1272,7 @@ impl KvRouter {
                     None,
                     block_mm_infos.as_deref(),
                     lora_name.as_deref(),
+                    false,
                 )
                 .await
                 .map_err(to_pyerr)?;
