@@ -438,15 +438,22 @@ impl From<DeltaChoice> for dynamo_protocols::types::ChatChoice {
     /// # Note
     /// The `function_call` field is deprecated.
     fn from(delta: DeltaChoice) -> Self {
-        // If tool calls are present and non-empty, finish reason should be ToolCalls
-        let finish_reason = if delta
+        // If tool calls are present and non-empty AND generation ended
+        // normally, finish reason should be ToolCalls. A `length` (or
+        // `content_filter`) finish must survive aggregation: it means the
+        // final tool call was cut mid-arguments and its JSON may be
+        // incomplete — reporting ToolCalls there tells clients a truncated
+        // call is complete and ready to execute (customer-reported as
+        // "malformed tool outputs").
+        let has_tool_calls = delta
             .tool_calls
             .as_ref()
-            .is_some_and(|calls| !calls.is_empty())
-        {
-            Some(dynamo_protocols::types::FinishReason::ToolCalls)
-        } else {
-            delta.finish_reason
+            .is_some_and(|calls| !calls.is_empty());
+        let finish_reason = match delta.finish_reason {
+            None | Some(dynamo_protocols::types::FinishReason::Stop) if has_tool_calls => {
+                Some(dynamo_protocols::types::FinishReason::ToolCalls)
+            }
+            other => other,
         };
 
         // Determine content format based on what we accumulated
@@ -1232,8 +1239,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tool_calling_finish_reason_override_from_length() {
-        // Test that when tool calls are present but finish reason is Length, it gets overridden to ToolCalls
+    async fn test_tool_calling_finish_reason_length_preserved() {
+        // Length must NOT be overridden to ToolCalls: it means the final
+        // tool call was truncated mid-arguments and may carry invalid JSON.
+        // Reporting ToolCalls tells clients a broken call is complete
+        // (surfaced by Perplexity as "malformed tool outputs", 8/27).
         let tool_call_json = r#"{"name": "search", "arguments": {"query": "rust programming"}}"#;
 
         let annotated_delta = create_test_delta(
@@ -1271,10 +1281,10 @@ mod tests {
             dynamo_protocols::types::FunctionType::Function
         );
 
-        // Verify that finish reason was overridden to ToolCalls despite original being Length
+        // Verify that the Length finish reason survives aggregation
         assert_eq!(
             choice.finish_reason,
-            Some(dynamo_protocols::types::FinishReason::ToolCalls)
+            Some(dynamo_protocols::types::FinishReason::Length)
         );
     }
 

@@ -301,7 +301,7 @@ where
 // The env-var value is parsed once and cached for the lifetime of the process.
 static REASONING_EFFORT_ALIASES: OnceLock<HashMap<String, String>> = OnceLock::new();
 
-fn reasoning_effort_aliases() -> &'static HashMap<String, String> {
+pub(crate) fn reasoning_effort_aliases() -> &'static HashMap<String, String> {
     REASONING_EFFORT_ALIASES.get_or_init(|| {
         if let Ok(val) = std::env::var("REASONING_EFFORT_ALIASES") {
             if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&val) {
@@ -314,6 +314,15 @@ fn reasoning_effort_aliases() -> &'static HashMap<String, String> {
     })
 }
 
+/// Canonicalize a reasoning-effort string through `REASONING_EFFORT_ALIASES`
+/// and parse it as `ReasoningEffort`. The single entry point for every request
+/// surface that accepts an effort (chat `reasoning_effort`, responses
+/// `reasoning.effort`) so all paths share one alias table and one error shape.
+pub(crate) fn parse_reasoning_effort(s: String) -> Result<ReasoningEffort, serde_json::Error> {
+    let s = reasoning_effort_aliases().get(&s).cloned().unwrap_or(s);
+    serde_json::from_value::<ReasoningEffort>(serde_json::Value::String(s))
+}
+
 fn deserialize_reasoning_effort_opt<'de, D>(
     deserializer: D,
 ) -> Result<Option<ReasoningEffort>, D::Error>
@@ -324,13 +333,9 @@ where
     let opt = Option::<String>::deserialize(deserializer)?;
     match opt {
         None => Ok(None),
-        Some(s) => {
-            let aliases = reasoning_effort_aliases();
-            let s = aliases.get(&s).cloned().unwrap_or(s);
-            serde_json::from_value::<ReasoningEffort>(serde_json::Value::String(s))
-                .map(Some)
-                .map_err(|e| D::Error::custom(e))
-        }
+        Some(s) => parse_reasoning_effort(s)
+            .map(Some)
+            .map_err(D::Error::custom),
     }
 }
 

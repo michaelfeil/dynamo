@@ -324,6 +324,39 @@ impl Default for InputParam {
 // CreateResponse (owned, uses Dynamo-owned InputParam)
 // ---------------------------------------------------------------------------
 
+// `reasoning.effort` runs through `crate::types::chat::parse_reasoning_effort`
+// — the same alias table (`REASONING_EFFORT_ALIASES`, default `"max"` →
+// `"xhigh"`) and parse path as top-level `reasoning_effort` on chat
+// completions, so both surfaces stay behaviour-identical. Upstream's
+// `ReasoningEffort` enum has no `max`, but DeepSeek V4 / GLM clients send it,
+// and Baseten's serve-side reasoning policy maps `xhigh` back to the model's
+// native `max` tier. Without this, `{"reasoning": {"effort": "max"}}` is a
+// deserialization 400 on `/v1/responses` while the identical effort succeeds
+// on `/v1/chat/completions`. (`Reasoning` is the upstream struct, so the
+// canonicalization hooks in here rather than as a field attribute.)
+fn deserialize_reasoning_param_opt<'de, D>(deserializer: D) -> Result<Option<Reasoning>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(mut v) => {
+            if let Some(effort) = v.as_object_mut().and_then(|obj| obj.get_mut("effort"))
+                && let Some(s) = effort.as_str()
+            {
+                let canonical = crate::types::chat::parse_reasoning_effort(s.to_string())
+                    .map_err(D::Error::custom)?;
+                *effort = serde_json::to_value(&canonical).map_err(D::Error::custom)?;
+            }
+            serde_json::from_value::<Reasoning>(v)
+                .map(Some)
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
 /// Request body for `POST /v1/responses`. Mirrors upstream `CreateResponse`
 /// field-for-field but uses Dynamo-owned `InputParam`, which transitively
 /// accepts the relaxed input shapes described in this module's header. All
@@ -357,7 +390,11 @@ pub struct CreateResponse {
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reasoning_param_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reasoning: Option<Reasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
@@ -388,6 +425,66 @@ pub struct CreateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_max_aliases_to_xhigh() {
+        let json = serde_json::json!({
+            "input": "hi",
+            "reasoning": {"effort": "max"}
+        });
+        let req: CreateResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(req.reasoning.unwrap().effort, Some(ReasoningEffort::Xhigh));
+    }
+
+    #[test]
+    fn reasoning_effort_canonical_values_pass_through() {
+        for (raw, expected) in [
+            ("none", ReasoningEffort::None),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::Xhigh),
+        ] {
+            let json = serde_json::json!({
+                "input": "hi",
+                "reasoning": {"effort": raw}
+            });
+            let req: CreateResponse = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                req.reasoning.unwrap().effort,
+                Some(expected),
+                "effort {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_block_without_effort_still_parses() {
+        let json = serde_json::json!({
+            "input": "hi",
+            "reasoning": {"summary": "auto"}
+        });
+        let req: CreateResponse = serde_json::from_value(json).unwrap();
+        let reasoning = req.reasoning.unwrap();
+        assert_eq!(reasoning.effort, None);
+    }
+
+    #[test]
+    fn reasoning_effort_unknown_value_still_errors() {
+        let json = serde_json::json!({
+            "input": "hi",
+            "reasoning": {"effort": "turbo"}
+        });
+        assert!(serde_json::from_value::<CreateResponse>(json).is_err());
+    }
+
+    #[test]
+    fn omitted_reasoning_defaults_to_none() {
+        let json = serde_json::json!({"input": "hi"});
+        let req: CreateResponse = serde_json::from_value(json).unwrap();
+        assert!(req.reasoning.is_none());
+    }
 
     #[test]
     fn relaxed_assistant_message_without_id_or_status() {
