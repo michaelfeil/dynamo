@@ -706,6 +706,14 @@ class AdmittedRequest:
         """
         ...
 
+    def frontend_overhead_duration_seconds(self) -> float | None:
+        """
+        Seconds from HTTP context creation through synchronous Python-to-Rust
+        request conversion, sampled before the async routing future is created.
+        ``None`` for contexts without an HTTP request-start timestamp.
+        """
+        ...
+
     def routing_new_duration_seconds(self) -> float:
         """
         Seconds from route/connect start to the successful KV-router ``new``

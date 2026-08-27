@@ -1,14 +1,13 @@
 use super::coordinator::{
     RouteAndConnectOutcome, RouteSource, RouterGuardClient, route_and_connect, route_request,
-    shield_route_and_connect,
+    shield_route_and_connect, stream_with_optional_prefill_mark,
 };
 use super::guard::{ROUTER_GUARD_CLEANUP_GRACE_PERIOD, RouterRequestGuard};
-use super::stream_with_optional_prefill_mark;
 use super::types::{
-    AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, PotentialLoadsCheckData,
-    PreflightInputs, RouterRequestNew,
+    AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable,
+    PotentialLoadsCheck as PotentialLoadsCheckData, PreflightInputs, RouterRequestNew,
 };
-use crate::context;
+use crate::{CancellationPolicy, RequestContext, RouteOptions, RouterWorkerCoordinator};
 use anyhow::Result;
 use dynamo_kv_router::protocols::{
     BlockExtraInfo, PotentialLoad as RsPotentialLoad, RouterBackpressureReason, RouterRequest,
@@ -536,8 +535,13 @@ fn without_tokens(value: &rmpv::Value) -> rmpv::Value {
     let rmpv::Value::Map(entries) = value else {
         return value.clone();
     };
-    let kept = entries.iter().filter(|(k, _)| k.as_str() != Some("tokens"));
-    rmpv::Value::Map(kept.cloned().collect())
+    let mut kept = entries
+        .iter()
+        .filter(|(k, _)| k.as_str() != Some("tokens"))
+        .cloned()
+        .collect::<Vec<_>>();
+    kept.sort_by(|(left, _), (right, _)| left.as_str().cmp(&right.as_str()));
+    rmpv::Value::Map(kept)
 }
 
 #[test]
@@ -702,9 +706,9 @@ fn router_request_new_routing_constraints_non_default_round_trip() {
 /// `route_and_connect`/`connect_worker`/`create_request_context` can
 /// link a child to it, propagate stop_generating, and observe
 /// `is_stopped()`/`is_killed()` from the fake's `direct()` body.
-fn build_test_context(id: &str) -> context::Context {
+fn build_test_context(id: &str) -> RequestContext {
     let inner: Arc<dyn AsyncEngineContext> = Arc::new(Controller::new(id.to_string()));
-    context::Context::new(inner, None, None, BTreeMap::new())
+    RequestContext::new(inner, None, BTreeMap::new())
 }
 
 fn make_routing_request() -> Arc<rmpv::Value> {
@@ -794,7 +798,7 @@ async fn connect(
     worker: Arc<RouterGuardClientForTesting>,
     routing_request: Arc<rmpv::Value>,
     request_id: &str,
-    context: context::Context,
+    context: RequestContext,
     require: Vec<MinReplicaAvailable>,
     preflight_inputs: Option<PreflightInputs>,
     worker_request: rmpv::Value,
@@ -903,6 +907,85 @@ fn assert_connected_timing_splits(timings: &AdmittedRequestTimings) {
 }
 
 // ----- end-to-end `route_and_connect` scenarios -----
+
+#[tokio::test]
+async fn high_level_rust_client_routes_and_opens_worker() {
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![route_response_new(1)]);
+    let coordinator = RouterWorkerCoordinator::new(
+        router.clone() as Arc<dyn RouterGuardClient>,
+        worker.clone() as Arc<dyn RouterGuardClient>,
+        TEST_BLOCK_SIZE,
+    )
+    .expect("valid coordinator");
+
+    let outcome = coordinator
+        .route_and_worker(
+            build_test_context("test-high-level-rust-client"),
+            RouterRequestNew::default(),
+            make_worker_request(),
+            RouteOptions::default(),
+        )
+        .await
+        .expect("route and worker open");
+
+    match outcome {
+        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(worker_id, 1),
+        other => panic!("expected Connected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn high_level_rust_client_links_stream_after_detached_setup() {
+    for (cancellation, kill_parent) in [
+        (CancellationPolicy::DetachToWorkerStreamConnected, false),
+        (CancellationPolicy::DetachSetupOnly, true),
+    ] {
+        let router =
+            RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+        let worker =
+            RouterGuardClientForTesting::new(vec![1], vec![1], vec![route_response_new(1)]);
+        let coordinator = RouterWorkerCoordinator::new(
+            router.clone() as Arc<dyn RouterGuardClient>,
+            worker.clone() as Arc<dyn RouterGuardClient>,
+            TEST_BLOCK_SIZE,
+        )
+        .expect("valid coordinator");
+        let context = build_test_context("test-high-level-rust-detached-setup-stream");
+
+        let outcome = coordinator
+            .route_and_worker(
+                context.clone(),
+                RouterRequestNew::default(),
+                make_worker_request(),
+                RouteOptions {
+                    cancellation,
+                    ..RouteOptions::default()
+                },
+            )
+            .await
+            .expect("route and worker open");
+        assert!(matches!(outcome, RouteAndConnectOutcome::Connected { .. }));
+
+        let worker_contexts = worker.route_contexts();
+        assert_eq!(worker_contexts.len(), 1);
+        assert!(!worker_contexts[0].is_stopped());
+        assert!(!worker_contexts[0].is_killed());
+
+        if kill_parent {
+            context
+                .inner()
+                .kill_with_reason(Some("test_parent_context_killed"));
+            assert!(worker_contexts[0].is_killed());
+        } else {
+            context.inner().stop_generating();
+            assert!(worker_contexts[0].is_stopped());
+        }
+
+        drop(outcome);
+        wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    }
+}
 
 #[tokio::test]
 async fn route_and_connect_happy_router_response_inject_and_mark_free_on_drop() {

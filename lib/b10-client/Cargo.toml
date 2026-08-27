@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-b10-client"
+description = "Baseten B10 router and worker admission client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+anyhow = { workspace = true }
+dynamo-kv-router = { workspace = true, features = ["runtime-protocols"] }
+dynamo-runtime = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { version = "1", features = ["with-serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

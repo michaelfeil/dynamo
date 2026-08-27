@@ -25,6 +25,7 @@ members = [
     "lib/parsers",
     "lib/bench",
     "lib/backend-common",
+    "lib/b10-client",
     "lib/backend-common/examples/mocker",
     "lib/bindings/c",
     "lib/bindings/python/codegen",
@@ -57,6 +58,7 @@ dynamo-gwp = { path = "lib/gwp", version = "1.2.0" }
 dynamo-protocols = { path = "lib/protocols", version = "1.2.0" }
 dynamo-parsers = { path = "lib/parsers", version = "1.2.0" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.2.0" }
+dynamo-b10-client = { path = "lib/b10-client", version = "1.2.0" }
 fastokens = { version = "0.2.0" }
 
 

@@ -1341,6 +1341,14 @@ the elapsed time.
 
 v1.2 b10_client portability note:
 
+The admission implementation now lives in the workspace crate
+`lib/b10-client` (`dynamo-b10-client`). Its high-level
+`RouterWorkerCoordinator` is usable directly from Rust; the Python extension
+converts PyO3 inputs and adapts the returned worker stream while sharing the
+same routing, preflight, reroute, cancellation, and guard-cleanup state machine.
+The lifecycle tests moved with the implementation so the language-neutral
+crate owns its behavioral contract.
+
 The fork-carried `lib/bindings/python/rust/b10_client/` module exposes the
 admission lifecycle used by `RouterConfig(..., algo_selector="B10")`. It is a
 self-contained unit added by the fork; the upstream at the target SHA does not

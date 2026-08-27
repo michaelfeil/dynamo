@@ -2058,6 +2058,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "dynamo-b10-client"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "dynamo-kv-router",
+ "dynamo-runtime",
+ "futures",
+ "rand 0.9.4",
+ "rmp-serde",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dynamo-backend-common"
 version = "1.2.0"
 dependencies = [
@@ -2313,6 +2330,7 @@ dependencies = [
  "axum",
  "clap",
  "dashmap",
+ "dynamo-b10-client",
  "dynamo-backend-common",
  "dynamo-kv-router",
  "dynamo-llm",
@@ -2330,7 +2348,6 @@ dependencies = [
  "pythonize",
  "rand 0.9.4",
  "rmp",
- "rmp-serde",
  "rmpv",
  "serde",
  "serde_json",

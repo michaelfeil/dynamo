@@ -17,7 +17,7 @@
 //! `RouterWorkerCoordinator` shim) and the sibling `b10_client::tests` module
 //! can reach them; purely internal items stay private.
 
-use crate::{context, create_request_context, get_span_for_direct_context, process_stream};
+use crate::context::RequestContext;
 use anyhow::Result;
 use dynamo_kv_router::protocols::{
     BlockExtraInfo, RouterBackpressureReason, RouterRequest, RouterResponse as RsRouterResponse,
@@ -28,7 +28,6 @@ use dynamo_runtime::pipeline::{
 };
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 use futures::StreamExt;
-use pyo3::PyObject;
 use rand::Rng;
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
@@ -60,12 +59,12 @@ fn from_rmpv_value<T: DeserializeOwned>(value: &rmpv::Value) -> Result<T> {
 use super::DROP_THIS_MESSAGE_KEY;
 use super::guard::{
     ROUTER_GUARD_ATTEMPTS, ROUTER_GUARD_CALLBACK_TIMEOUT, ROUTER_GUARD_CLEANUP_GRACE_PERIOD,
-    ROUTER_GUARD_RETRY_DELAY, RouterRequestGuard,
+    ROUTER_GUARD_NOTIFY_TIMEOUT, ROUTER_GUARD_RETRY_DELAY, RouterRequestGuard,
 };
 use super::payload_copy::PayloadCopy;
 use super::types::{
     AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, NextRouterBackpressureInfo,
-    PotentialLoadsCheckData, PreflightInputs,
+    PotentialLoadsCheck, PreflightInputs, RouteOptions, RouterRequestNew,
 };
 
 /// JSON-typed push router used to talk to KV router instances.
@@ -73,13 +72,112 @@ use super::types::{
 /// On v1.2.0 the Python `Client` pyclass holds a `PushRouter<rmpv::Value,
 /// RsAnnotated<rmpv::Value>>` plus a separate `endpoint` handle; this
 /// alias names that router type used throughout the b10_client coordinator.
-type JsonPushRouter = PushRouter<rmpv::Value, RsAnnotated<rmpv::Value>>;
+pub type JsonPushRouter = PushRouter<rmpv::Value, RsAnnotated<rmpv::Value>>;
 
 const POTENTIAL_LOADS_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(590);
 const DURATION_LOG_MS_PRECISION: f64 = 1_000.0;
+
+/// High-level B10 client that routes a request and opens the selected worker.
+pub struct RouterWorkerCoordinator {
+    router: Arc<dyn RouterGuardClient>,
+    worker: Arc<dyn RouterGuardClient>,
+    block_size: u32,
+}
+
+impl RouterWorkerCoordinator {
+    pub fn new(
+        router: Arc<dyn RouterGuardClient>,
+        worker: Arc<dyn RouterGuardClient>,
+        block_size: u32,
+    ) -> Result<Self> {
+        if block_size == 0 {
+            anyhow::bail!("block_size must be positive");
+        }
+        Ok(Self {
+            router,
+            worker,
+            block_size,
+        })
+    }
+
+    pub fn from_push_routers(
+        router: JsonPushRouter,
+        worker: JsonPushRouter,
+        block_size: u32,
+    ) -> Result<Self> {
+        Self::new(
+            Arc::new(JsonRouterGuardClient::new(router)),
+            Arc::new(JsonRouterGuardClient::new(worker)),
+            block_size,
+        )
+    }
+
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    pub async fn route_and_worker(
+        &self,
+        context: RequestContext,
+        routing_request: RouterRequestNew,
+        worker_request: rmpv::Value,
+        options: RouteOptions,
+    ) -> Result<RouteAndConnectOutcome> {
+        if !matches!(worker_request, rmpv::Value::Map(_)) {
+            anyhow::bail!(
+                "worker_args must be a JSON object so the router response can be added as the `router_response` field"
+            );
+        }
+
+        let preflight_inputs = options.potential_loads_check.map(|check| PreflightInputs {
+            tokens: routing_request.tokens.clone(),
+            block_mm_infos: routing_request.block_mm_infos.clone(),
+            check,
+        });
+        let routing_request = Arc::new(routing_request.into_routing_request_value()?);
+        let request_id = context.id().to_string();
+        let phase = options.phase.map(|phase| phase.as_str().to_string());
+        let allow_cancel_routing = options.cancellation.allow_cancel_routing();
+        let allow_cancel_setup = options.cancellation.allow_cancel_setup();
+        let allow_cancel_stream = options.cancellation.allow_cancel_stream();
+        let parent_context_for_stream = context.clone();
+        let loop_fut = route_and_connect(
+            Arc::clone(&self.router),
+            Arc::clone(&self.worker),
+            routing_request,
+            request_id,
+            context,
+            options.require_available,
+            preflight_inputs,
+            worker_request,
+            self.block_size,
+            options.max_reroutes,
+            allow_cancel_routing,
+            allow_cancel_setup,
+            options.wait_for_first_response,
+            ROUTER_GUARD_NOTIFY_TIMEOUT,
+            options.tracing_enabled,
+            phase,
+        );
+        let outcome = if allow_cancel_routing {
+            loop_fut.await
+        } else {
+            shield_route_and_connect(loop_fut).await
+        }?;
+
+        if allow_cancel_stream
+            && !allow_cancel_setup
+            && let RouteAndConnectOutcome::Connected { stream, .. } = &outcome
+        {
+            attach_worker_stream_to_parent_context(stream, &parent_context_for_stream);
+        }
+
+        Ok(outcome)
+    }
+}
 
 pub(super) fn duration_ms_for_log(duration: Duration) -> f64 {
     let duration_ms = duration.as_secs_f64() * 1000.0;
@@ -121,7 +219,7 @@ fn log_route_and_connect_denied(
 
 fn create_detached_router_request_context(
     request: rmpv::Value,
-    parent_ctx: &Option<context::Context>,
+    parent_ctx: &Option<RequestContext>,
     request_id: &str,
     follow_parent_cancellation: bool,
 ) -> (RsContext<rmpv::Value>, Option<tokio::task::JoinHandle<()>>) {
@@ -191,7 +289,7 @@ fn abort_cancellation_forwarder(forwarder: &mut Option<tokio::task::JoinHandle<(
     }
 }
 
-fn trace_context_available(context: &Option<context::Context>) -> bool {
+fn trace_context_available(context: &Option<RequestContext>) -> bool {
     context
         .as_ref()
         .and_then(|context| context.trace_context())
@@ -200,7 +298,7 @@ fn trace_context_available(context: &Option<context::Context>) -> bool {
 
 fn log_route_step(
     enabled: bool,
-    context: &Option<context::Context>,
+    context: &Option<RequestContext>,
     request_id: &str,
     step: &'static str,
 ) {
@@ -215,10 +313,7 @@ fn log_route_step(
     );
 }
 
-fn cancellation_denial_for_context(
-    context: &context::Context,
-    allow: bool,
-) -> Option<DeniedRequest> {
+fn cancellation_denial_for_context(context: &RequestContext, allow: bool) -> Option<DeniedRequest> {
     if !allow {
         return None;
     }
@@ -232,7 +327,7 @@ fn cancellation_denial_for_context(
 }
 
 fn cancellation_denial_for_optional_context(
-    context: &Option<context::Context>,
+    context: &Option<RequestContext>,
     allow: bool,
 ) -> Option<DeniedRequest> {
     context
@@ -242,11 +337,22 @@ fn cancellation_denial_for_optional_context(
 
 fn create_worker_request_context(
     request: rmpv::Value,
-    parent_ctx: &context::Context,
+    parent_ctx: &RequestContext,
     follow_parent_during_setup: bool,
 ) -> RsContext<rmpv::Value> {
     if follow_parent_during_setup {
-        create_request_context(request, &Some(parent_ctx.clone()))
+        let child_ctx = RsContext::with_id_and_metadata(
+            request,
+            parent_ctx.id().to_string(),
+            parent_ctx.metadata_snapshot(),
+        );
+        parent_ctx.inner().link_child(child_ctx.context());
+        if parent_ctx.inner().is_stopped() || parent_ctx.inner().is_killed() {
+            child_ctx
+                .context()
+                .stop_generating_with_reason(Some("parent_context_already_stopped_or_killed"));
+        }
+        child_ctx
     } else {
         RsContext::with_id_and_metadata(
             request,
@@ -256,11 +362,25 @@ fn create_worker_request_context(
     }
 }
 
+fn attach_worker_stream_to_parent_context(
+    stream: &EngineStream<RsAnnotated<rmpv::Value>>,
+    parent: &RequestContext,
+) {
+    let parent_inner = parent.inner();
+    let stream_context = stream.context();
+    parent_inner.link_child(stream_context.clone());
+    if parent_inner.is_killed() {
+        stream_context.kill_with_reason(Some("parent_context_already_killed"));
+    } else if parent_inner.is_stopped() {
+        stream_context.stop_generating_with_reason(Some("parent_context_already_stopped"));
+    }
+}
+
 /// Why a [`route_request`] call resolved the way it did. The coordinator maps
 /// these onto `DeniedRequest::RouterBackpressure` /
 /// `DeniedRequest::RequiredComponentsDown` /
 /// `DeniedRequest::ProtocolError`.
-pub(super) enum RouteSource {
+pub enum RouteSource {
     /// Route succeeded; carries the KV router's chosen worker id for generation.
     Routed { worker_id: u64 },
     /// The router itself returned backpressure (or no router instances were up).
@@ -289,7 +409,7 @@ pub(super) struct RouterStreamResponse {
 }
 
 #[async_trait]
-pub(super) trait RouterGuardClient: Send + Sync {
+pub trait RouterGuardClient: Send + Sync {
     fn endpoint_id(&self) -> String;
 
     fn available_instance_ids(&self) -> Vec<u64>;
@@ -304,12 +424,12 @@ pub(super) trait RouterGuardClient: Send + Sync {
 }
 
 #[derive(Clone)]
-pub(super) struct JsonRouterGuardClient {
+pub struct JsonRouterGuardClient {
     router: JsonPushRouter,
 }
 
 impl JsonRouterGuardClient {
-    pub(super) fn new(router: JsonPushRouter) -> Self {
+    pub fn new(router: JsonPushRouter) -> Self {
         Self { router }
     }
 }
@@ -345,11 +465,11 @@ impl RouterGuardClient for JsonRouterGuardClient {
 /// any of those with zero replicas short-circuits to
 /// [`RouteSource::RequiredDown`] without routing.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn route_request(
+pub async fn route_request(
     router: Arc<dyn RouterGuardClient>,
     request: Arc<rmpv::Value>,
     request_id: String,
-    context: Option<context::Context>,
+    context: Option<RequestContext>,
     require_min1_replica_available: Vec<MinReplicaAvailable>,
     notify_timeout: Duration,
     tracing_enabled: bool,
@@ -422,9 +542,7 @@ pub(super) async fn route_request(
             let route_context = request_ctx.context();
             let span = context
                 .as_ref()
-                .map(|context| {
-                    get_span_for_direct_context(context, "route_request", &instance_id.to_string())
-                })
+                .map(|context| context.direct_span("route_request", instance_id))
                 .unwrap_or_else(tracing::Span::none);
 
             // Provisional guard armed BEFORE the router `direct`: if the
@@ -821,7 +939,7 @@ pub(super) async fn first_stream_response(
 /// the shield error (no taker) and the inner future's own error via
 /// `.map_err(to_pyerr)?.map_err(to_pyerr)?` when the output is itself a
 /// `Result`.
-pub(super) async fn shield_to_completion<F, T>(fut: F) -> Result<T, anyhow::Error>
+pub async fn shield_to_completion<F, T>(fut: F) -> Result<T, anyhow::Error>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -854,52 +972,6 @@ async fn drain_worker_stream_to_completion(
             break;
         }
     }
-}
-
-/// Spawn [`process_stream`] for `stream` on a detached task and hand back the
-/// channel receiver plus the `guard` and `source` via a oneshot, so a Python
-/// cancellation cannot abort the worker generation hand-back. If the caller is
-/// dropped before receiving (no taker), the task drains the worker generation
-/// to completion (so the server-side work is not interrupted mid-prefill) and
-/// then drops the guard, which fires `mark_free`. The caller drives
-/// `mark_prefill` / `mark_free` itself once it receives the guard. After the
-/// receiver has been handed back, dropping it is treated as consumer
-/// cancellation: [`process_stream`] exits on send failure and drops the
-/// upstream worker stream.
-pub(super) async fn shield_stream_to_completion(
-    stream: EngineStream<RsAnnotated<rmpv::Value>>,
-    guard: Arc<RouterRequestGuard>,
-    source: RouteSource,
-) -> Result<
-    (
-        Arc<RouterRequestGuard>,
-        RouteSource,
-        tokio::sync::mpsc::Receiver<RsAnnotated<PyObject>>,
-    ),
-    anyhow::Error,
-> {
-    let (otx, orx) = tokio::sync::oneshot::channel::<(
-        Arc<RouterRequestGuard>,
-        RouteSource,
-        tokio::sync::mpsc::Receiver<RsAnnotated<PyObject>>,
-    )>();
-    tokio::spawn(async move {
-        let (tx, rx) = tokio::sync::mpsc::channel::<RsAnnotated<PyObject>>(32);
-        let guard_for_drain = Arc::clone(&guard);
-        tokio::spawn(async move {
-            process_stream(stream, tx).await;
-            drop(guard_for_drain);
-        });
-        // No taker: drain the worker generation to completion, then the
-        // returned guard drops -> cleanup -> mark_free.
-        if let Err((mut _guard, _source, mut rx)) = otx.send((guard, source, rx)) {
-            while rx.recv().await.is_some() {}
-            drop(_guard);
-        }
-    });
-    orx.await.map_err(|_| {
-        anyhow::anyhow!("detached stream task ended without a receiver (caller cancelled)")
-    })
 }
 
 /// Error from the `potential_loads` preflight: either the downstream router
@@ -945,9 +1017,9 @@ fn potential_loads_outcome(
 async fn query_potential_loads(
     tokens: Vec<u32>,
     block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
-    context: Option<context::Context>,
+    context: Option<RequestContext>,
     request_id: &str,
-    check: &PotentialLoadsCheckData,
+    check: &PotentialLoadsCheck,
     block_size: u32,
     tracing_enabled: bool,
     allow_cancel_routing: bool,
@@ -999,13 +1071,7 @@ async fn query_potential_loads(
                     );
                 let span = context
                     .as_ref()
-                    .map(|ctx| {
-                        get_span_for_direct_context(
-                            ctx,
-                            "query_potential_loads",
-                            &instance_id.to_string(),
-                        )
-                    })
+                    .map(|ctx| ctx.direct_span("query_potential_loads", instance_id))
                     .unwrap_or_else(tracing::Span::none);
 
                 let result = async {
@@ -1103,7 +1169,7 @@ async fn query_potential_loads(
 /// passing the overload check.
 fn evaluate_potential_loads(
     response: &RsRouterResponse,
-    check: &PotentialLoadsCheckData,
+    check: &PotentialLoadsCheck,
     block_size: u32,
 ) -> Result<Option<NextRouterBackpressureInfo>, PotentialLoadsError> {
     let RsRouterResponse::PotentialLoads {
@@ -1241,7 +1307,7 @@ async fn route_once(
     router_guard_client: Arc<dyn RouterGuardClient>,
     routing_request: Arc<rmpv::Value>,
     request_id: String,
-    context: Option<context::Context>,
+    context: Option<RequestContext>,
     require: Vec<MinReplicaAvailable>,
     preflight: Option<PreflightInputs>,
     block_size: u32,
@@ -1499,13 +1565,39 @@ async fn wait_for_first_worker_event(
     Ok(first)
 }
 
-pub(super) fn should_drop_first_worker_event(event: &RsAnnotated<rmpv::Value>) -> bool {
+pub fn should_drop_first_worker_event(event: &RsAnnotated<rmpv::Value>) -> bool {
     event
         .data
         .as_ref()
         .map(|data| data[DROP_THIS_MESSAGE_KEY].as_bool())
         .and_then(|value| value)
         .unwrap_or(false)
+}
+
+/// Mark prefill on the first real worker response while preserving the stream.
+pub fn stream_with_optional_prefill_mark(
+    stream: EngineStream<RsAnnotated<rmpv::Value>>,
+    guard: Arc<RouterRequestGuard>,
+    mark_prefill_on_response: bool,
+) -> EngineStream<RsAnnotated<rmpv::Value>> {
+    if !mark_prefill_on_response {
+        return stream;
+    }
+
+    let stream_context = stream.context();
+    let mut marked = false;
+    let stream = stream.map(move |response| {
+        if !marked
+            && !response.is_error()
+            && response.data.is_some()
+            && !should_drop_first_worker_event(&response)
+        {
+            guard.mark_prefill();
+            marked = true;
+        }
+        response
+    });
+    ResponseStream::new(Box::pin(stream), stream_context)
 }
 
 fn prepend_first_worker_event(
@@ -1549,7 +1641,7 @@ async fn connect_worker(
     payload: PayloadCopy,
     request_id: String,
     phase: Option<String>,
-    context: context::Context,
+    context: RequestContext,
     allow_cancel_setup: bool,
     wait_for_first_response: bool,
 ) -> OpenResult {
@@ -1569,7 +1661,7 @@ async fn connect_worker(
         };
     }
 
-    let span = get_span_for_direct_context(&context, "route_and_worker", &worker_id.to_string());
+    let span = context.direct_span("route_and_worker", worker_id);
     let open_ctx = context.clone();
     let wgc = worker_guard_client.clone();
     // The guard is MOVED into `open_fut` so an outer cancellation during a
@@ -1701,7 +1793,7 @@ async fn connect_worker(
 /// (ready to hand back as an `AdmittedRequest`) or a denial. A non-stale open
 /// failure propagates as `Err` from the loop and is raised by the caller.
 #[allow(clippy::large_enum_variant)]
-pub(super) enum RouteAndConnectOutcome {
+pub enum RouteAndConnectOutcome {
     Connected {
         guard: RouterRequestGuard,
         worker_id: u64,
@@ -1730,7 +1822,7 @@ impl std::fmt::Debug for RouteAndConnectOutcome {
 /// `Connected` outcome can be handed back, it drains the connected worker stream
 /// before dropping the guard. That keeps a detached request from being aborted
 /// exactly at the route/setup -> stream handoff.
-pub(super) async fn shield_route_and_connect<F>(fut: F) -> Result<RouteAndConnectOutcome>
+pub async fn shield_route_and_connect<F>(fut: F) -> Result<RouteAndConnectOutcome>
 where
     F: std::future::Future<Output = Result<RouteAndConnectOutcome>> + Send + 'static,
 {
@@ -1783,12 +1875,12 @@ where
 /// `overlap_blocks`. The whole loop is run under the routing cancellation shield
 /// by the caller.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn route_and_connect(
+pub async fn route_and_connect(
     router_guard_client: Arc<dyn RouterGuardClient>,
     worker_guard_client: Arc<dyn RouterGuardClient>,
     routing_request: Arc<rmpv::Value>,
     request_id: String,
-    context: context::Context,
+    context: RequestContext,
     require: Vec<MinReplicaAvailable>,
     mut preflight_inputs: Option<PreflightInputs>,
     worker_request: rmpv::Value,

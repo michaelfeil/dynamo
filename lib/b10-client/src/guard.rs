@@ -30,7 +30,7 @@ use super::coordinator::{RouterGuardClient, callback_router_instance_ids, first_
 pub(super) const ROUTER_GUARD_ATTEMPTS: usize = 2;
 pub(super) const ROUTER_GUARD_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(super) const ROUTER_GUARD_CLEANUP_GRACE_PERIOD: Duration = Duration::from_millis(500);
-pub(super) const ROUTER_GUARD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub const ROUTER_GUARD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Per-attempt cap on a single `mark_prefill` / `mark_free` callback to an
 /// instance of the KV router. When the cap fires the in-flight future is
 /// aborted, the attempt is recorded as an error so the outer
@@ -133,7 +133,7 @@ pub(super) struct RouterRequestGuardState {
 ///   [`RouterRequestGuard::commit`] (response ready) or
 ///   [`RouterRequestGuard::dismiss`] (router denied) before dropping, so the
 ///   cleanup task's behaviour is well-defined.
-pub(super) struct RouterRequestGuard {
+pub struct RouterRequestGuard {
     state: Arc<RouterRequestGuardState>,
     /// Raw JSON of the router response. `None` on a provisional guard until
     /// [`Self::commit`] installs it.
@@ -285,7 +285,7 @@ impl RouterRequestGuard {
 
     /// Worker and data-parallel rank selected by the router for an admitted
     /// request. Returns `None` for backpressure and provisional guards.
-    pub(super) fn routed_worker_info(&self) -> Option<(u64, u32)> {
+    pub fn routed_worker_info(&self) -> Option<(u64, u32)> {
         match self.response.as_ref() {
             Some(RsRouterResponse::New {
                 worker_id, dp_rank, ..
@@ -330,7 +330,7 @@ impl RouterRequestGuard {
     /// [`RouterResponse::New`], derived from router-native `overlap_blocks` and
     /// the coordinator block size.
     /// `0` when the route did not arm the guard (the response is not `New`).
-    pub(super) fn estimated_overlap_tokens(&self, block_size: u32) -> u64 {
+    pub fn estimated_overlap_tokens(&self, block_size: u32) -> u64 {
         if let Some(RsRouterResponse::New { overlap_blocks, .. }) = self.response.as_ref() {
             u64::from(*overlap_blocks) * u64::from(block_size)
         } else {
@@ -340,7 +340,7 @@ impl RouterRequestGuard {
 
     /// Max device-tier overlap across all candidate workers, in blocks.
     /// `0` when the route did not arm the guard (the response is not `New`).
-    pub(super) fn b10_best_overlap_blocks(&self) -> u64 {
+    pub fn b10_best_overlap_blocks(&self) -> u64 {
         if let Some(RsRouterResponse::New {
             best_overlap_blocks,
             ..
@@ -353,7 +353,7 @@ impl RouterRequestGuard {
     }
 
     /// Request that the cleanup task marks prefill complete.
-    pub(super) fn mark_prefill(&self) {
+    pub fn mark_prefill(&self) {
         if !self.armed {
             return;
         }
@@ -361,7 +361,7 @@ impl RouterRequestGuard {
     }
 
     /// Request that the cleanup task frees the request.
-    pub(super) fn mark_free(&self) {
+    pub fn mark_free(&self) {
         if !self.armed {
             return;
         }

@@ -1,86 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pyclasses and cross-submodule data carriers for the
-//! `b10_client::RouterWorkerCoordinator` lifecycle.
-//!
-//! This submodule holds:
-//!  * the Python-facing pyclasses ([`PyRouterRequestNew`], [`CancellationPolicy`],
-//!    [`PyRouterWorkerPhase`], [`DeniedRequest`], [`RouterCoordinatorPotentialLoadsCheck`],
-//!    [`AdmittedRequest`]);
-//!  * the wire-mirror [`RouterRequestNew`] + its conversion to the wire
-//!    [`RouterRequest::New`];
-//!  * the plain `Send` data carriers the binding shim (root `b10_client.rs`)
-//!    builds under the GIL and hands to the async coordinator: [`MinReplicaAvailable`],
-//!    [`PotentialLoadsCheckData`], [`PreflightInputs`], [`NextRouterBackpressureInfo`].
-//!
-//! Cross-submodule items use `pub(super)`; pyclasses use `pub(crate)` so `lib.rs`
-//! can register them as `crate::b10_client::Foo`.
+//! Python-facing request, option, denial, and admission wrappers for the
+//! language-neutral types in `dynamo-b10-client`.
 
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
 use crate::tokens::extract_list_or_numpy_u32;
 use crate::{AsyncResponseStream, Client};
-use anyhow::Result;
-use dynamo_kv_router::protocols::{BlockExtraInfo, RouterRequest, RoutingConstraints};
+use dynamo_b10_client::{
+    AdmittedRequestTimings, CancellationPolicy as CoreCancellationPolicy,
+    DeniedRequest as CoreDeniedRequest, RouterRequestGuard,
+    RouterWorkerPhase as CoreRouterWorkerPhase,
+};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-
-use super::coordinator::RouterGuardClient;
-use super::guard::RouterRequestGuard;
-
-/// The payload of a `RouterRequest::New` routing request, minus the `method`
-/// tag (supplied by the coordinator). Built from the typed fields of the
-/// Python-facing [`PyRouterRequestNew`] pyclass under the GIL, this tag-less
-/// mirror is converted to the wire [`RouterRequest::New`] via the [`From`]
-/// impl below. The pyclass is the single source of truth for the routing
-/// inputs (no `routing_kwargs` dict, no first-class `tokens`/`block_mm_infos`
-/// override arguments), so this mirror is no longer serde-deserialized from a
-/// Python dict; it is constructed directly and converted to the wire enum.
-#[derive(Debug, Clone, Default)]
-pub(super) struct RouterRequestNew {
-    pub(super) tokens: Vec<u32>,
-    pub(super) block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
-    pub(super) routing_constraints: RoutingConstraints,
-    pub(super) allowed_worker_ids: Option<HashSet<u64>>,
-    pub(super) priority_jump: f64,
-    pub(super) priority_load_shed_percent: u8,
-    pub(super) do_not_queue: bool,
-}
-
-/// Canonical conversion from the tag-less kwargs mirror into the wire
-/// [`RouterRequest::New`] variant. Enum variants have no field-spread syntax in
-/// Rust, so the per-field copy lives in this single `From` impl rather than at
-/// every call site.
-impl From<RouterRequestNew> for RouterRequest {
-    fn from(req: RouterRequestNew) -> Self {
-        RouterRequest::New {
-            tokens: req.tokens.into(),
-            block_mm_infos: req.block_mm_infos,
-            routing_constraints: req.routing_constraints,
-            allowed_worker_ids: req.allowed_worker_ids,
-            priority_jump: req.priority_jump,
-            priority_load_shed_percent: req.priority_load_shed_percent,
-            do_not_queue: req.do_not_queue,
-        }
-    }
-}
-
-impl RouterRequestNew {
-    /// Build the wire body for a `new` routing request from the typed fields.
-    /// Every field is set by the caller from the [`PyRouterRequestNew`] pyclass
-    /// under the GIL; no serde-deserialized defaults are layered in.
-    pub(super) fn into_routing_request_value(self) -> Result<rmpv::Value> {
-        // Through msgpack rather than `serde_json`: a `new` request carries
-        // the whole prompt, so the JSON hop rebuilt every token as a
-        // `serde_json::Value` before rebuilding it again as an `rmpv::Value`.
-        // `to_vec_named` matches what the request plane actually sends.
-        let bytes = rmp_serde::to_vec_named(&RouterRequest::from(self))?;
-        Ok(rmpv::decode::read_value(&mut bytes.as_slice())?)
-    }
-}
 
 /// Cancellation policy for a [`super::RouterWorkerCoordinator::route_and_worker`]
 /// call. Selects which of the three phases — routing (the `route_and_connect`
@@ -130,42 +66,18 @@ pub(crate) enum CancellationPolicy {
     DetachSetupOnly,
 }
 
-impl CancellationPolicy {
-    /// Whether the `route_and_connect` loop (route + required-available check
-    /// + first-attempt preflight + per-attempt worker setup shield) may be
-    ///   cancelled in-band via the request context.
-    pub(super) fn allow_cancel_routing(self) -> bool {
-        match self {
-            Self::Cancellable => true,
-            Self::DetachToWorkerStreamConnected => false,
-            Self::FullyDetached => false,
-            Self::CancellableUntilWorkerThenDetach => true,
-            Self::DetachSetupOnly => true,
-        }
-    }
-
-    /// Whether each per-attempt `direct()` worker-stream open may be cancelled
-    /// in-band. Independent from [`Self::allow_cancel_routing`] so a caller can
-    /// allow routing cancellation while protecting the open.
-    pub(super) fn allow_cancel_setup(self) -> bool {
-        match self {
-            Self::Cancellable => true,
-            Self::DetachToWorkerStreamConnected => false,
-            Self::FullyDetached => false,
-            Self::CancellableUntilWorkerThenDetach => true,
-            Self::DetachSetupOnly => false,
-        }
-    }
-
-    /// Whether the worker generation stream hand-back may be cancelled after
-    /// the open hands the stream back.
-    pub(super) fn allow_cancel_stream(self) -> bool {
-        match self {
-            Self::Cancellable => true,
-            Self::DetachToWorkerStreamConnected => true,
-            Self::FullyDetached => false,
-            Self::CancellableUntilWorkerThenDetach => false,
-            Self::DetachSetupOnly => true,
+impl From<CancellationPolicy> for CoreCancellationPolicy {
+    fn from(value: CancellationPolicy) -> Self {
+        match value {
+            CancellationPolicy::Cancellable => Self::Cancellable,
+            CancellationPolicy::DetachToWorkerStreamConnected => {
+                Self::DetachToWorkerStreamConnected
+            }
+            CancellationPolicy::FullyDetached => Self::FullyDetached,
+            CancellationPolicy::CancellableUntilWorkerThenDetach => {
+                Self::CancellableUntilWorkerThenDetach
+            }
+            CancellationPolicy::DetachSetupOnly => Self::DetachSetupOnly,
         }
     }
 }
@@ -204,6 +116,18 @@ impl PyRouterWorkerPhase {
             Self::PrefillFirst => "prefill_first",
             Self::DecodeSecond => "decode_second",
             Self::PrefillSecond => "prefill_second",
+        }
+    }
+}
+
+impl From<PyRouterWorkerPhase> for CoreRouterWorkerPhase {
+    fn from(value: PyRouterWorkerPhase) -> Self {
+        match value {
+            PyRouterWorkerPhase::Agg => Self::Agg,
+            PyRouterWorkerPhase::DecodeFirst => Self::DecodeFirst,
+            PyRouterWorkerPhase::PrefillFirst => Self::PrefillFirst,
+            PyRouterWorkerPhase::DecodeSecond => Self::DecodeSecond,
+            PyRouterWorkerPhase::PrefillSecond => Self::PrefillSecond,
         }
     }
 }
@@ -343,58 +267,6 @@ impl PyRouterRequestNew {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct MinReplicaAvailable {
-    pub(super) name: String,
-    pub(super) router: Arc<dyn RouterGuardClient>,
-}
-
-/// Plain, `Send` view of a [`RouterCoordinatorPotentialLoadsCheck`] extracted
-/// under the GIL so the async block can run without holding it. `router` is the
-/// downstream `client`'s router wrapped as a [`RouterGuardClient`]; the
-/// preflight queries *it* (not the routing router).
-pub(super) struct PotentialLoadsCheckData {
-    pub(super) router: Arc<dyn RouterGuardClient>,
-    pub(super) queue_depth_threshold: usize,
-    pub(super) prefill_tokens_threshold: usize,
-    pub(super) decode_tokens_threshold: usize,
-    pub(super) load_percentile: f64,
-}
-
-/// Fields captured when the next-router preflight finds the selected router
-/// load percentile exceeds the configured thresholds. Carried on
-/// `DeniedRequest::NextRouterBackpressure`.
-pub(super) struct NextRouterBackpressureInfo {
-    pub(super) queue_depth: usize,
-    pub(super) pending_isl_tokens: usize,
-    pub(super) prefill_tokens: usize,
-    pub(super) decode_blocks: usize,
-}
-
-/// Inputs for the next-router potential-loads preflight, captured up front so
-/// the `route_and_connect` loop can run the preflight exactly once (on the first
-/// attempt) and skip it on stale-route reroutes -- the downstream router's loads
-/// do not change because a routed worker turned out to be stale, so re-querying
-/// is wasteful.
-pub(super) struct PreflightInputs {
-    pub(super) check: PotentialLoadsCheckData,
-    pub(super) tokens: Vec<u32>,
-    pub(super) block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
-}
-
-/// Successful route/connect phase timings and reroute count carried back on
-/// [`AdmittedRequest`].
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct AdmittedRequestTimings {
-    pub(super) routing_new_duration: Duration,
-    pub(super) routing_stream_connect_duration: Duration,
-    pub(super) worker_stream_connect_duration: Duration,
-    pub(super) worker_first_response_duration: Option<Duration>,
-    pub(super) worker_sentinel_event_duration: Option<Duration>,
-    pub(super) worker_connect_duration: Duration,
-    pub(super) stale_reroutes: u64,
-}
-
 /// Why a [`super::RouterWorkerCoordinator::route_and_worker`] call was denied. One of
 /// these is returned (never raised) instead of a `AdmittedRequest` when the
 /// router is backpressured, a `require_available` component is down, the
@@ -465,6 +337,44 @@ pub(crate) enum DeniedRequest {
         /// event.
         error: String,
     },
+}
+
+impl From<CoreDeniedRequest> for DeniedRequest {
+    fn from(value: CoreDeniedRequest) -> Self {
+        match value {
+            CoreDeniedRequest::RouterBackpressure {
+                reason,
+                queued_isl_tokens,
+                max_queued_isl_tokens,
+            } => Self::RouterBackpressure {
+                reason,
+                queued_isl_tokens,
+                max_queued_isl_tokens,
+            },
+            CoreDeniedRequest::RequiredComponentsDown { name } => {
+                Self::RequiredComponentsDown { name }
+            }
+            CoreDeniedRequest::NextRouterBackpressure {
+                queue_depth,
+                pending_isl_tokens,
+                total_prefill_tokens,
+                total_decode_blocks,
+            } => Self::NextRouterBackpressure {
+                queue_depth,
+                pending_isl_tokens,
+                total_prefill_tokens,
+                total_decode_blocks,
+            },
+            CoreDeniedRequest::NextRouterUnreachable { error } => {
+                Self::NextRouterUnreachable { error }
+            }
+            CoreDeniedRequest::ProtocolError { received } => Self::ProtocolError { received },
+            CoreDeniedRequest::Cancelled() => Self::Cancelled(),
+            CoreDeniedRequest::FirstWorkerEventFailed { error } => {
+                Self::FirstWorkerEventFailed { error }
+            }
+        }
+    }
 }
 
 /// Required preflight passed to [`super::RouterWorkerCoordinator::route_and_worker`]:
@@ -543,6 +453,7 @@ pub(crate) struct AdmittedRequest {
     pub(super) stream: std::sync::Mutex<Option<AsyncResponseStream>>,
     pub(super) timings: AdmittedRequestTimings,
     pub(super) block_size: u32,
+    pub(super) frontend_overhead_duration: Option<Duration>,
 }
 
 impl AdmittedRequest {
@@ -558,12 +469,14 @@ impl AdmittedRequest {
         stream: AsyncResponseStream,
         timings: AdmittedRequestTimings,
         block_size: u32,
+        frontend_overhead_duration: Option<Duration>,
     ) -> Self {
         Self {
             guard,
             stream: std::sync::Mutex::new(Some(stream)),
             timings,
             block_size,
+            frontend_overhead_duration,
         }
     }
 }
@@ -580,6 +493,13 @@ impl AdmittedRequest {
     /// `0` on routers that predate the field.
     fn b10_best_overlap_blocks(&self) -> u64 {
         self.guard.b10_best_overlap_blocks()
+    }
+
+    /// Seconds from HTTP context creation through synchronous Python-to-Rust
+    /// request conversion, sampled before the async routing future is created.
+    fn frontend_overhead_duration_seconds(&self) -> Option<f64> {
+        self.frontend_overhead_duration
+            .map(|duration| duration.as_secs_f64())
     }
 
     /// Seconds from entering route/connect setup to the successful KV-router

@@ -1,38 +1,9 @@
-//! Router-worker coordinator: route a KV-router `new` request, then generate
-//! on the routed worker with detached guard cleanup on cancellation.
+//! PyO3 adapter for [`dynamo_b10_client::RouterWorkerCoordinator`].
 //!
-//! The module is split across four submodules:
-//! - [`types`] holds the PyO3 pyclasses (`PyRouterRequestNew`,
-//!   `CancellationPolicy`, `DeniedRequest`, `AdmittedRequest`,
-//!   `RouterCoordinatorPotentialLoadsCheck`) plus the
-//!   cross-module wire structs (`RouterRequestNew`, `PreflightInputs`,
-//!   `MinReplicaAvailable`, `PotentialLoadsCheckData`,
-//!   `NextRouterBackpressureInfo`).
-//! - [`guard`] holds the per-request lifecycle guard (`mark_prefill` /
-//!   `mark_free`, the detached cleanup task on drop) plus the
-//!   `ROUTER_GUARD_*` timeouts.
-//! - [`coordinator`] is the algorithmic core: the `RouterGuardClient` trait
-//!   and `JsonRouterGuardClient` adapter, the `route_request` /
-//!   `route_and_connect` loop, the `route_once` / `connect_worker` helpers,
-//!   the preflight `query_potential_loads` / `evaluate_potential_loads`, and
-//!   the shielded-phase drivers (`shield_to_completion`,
-//!   `shield_route_and_connect`, `shield_stream_to_completion`).
-//! - [`tests`] is the `#[cfg(test)]` suite covering the legacy `route_request`
-//!   and full `route_and_connect` lifecycle (the in-file fake and sync
-//!   `RouterRequestNew` round-trip tests).
-//!
-//! The root file declares the `RouterWorkerCoordinator` pyclass and its
-//! `route_and_worker` shim: it borrows the user's `PyRouterRequestNew`
-//! under the GIL, lifts the routing knobs and preflight inputs into
-//! plain `Send` values, then drives the `coordinator::route_and_connect`
-//! loop with a per-phase shield selected by the caller's `CancellationPolicy`.
-mod coordinator;
-mod guard;
-mod payload_copy;
+//! Routing, admission, worker connection, cancellation, and guard cleanup live
+//! in `dynamo-b10-client`. This module converts Python inputs, records routed
+//! worker metadata, and exposes the returned stream as an async Python object.
 mod types;
-
-#[cfg(test)]
-mod tests;
 
 // Re-export the pyclasses registered in `lib.rs::add_class::<...>` so they
 // resolve as `crate::b10_client::Foo` (the crate-root path lib.rs expects).
@@ -46,69 +17,51 @@ pub(crate) use types::{
 
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
 use crate::{AsyncResponseStream, Client, context, process_stream, to_pyerr};
+use dynamo_b10_client::{
+    CancellationPolicy as CoreCancellationPolicy, JsonRouterGuardClient, MinReplicaAvailable,
+    PotentialLoadsCheck, RequestContext, RouteAndConnectOutcome, RouteOptions, RouterRequestGuard,
+    RouterRequestNew, RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
+    RouterWorkerPhase as CoreRouterWorkerPhase, stream_with_optional_prefill_mark,
+};
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints};
-use dynamo_runtime::pipeline::{EngineStream, ResponseStream};
+use dynamo_runtime::pipeline::EngineStream;
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
-use futures::StreamExt;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use std::sync::Arc;
+use std::time::Duration;
 
-use coordinator::{
-    JsonRouterGuardClient, RouteAndConnectOutcome, RouteSource, RouterGuardClient,
-    route_and_connect, shield_route_and_connect, shield_stream_to_completion,
-    should_drop_first_worker_event,
-};
-use guard::{ROUTER_GUARD_NOTIFY_TIMEOUT, RouterRequestGuard};
-use types::{MinReplicaAvailable, PotentialLoadsCheckData, PreflightInputs, RouterRequestNew};
+pub(crate) use dynamo_b10_client::DROP_THIS_MESSAGE_KEY;
 
-pub(crate) const DROP_THIS_MESSAGE_KEY: &str = "drop_this_message";
-
-fn stream_with_optional_prefill_mark(
+async fn shield_stream_to_completion(
     stream: EngineStream<RsAnnotated<rmpv::Value>>,
     guard: Arc<RouterRequestGuard>,
-    mark_prefill_on_response: bool,
-) -> EngineStream<RsAnnotated<rmpv::Value>> {
-    if !mark_prefill_on_response {
-        return stream;
-    }
-
-    let stream_context = stream.context();
-    let mut marked = false;
-    let stream = stream.map(move |response| {
-        if !marked
-            && !response.is_error()
-            && response.data.is_some()
-            && !should_drop_first_worker_event(&response)
-        {
-            guard.mark_prefill();
-            marked = true;
+) -> anyhow::Result<(
+    Arc<RouterRequestGuard>,
+    tokio::sync::mpsc::Receiver<RsAnnotated<PyObject>>,
+)> {
+    let (output_tx, output_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
+        let guard_for_drain = Arc::clone(&guard);
+        tokio::spawn(async move {
+            process_stream(stream, stream_tx).await;
+            drop(guard_for_drain);
+        });
+        if let Err((guard, mut stream_rx)) = output_tx.send((guard, stream_rx)) {
+            while stream_rx.recv().await.is_some() {}
+            drop(guard);
         }
-        response
     });
-    ResponseStream::new(Box::pin(stream), stream_context)
-}
-
-fn attach_worker_stream_to_parent_context(
-    stream: &EngineStream<RsAnnotated<rmpv::Value>>,
-    parent: &context::Context,
-) {
-    let parent_inner = parent.inner();
-    let stream_context = stream.context();
-    parent_inner.link_child(stream_context.clone());
-    if parent_inner.is_killed() {
-        stream_context.kill_with_reason(Some("parent_context_already_killed"));
-    } else if parent_inner.is_stopped() {
-        stream_context.stop_generating_with_reason(Some("parent_context_already_stopped"));
-    }
+    output_rx.await.map_err(|_| {
+        anyhow::anyhow!("detached stream task ended without a receiver (caller cancelled)")
+    })
 }
 
 #[pyclass]
 pub(crate) struct RouterWorkerCoordinator {
-    router: Client,
-    worker: Client,
-    block_size: u32,
+    inner: Arc<CoreRouterWorkerCoordinator>,
 }
 
 #[pymethods]
@@ -124,16 +77,20 @@ impl RouterWorkerCoordinator {
             return Err(PyValueError::new_err("block_size must be positive"));
         }
 
-        Ok(Self {
-            router: router_client,
-            worker: worker_client,
+        let inner = CoreRouterWorkerCoordinator::from_push_routers(
+            router_client.router,
+            worker_client.router,
             block_size,
+        )
+        .map_err(to_pyerr)?;
+        Ok(Self {
+            inner: Arc::new(inner),
         })
     }
 
     /// KV router block size in tokens.
     fn block_size(&self) -> u32 {
-        self.block_size
+        self.inner.block_size()
     }
 
     /// Route a KV-router `new` request, then generate on the routed worker.
@@ -233,9 +190,8 @@ impl RouterWorkerCoordinator {
         phase: Option<RouterWorkerPhaseArg>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let annotated = annotated.unwrap_or(false);
-        let allow_cancel_routing = cancellation.allow_cancel_routing();
-        let allow_cancel_setup = cancellation.allow_cancel_setup();
-        let allow_cancel_stream = cancellation.allow_cancel_stream();
+        let core_cancellation = CoreCancellationPolicy::from(cancellation);
+        let allow_cancel_stream = core_cancellation.allow_cancel_stream();
 
         // Extract the PyRouterRequestNew under the GIL; the async block runs
         // without it. `tokens`, `block_mm_infos`, and `routing_constraints` all
@@ -282,7 +238,7 @@ impl RouterWorkerCoordinator {
         // preflight queries, distinct from the routing router). The
         // `block_mm_infos` conditioning the preflight comes from the pyclass
         // field (see above), not the check itself.
-        let next_check: Option<PotentialLoadsCheckData> = match potential_loads_next_check {
+        let next_check: Option<PotentialLoadsCheck> = match potential_loads_next_check {
             Some(obj) => {
                 let bound = obj.into_bound(py);
                 let check = bound
@@ -293,7 +249,7 @@ impl RouterWorkerCoordinator {
                         )
                     })?;
                 let borrowed = check.borrow();
-                Some(PotentialLoadsCheckData {
+                Some(PotentialLoadsCheck {
                     router: Arc::new(JsonRouterGuardClient::new(borrowed.client.router.clone())),
                     queue_depth_threshold: borrowed.queue_depth_threshold,
                     prefill_tokens_threshold: borrowed.prefill_tokens_threshold,
@@ -304,21 +260,15 @@ impl RouterWorkerCoordinator {
             None => None,
         };
 
-        // The preflight needs the tokens too; clone now -- the routing request
-        // below will move `tokens` into `RouterRequestNew`.
-        let tokens_for_check: Option<Vec<u32>> = next_check.as_ref().map(|_| tokens.clone());
-
-        let req = RouterRequestNew {
+        let routing_request = RouterRequestNew {
             tokens,
-            block_mm_infos: block_mm_infos_typed.clone(),
+            block_mm_infos: block_mm_infos_typed,
             routing_constraints: routing_constraints_wire,
             allowed_worker_ids,
             priority_jump,
             priority_load_shed_percent,
             do_not_queue,
         };
-        let routing_request = Arc::new(req.into_routing_request_value().map_err(to_pyerr)?);
-
         let worker_request: rmpv::Value = match worker_args {
             Some(wa) => pythonize::depythonize(&wa.into_bound(py))?,
             None => rmpv::Value::Map(Vec::new()),
@@ -333,87 +283,57 @@ impl RouterWorkerCoordinator {
             })
             .collect();
 
-        // The preflight runs only on the first route attempt (a stale-route
-        // reroute does not change the downstream router's reported loads), so
-        // capture its inputs here; `route_and_connect` takes them by value and
-        // `take`s once.
-        let preflight_inputs: Option<PreflightInputs> = next_check.map(|check| PreflightInputs {
-            check,
-            tokens: tokens_for_check.unwrap_or_default(),
-            block_mm_infos: block_mm_infos_typed,
-        });
-
-        let request_id = context.inner().id().to_string();
-        let router_router = self.router.router.clone();
-        let worker_router = self.worker.router.clone();
-        let block_size = self.block_size;
+        let block_size = self.inner.block_size();
+        let coordinator = Arc::clone(&self.inner);
         let phase = phase.map(|phase| phase.0);
-        let phase_name = phase.map(|phase| phase.as_str().to_string());
+        let core_phase = phase.map(CoreRouterWorkerPhase::from);
+        let core_context = RequestContext::new(
+            context.inner(),
+            context.trace_context().cloned(),
+            context.metadata_snapshot(),
+        );
+        // Sample after all synchronous PyO3 conversions and immediately before
+        // creating the async routing future.
+        let frontend_overhead_duration = context
+            .milliseconds_since_request_start()?
+            .map(Duration::from_millis);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // `worker_args` must be a JSON object so the per-route
-            // `RouterResponse::New` can be injected under `router_response`.
+            let parent_context_for_stream = context.clone();
             if !matches!(worker_request, rmpv::Value::Map(_)) {
                 return Err(PyValueError::new_err(
                     "worker_args must be a JSON object so the router response can be added as the `router_response` field",
                 ));
             }
+            let outcome = coordinator
+                .route_and_worker(
+                    core_context,
+                    routing_request,
+                    worker_request,
+                    RouteOptions {
+                        require_available: require,
+                        potential_loads_check: next_check,
+                        cancellation: core_cancellation,
+                        max_reroutes,
+                        tracing_enabled,
+                        wait_for_first_response,
+                        phase: core_phase,
+                    },
+                )
+                .await
+                .map_err(to_pyerr)?;
 
-            let router_guard_client: Arc<dyn RouterGuardClient> =
-                Arc::new(JsonRouterGuardClient::new(router_router));
-            let worker_guard_client: Arc<dyn RouterGuardClient> =
-                Arc::new(JsonRouterGuardClient::new(worker_router));
-            let parent_context_for_stream = context.clone();
-
-            // --- Route + connect phase (routing shield) ---
-            // The whole loop -- `route_once` running the `require_available`
-            // check, then (on the first attempt only) the sequential
-            // `potential_loads_next_check` preflight, then the `new` route and
-            // post-route `require_available` re-check, then `connect_worker`
-            // opening the worker stream and re-routing on a stale worker up to
-            // `max_reroutes` -- is the `routing` phase. When the caller disallows
-            // cancellation during routing it is detached via `shield_route_and_connect`
-            // so a Python cancellation cannot abort it; an armed guard abandoned
-            // by a cancelled shield is handled inside the detached task: if the
-            // loop only reached an armed guard, dropping it fires the cleanup
-            // task -> mark_free; if it reached a connected worker stream, the
-            // no-taker path drains that stream before dropping the guard. A
-            // non-stale open failure propagates from the loop as `Err` and is
-            // raised (not a denial).
-            let loop_fut = route_and_connect(
-                router_guard_client,
-                worker_guard_client,
-                routing_request,
-                request_id,
-                context,
-                require,
-                preflight_inputs,
-                worker_request,
-                block_size,
-                max_reroutes,
-                allow_cancel_routing,
-                allow_cancel_setup,
-                wait_for_first_response,
-                ROUTER_GUARD_NOTIFY_TIMEOUT,
-                tracing_enabled,
-                phase_name,
-            );
-            let outcome = if allow_cancel_routing {
-                loop_fut.await.map_err(to_pyerr)?
-            } else {
-                shield_route_and_connect(loop_fut).await.map_err(to_pyerr)?
-            };
-
-            let (guard, worker_id, stream, timings) = match outcome {
+            let (guard, stream, timings) = match outcome {
                 RouteAndConnectOutcome::Denied(denied) => {
+                    let denied = DeniedRequest::from(denied);
                     return Python::with_gil(|py| denied.into_py_any(py));
                 }
                 RouteAndConnectOutcome::Connected {
                     guard,
-                    worker_id,
+                    worker_id: _,
                     stream,
                     timings,
-                } => (guard, worker_id, stream, timings),
+                } => (guard, stream, timings),
             };
 
             if let (Some(phase), Some((worker_id, dp_rank))) = (phase, guard.routed_worker_info()) {
@@ -429,10 +349,6 @@ impl RouterWorkerCoordinator {
                         parent_context_for_stream.record_prefill_worker(worker_id, dp_rank);
                     }
                 }
-            }
-
-            if allow_cancel_stream && !allow_cancel_setup {
-                attach_worker_stream_to_parent_context(&stream, &parent_context_for_stream);
             }
 
             // The guard is wrapped in an `Arc` shared with the background
@@ -502,14 +418,19 @@ impl RouterWorkerCoordinator {
                     Arc::clone(&guard),
                     mark_prefill_on_response,
                 );
-                let (guard, _source, rx) =
-                    shield_stream_to_completion(stream, guard, RouteSource::Routed { worker_id })
-                        .await
-                        .map_err(to_pyerr)?;
+                let (guard, rx) = shield_stream_to_completion(stream, guard)
+                    .await
+                    .map_err(to_pyerr)?;
                 (guard, AsyncResponseStream::new(rx, annotated))
             };
 
-            let admitted = AdmittedRequest::new(guard, stream, timings, block_size);
+            let admitted = AdmittedRequest::new(
+                guard,
+                stream,
+                timings,
+                block_size,
+                frontend_overhead_duration,
+            );
             Python::with_gil(|py| admitted.into_py_any(py))
         })
     }

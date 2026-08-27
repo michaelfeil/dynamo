@@ -44,6 +44,7 @@ dynamo-mocker = { path = "../../mocker" }
 dynamo-parsers = { path = "../../parsers" }
 dynamo-protocols = { path = "../../protocols" }
 dynamo-backend-common = { path = "../../backend-common" }
+dynamo-b10-client = { path = "../../b10-client" }
 
 anyhow = { version = "1" }
 async-stream = { version = "0.3" }
@@ -51,7 +52,6 @@ async-trait = { version = "0.1" }
 dashmap = { version = "6.1" }
 futures = { version = "0.3" }
 rmp = { version = "0.8" }
-rmp-serde = { version = "1" }
 rmpv = { version = "1", features = ["with-serde"] }
 once_cell = { version = "1.20.3" }
 parking_lot = { version = "0.12.4" }
