@@ -1046,6 +1046,9 @@ Source commits:
 - `de9d4ba04` fix(frontend): correct Anthropic /v1/messages input_tokens accounting
   (port of upstream #11030 `2a29f6d65f`; Baseten deviation: always emit
   `cache_creation_input_tokens: 0`)
+- `08000db` fix(protocols): accept image_url detail=original (#693; original is
+  in OpenAI's current vision API and Baseten's Model APIs docs; no backend
+  consumes detail today, so all values are no-ops; upstreamable)
 
 Purpose:
 

@@ -399,6 +399,7 @@ pub enum ImageDetail {
     Auto,
     Low,
     High,
+    Original,
 }
 
 /// Image content part -- uses our extended `ImageUrl` with `url::Url` and `uuid`.
@@ -1058,6 +1059,34 @@ mod tests {
         assert_eq!(
             Stop::from(upstream),
             Stop::StringArray(vec!["END".to_string()])
+        );
+    }
+
+    #[test]
+    fn image_url_detail_accepts_original() {
+        // "original" is a Baseten docs extension; rejecting it fails the whole
+        // untagged ChatCompletionRequestUserMessageContent match with an opaque 400.
+        let content: ChatCompletionRequestUserMessageContent =
+            serde_json::from_value(serde_json::json!([
+                {"type": "text", "text": "Reply OK."},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png", "detail": "original"}}
+            ]))
+            .unwrap();
+
+        let ChatCompletionRequestUserMessageContent::Array(parts) = content else {
+            panic!("expected content part array");
+        };
+        let ChatCompletionRequestUserMessageContentPart::ImageUrl(image) = &parts[1] else {
+            panic!("expected image_url part");
+        };
+        assert_eq!(image.image_url.detail, Some(ImageDetail::Original));
+    }
+
+    #[test]
+    fn image_detail_original_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_value(ImageDetail::Original).unwrap(),
+            serde_json::json!("original")
         );
     }
 

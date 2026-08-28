@@ -253,6 +253,7 @@ fn convert_image_detail_str(detail: &impl serde::Serialize) -> ChatImageDetail {
     {
         Some("low") => ChatImageDetail::Low,
         Some("high") => ChatImageDetail::High,
+        Some("original") => ChatImageDetail::Original,
         _ => ChatImageDetail::Auto,
     }
 }
