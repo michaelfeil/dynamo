@@ -1872,6 +1872,9 @@ Required when KVBM connector is used. If this branch is deployed with
   completion from success, rewinds connector state to the native device
   prefix, and suppresses one external rematch so normal prefill recomputes the
   missing suffix.
+- **Terminal prefill boundary**: accepts the scheduler's first decode token in
+  `num_scheduled_tokens` without requiring a device block for KV that is never
+  materialized.
 
 Source commits:
 
@@ -1882,6 +1885,7 @@ Source commits:
 - `139a41ecc` fix(kvbm): truncate token sequence on rewind
 - Current PR: fix(kvbm): recompute prefixes after failed asynchronous loads
 - Current follow-up: fix(kvbm): accept sparse TensorRT-LLM connector hashes
+- Current follow-up: fix(kvbm): handle the terminal prefill token boundary
 
 Upstream PRs:
 
@@ -1914,6 +1918,9 @@ Changes:
   `KvConnectorLeader.on_rewind` delegate to the Rust leader
 - The TensorRT-LLM adapter preserves an absent incremental block-hash update
   as `None`, matching the Rust binding's optional external hash-chain contract
+- `VllmConnectorSlot.apply_scheduler_output` recognizes the transition beyond
+  the known token sequence before validating device-block coverage, preventing
+  a one-token boundary panic when the scheduler begins decoding
 - `_core.pyi`: type stub added
 - Rust unit tests: covers `[0,1,2] -> rewind [0,1] -> append [3]` cycle and
   no-op-when-growing case

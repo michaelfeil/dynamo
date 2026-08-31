@@ -807,8 +807,19 @@ impl Slot for VllmConnectorSlot {
             return Ok(());
         }
 
-        // we should have enough device blocks to cover the newly scheduled tokens
         let next_position = self.current_position + num_scheduled_tokens;
+
+        // The scheduler may include the first decode token in this count. Its KV is not
+        // allocated, so stop before validating the prefill block coverage.
+        if next_position > self.sequence.total_tokens() {
+            self.state = SlotState::Decoding;
+            tracing::debug!(
+                "connector source stopped providing tokens; no further evaluation possible"
+            );
+            return Ok(());
+        }
+
+        // we should have enough device blocks to cover the newly scheduled tokens
         assert!(
             next_position <= self.device_blocks.len() * self.block_size,
             "next_position: {} > device_blocks.len() {} * block_size {}",
@@ -816,15 +827,6 @@ impl Slot for VllmConnectorSlot {
             self.device_blocks.len(),
             self.block_size
         );
-
-        if next_position > self.sequence.total_tokens() {
-            // vllm stopped providing tokens, so we are done
-            self.state = SlotState::Decoding;
-            tracing::debug!(
-                "connector source stopped providing tokens; no further evaluation possible"
-            );
-            return Ok(());
-        }
 
         // now we decide what we should do from the current position to the num_scheduled_tokens
         tracing::debug!(
@@ -2273,6 +2275,20 @@ mod connector_tests {
         let offloads = drain_offload_block_ids(&mut rx);
         assert_eq!(offloads.len(), 1, "expected exactly one offload batch");
         assert_eq!(offloads[0], vec![100, 101, 102]);
+    }
+
+    #[test]
+    fn test_terminal_prefill_token_does_not_require_an_extra_device_block() {
+        let num_tokens = 544; // 17 full blocks
+        let (mut slot, mut rx) = create_test_slot(num_tokens, 0);
+        let blocks = block_ids(100, 17);
+
+        slot.append_mutable_device_blocks(&blocks).unwrap();
+        slot.apply_scheduler_output(&[], &[], 0, num_tokens + 1, None, None)
+            .unwrap();
+
+        assert_eq!(slot.state(), SlotState::Decoding);
+        assert!(drain_offload_block_ids(&mut rx).is_empty());
     }
 
     // ---------------------------------------------------------------
