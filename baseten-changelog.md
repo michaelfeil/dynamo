@@ -1868,6 +1868,10 @@ Required when KVBM connector is used. If this branch is deployed with
   block ids and token sequence after speculative-decoding rewind. Without
   this, `get_finished` hangs when Eagle rejects draft tokens crossing a
   block boundary.
+- **Failed onboard recovery** (`recover_failed_load`): separates transfer
+  completion from success, rewinds connector state to the native device
+  prefix, and suppresses one external rematch so normal prefill recomputes the
+  missing suffix.
 
 Source commits:
 
@@ -1876,6 +1880,7 @@ Source commits:
 - `a91abfd63` style: apply cargo fmt formatting
 - `107b81364` fix(kvbm): guard on_rewind against missing slots
 - `139a41ecc` fix(kvbm): truncate token sequence on rewind
+- Current PR: fix(kvbm): recompute prefixes after failed asynchronous loads
 
 Upstream PRs:
 
@@ -1923,6 +1928,15 @@ truncation in `rewind_device_blocks` is needed because without it, rejected
 draft tokens remain in `self.sequence` and the next
 `apply_scheduler_output` appends new tokens after them, corrupting block
   hashes used for offload/save.
+
+For asynchronous onboard failures, keep the scheduler's failure bit until the
+worker has observed completion, then drain failed request IDs separately from
+the normal completion list. `recover_failed_load` preserves native device
+blocks, clears host/disk match provenance, rewinds the computed position, and
+prevents the same external cache entry from immediately matching again. The
+paired TensorRT-LLM change performs TP-wide failure consensus and invokes this
+hook before resuming the request. This behavior is request-granular because
+the TensorRT-LLM connector API does not expose individual invalid block IDs.
 
 ## PATCH-018: B10 Residency Capacity Tracking for On-the-Fly Discovery
 

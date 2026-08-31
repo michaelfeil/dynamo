@@ -53,6 +53,8 @@ pub trait Worker: Send + Sync {
         started_loading_req_ids: Vec<u64>,
     ) -> (Vec<u64>, Vec<u64>);
 
+    fn get_failed_load_request_ids(&mut self) -> Vec<u64>;
+
     /// Submit offload operations to execute after the CUDA event completes (non-blocking).
     /// Does slot bookkeeping synchronously, then spawns an async task to poll the event
     /// and send operations to the scheduler when complete.
@@ -70,6 +72,9 @@ pub struct KvConnectorWorker {
 
     /// Map of request id to inflight finished requests
     maybe_finished_offloading: HashSet<String>,
+
+    /// Failed load IDs remain available after their scheduler slots are removed.
+    failed_loading_request_ids: HashSet<String>,
 
     onboarding_operations: Vec<WorkerTransferRequest>,
     offloading_operations: Vec<WorkerTransferRequest>,
@@ -146,6 +151,7 @@ impl KvConnectorWorker {
             transfer_client,
             maybe_finished_onboarding: HashSet::new(),
             maybe_finished_offloading: HashSet::new(),
+            failed_loading_request_ids: HashSet::new(),
             onboarding_operations: Vec::new(),
             offloading_operations: Vec::new(),
             bound: false,
@@ -491,6 +497,13 @@ impl Worker for KvConnectorWorker {
             if self.connector.has_slot(request_id) {
                 if self.connector.is_complete(request_id) {
                     tracing::debug!(request_id, "request slot is finished onboarding");
+                    if self.connector.has_onboard_failures(request_id) {
+                        tracing::warn!(
+                            request_id,
+                            "request finished onboarding with failed KV transfers"
+                        );
+                        self.failed_loading_request_ids.insert(request_id.clone());
+                    }
                     is_finished_onboarding.insert(request_id.clone());
                 } else {
                     tracing::debug!(request_id, "request slot is not finished onboarding");
@@ -521,6 +534,17 @@ impl Worker for KvConnectorWorker {
             .collect();
 
         (finished_offloading, finished_onboarding)
+    }
+
+    fn get_failed_load_request_ids(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.failed_loading_request_ids)
+            .into_iter()
+            .map(|request_id| {
+                request_id
+                    .parse::<u64>()
+                    .expect("TRT-LLM request ID must be an unsigned integer")
+            })
+            .collect()
     }
 
     fn submit_offload_on_event(&mut self, event: u64) -> anyhow::Result<()> {
@@ -637,9 +661,94 @@ impl PyTrtllmKvConnectorWorker {
             .get_finished(finished_gen_req_ids, started_loading_req_ids)
     }
 
+    pub fn get_failed_load_request_ids(&mut self) -> Vec<u64> {
+        self.connector_worker.get_failed_load_request_ids()
+    }
+
     pub fn submit_offload_on_event(&mut self, event: u64) -> PyResult<()> {
         self.connector_worker
             .submit_offload_on_event(event)
             .map_err(to_pyerr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_llm::block_manager::connector::protocol::{LeaderTransferRequest, RequestType};
+    use tokio_util::sync::CancellationToken;
+
+    fn worker_for_operation_tests() -> (KvConnectorWorker, Scheduler) {
+        let (scheduler, connector, transfer_client) = Scheduler::new(CancellationToken::new());
+        (
+            KvConnectorWorker {
+                _drt: None,
+                kvbm_worker: OnceLock::new(),
+                connector,
+                transfer_client,
+                maybe_finished_onboarding: HashSet::new(),
+                maybe_finished_offloading: HashSet::new(),
+                failed_loading_request_ids: HashSet::new(),
+                onboarding_operations: Vec::new(),
+                offloading_operations: Vec::new(),
+                bound: false,
+                iteration: 0,
+                layers_complete: 0,
+                layer_events: Vec::new(),
+                nccl_rank: None,
+                world_size: None,
+                #[cfg(feature = "nccl")]
+                nccl_comm: None,
+            },
+            scheduler,
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_onboarding_is_reported_separately_from_completion() {
+        let (mut worker, mut scheduler) = worker_for_operation_tests();
+        let scheduler_task = tokio::spawn(async move { scheduler.run().await.unwrap() });
+        let operation_id = uuid::Uuid::new_v4();
+        let completion = worker
+            .transfer_client
+            .clone()
+            .schedule_transfer(LeaderTransferRequest {
+                request_id: "42".to_string(),
+                uuid: operation_id,
+                requirement: None,
+                request_type: RequestType::Immediate,
+            })
+            .await
+            .unwrap();
+
+        worker
+            .connector
+            .create_slot_with_immediate_ops("42".to_string(), 1)
+            .unwrap();
+        worker.onboarding_operations.push(WorkerTransferRequest {
+            request_id: "42".to_string(),
+            uuid: operation_id,
+            transfer_type: TransferType::Load,
+            request_type: RequestType::Immediate,
+        });
+        worker.start_load_kv().unwrap();
+        completion
+            .mark_complete(Err(anyhow::anyhow!("injected load failure")))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !worker.connector.is_complete("42") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            worker.get_finished(Vec::new(), vec![42]),
+            (vec![], vec![42])
+        );
+        assert_eq!(worker.get_failed_load_request_ids(), vec![42]);
+        assert!(worker.get_failed_load_request_ids().is_empty());
+        scheduler_task.abort();
     }
 }

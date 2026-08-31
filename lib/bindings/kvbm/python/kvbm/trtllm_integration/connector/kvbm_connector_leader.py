@@ -181,6 +181,14 @@ class DynamoKVBMConnectorLeader(KvCacheConnectorScheduler):
             num_computed_tokens,
         )
 
+    def recover_failed_load(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> None:
+        """Rewind KVBM state and prevent a failed cache entry from rematching."""
+        self._connector.recover_failed_load(
+            str(request.request_id), num_computed_tokens
+        )
+
     @nvtx_annotate(category="scheduler")
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
         """

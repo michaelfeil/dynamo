@@ -16,7 +16,7 @@ use anyhow;
 use dynamo_llm::block_manager::connector::protocol::RequestType;
 use dynamo_llm::block_manager::kv_consolidator::{EventSource, KvEventConsolidationMode};
 use dynamo_llm::block_manager::metrics_kvbm::{KvbmMetrics, KvbmMetricsRegistry};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle;
 
@@ -45,6 +45,12 @@ pub trait Leader: Send + Sync + std::fmt::Debug {
         request_num_tokens: usize,
         num_computed_tokens: usize,
     ) -> anyhow::Result<(usize, bool)>;
+
+    fn recover_failed_load(
+        &mut self,
+        request_id: String,
+        num_computed_tokens: usize,
+    ) -> anyhow::Result<()>;
 
     fn update_state_after_alloc(
         &mut self,
@@ -86,6 +92,9 @@ pub struct KvConnectorLeader {
     onboarding_slots: HashSet<String>,
     iteration_counter: u64,
     inflight_request_to_num_external_tokens: HashMap<String, usize>,
+    /// Requests whose failed connector prefix must be recomputed rather than
+    /// immediately matched from the same cache entry again.
+    failed_onboard_recomputations: HashMap<String, usize>,
     kvbm_metrics: KvbmMetrics,
 }
 
@@ -186,6 +195,7 @@ impl KvConnectorLeader {
             onboarding_slots: HashSet::new(),
             iteration_counter: 0,
             inflight_request_to_num_external_tokens: HashMap::new(),
+            failed_onboard_recomputations: HashMap::new(),
             kvbm_metrics,
         }
     }
@@ -215,6 +225,19 @@ impl Leader for KvConnectorLeader {
         tracing::debug!(
             "request_num_tokens: {request_num_tokens}; num_computed_tokens: {num_computed_tokens}"
         );
+
+        if let Some(expected_position) = self.failed_onboard_recomputations.remove(&request_id) {
+            anyhow::ensure!(
+                num_computed_tokens == expected_position,
+                "failed onboard recovery for request {request_id} expected computed position {expected_position}, got {num_computed_tokens}"
+            );
+            tracing::warn!(
+                request_id,
+                num_computed_tokens,
+                "skipping KVBM rematch so the failed prefix is recomputed"
+            );
+            return Ok((0, false));
+        }
 
         // TRTLLM could match partial blocks if enable_partial_reuse = True,
         // immediately return 0 to simplify things.
@@ -262,6 +285,21 @@ impl Leader for KvConnectorLeader {
         } else {
             Ok((0, false))
         }
+    }
+
+    fn recover_failed_load(
+        &mut self,
+        request_id: String,
+        num_computed_tokens: usize,
+    ) -> anyhow::Result<()> {
+        let shared_slot = self.slot_manager().get_slot(&request_id)?;
+        let mut slot = shared_slot
+            .lock()
+            .map_err(|error| anyhow::anyhow!("Failed to lock slot: {error}"))?;
+        slot.recover_failed_onboard(num_computed_tokens)?;
+        self.failed_onboard_recomputations
+            .insert(request_id, num_computed_tokens);
+        Ok(())
     }
 
     /// Note: TRTLLM will not provide any scheduler output data for requests that are onboarding. it is entirely
@@ -539,6 +577,7 @@ impl Leader for KvConnectorLeader {
         self.slot_manager().remove_slot(&request_id)?;
         self.inflight_request_to_num_external_tokens
             .remove(&request_id);
+        self.failed_onboard_recomputations.remove(&request_id);
 
         // if the slot has finished, we can return false to trtllm, indicating all gpu blocks are free to be reused
         // otherwise, we return true, which means there are still outstanding operations on gpu blocks which
@@ -607,6 +646,16 @@ impl PyTrtllmKvConnectorLeader {
     ) -> PyResult<(usize, bool)> {
         self.connector_leader
             .get_num_new_matched_tokens(request_id, request_num_tokens, num_computed_tokens)
+            .map_err(to_pyerr)
+    }
+
+    fn recover_failed_load(
+        &mut self,
+        request_id: String,
+        num_computed_tokens: usize,
+    ) -> PyResult<()> {
+        self.connector_leader
+            .recover_failed_load(request_id, num_computed_tokens)
             .map_err(to_pyerr)
     }
 

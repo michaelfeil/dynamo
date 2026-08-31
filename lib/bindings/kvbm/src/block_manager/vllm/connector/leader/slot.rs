@@ -117,6 +117,11 @@ pub trait Slot: std::fmt::Debug {
         external_sequence_hashes: Option<&[SequenceHash]>,
     ) -> Result<(), SlotError>;
 
+    /// Rewind bookkeeping after an asynchronous load failed. Device blocks
+    /// remain allocated by the external KV cache manager and will be filled by
+    /// normal prefill from `num_computed_tokens` onward.
+    fn recover_failed_onboard(&mut self, num_computed_tokens: usize) -> Result<(), SlotError>;
+
     fn record_start_iteration(&mut self, iteration: u64) -> Result<(), SlotError>;
 
     fn mark_as_prefilling(&mut self, iteration: u64) -> Result<(), SlotError>;
@@ -574,6 +579,38 @@ impl Slot for VllmConnectorSlot {
 
     fn state(&self) -> SlotState {
         self.state
+    }
+
+    fn recover_failed_onboard(&mut self, num_computed_tokens: usize) -> Result<(), SlotError> {
+        if !matches!(self.state, SlotState::Onboarding(_)) {
+            return Err(SlotError::InvalidState(format!(
+                "cannot recover failed onboard from {:?}",
+                self.state
+            )));
+        }
+        if num_computed_tokens > self.current_position
+            || num_computed_tokens > self.sequence.total_tokens()
+        {
+            return Err(SlotError::InvalidOperation(format!(
+                "failed onboard recovery position {num_computed_tokens} exceeds current position {} or sequence length {}",
+                self.current_position,
+                self.sequence.total_tokens()
+            )));
+        }
+
+        tracing::warn!(
+            request_id = self.request_id,
+            old_position = self.current_position,
+            new_position = num_computed_tokens,
+            "rewinding KVBM slot after asynchronous onboard failure"
+        );
+        self.current_position = num_computed_tokens;
+        self.evaluated_blocks = num_computed_tokens / self.block_size;
+        self.tokens_cached_from_host = 0;
+        self.tokens_cached_from_disk = 0;
+        self.offload_terminated_at_block = None;
+        self.state = SlotState::Initialized;
+        Ok(())
     }
 
     fn reset_after_preemption(&mut self) {
@@ -2428,6 +2465,29 @@ mod connector_tests {
         // new_ids = [10]. But 10 ∈ device_blocks → contract violation.
         slot.apply_scheduler_output(&[], &[13, 14, 10], 0, 192, None, None)
             .unwrap();
+    }
+
+    #[test]
+    fn test_failed_onboard_rewinds_without_discarding_device_blocks() {
+        let (mut slot, _rx) = create_test_slot(128, 0);
+        slot.append_mutable_device_blocks(&[10, 11, 12, 13])
+            .unwrap();
+        slot.state = SlotState::Onboarding(64);
+        slot.current_position = 96;
+        slot.evaluated_blocks = 3;
+        slot.tokens_cached_from_host = 64;
+
+        slot.recover_failed_onboard(32).unwrap();
+
+        assert_eq!(slot.state(), SlotState::Initialized);
+        assert_eq!(slot.current_position, 32);
+        assert_eq!(slot.evaluated_blocks, 1);
+        assert_eq!(slot.device_blocks_snapshot(), &[10, 11, 12, 13]);
+        assert_eq!(slot.tokens_cached_from_host, 0);
+
+        slot.apply_scheduler_output(&[], &[], 32, 64, None, None)
+            .unwrap();
+        assert_eq!(slot.state(), SlotState::Prefilling);
     }
 
     // ---------------------------------------------------------------

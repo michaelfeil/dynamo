@@ -522,6 +522,10 @@ class PyTrtllmKvConnectorWorker:
         """
         ...
 
+    def get_failed_load_request_ids(self) -> List[int]:
+        """Drain request IDs whose asynchronous KV load failed."""
+        ...
+
     def submit_offload_on_event(self, event: int) -> None:
         """
         Submit offload operations to be executed when the given event completes.
@@ -594,6 +598,14 @@ class PyTrtllmKvConnectorLeader:
         tuple
             A tuple of (num_matched_tokens, is_complete)
         """
+        ...
+
+    def recover_failed_load(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> None:
+        """Rewind connector state before recomputing a failed async load."""
         ...
 
     def update_state_after_alloc(

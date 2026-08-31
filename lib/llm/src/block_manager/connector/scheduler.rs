@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::protocol::*;
@@ -149,6 +148,7 @@ impl WorkerSchedulerClient {
 pub struct WorkerSchedulerClientSlot {
     operations: Vec<uuid::Uuid>,
     completed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
 }
 
 impl WorkerSchedulerClientSlot {
@@ -156,6 +156,7 @@ impl WorkerSchedulerClientSlot {
         Self {
             operations: Vec::new(),
             completed: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -167,12 +168,17 @@ impl WorkerSchedulerClientSlot {
         SchedulerCreateSlotDetails {
             request_id,
             completed: self.completed.clone(),
+            failed: self.failed.clone(),
             expected_immediate_ops,
         }
     }
 
     pub fn is_complete(&self) -> bool {
-        self.completed.load(Ordering::Relaxed) == self.operations.len() as u64
+        self.completed.load(Ordering::Acquire) == self.operations.len() as u64
+    }
+
+    pub fn has_failures(&self) -> bool {
+        self.failed.load(Ordering::Relaxed) > 0
     }
 }
 
@@ -250,6 +256,12 @@ impl WorkerSchedulerClient {
         }
     }
 
+    pub fn has_onboard_failures(&self, request_id: &str) -> bool {
+        self.slots
+            .get(request_id)
+            .is_some_and(WorkerSchedulerClientSlot::has_failures)
+    }
+
     /// Clone the scheduler channel for async use.
     pub fn get_scheduler_tx(&self) -> mpsc::UnboundedSender<SchedulerMessage> {
         self.scheduler_tx.clone()
@@ -300,7 +312,7 @@ pub struct Scheduler {
     // Created by immediately scheduled transfers completing and returning their completion
     // signals to the scheduler.
     // Note: this does not require a slot to exist yet
-    unprocessed_immediate_results: HashMap<String, HashSet<uuid::Uuid>>,
+    unprocessed_immediate_results: HashMap<String, HashMap<uuid::Uuid, bool>>,
 
     // This object coordinates the two-stage execution of a scheduled transfer request.
     // If the scheduled request arrives first, the controller object will be Some; otherwise,
@@ -412,6 +424,7 @@ impl Scheduler {
 
         let slot = SchedulerSlot {
             completed: req.completed,
+            failed: req.failed,
         };
 
         // Check for buffered ImmediateTransferResults that arrived before the slot was created.
@@ -431,7 +444,9 @@ impl Scheduler {
             // Use num_buffered (not expected_immediate_ops) because we only mark operations
             // as complete that have actually completed. Remaining results will arrive later
             // via handle_immediate_result() and increment the counter then.
-            slot.completed.fetch_add(num_buffered, Ordering::Relaxed);
+            let num_failed = buffered_results.values().filter(|failed| **failed).count() as u64;
+            slot.failed.fetch_add(num_failed, Ordering::Relaxed);
+            slot.completed.fetch_add(num_buffered, Ordering::Release);
         }
 
         self.slots.insert(request_id, slot);
@@ -508,9 +523,16 @@ impl Scheduler {
 
     #[tracing::instrument(level = "debug", skip_all, fields(request_id = %result.request_id, operation_id = %result.uuid))]
     fn handle_immediate_result(&mut self, result: ImmediateTransferResult) {
+        let failed = result.status.is_err();
+        if let Err(error) = &result.status {
+            tracing::warn!(error = %error, "immediate KV transfer failed");
+        }
         match self.slots.get_mut(&result.request_id) {
             Some(slot) => {
-                slot.completed.fetch_add(1, Ordering::Relaxed);
+                if failed {
+                    slot.failed.fetch_add(1, Ordering::Relaxed);
+                }
+                slot.completed.fetch_add(1, Ordering::Release);
                 tracing::debug!(
                     "matched slot; incrementing completed counter to {}",
                     slot.completed.load(Ordering::Relaxed)
@@ -521,7 +543,7 @@ impl Scheduler {
                 self.unprocessed_immediate_results
                     .entry(result.request_id)
                     .or_default()
-                    .insert(result.uuid);
+                    .insert(result.uuid, failed);
             }
         }
     }
@@ -690,12 +712,14 @@ impl ScheduledTaskAsyncResult {
 pub struct SchedulerCreateSlotDetails {
     pub request_id: String,
     pub completed: Arc<AtomicU64>,
+    pub failed: Arc<AtomicU64>,
     /// Expected number of immediate (onboard) operations for this slot.
     pub expected_immediate_ops: u64,
 }
 
 pub struct SchedulerSlot {
     completed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
 }
 
 pub trait TaskScheduler {
@@ -758,7 +782,9 @@ mod tests {
         assert_eq!(handle.scheduler_decision(), SchedulingDecision::Execute);
 
         // the completion handle will be marked as complete
-        handle.mark_complete(Ok(())).await;
+        handle
+            .mark_complete(Err(anyhow::anyhow!("injected load failure")))
+            .await;
 
         assert_eq!(scheduler.unprocessed_immediate_results.len(), 0);
         scheduler.step().await;
@@ -812,6 +838,7 @@ mod tests {
         worker_client.enqueue_request(worker_request);
         assert_eq!(worker_client.slots.get("test").unwrap().operations.len(), 1);
         assert!(worker_client.is_complete("test"));
+        assert!(worker_client.has_onboard_failures("test"));
 
         // verify that remove_slot() cleans up the buffered results
         assert_eq!(scheduler.unprocessed_immediate_results.len(), 1);
@@ -875,7 +902,9 @@ mod tests {
         assert_eq!(worker_slot.completed.load(Ordering::Relaxed), 0);
 
         // the completion handle will be marked as complete
-        handle.mark_complete(Ok(())).await;
+        handle
+            .mark_complete(Err(anyhow::anyhow!("injected load failure")))
+            .await;
 
         assert_eq!(scheduler.unprocessed_immediate_results.len(), 0);
         scheduler.step().await;
@@ -904,6 +933,7 @@ mod tests {
 
         // the worker has not issued any operations yet
         assert_eq!(worker_client.slots.get("test").unwrap().operations.len(), 1);
+        assert!(worker_client.has_onboard_failures("test"));
     }
 
     // this test verifies that the scheduler can handle the case where the transfer engine's   /// in this case, the request arrives first via the worker client, meaning it traverse

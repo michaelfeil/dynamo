@@ -327,3 +327,7 @@ class DynamoKVBMConnectorWorker(KvCacheConnectorWorker):
         return self._connector.get_finished(
             finished_gen_req_ids, started_loading_req_ids
         )
+
+    def get_failed_load_request_ids(self) -> set[int]:
+        """Drain async KV loads that completed with a transfer failure."""
+        return set(self._connector.get_failed_load_request_ids())
