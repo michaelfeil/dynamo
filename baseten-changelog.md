@@ -1881,6 +1881,7 @@ Source commits:
 - `107b81364` fix(kvbm): guard on_rewind against missing slots
 - `139a41ecc` fix(kvbm): truncate token sequence on rewind
 - Current PR: fix(kvbm): recompute prefixes after failed asynchronous loads
+- Current follow-up: fix(kvbm): accept sparse TensorRT-LLM connector hashes
 
 Upstream PRs:
 
@@ -1911,6 +1912,8 @@ Changes:
   channel (matching `UpdateStateAfterAlloc` pattern)
 - Python wrappers: `DynamoKVBMConnectorLeader.on_rewind` (trtllm) and vLLM
   `KvConnectorLeader.on_rewind` delegate to the Rust leader
+- The TensorRT-LLM adapter preserves an absent incremental block-hash update
+  as `None`, matching the Rust binding's optional external hash-chain contract
 - `_core.pyi`: type stub added
 - Rust unit tests: covers `[0,1,2] -> rewind [0,1] -> append [3]` cycle and
   no-op-when-growing case
