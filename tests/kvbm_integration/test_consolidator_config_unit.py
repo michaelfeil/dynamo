@@ -16,6 +16,7 @@ import pytest
 
 kvbm = pytest.importorskip("kvbm", reason="kvbm package not installed")
 from kvbm.trtllm_integration.consolidator_config import (  # noqa: E402
+    get_consolidator_mode,
     should_enable_consolidator,
 )
 
@@ -47,6 +48,20 @@ class TestShouldEnableConsolidatorDict:
             os.environ, {"DYN_KVBM_KV_EVENTS_ENABLE_CONSOLIDATOR": "false"}
         ):
             assert should_enable_consolidator(arg_map) is False
+
+    def test_baseten_dedup_mode(self):
+        with patch.dict(
+            os.environ,
+            {"DYN_KVBM_KV_EVENTS_CONSOLIDATOR_MODE": "baseten_dedup"},
+        ):
+            assert get_consolidator_mode() == "baseten_dedup"
+
+    def test_invalid_mode_preserves_dedup_fallback(self):
+        with patch.dict(
+            os.environ,
+            {"DYN_KVBM_KV_EVENTS_CONSOLIDATOR_MODE": "invalid"},
+        ):
+            assert get_consolidator_mode() == "dedup"
 
 
 @pytest.mark.unit

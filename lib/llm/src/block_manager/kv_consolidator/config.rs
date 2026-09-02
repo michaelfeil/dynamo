@@ -12,6 +12,7 @@ use super::tracker::EventSource;
 pub enum KvEventConsolidationMode {
     #[default]
     Dedup,
+    BasetenDedup,
     Passthrough,
 }
 
@@ -19,6 +20,7 @@ impl KvEventConsolidationMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dedup => "dedup",
+            Self::BasetenDedup => "baseten_dedup",
             Self::Passthrough => "passthrough",
         }
     }
@@ -30,6 +32,7 @@ impl std::str::FromStr for KvEventConsolidationMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "dedup" => Ok(Self::Dedup),
+            "baseten_dedup" => Ok(Self::BasetenDedup),
             "passthrough" => Ok(Self::Passthrough),
             _ => Err(format!("Unknown KV event consolidator mode: {s}")),
         }
@@ -105,5 +108,17 @@ impl KvEventConsolidatorConfig {
             engine_source: EventSource::Trtllm,
             mode,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseten_dedup_round_trips_through_mode_parser() {
+        let mode = "baseten_dedup".parse::<KvEventConsolidationMode>().unwrap();
+        assert_eq!(mode, KvEventConsolidationMode::BasetenDedup);
+        assert_eq!(mode.as_str(), "baseten_dedup");
     }
 }

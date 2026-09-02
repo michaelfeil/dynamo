@@ -2136,6 +2136,31 @@ Additional upstream mocker sync:
   as a compatibility fallback with an operational opt-out. Drop this adaptation
   when the fork advances to a release containing the upstream implementation.
 
+## PATCH-021: KVBM logical tier-residency event consolidation
+
+Status: `keep`
+
+Source commits:
+
+- Current PR: feat(kvbm): add Baseten tier-dedup event mode
+
+Purpose:
+
+Add the opt-in `baseten_dedup` KV-event consolidator mode. It tracks G1, G2,
+and G3 residency as an internal bit mask but exposes one synthetic Device
+presence to the router. The first reachable residency publishes `BlockStored`,
+intermediate tier stores and removals are suppressed, and the last residency
+publishes `BlockRemoved`. Canonical engine metadata bridges KVBM events without
+rehashing MLA token spans. Parent loss withdraws descendants leaf-first, while
+parent restoration replays still-resident descendants parent-first.
+
+Replay notes:
+
+Keep this as a separate mode until production churn testing establishes it as
+the default. Preserve the external-hash-to-canonical-sequence mapping: KVBM's
+published hash is the bridge to authoritative engine metadata and must not be
+used as the tracker's token-derived internal key.
+
 ## GWP Control Plane (global-routing)
 
 Status: `keep` — Baseten-specific control plane; not upstream.

@@ -23,7 +23,7 @@ use dynamo_kv_router::protocols::{StorageTier as RouterStorageTier, XXH3_SEED};
 type LocalBlockHash = u64;
 
 /// SequenceHash type (position-aware hash, includes parent context)
-type SequenceHash = u64;
+pub(super) type SequenceHash = u64;
 
 /// Compute a LocalBlockHash from token IDs (content only)
 fn compute_local_block_hash(token_ids: &[u32]) -> LocalBlockHash {
@@ -34,12 +34,28 @@ fn compute_local_block_hash(token_ids: &[u32]) -> LocalBlockHash {
     xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, XXH3_SEED)
 }
 
+/// Compute the router-compatible local block hash for an optional LoRA.
+pub(super) fn compute_local_block_hash_with_lora(
+    token_ids: &[u32],
+    lora_name: Option<&str>,
+) -> LocalBlockHash {
+    let seed = match lora_name.filter(|name| !name.is_empty()) {
+        Some(name) => XXH3_SEED.wrapping_add(xxhash_rust::xxh3::xxh3_64(name.as_bytes())),
+        None => XXH3_SEED,
+    };
+    let bytes: Vec<u8> = token_ids
+        .iter()
+        .flat_map(|&num| num.to_le_bytes())
+        .collect();
+    xxhash_rust::xxh3::xxh3_64_with_seed(&bytes, seed)
+}
+
 /// Compute a SequenceHash from parent sequence hash and current block hash
 /// This mirrors the indexer's sequence hash computation for consistent tracking
 ///
 /// For the first block (no parent): sequence_hash = block_hash
 /// For subsequent blocks: sequence_hash = hash([parent_sequence_hash, current_block_hash])
-fn compute_sequence_hash(
+pub(super) fn compute_sequence_hash(
     parent_sequence_hash: Option<SequenceHash>,
     current_block_hash: LocalBlockHash,
 ) -> SequenceHash {
@@ -617,6 +633,7 @@ impl CacheStatusTracker for PassthroughCacheStatusTracker {
 
 #[cfg(test)]
 mod tests {
+    use super::super::baseten_dedup_consolidator::BasetenDedupCacheStatusTracker;
     use super::*;
 
     type TestTracker = DedupCacheStatusTracker;
@@ -1212,6 +1229,448 @@ mod tests {
         let different_parent = compute_local_block_hash(&[9, 10, 11, 12]);
         let seq_hash2_different = compute_sequence_hash(Some(different_parent), block_hash2);
         assert_ne!(seq_hash2_v1, seq_hash2_different);
+    }
+
+    fn canonical_hash(tokens: &[u32], parent: Option<u64>) -> String {
+        compute_sequence_hash(parent, compute_local_block_hash(tokens)).to_string()
+    }
+
+    #[test]
+    fn test_baseten_dedup_collapses_g1_g2_g3_lifecycle() {
+        let mut tracker = BasetenDedupCacheStatusTracker::new();
+        let tokens = vec![1, 2, 3, 4];
+        let block_hash = canonical_hash(&tokens, None);
+
+        assert!(tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Trtllm,
+            tokens.clone(),
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        assert_eq!(tracker.drain_events().len(), 1);
+        assert_eq!(tracker.residency(&block_hash), Some(0b0001));
+
+        assert!(!tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Kvbm,
+            tokens.clone(),
+            None,
+            4,
+            None,
+            Some(StorageTier::HostPinned),
+            None,
+        ));
+        assert!(!tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Kvbm,
+            tokens,
+            None,
+            4,
+            None,
+            Some(StorageTier::Disk),
+            None,
+        ));
+        assert_eq!(tracker.residency(&block_hash), Some(0b1101));
+        assert!(tracker.drain_events().is_empty());
+
+        assert!(!tracker.handle_remove(
+            &block_hash,
+            EventSource::Trtllm,
+            Some(StorageTier::Device),
+        ));
+        assert!(!tracker.handle_remove(
+            &block_hash,
+            EventSource::Kvbm,
+            Some(StorageTier::HostPinned),
+        ));
+        assert_eq!(tracker.residency(&block_hash), Some(0b1000));
+        assert!(tracker.drain_events().is_empty());
+
+        assert!(tracker.handle_remove(&block_hash, EventSource::Kvbm, Some(StorageTier::Disk),));
+        let events = tracker.drain_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ConsolidatedEvent::Remove {
+                tier: Some(StorageTier::Device),
+                ..
+            }
+        ));
+        assert_eq!(tracker.num_blocks(), 0);
+        assert!(
+            tracker.metadata_is_empty(),
+            "dead leaf metadata must be pruned"
+        );
+    }
+
+    #[test]
+    fn test_baseten_dedup_keeps_engine_and_kvbm_device_residency_distinct() {
+        let mut tracker = BasetenDedupCacheStatusTracker::new();
+        let tokens = vec![1, 2, 3, 4];
+        let block_hash = canonical_hash(&tokens, None);
+
+        assert!(tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Trtllm,
+            tokens.clone(),
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        assert_eq!(tracker.drain_events().len(), 1);
+
+        assert!(!tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Kvbm,
+            tokens,
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        assert_eq!(tracker.residency(&block_hash), Some(0b0011));
+
+        assert!(!tracker.handle_remove(
+            &block_hash,
+            EventSource::Trtllm,
+            Some(StorageTier::Device),
+        ));
+        assert_eq!(tracker.residency(&block_hash), Some(0b0010));
+        assert!(tracker.drain_events().is_empty());
+
+        assert!(tracker.handle_remove(&block_hash, EventSource::Kvbm, Some(StorageTier::Device),));
+        assert!(matches!(
+            tracker.drain_events().as_slice(),
+            [ConsolidatedEvent::Remove { .. }]
+        ));
+    }
+
+    #[test]
+    fn test_baseten_dedup_migrates_an_advertised_external_hash() {
+        let mut tracker = BasetenDedupCacheStatusTracker::new();
+        let tokens = vec![1, 2, 3, 4];
+
+        assert!(tracker.handle_store(
+            "kvbm-hash".to_string(),
+            EventSource::Kvbm,
+            tokens.clone(),
+            None,
+            4,
+            None,
+            Some(StorageTier::HostPinned),
+            None,
+        ));
+        assert!(matches!(
+            tracker.drain_events().as_slice(),
+            [ConsolidatedEvent::Store { block_hash, .. }] if block_hash == "kvbm-hash"
+        ));
+
+        assert!(tracker.handle_store(
+            "engine-hash".to_string(),
+            EventSource::Trtllm,
+            tokens,
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        let migration = tracker.drain_events();
+        assert!(matches!(
+            migration.as_slice(),
+            [
+                ConsolidatedEvent::Remove { block_hash: removed, .. },
+                ConsolidatedEvent::Store { block_hash: stored, .. }
+            ] if removed == "kvbm-hash" && stored == "engine-hash"
+        ));
+
+        assert!(!tracker.handle_remove(
+            "kvbm-hash",
+            EventSource::Kvbm,
+            Some(StorageTier::HostPinned),
+        ));
+        assert!(tracker.drain_events().is_empty());
+        assert!(tracker.handle_remove(
+            "engine-hash",
+            EventSource::Trtllm,
+            Some(StorageTier::Device),
+        ));
+        assert!(matches!(
+            tracker.drain_events().as_slice(),
+            [ConsolidatedEvent::Remove { block_hash, .. }] if block_hash == "engine-hash"
+        ));
+    }
+
+    #[test]
+    fn test_baseten_dedup_separates_lora_adapters() {
+        let mut tracker = BasetenDedupCacheStatusTracker::new();
+        let tokens = vec![1, 2, 3, 4];
+
+        assert!(tracker.handle_store(
+            "adapter-a-hash".to_string(),
+            EventSource::Trtllm,
+            tokens.clone(),
+            None,
+            4,
+            Some("adapter-a".to_string()),
+            Some(StorageTier::Device),
+            None,
+        ));
+        assert!(tracker.handle_store(
+            "adapter-b-hash".to_string(),
+            EventSource::Trtllm,
+            tokens,
+            None,
+            4,
+            Some("adapter-b".to_string()),
+            Some(StorageTier::Device),
+            None,
+        ));
+        assert_eq!(tracker.drain_events().len(), 2);
+        assert_eq!(tracker.num_blocks(), 2);
+
+        assert!(tracker.handle_remove(
+            "adapter-a-hash",
+            EventSource::Trtllm,
+            Some(StorageTier::Device),
+        ));
+        assert_eq!(tracker.num_blocks(), 1);
+        assert!(matches!(
+            tracker.drain_events().as_slice(),
+            [ConsolidatedEvent::Remove { block_hash, .. }] if block_hash == "adapter-a-hash"
+        ));
+
+        assert!(tracker.handle_remove(
+            "adapter-b-hash",
+            EventSource::Trtllm,
+            Some(StorageTier::Device),
+        ));
+        assert_eq!(tracker.num_blocks(), 0);
+    }
+
+    #[test]
+    fn test_baseten_dedup_recreates_metadata_for_late_kvbm_store() {
+        let mut tracker = BasetenDedupCacheStatusTracker::new();
+        let tokens = vec![1, 2, 3, 4];
+        let block_hash = "4242424242".to_string();
+
+        assert!(tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Trtllm,
+            tokens.clone(),
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        tracker.drain_events();
+
+        assert!(
+            tracker.handle_remove(&block_hash, EventSource::Trtllm, Some(StorageTier::Device),)
+        );
+        assert!(matches!(
+            tracker.drain_events().as_slice(),
+            [ConsolidatedEvent::Remove { .. }]
+        ));
+        assert!(tracker.metadata_is_empty());
+
+        assert!(tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Kvbm,
+            tokens,
+            None,
+            4,
+            None,
+            Some(StorageTier::HostPinned),
+            None,
+        ));
+        let events = tracker.drain_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ConsolidatedEvent::Store {
+                parent_hash: None,
+                tier: Some(StorageTier::Device),
+                ..
+            }
+        ));
+        assert_eq!(tracker.residency(&block_hash), Some(0b0100));
+    }
+
+    #[test]
+    fn test_baseten_dedup_reannounces_resident_child_with_parent() {
+        let mut tracker = BasetenDedupCacheStatusTracker::new();
+        let parent_tokens = vec![1, 2, 3, 4];
+        let parent_hash = canonical_hash(&parent_tokens, None);
+        let parent_sequence_hash = parent_hash.parse::<u64>().unwrap();
+        let child_tokens = vec![5, 6, 7, 8];
+        let child_hash = canonical_hash(&child_tokens, Some(parent_sequence_hash));
+
+        tracker.handle_store(
+            parent_hash.clone(),
+            EventSource::Trtllm,
+            parent_tokens.clone(),
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        );
+        tracker.handle_store(
+            child_hash.clone(),
+            EventSource::Trtllm,
+            child_tokens.clone(),
+            Some(parent_hash.clone()),
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        );
+        tracker.handle_store(
+            child_hash.clone(),
+            EventSource::Kvbm,
+            child_tokens,
+            Some(parent_hash.clone()),
+            4,
+            None,
+            Some(StorageTier::HostPinned),
+            None,
+        );
+        assert_eq!(tracker.drain_events().len(), 2);
+
+        assert!(tracker.handle_remove(
+            &parent_hash,
+            EventSource::Trtllm,
+            Some(StorageTier::Device),
+        ));
+        let removals = tracker.drain_events();
+        assert_eq!(removals.len(), 2, "child must be hidden before its parent");
+        assert!(
+            matches!(&removals[0], ConsolidatedEvent::Remove { block_hash, .. } if block_hash == &child_hash)
+        );
+        assert!(
+            matches!(&removals[1], ConsolidatedEvent::Remove { block_hash, .. } if block_hash == &parent_hash)
+        );
+        assert_eq!(tracker.residency(&child_hash), Some(0b0101));
+
+        assert!(tracker.handle_store(
+            parent_hash.clone(),
+            EventSource::Trtllm,
+            parent_tokens,
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        let stores = tracker.drain_events();
+        assert_eq!(stores.len(), 2, "parent return must re-announce its child");
+        assert!(
+            matches!(&stores[0], ConsolidatedEvent::Store { block_hash, .. } if block_hash == &parent_hash)
+        );
+        assert!(
+            matches!(&stores[1], ConsolidatedEvent::Store { block_hash, parent_hash: Some(parent), .. } if block_hash == &child_hash && parent == &parent_hash)
+        );
+    }
+
+    #[test]
+    fn test_baseten_dedup_replays_child_received_before_parent() {
+        let mut tracker = BasetenDedupCacheStatusTracker::new();
+        let parent_hash = "111".to_string();
+        let child_hash = "222".to_string();
+        let parent_tokens = vec![1, 2, 3, 4];
+        let child_tokens = vec![5, 6, 7, 8];
+
+        assert!(!tracker.handle_store(
+            child_hash.clone(),
+            EventSource::Kvbm,
+            child_tokens.clone(),
+            Some(parent_hash.clone()),
+            4,
+            None,
+            Some(StorageTier::HostPinned),
+            None,
+        ));
+        assert!(!tracker.handle_store(
+            child_hash.clone(),
+            EventSource::Trtllm,
+            child_tokens,
+            Some(parent_hash.clone()),
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        assert!(tracker.drain_events().is_empty());
+
+        assert!(tracker.handle_store(
+            parent_hash.clone(),
+            EventSource::Trtllm,
+            parent_tokens,
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        let stores = tracker.drain_events();
+        assert_eq!(stores.len(), 2);
+        assert!(
+            matches!(&stores[0], ConsolidatedEvent::Store { block_hash, .. } if block_hash == &parent_hash)
+        );
+        assert!(
+            matches!(&stores[1], ConsolidatedEvent::Store { block_hash, parent_hash: Some(parent), .. } if block_hash == &child_hash && parent == &parent_hash)
+        );
+        assert_eq!(tracker.residency(&child_hash), Some(0b0101));
+    }
+
+    #[test]
+    fn test_baseten_dedup_duplicate_tier_transitions_are_idempotent() {
+        let mut tracker = BasetenDedupCacheStatusTracker::new();
+        let tokens = vec![1, 2, 3, 4];
+        let block_hash = canonical_hash(&tokens, None);
+
+        tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Trtllm,
+            tokens.clone(),
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        );
+        tracker.drain_events();
+        assert!(!tracker.handle_store(
+            block_hash.clone(),
+            EventSource::Trtllm,
+            tokens,
+            None,
+            4,
+            None,
+            Some(StorageTier::Device),
+            None,
+        ));
+        assert!(tracker.drain_events().is_empty());
+
+        assert!(
+            tracker.handle_remove(&block_hash, EventSource::Trtllm, Some(StorageTier::Device),)
+        );
+        tracker.drain_events();
+        assert!(!tracker.handle_remove(
+            &block_hash,
+            EventSource::Trtllm,
+            Some(StorageTier::Device),
+        ));
+        assert!(tracker.drain_events().is_empty());
     }
 
     #[test]

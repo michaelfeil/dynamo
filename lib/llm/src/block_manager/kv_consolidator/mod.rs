@@ -5,11 +5,13 @@
 //!
 //! This module consolidates kv events from multiple sources (vLLM's G1 events
 //! and KVBM's G2/G3 events) before publishing them to the router.
+mod baseten_dedup_consolidator;
 pub mod config;
 pub mod publisher;
 pub mod subscriber;
 pub mod tracker;
 
+pub use baseten_dedup_consolidator::BasetenDedupCacheStatusTracker;
 pub use config::{KvEventConsolidationMode, KvEventConsolidatorConfig};
 pub use publisher::KvEventConsolidatorPublisher;
 pub use tracker::{
@@ -103,6 +105,9 @@ impl KvEventConsolidator {
     pub fn new(config: KvEventConsolidatorConfig) -> Result<Self> {
         let tracker: Box<dyn CacheStatusTracker> = match config.mode {
             KvEventConsolidationMode::Dedup => Box::new(DedupCacheStatusTracker::new()),
+            KvEventConsolidationMode::BasetenDedup => {
+                Box::new(BasetenDedupCacheStatusTracker::new())
+            }
             KvEventConsolidationMode::Passthrough => Box::new(PassthroughCacheStatusTracker::new()),
         };
         let tracker = Arc::new(RwLock::new(tracker));

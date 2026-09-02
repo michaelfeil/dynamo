@@ -16,10 +16,11 @@ def is_truthy(val: str) -> bool:
 def get_consolidator_mode() -> str:
     """Return the KV event consolidator mode from DYN_KVBM_KV_EVENTS_CONSOLIDATOR_MODE.
 
-    Returns "dedup" or "passthrough"; invalid/unset values fall back to "dedup".
+    Returns "dedup", "baseten_dedup", or "passthrough"; invalid/unset values
+    fall back to "dedup".
     """
     mode = os.getenv("DYN_KVBM_KV_EVENTS_CONSOLIDATOR_MODE", "dedup").strip().lower()
-    if mode in ("dedup", "passthrough"):
+    if mode in ("dedup", "baseten_dedup", "passthrough"):
         return mode
 
     logger.warning(
