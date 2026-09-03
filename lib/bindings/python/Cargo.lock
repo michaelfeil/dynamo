@@ -2063,6 +2063,7 @@ version = "1.2.0"
 dependencies = [
  "anyhow",
  "dynamo-kv-router",
+ "dynamo-llm",
  "dynamo-runtime",
  "futures",
  "rand 0.9.4",

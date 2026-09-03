@@ -219,6 +219,10 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         self.instance_ids.lock().unwrap().clone()
     }
 
+    fn stable_routing_id(&self, _worker_id: u64) -> Option<String> {
+        None
+    }
+
     async fn direct(
         &self,
         request: RsContext<rmpv::Value>,

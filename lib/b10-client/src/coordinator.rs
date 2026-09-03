@@ -22,15 +22,18 @@ use anyhow::Result;
 use dynamo_kv_router::protocols::{
     BlockExtraInfo, RouterBackpressureReason, RouterRequest, RouterResponse as RsRouterResponse,
 };
+use dynamo_llm::discovery::{RuntimeConfigWatch, runtime_config_watch};
+use dynamo_runtime::component::Endpoint;
 use dynamo_runtime::pipeline::{
     AsyncEngineContextProvider, EngineStream, PushRouter, ResponseStream, async_trait,
     context::Context as RsContext,
 };
+use dynamo_runtime::prelude::DistributedRuntimeProvider;
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 use futures::StreamExt;
 use rand::Rng;
 use serde::{Serialize, de::DeserializeOwned};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 
@@ -108,9 +111,13 @@ impl RouterWorkerCoordinator {
         worker: JsonPushRouter,
         block_size: u32,
     ) -> Result<Self> {
+        let runtime_configs = spawn_runtime_config_watch(&worker.client.endpoint);
         Self::new(
             Arc::new(JsonRouterGuardClient::new(router)),
-            Arc::new(JsonRouterGuardClient::new(worker)),
+            Arc::new(JsonRouterGuardClient {
+                router: worker,
+                runtime_configs: Some(runtime_configs),
+            }),
             block_size,
         )
     }
@@ -205,10 +212,11 @@ fn log_route_and_connect_denied(
     stale_reroutes: u64,
     denied: &DeniedRequest,
 ) {
+    let worker_id = worker_id.map(|worker_id| worker_id.to_string());
     tracing::info!(
         request_id = %request_id,
         phase = phase.unwrap_or("unknown"),
-        worker_id = worker_id,
+        worker_id = worker_id.as_deref(),
         stale_reroutes,
         denied_kind = %denied_request_kind(denied),
         denied = ?denied,
@@ -416,6 +424,8 @@ pub trait RouterGuardClient: Send + Sync {
 
     fn instance_ids(&self) -> Vec<u64>;
 
+    fn stable_routing_id(&self, worker_id: u64) -> Option<String>;
+
     async fn direct(
         &self,
         request: RsContext<rmpv::Value>,
@@ -426,12 +436,36 @@ pub trait RouterGuardClient: Send + Sync {
 #[derive(Clone)]
 pub struct JsonRouterGuardClient {
     router: JsonPushRouter,
+    runtime_configs: Option<Arc<OnceLock<RuntimeConfigWatch>>>,
 }
 
 impl JsonRouterGuardClient {
     pub fn new(router: JsonPushRouter) -> Self {
-        Self { router }
+        Self {
+            router,
+            runtime_configs: None,
+        }
     }
+}
+
+/// Non-blocking; lookups return `None` until the watch is established.
+fn spawn_runtime_config_watch(endpoint: &Endpoint) -> Arc<OnceLock<RuntimeConfigWatch>> {
+    let endpoint = endpoint.clone();
+    let slot = Arc::new(OnceLock::new());
+    let slot_for_task = Arc::clone(&slot);
+    endpoint.drt().runtime().primary().spawn(async move {
+        match runtime_config_watch(&endpoint).await {
+            Ok(watch) => {
+                let _ = slot_for_task.set(watch);
+            }
+            Err(err) => tracing::warn!(
+                endpoint = %endpoint.id(),
+                error = %err,
+                "stable_routing_id lookup unavailable: runtime config watch failed"
+            ),
+        }
+    });
+    slot
 }
 
 #[async_trait]
@@ -446,6 +480,16 @@ impl RouterGuardClient for JsonRouterGuardClient {
 
     fn instance_ids(&self) -> Vec<u64> {
         self.router.client.instance_ids()
+    }
+
+    fn stable_routing_id(&self, worker_id: u64) -> Option<String> {
+        self.runtime_configs
+            .as_ref()?
+            .get()?
+            .borrow()
+            .get(&worker_id)?
+            .stable_routing_id
+            .clone()
     }
 
     async fn direct(
@@ -1559,7 +1603,7 @@ async fn wait_for_first_worker_event(
         .map_err(|err| anyhow::anyhow!("worker stream first event was an error: {err}"))?;
 
     tracing::debug!(
-        worker_id,
+        worker_id = %worker_id,
         "connect_worker: observed first worker stream event during setup"
     );
     Ok(first)
@@ -1647,7 +1691,7 @@ async fn connect_worker(
 ) -> OpenResult {
     if !worker_guard_client.instance_ids().contains(&worker_id) {
         tracing::info!(
-            worker_id,
+            worker_id = %worker_id,
             "connect_worker: routed worker not in worker instance set (stale route)"
         );
         // Stale pre-check (before any open): free the guard now and wait for
@@ -1715,8 +1759,10 @@ async fn connect_worker(
                     let first = match wait_for_first_worker_event(&mut stream, worker_id).await {
                         Ok(first) => first,
                         Err(err) => {
+                            let stable_routing_id = wgc.stable_routing_id(worker_id);
                             tracing::warn!(
-                                worker_id,
+                                worker_id = %worker_id,
+                                stable_routing_id = stable_routing_id.as_deref().unwrap_or("unavailable"),
                                 error = %err,
                                 "connect_worker: failed while waiting for first worker stream event"
                             );
@@ -1731,7 +1777,7 @@ async fn connect_worker(
                     if should_drop_first_worker_event(&first) {
                         timings.sentinel_event_duration = Some(first_event_duration);
                         tracing::debug!(
-                            worker_id,
+                            worker_id = %worker_id,
                             "connect_worker: swallowed first worker stream sentinel"
                         );
                     } else {
@@ -1747,9 +1793,11 @@ async fn connect_worker(
                 }
             }
             Err(err) => {
+                let stable_routing_id = wgc.stable_routing_id(worker_id);
                 if wgc.instance_ids().contains(&worker_id) {
                     tracing::warn!(
-                        worker_id,
+                        worker_id = %worker_id,
+                        stable_routing_id = stable_routing_id.as_deref().unwrap_or("unavailable"),
                         error = %err,
                         "connect_worker: worker open failed (non-stale)"
                     );
@@ -1760,7 +1808,8 @@ async fn connect_worker(
                     OpenResult::Other(err)
                 } else {
                     tracing::info!(
-                        worker_id,
+                        worker_id = %worker_id,
+                        stable_routing_id = stable_routing_id.as_deref().unwrap_or("unavailable"),
                         error = %err,
                         "connect_worker: open failed and worker now absent (stale route)"
                     );
@@ -1837,7 +1886,7 @@ where
                     ..
                 }) => {
                     tracing::info!(
-                        worker_id,
+                        worker_id = %worker_id,
                         "route_and_connect shield completed after caller cancelled; \
                          draining connected worker stream before freeing guard"
                     );
@@ -1965,7 +2014,7 @@ pub async fn route_and_connect(
                     drop(guard);
                     tracing::info!(
                         request_id = %request_id,
-                        worker_id,
+                        worker_id = %worker_id,
                         "route_and_connect denied after worker setup because context was cancelled"
                     );
                     log_route_and_connect_denied(
@@ -1992,7 +2041,7 @@ pub async fn route_and_connect(
                 };
                 tracing::info!(
                     request_id = %request_id,
-                    worker_id,
+                    worker_id = %worker_id,
                     phase = phase.as_deref().unwrap_or("unknown"),
                     stale_reroutes = attempt,
                     routing_new_ms = duration_ms_for_log(timings.routing_new_duration),
