@@ -1444,6 +1444,22 @@ same helper. The extraction order and error strings mirror
 This adds a `numpy` crate dependency to `lib/bindings/python/Cargo.toml`,
 which must be kept in lockstep with the pyo3 minor version.
 
+v1.2 Rust generation coordinator:
+
+`dynamo-b10-client::GenerationCoordinator` owns aggregate and prefill-first
+generation above `RouterWorkerCoordinator`. It carries the prefill handoff into
+decode, merges topology constraints, suppresses the decode bootstrap, and keeps
+both router guards alive through the returned stream. The Python extension
+only converts serialized worker maps, exposes admission metadata, and adapts
+the response stream.
+
+Aggregate routing, worker setup, and streaming follow parent cancellation.
+Prefill-first follows parent cancellation through the prefill response, shields
+the prefill-to-decode routing and connection handoff, then links the decode
+stream back to the parent cancellation context after the connection exists.
+Keep the cancellation and guard-lifecycle tests with the Rust implementation
+when replaying this API.
+
 Validation:
 
 Compile Python bindings, import `dynamo.runtime`, validate type stubs, and run

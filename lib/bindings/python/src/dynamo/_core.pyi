@@ -682,6 +682,56 @@ class RouterWorkerCoordinator:
         ...
 
 
+class GenerationCoordinator:
+    """Coordinates aggregate or prefill-first generation in Rust."""
+
+    def __init__(
+        self,
+        *,
+        primary_worker_client: Client,
+        primary_router_client: Client,
+        next_worker_client: Client | None = None,
+        next_router_client: Client | None = None,
+        disaggregation_strategy: Any | None = None,
+        model_name: str,
+        kv_block_size: int,
+        disagg_request_id_machine_id: int,
+        prefill_mark_timing: Any | None = None,
+    ) -> None: ...
+
+    async def generate(
+        self,
+        context: Context,
+        routing_kwargs: PyRouterRequestNew,
+        worker_args: Any,
+        decode_worker_args: Any | None = None,
+        enable_potential_loads_next_check: bool = False,
+        annotated: bool = False,
+    ) -> GeneratedRequest | DeniedGenerationRequest: ...
+
+
+class DeniedGenerationRequest:
+    """A generation denial with optional completed-prefill admission metadata."""
+
+    def denied_request(self) -> DeniedRequest: ...
+    def estimated_overlap_tokens(self) -> int | None: ...
+    def b10_best_overlap_blocks(self) -> int | None: ...
+    def prefill_worker_id(self) -> int | None: ...
+    def prefill_dp_rank(self) -> int | None: ...
+
+
+class GeneratedRequest:
+    """An admitted generation stream and its routed worker metadata."""
+
+    def estimated_overlap_tokens(self) -> int: ...
+    def b10_best_overlap_blocks(self) -> int: ...
+    def prefill_worker_id(self) -> int: ...
+    def prefill_dp_rank(self) -> int: ...
+    def decode_worker_id(self) -> int | None: ...
+    def decode_dp_rank(self) -> int | None: ...
+    def response_stream(self) -> AsyncIterator[JsonLike]: ...
+
+
 class AdmittedRequest:
     """
     Outcome of :meth:`RouterWorkerCoordinator.route_and_worker` on a successful

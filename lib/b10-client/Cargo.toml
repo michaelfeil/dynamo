@@ -14,6 +14,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = { workspace = true }
+async-stream = { workspace = true }
 dynamo-kv-router = { workspace = true, features = ["runtime-protocols"] }
 dynamo-llm = { workspace = true }
 dynamo-runtime = { workspace = true }

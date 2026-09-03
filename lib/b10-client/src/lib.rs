@@ -9,6 +9,7 @@
 
 mod context;
 mod coordinator;
+mod generation;
 mod guard;
 mod payload_copy;
 mod types;
@@ -20,6 +21,13 @@ pub use context::RequestContext;
 pub use coordinator::{
     JsonPushRouter, JsonRouterGuardClient, RouteAndConnectOutcome, RouterGuardClient,
     RouterWorkerCoordinator, stream_with_optional_prefill_mark,
+};
+pub use generation::{
+    DeniedGenerationRequest, DisaggregationStrategy, GeneratedRequest, GenerationAdmission,
+    GenerationCoordinator, GenerationOptions, GenerationOutcome, GenerationRequest,
+    POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD, POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE,
+    POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD, POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD,
+    PrefillMarkTiming,
 };
 pub use guard::RouterRequestGuard;
 pub use types::{

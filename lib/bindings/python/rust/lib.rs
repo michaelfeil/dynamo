@@ -191,7 +191,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ModelCardInstanceId>()?;
     m.add_class::<Client>()?;
     m.add_class::<b10_client::RouterWorkerCoordinator>()?;
+    m.add_class::<b10_client::GenerationCoordinator>()?;
     m.add_class::<b10_client::AdmittedRequest>()?;
+    m.add_class::<b10_client::GeneratedRequest>()?;
+    m.add_class::<b10_client::DeniedGenerationRequest>()?;
     m.add_class::<b10_client::DeniedRequest>()?;
     m.add_class::<b10_client::RouterCoordinatorPotentialLoadsCheck>()?;
     m.add_class::<b10_client::PyRouterRequestNew>()?;

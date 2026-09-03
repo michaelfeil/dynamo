@@ -2386,6 +2386,7 @@ name = "dynamo-b10-client"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "dynamo-kv-router",
  "dynamo-llm",
  "dynamo-runtime",

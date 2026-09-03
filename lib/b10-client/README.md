@@ -29,6 +29,14 @@ let outcome = client
     .await?;
 ```
 
+Complete aggregate or prefill-first generation is owned by
+`GenerationCoordinator`. Bindings provide already-serialized primary and
+decode worker maps; the coordinator routes both legs, carries the prefill
+handoff into decode, merges topology constraints, suppresses the decode
+bootstrap, and owns both router guards for the lifetime of the returned stream.
+If decode routing is denied after prefill admission, the denied outcome retains
+the prefill worker and overlap metadata for failure-path observability.
+
 `RouterGuardClient` is the transport seam for custom clients and deterministic
 tests. `JsonRouterGuardClient` adapts Dynamo's JSON `PushRouter`.
 

@@ -9,7 +9,7 @@ use crate::tokens::extract_list_or_numpy_u32;
 use crate::{AsyncResponseStream, Client};
 use dynamo_b10_client::{
     AdmittedRequestTimings, CancellationPolicy as CoreCancellationPolicy,
-    DeniedRequest as CoreDeniedRequest, RouterRequestGuard,
+    DeniedRequest as CoreDeniedRequest, GenerationAdmission, RouterRequestGuard,
     RouterWorkerPhase as CoreRouterWorkerPhase,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -279,7 +279,7 @@ impl PyRouterRequestNew {
 /// DeniedRequest.<Variant>)` and read fields as attributes, e.g.
 /// `result.name` on `DeniedRequest.RequiredComponentsDown`.
 #[pyclass]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum DeniedRequest {
     /// The KV router itself returned backpressure (or had no router instances up).
     RouterBackpressure {
@@ -374,6 +374,46 @@ impl From<CoreDeniedRequest> for DeniedRequest {
                 Self::FirstWorkerEventFailed { error }
             }
         }
+    }
+}
+
+/// A coordinated generation denial. Unlike a router-only `DeniedRequest`, it
+/// may retain admission metadata for a prefill leg that completed before the
+/// decode leg was denied.
+#[pyclass]
+pub(crate) struct DeniedGenerationRequest {
+    denied: DeniedRequest,
+    admission: Option<GenerationAdmission>,
+}
+
+impl DeniedGenerationRequest {
+    pub(super) fn new(denied: DeniedRequest, admission: Option<GenerationAdmission>) -> Self {
+        Self { denied, admission }
+    }
+}
+
+#[pymethods]
+impl DeniedGenerationRequest {
+    fn denied_request(&self, py: Python<'_>) -> PyResult<Py<DeniedRequest>> {
+        Py::new(py, self.denied.clone())
+    }
+
+    fn estimated_overlap_tokens(&self) -> Option<u64> {
+        self.admission
+            .map(|admission| admission.estimated_overlap_tokens)
+    }
+
+    fn b10_best_overlap_blocks(&self) -> Option<u64> {
+        self.admission
+            .map(|admission| admission.best_overlap_blocks)
+    }
+
+    fn prefill_worker_id(&self) -> Option<u64> {
+        self.admission.map(|admission| admission.prefill_worker_id)
+    }
+
+    fn prefill_dp_rank(&self) -> Option<u32> {
+        self.admission.map(|admission| admission.prefill_dp_rank)
     }
 }
 
@@ -478,6 +518,59 @@ impl AdmittedRequest {
             block_size,
             frontend_overhead_duration,
         }
+    }
+}
+
+/// A complete aggregate or prefill-first generation admitted by the Rust
+/// generation coordinator. Unlike `AdmittedRequest`, all router guards are
+/// owned inside the stream because the coordinator may span two worker pools.
+#[pyclass]
+pub(crate) struct GeneratedRequest {
+    pub(super) stream: std::sync::Mutex<Option<AsyncResponseStream>>,
+    pub(super) admission: GenerationAdmission,
+}
+
+impl GeneratedRequest {
+    pub(super) fn new(stream: AsyncResponseStream, admission: GenerationAdmission) -> Self {
+        Self {
+            stream: std::sync::Mutex::new(Some(stream)),
+            admission,
+        }
+    }
+}
+
+#[pymethods]
+impl GeneratedRequest {
+    fn estimated_overlap_tokens(&self) -> u64 {
+        self.admission.estimated_overlap_tokens
+    }
+
+    fn b10_best_overlap_blocks(&self) -> u64 {
+        self.admission.best_overlap_blocks
+    }
+
+    fn prefill_worker_id(&self) -> u64 {
+        self.admission.prefill_worker_id
+    }
+
+    fn prefill_dp_rank(&self) -> u32 {
+        self.admission.prefill_dp_rank
+    }
+
+    fn decode_worker_id(&self) -> Option<u64> {
+        self.admission.decode_worker_id
+    }
+
+    fn decode_dp_rank(&self) -> Option<u32> {
+        self.admission.decode_dp_rank
+    }
+
+    /// The coordinated response stream. May be called only once.
+    fn response_stream<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let stream = self.stream.lock().unwrap().take().ok_or_else(|| {
+            PyValueError::new_err("no response stream available: already consumed")
+        })?;
+        Ok(Bound::new(py, stream)?.into_any())
     }
 }
 

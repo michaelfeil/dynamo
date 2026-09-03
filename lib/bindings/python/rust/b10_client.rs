@@ -11,16 +11,23 @@ mod types;
 // `RouterWorkerCoordinator`); glob re-export would miss them.
 use types::RouterWorkerPhaseArg;
 pub(crate) use types::{
-    AdmittedRequest, CancellationPolicy, DeniedRequest, PyRouterRequestNew, PyRouterWorkerPhase,
-    RouterCoordinatorPotentialLoadsCheck,
+    AdmittedRequest, CancellationPolicy, DeniedGenerationRequest, DeniedRequest, GeneratedRequest,
+    PyRouterRequestNew, PyRouterWorkerPhase, RouterCoordinatorPotentialLoadsCheck,
 };
 
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
 use crate::{AsyncResponseStream, Client, context, process_stream, to_pyerr};
 use dynamo_b10_client::{
-    CancellationPolicy as CoreCancellationPolicy, JsonRouterGuardClient, MinReplicaAvailable,
-    PotentialLoadsCheck, RequestContext, RouteAndConnectOutcome, RouteOptions, RouterRequestGuard,
-    RouterRequestNew, RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
+    CancellationPolicy as CoreCancellationPolicy,
+    DisaggregationStrategy as CoreDisaggregationStrategy,
+    GenerationCoordinator as CoreGenerationCoordinator, GenerationOptions,
+    GenerationOutcome as CoreGenerationOutcome, GenerationRequest, JsonPushRouter,
+    JsonRouterGuardClient, MinReplicaAvailable, POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
+    POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE, POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
+    POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD, PotentialLoadsCheck,
+    PrefillMarkTiming as CorePrefillMarkTiming, RequestContext, RouteAndConnectOutcome,
+    RouteOptions, RouterRequestGuard, RouterRequestNew,
+    RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
     RouterWorkerPhase as CoreRouterWorkerPhase, stream_with_optional_prefill_mark,
 };
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints};
@@ -57,6 +64,295 @@ async fn shield_stream_to_completion(
     output_rx.await.map_err(|_| {
         anyhow::anyhow!("detached stream task ended without a receiver (caller cancelled)")
     })
+}
+
+fn enum_value(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    if let Ok(value) = value.extract::<String>() {
+        return Ok(Some(value));
+    }
+    value
+        .getattr("value")
+        .and_then(|value| value.extract::<String>())
+        .map(Some)
+        .map_err(|_| PyTypeError::new_err("expected a string or enum with a string .value"))
+}
+
+fn extract_router_request(
+    py: Python<'_>,
+    routing_kwargs: &Py<PyRouterRequestNew>,
+) -> PyResult<RouterRequestNew> {
+    let borrowed = routing_kwargs.bind(py).borrow();
+    let tokens = borrowed.tokens.clone();
+    let block_mm_infos_py = borrowed.block_mm_infos.clone();
+    let routing_constraints_py = borrowed.routing_constraints.clone();
+    let allowed_worker_ids = borrowed.allowed_worker_ids.clone();
+    let priority_jump = borrowed.priority_jump;
+    let priority_load_shed_percent = borrowed.priority_load_shed_percent;
+    let do_not_queue = borrowed.do_not_queue;
+    drop(borrowed);
+
+    let block_mm_infos = match block_mm_infos_py {
+        Some(mm) => {
+            let value = pythonize::depythonize(&mm.into_bound(py))?;
+            Some(serde_json::from_value(value).map_err(to_pyerr)?)
+        }
+        None => None,
+    };
+    let routing_constraints = match routing_constraints_py {
+        Some(rc) => {
+            let rc = rc.bind(py).borrow().clone();
+            RoutingConstraints::from(rc)
+        }
+        None => RoutingConstraints::default(),
+    };
+
+    Ok(RouterRequestNew {
+        tokens,
+        block_mm_infos,
+        routing_constraints,
+        allowed_worker_ids,
+        priority_jump,
+        priority_load_shed_percent,
+        do_not_queue,
+    })
+}
+
+fn generation_python_stream(
+    stream: EngineStream<RsAnnotated<rmpv::Value>>,
+    annotated: bool,
+) -> AsyncResponseStream {
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let tx_for_closed = tx.clone();
+    tokio::spawn(async move {
+        let mut drain = tokio::spawn(process_stream(stream, tx));
+        tokio::select! {
+            _ = &mut drain => {}
+            _ = tx_for_closed.closed() => {
+                drain.abort();
+                let _ = drain.await;
+            }
+        }
+    });
+    AsyncResponseStream::new(rx, annotated)
+}
+
+/// Python adapter for the language-neutral Rust generation coordinator.
+///
+/// `generate()` is awaitable and returns either `GeneratedRequest` or a
+/// `DeniedGenerationRequest`, which wraps the typed denial and any completed
+/// prefill admission. Request-model serialization remains outside this class:
+/// callers pass the already-msgpackable worker dictionaries and a
+/// `PyRouterRequestNew`.
+#[pyclass]
+pub(crate) struct GenerationCoordinator {
+    inner: Arc<CoreGenerationCoordinator>,
+    next_router: Option<JsonPushRouter>,
+}
+
+#[pymethods]
+impl GenerationCoordinator {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        primary_worker_client,
+        primary_router_client,
+        next_worker_client=None,
+        next_router_client=None,
+        disaggregation_strategy=None,
+        model_name,
+        kv_block_size,
+        disagg_request_id_machine_id,
+        prefill_mark_timing=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        primary_worker_client: Client,
+        primary_router_client: Client,
+        next_worker_client: Option<Client>,
+        next_router_client: Option<Client>,
+        disaggregation_strategy: Option<&Bound<'_, PyAny>>,
+        model_name: String,
+        kv_block_size: u32,
+        disagg_request_id_machine_id: u64,
+        prefill_mark_timing: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let _ = model_name;
+        let strategy = match enum_value(disaggregation_strategy)?.as_deref() {
+            None | Some("aggregated" | "prefill_and_decode") => {
+                CoreDisaggregationStrategy::Aggregated
+            }
+            Some("prefill_first") => CoreDisaggregationStrategy::PrefillFirst,
+            Some(value) => {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported disaggregation strategy: {value}"
+                )));
+            }
+        };
+        let mark_timing = match enum_value(prefill_mark_timing)?.as_deref() {
+            None | Some("after_prefill_compute") => CorePrefillMarkTiming::AfterPrefillCompute,
+            Some("after_transfer") => CorePrefillMarkTiming::AfterTransfer,
+            Some(value) => {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported prefill mark timing: {value}"
+                )));
+            }
+        };
+        if strategy == CoreDisaggregationStrategy::PrefillFirst
+            && (next_worker_client.is_none() || next_router_client.is_none())
+        {
+            return Err(PyValueError::new_err(
+                "next_worker_client and next_router_client are required for disaggregated generation",
+            ));
+        }
+        let primary = Arc::new(
+            CoreRouterWorkerCoordinator::from_push_routers(
+                primary_router_client.router,
+                primary_worker_client.router,
+                kv_block_size,
+            )
+            .map_err(to_pyerr)?,
+        );
+        let next_router = next_router_client
+            .as_ref()
+            .map(|client| client.router.clone());
+        let next = next_router_client
+            .zip(next_worker_client)
+            .map(|(router, worker)| {
+                CoreRouterWorkerCoordinator::from_push_routers(
+                    router.router,
+                    worker.router,
+                    kv_block_size,
+                )
+                .map(Arc::new)
+            });
+        let next = next.transpose().map_err(to_pyerr)?;
+        let inner = CoreGenerationCoordinator::new(
+            primary,
+            next,
+            strategy,
+            mark_timing,
+            disagg_request_id_machine_id,
+        )
+        .map_err(to_pyerr)?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            next_router,
+        })
+    }
+
+    /// Coordinate aggregate or prefill-first generation entirely in Rust.
+    ///
+    /// Aggregate routing/setup/streaming is cancellable. In prefill-first mode,
+    /// cancellation is allowed through the prefill response, disabled while
+    /// the handoff is routed and connected to decode, then enabled again for
+    /// the decode stream.
+    #[pyo3(signature = (
+        context,
+        routing_kwargs,
+        worker_args,
+        decode_worker_args=None,
+        enable_potential_loads_next_check=false,
+        annotated=false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn generate<'p>(
+        &self,
+        py: Python<'p>,
+        context: context::Context,
+        routing_kwargs: Py<PyRouterRequestNew>,
+        worker_args: PyObject,
+        decode_worker_args: Option<PyObject>,
+        enable_potential_loads_next_check: bool,
+        annotated: bool,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let routing_request = extract_router_request(py, &routing_kwargs)?;
+        let primary_worker_request = pythonize::depythonize(&worker_args.into_bound(py))?;
+        let decode_worker_request = decode_worker_args
+            .map(|args| pythonize::depythonize(&args.into_bound(py)))
+            .transpose()?;
+        let potential_loads_check = if enable_potential_loads_next_check {
+            let router = self.next_router.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "potential loads next check requires a downstream router client",
+                )
+            })?;
+            Some(PotentialLoadsCheck {
+                router: Arc::new(JsonRouterGuardClient::new(router)),
+                queue_depth_threshold: POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD,
+                prefill_tokens_threshold: POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
+                decode_tokens_threshold: POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
+                load_percentile: POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE,
+            })
+        } else {
+            None
+        };
+        let core_context = RequestContext::new(
+            context.inner(),
+            context.trace_context().cloned(),
+            context.metadata_snapshot(),
+        );
+        let coordinator = Arc::clone(&self.inner);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let outcome = coordinator
+                .generate(
+                    core_context,
+                    GenerationRequest {
+                        routing_request,
+                        primary_worker_request,
+                        decode_worker_request,
+                    },
+                    GenerationOptions {
+                        primary: RouteOptions {
+                            potential_loads_check,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(to_pyerr)?;
+            match outcome {
+                CoreGenerationOutcome::Denied(denied) => {
+                    if let Some(admission) = denied.admission {
+                        context.record_prefill_worker(
+                            admission.prefill_worker_id,
+                            admission.prefill_dp_rank,
+                        );
+                    }
+                    Python::with_gil(|py| {
+                        DeniedGenerationRequest::new(
+                            DeniedRequest::from(denied.denied),
+                            denied.admission,
+                        )
+                        .into_py_any(py)
+                    })
+                }
+                CoreGenerationOutcome::Connected(generated) => {
+                    context.record_prefill_worker(
+                        generated.admission.prefill_worker_id,
+                        generated.admission.prefill_dp_rank,
+                    );
+                    if let (Some(worker_id), Some(dp_rank)) = (
+                        generated.admission.decode_worker_id,
+                        generated.admission.decode_dp_rank,
+                    ) {
+                        context.record_decode_worker(worker_id, dp_rank);
+                    }
+                    let stream = generation_python_stream(generated.stream, annotated);
+                    Python::with_gil(|py| {
+                        GeneratedRequest::new(stream, generated.admission).into_py_any(py)
+                    })
+                }
+            }
+        })
+    }
 }
 
 #[pyclass]

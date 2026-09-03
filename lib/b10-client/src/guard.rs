@@ -123,15 +123,15 @@ pub(super) struct RouterRequestGuardState {
 /// `mark_free` is requested. Held internally by the Python `AdmittedRequest`.
 ///
 /// Two construction modes:
-/// - [`RouterRequestGuard::new`] builds a guard with a known router response
+/// - `RouterRequestGuard::new` builds a guard with a known router response
 ///   (used for synthesised backpressure / `RequiredDown` outcomes). When
 ///   `armed=false` no cleanup task is spawned.
-/// - [`RouterRequestGuard::new_provisional`] arms a cleanup task BEFORE the
+/// - `RouterRequestGuard::new_provisional` arms a cleanup task BEFORE the
 ///   router's `direct()` reply is observed, so a cancellation between
 ///   admit-on-router and first-response still reclaims the router's slot via
 ///   `mark_free`. The caller MUST convert the provisional guard with
-///   [`RouterRequestGuard::commit`] (response ready) or
-///   [`RouterRequestGuard::dismiss`] (router denied) before dropping, so the
+///   `RouterRequestGuard::commit` (response ready) or
+///   `RouterRequestGuard::dismiss` (router denied) before dropping, so the
 ///   cleanup task's behaviour is well-defined.
 pub struct RouterRequestGuard {
     state: Arc<RouterRequestGuardState>,
@@ -327,7 +327,7 @@ impl RouterRequestGuard {
     }
 
     /// Estimated cached-token overlap the router reported for a routed
-    /// [`RouterResponse::New`], derived from router-native `overlap_blocks` and
+    /// `RouterResponse::New`, derived from router-native `overlap_blocks` and
     /// the coordinator block size.
     /// `0` when the route did not arm the guard (the response is not `New`).
     pub fn estimated_overlap_tokens(&self, block_size: u32) -> u64 {

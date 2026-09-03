@@ -7,7 +7,11 @@ use super::types::{
     AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable,
     PotentialLoadsCheck as PotentialLoadsCheckData, PreflightInputs, RouterRequestNew,
 };
-use crate::{CancellationPolicy, RequestContext, RouteOptions, RouterWorkerCoordinator};
+use crate::{
+    CancellationPolicy, DisaggregationStrategy, GenerationCoordinator, GenerationOptions,
+    GenerationOutcome, GenerationRequest, PrefillMarkTiming, RequestContext, RouteOptions,
+    RouterWorkerCoordinator,
+};
 use anyhow::Result;
 use dynamo_kv_router::protocols::{
     BlockExtraInfo, PotentialLoad as RsPotentialLoad, RouterBackpressureReason, RouterRequest,
@@ -3062,4 +3066,262 @@ fn router_request_new_matches_legacy_json_roundtrip() {
             "rmpv wire value changed"
         );
     }
+}
+
+fn generation_coordinator(
+    router: Arc<RouterGuardClientForTesting>,
+    worker: Arc<RouterGuardClientForTesting>,
+    next_router: Option<Arc<RouterGuardClientForTesting>>,
+    next_worker: Option<Arc<RouterGuardClientForTesting>>,
+    strategy: DisaggregationStrategy,
+) -> GenerationCoordinator {
+    let primary = Arc::new(
+        RouterWorkerCoordinator::new(router, worker, TEST_BLOCK_SIZE).expect("primary coordinator"),
+    );
+    let next = next_router.zip(next_worker).map(|(router, worker)| {
+        Arc::new(
+            RouterWorkerCoordinator::new(router, worker, TEST_BLOCK_SIZE)
+                .expect("next coordinator"),
+        )
+    });
+    GenerationCoordinator::new(
+        primary,
+        next,
+        strategy,
+        PrefillMarkTiming::AfterPrefillCompute,
+        7,
+    )
+    .expect("generation coordinator")
+}
+
+#[tokio::test]
+async fn generation_coordinator_prefill_first_moves_handoff_and_drops_bootstrap() {
+    let prefill_router =
+        RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+    prefill_worker.set_stream_chunks(vec![vec![jv!({
+        "request_id": "req",
+        "finished": false,
+        "outputs": [{
+            "finish_reason": "not_finished",
+            "token_ids_diff": [11],
+            "disaggregated_params": {
+                "request_type": "context_only",
+                "ctx_request_id": 1234
+            }
+        }],
+        "added_topology_routing_constraints": {
+            "required_taints": ["rack=a"]
+        }
+    })]]);
+    let decode_router =
+        RouterGuardClientForTesting::new(vec![8], vec![8], vec![route_response_new(2)]);
+    let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+    decode_worker.set_stream_chunks(vec![vec![jv!({"bootstrap": true}), jv!({"decode": true})]]);
+    let coordinator = generation_coordinator(
+        prefill_router.clone(),
+        prefill_worker.clone(),
+        Some(decode_router.clone()),
+        Some(decode_worker.clone()),
+        DisaggregationStrategy::PrefillFirst,
+    );
+
+    let outcome = coordinator
+        .generate(
+            build_test_context("generation-prefill-first"),
+            GenerationRequest {
+                routing_request: RouterRequestNew {
+                    tokens: vec![1, 2, 3],
+                    priority_jump: 0.5,
+                    priority_load_shed_percent: 10,
+                    ..Default::default()
+                },
+                primary_worker_request: make_worker_request(),
+                decode_worker_request: Some(jv!({"method": "generate", "prompt": "hello"})),
+            },
+            GenerationOptions::default(),
+        )
+        .await
+        .expect("generation starts");
+    let GenerationOutcome::Connected(generated) = outcome else {
+        panic!("expected connected generation: {outcome:?}");
+    };
+    assert_eq!(generated.admission.prefill_worker_id, 1);
+    assert_eq!(generated.admission.decode_worker_id, Some(2));
+    let responses = generated.stream.collect::<Vec<_>>().await;
+
+    assert_eq!(responses.len(), 2, "prefill + decode, without bootstrap");
+    let prefill = responses[0].data.as_ref().unwrap();
+    assert!(prefill["outputs"][0]["finish_reason"].is_nil());
+    assert_eq!(
+        prefill["outputs"][0]["disaggregated_params"]["disagg_request_id"].as_u64(),
+        Some(1234)
+    );
+    assert_eq!(
+        responses[1].data.as_ref().unwrap()["decode"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        prefill_worker.calls()[0].1["disaggregation_mode"].as_str(),
+        Some("prefill")
+    );
+    let decode_call = &decode_worker.calls()[0].1;
+    assert_eq!(decode_call["disaggregation_mode"].as_str(), Some("decode"));
+    assert_eq!(
+        decode_call["disaggregated_params"]["disagg_request_id"].as_u64(),
+        Some(1234)
+    );
+    assert_eq!(
+        decode_router.calls()[0].1["routing_constraints"]["required_taints"][0].as_str(),
+        Some("rack=a")
+    );
+    assert!(decode_router.calls()[0].1["priority_jump"].is_nil());
+    assert!(decode_router.calls()[0].1["priority_load_shed_percent"].is_nil());
+    wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
+    wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn generation_coordinator_decode_denial_retains_prefill_admission() {
+    let prefill_router = RouterGuardClientForTesting::new(
+        vec![7],
+        vec![7],
+        vec![Ok(RsRouterResponse::New {
+            worker_id: 1,
+            dp_rank: 3,
+            overlap_blocks: 2,
+            best_overlap_blocks: 5,
+            dp_strict_rank: false,
+        })],
+    );
+    let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+    prefill_worker.set_stream_chunks(vec![vec![jv!({
+        "outputs": [{
+            "finish_reason": "not_finished",
+            "disaggregated_params": {"request_type": "context_only", "ctx_request_id": 9}
+        }]
+    })]]);
+    let decode_router = RouterGuardClientForTesting::new(
+        vec![8],
+        vec![8],
+        vec![backpressure_response(
+            RouterBackpressureReason::DoNotQueue,
+            10,
+            Some(100),
+        )],
+    );
+    let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+    let coordinator = generation_coordinator(
+        prefill_router.clone(),
+        prefill_worker,
+        Some(decode_router),
+        Some(decode_worker),
+        DisaggregationStrategy::PrefillFirst,
+    );
+
+    let outcome = coordinator
+        .generate(
+            build_test_context("generation-decode-denied"),
+            GenerationRequest {
+                routing_request: RouterRequestNew {
+                    tokens: vec![1, 2, 3],
+                    ..Default::default()
+                },
+                primary_worker_request: make_worker_request(),
+                decode_worker_request: Some(make_worker_request()),
+            },
+            GenerationOptions::default(),
+        )
+        .await
+        .expect("decode denial is typed");
+
+    let GenerationOutcome::Denied(denied) = outcome else {
+        panic!("expected decode denial: {outcome:?}");
+    };
+    assert!(matches!(
+        denied.denied,
+        DeniedRequest::RouterBackpressure { .. }
+    ));
+    assert_eq!(
+        denied.admission,
+        Some(crate::GenerationAdmission {
+            estimated_overlap_tokens: 2 * u64::from(TEST_BLOCK_SIZE),
+            best_overlap_blocks: 5,
+            prefill_worker_id: 1,
+            prefill_dp_rank: 3,
+            decode_worker_id: None,
+            decode_dp_rank: None,
+        })
+    );
+    wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn generation_coordinator_shields_prefill_to_decode_handoff() {
+    let prefill_router =
+        RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+    prefill_worker.set_stream_chunks(vec![vec![jv!({
+        "outputs": [{
+            "finish_reason": "not_finished",
+            "disaggregated_params": {"request_type": "context_only", "ctx_request_id": 9}
+        }]
+    })]]);
+    let decode_router =
+        RouterGuardClientForTesting::new(vec![8], vec![8], vec![route_response_new(2)]);
+    let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+    decode_worker.set_respect_cancel(CancelRespect::Yes);
+    decode_worker.set_open_delay(Duration::from_millis(200));
+    decode_worker.set_stream_chunks(vec![vec![jv!({"bootstrap": true}), jv!({"decode": true})]]);
+    let coordinator = generation_coordinator(
+        prefill_router.clone(),
+        prefill_worker,
+        Some(decode_router.clone()),
+        Some(decode_worker.clone()),
+        DisaggregationStrategy::PrefillFirst,
+    );
+    let context = build_test_context("generation-handoff-cancel");
+    let context_for_task = context.clone();
+    let task = tokio::spawn(async move {
+        coordinator
+            .generate(
+                context_for_task,
+                GenerationRequest {
+                    routing_request: RouterRequestNew {
+                        tokens: vec![1, 2, 3],
+                        ..Default::default()
+                    },
+                    primary_worker_request: make_worker_request(),
+                    decode_worker_request: Some(make_worker_request()),
+                },
+                GenerationOptions {
+                    // The coordinator must override this attempted opt-in to
+                    // cancellation during the critical handoff window.
+                    decode: RouteOptions {
+                        cancellation: CancellationPolicy::Cancellable,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+
+    wait_for_call_count(&decode_worker, 1).await;
+    context.inner().stop_generating();
+    task.abort();
+    let _ = task.await;
+
+    // The outer request disappeared during decode setup, but the shielded
+    // handoff still opens and drains decode instead of abandoning transferred
+    // KV state between the two workers.
+    wait_for_completion_count(&decode_worker, 1, Duration::from_secs(2)).await;
+    wait_for_stream_items_polled(&decode_worker, 2, Duration::from_secs(2)).await;
+    wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
+    wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(decode_worker.method_call_count("generate"), 1);
+    assert_eq!(
+        decode_worker.calls()[0].1["disaggregated_params"]["disagg_request_id"].as_u64(),
+        Some(9)
+    );
 }
