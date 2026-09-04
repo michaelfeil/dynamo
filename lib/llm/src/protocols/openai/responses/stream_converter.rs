@@ -268,7 +268,7 @@ impl ResponseStreamConverter {
                             sequence_number: self.next_seq(),
                             output_index,
                             item: OutputItem::Reasoning(ReasoningItem {
-                                id: self.reasoning_item_id.clone(),
+                                id: Some(self.reasoning_item_id.clone()),
                                 summary: vec![],
                                 content: None,
                                 encrypted_content: None,
@@ -580,7 +580,7 @@ impl ResponseStreamConverter {
             sequence_number: self.next_seq(),
             output_index: self.reasoning_output_index,
             item: OutputItem::Reasoning(ReasoningItem {
-                id: self.reasoning_item_id.clone(),
+                id: Some(self.reasoning_item_id.clone()),
                 summary: vec![summary],
                 content: None,
                 encrypted_content: None,
@@ -600,7 +600,7 @@ impl ResponseStreamConverter {
             output.push((
                 self.reasoning_output_index,
                 OutputItem::Reasoning(ReasoningItem {
-                    id: self.reasoning_item_id.clone(),
+                    id: Some(self.reasoning_item_id.clone()),
                     summary: vec![SummaryPart::SummaryText(SummaryTextContent {
                         text: self.accumulated_reasoning.clone(),
                     })],

@@ -20,7 +20,7 @@ repository.workspace = true
 
 [dependencies]
 # Upstream OpenAI types (types-only, no HTTP client)
-async-openai = { version = "0.34", default-features = false, features = [
+async-openai = { version = "0.41", default-features = false, features = [
     "chat-completion-types",
     "response-types",
     "completion-types",
@@ -31,7 +31,9 @@ async-openai = { version = "0.34", default-features = false, features = [
 
 # Serialization
 serde = { workspace = true }
-serde_json = { workspace = true }
+# preserve_order: the `unmodeled` passthrough map must re-serialize fields in
+# the order the client sent them (turn-stable forwarded bytes).
+serde_json = { workspace = true, features = ["preserve_order"] }
 derive_builder = { workspace = true }
 
 # Type support

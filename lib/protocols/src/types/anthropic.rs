@@ -52,14 +52,50 @@ impl CacheControl {
         raw.clamp(MIN_TTL_SECONDS, MAX_TTL_SECONDS)
     }
 }
-/// Parsed system prompt content, preserving cache_control from block arrays.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Parsed system prompt content. This is a LOSSY view of the wire `system`
+/// field: a block array is collapsed to one string (blocks joined with `\n`)
+/// and only the last `cache_control` marker is kept — per-block boundaries,
+/// per-block `cache_control`, and any other block attributes are gone. It
+/// serves the typed request's own consumers (template rendering); the shared
+/// canonicalizer reads the client's original JSON instead, so it never sees
+/// this collapse.
+///
+/// Serializes back in Anthropic's own wire shapes — a plain string, or a
+/// single text block when a `cache_control` has to be carried — never as
+/// this struct's own `{"text": ...}` object, which no Anthropic consumer
+/// would read as system text. That output is well-formed Anthropic, not a
+/// byte-for-byte round trip of a multi-block input.
+#[derive(Debug, Clone, Deserialize)]
 pub struct SystemContent {
     /// The concatenated text from all system blocks (or the plain string).
     pub text: String,
     /// Cache control from the last system block that had one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+}
+
+impl Serialize for SystemContent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let Some(cache_control) = &self.cache_control else {
+            return serializer.serialize_str(&self.text);
+        };
+        #[derive(Serialize)]
+        struct SystemBlockRef<'a> {
+            #[serde(rename = "type")]
+            block_type: &'static str,
+            text: &'a str,
+            cache_control: &'a CacheControl,
+        }
+        let block = SystemBlockRef {
+            block_type: "text",
+            text: &self.text,
+            cache_control,
+        };
+        let mut seq = serializer.serialize_seq(Some(1))?;
+        seq.serialize_element(&block)?;
+        seq.end()
+    }
 }
 
 /// Deserialize `system` from either a plain string or an array of text blocks.
@@ -182,6 +218,11 @@ pub struct AnthropicCreateMessageRequest {
     /// `format` specifies structured JSON output constraints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_config: Option<serde_json::Value>,
+
+    /// Verbatim passthrough of request fields not modeled above (ordered
+    /// under `preserve_order`; see `CreateChatCompletionRequest.unmodeled`).
+    #[serde(flatten)]
+    pub unmodeled: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Extended thinking configuration for the request.
@@ -220,13 +261,47 @@ pub enum AnthropicRole {
 }
 
 /// Message content -- either a plain string or an array of content blocks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum AnthropicMessageContent {
     /// Plain text content.
     Text { content: String },
     /// Array of structured content blocks.
     Blocks { content: Vec<AnthropicContentBlock> },
+}
+
+/// Hand-written so a malformed block reports the field that is actually
+/// wrong. `#[serde(untagged)]` discards every inner error and yields only
+/// "data did not match any variant of untagged enum AnthropicMessageContent",
+/// which is useless in a 400 body.
+impl<'de> Deserialize<'de> for AnthropicMessageContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ContentField {
+            content: serde_json::Value,
+        }
+
+        let content = ContentField::deserialize(deserializer)?.content;
+        match content {
+            serde_json::Value::String(text) => Ok(Self::Text { content: text }),
+            serde_json::Value::Array(_) => Ok(Self::Blocks {
+                content: serde_json::from_value(content).map_err(serde::de::Error::custom)?,
+            }),
+            other => Err(serde::de::Error::custom(format!(
+                "message `content` must be a string or an array of content blocks, got {}",
+                match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "a boolean",
+                    serde_json::Value::Number(_) => "a number",
+                    serde_json::Value::Object(_) => "an object",
+                    serde_json::Value::String(_) | serde_json::Value::Array(_) => unreachable!(),
+                }
+            ))),
+        }
+    }
 }
 
 /// A single content block within a message.
@@ -693,6 +768,10 @@ pub struct AnthropicTool {
     /// Cache control breakpoint on this tool definition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+    /// Anthropic `defer_loading`: the tool's definition may be loaded lazily.
+    /// Modeled so it survives conversion instead of being silently dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
 }
 
 /// Tool choice specification.
@@ -761,6 +840,19 @@ pub struct AnthropicMessageResponse {
 pub enum AnthropicResponseContentBlock {
     #[serde(rename = "thinking")]
     Thinking { thinking: String, signature: String },
+    /// Anthropic's own API never returns a `tool_result` — the client sends
+    /// those. A server-side tool loop does return them, as the other half of
+    /// each `tool_use` it resolved, so the response block set has to include
+    /// one.
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        /// Omitted rather than `false`, matching how a client sends a
+        /// successful result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
     #[serde(rename = "text")]
     Text {
         text: String,
@@ -1039,6 +1131,146 @@ fn estimate_block_len(block: &AnthropicContentBlock) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `system` re-serializes in Anthropic's own wire shapes (string, or a text block carrying
+    /// the cache_control), never as the parsed struct's `{"text": ...}` object — a consumer
+    /// reading the re-serialized request must see the same system prompt the client sent.
+    #[test]
+    fn system_content_reserializes_in_wire_shape() {
+        let req: AnthropicCreateMessageRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "max_tokens": 1, "messages": [],
+            "system": "You are helpful."
+        }))
+        .unwrap();
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["system"], "You are helpful.");
+
+        let req: AnthropicCreateMessageRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "max_tokens": 1, "messages": [],
+            "system": [
+                {"type": "text", "text": "A"},
+                {"type": "text", "text": "B", "cache_control": {"type": "ephemeral"}}
+            ]
+        }))
+        .unwrap();
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            out["system"],
+            serde_json::json!([{"type": "text", "text": "A\nB", "cache_control": {"type": "ephemeral"}}])
+        );
+        // And it reads back as the same parsed content.
+        let again: AnthropicCreateMessageRequest = serde_json::from_value(out).unwrap();
+        let system = again.system.unwrap();
+        assert_eq!(system.text, "A\nB");
+        assert_eq!(
+            serde_json::to_value(system.cache_control.unwrap()).unwrap()["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn message_content_errors_name_the_actual_problem() {
+        let err = serde_json::from_value::<AnthropicMessage>(serde_json::json!({
+            "role": "user",
+            "content": 42
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("must be a string or an array of content blocks"),
+            "{err}"
+        );
+        assert!(err.contains("a number"), "{err}");
+
+        // Strict shapes still parse.
+        let text: AnthropicMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "hello"
+        }))
+        .unwrap();
+        assert!(matches!(text.content, AnthropicMessageContent::Text { .. }));
+        let blocks: AnthropicMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}]
+        }))
+        .unwrap();
+        assert!(matches!(
+            blocks.content,
+            AnthropicMessageContent::Blocks { .. }
+        ));
+    }
+
+    #[test]
+    fn response_tool_result_block_round_trips() {
+        let success = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": "result body"
+        });
+        let block: AnthropicResponseContentBlock = serde_json::from_value(success.clone()).unwrap();
+        assert!(matches!(
+            block,
+            AnthropicResponseContentBlock::ToolResult { ref tool_use_id, is_error: None, .. }
+                if tool_use_id == "srvtoolu_1"
+        ));
+        // is_error omitted on success, matching how a client sends one.
+        assert_eq!(serde_json::to_value(block).unwrap(), success);
+    }
+
+    /// Unknown top-level request fields survive a parse/serialize round trip in the client's
+    /// order (the passthrough contract the shared crate builds on), while every modeled field
+    /// still lands in its typed home.
+    #[test]
+    fn unmodeled_request_fields_round_trip_in_client_order() {
+        let input = serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "context_management": {"edits": []},
+            "zeta_first": 1,
+            "alpha_second": 2
+        });
+        let request: AnthropicCreateMessageRequest = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(request.model, "m");
+        assert_eq!(
+            request.unmodeled.keys().collect::<Vec<_>>(),
+            ["context_management", "zeta_first", "alpha_second"]
+        );
+        let output = serde_json::to_value(&request).unwrap();
+        assert_eq!(output["context_management"], input["context_management"]);
+        assert_eq!(output["zeta_first"], 1);
+        assert_eq!(output["alpha_second"], 2);
+        assert_eq!(
+            serde_json::to_string(&request)
+                .unwrap()
+                .matches("\"model\"")
+                .count(),
+            1
+        );
+    }
+
+    /// `defer_loading` is optional on the wire and omitted when absent; a present value parses
+    /// and re-serializes.
+    #[test]
+    fn tool_defer_loading_is_optional_and_round_trips() {
+        let without: AnthropicTool = serde_json::from_value(serde_json::json!({
+            "name": "t", "input_schema": {"type": "object"}
+        }))
+        .unwrap();
+        assert_eq!(without.defer_loading, None);
+        assert!(
+            serde_json::to_value(&without)
+                .unwrap()
+                .get("defer_loading")
+                .is_none()
+        );
+        let with: AnthropicTool = serde_json::from_value(serde_json::json!({
+            "name": "t", "input_schema": {"type": "object"}, "defer_loading": true
+        }))
+        .unwrap();
+        assert_eq!(with.defer_loading, Some(true));
+        assert_eq!(serde_json::to_value(&with).unwrap()["defer_loading"], true);
+    }
 
     #[test]
     fn tool_result_blocks_parse_typed_and_round_trip() {

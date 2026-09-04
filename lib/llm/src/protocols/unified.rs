@@ -571,6 +571,7 @@ mod tests {
         use super::super::anthropic::types::*;
 
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {

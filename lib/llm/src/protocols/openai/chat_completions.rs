@@ -256,9 +256,10 @@ impl CommonExtProvider for NvCreateChatCompletionRequest {
                     }));
                 }
                 ResponseFormat::JsonSchema { json_schema } => {
-                    // validate_response_format ensures schema is present when type=json_schema
-                    if let Some(schema) = json_schema.schema.clone() {
-                        return Some(schema);
+                    // async-openai 0.41: `schema` is a required `Value`; validate_response_format
+                    // rejects an explicit `null`.
+                    if !json_schema.schema.is_null() {
+                        return Some(json_schema.schema.clone());
                     }
                 }
             }
@@ -427,7 +428,7 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_service_tier(&self.inner.service_tier)?;
         validate::validate_stop(&self.inner.stop)?;
         // none for stream
-        // none for stream_options
+        // none for stream_options (the handler's validate_stream_options runs first)
         validate::validate_temperature(self.inner.temperature)?;
         validate::validate_top_p(self.inner.top_p)?;
         validate::validate_tools(&self.inner.tools.as_deref())?;
@@ -446,6 +447,9 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod b10_tests;
 
 #[cfg(test)]
 mod tests {

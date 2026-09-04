@@ -265,6 +265,39 @@ pub enum MessageItem {
     Input(InputMessage),
 }
 
+/// Content part of an `agent_message` item. Codex drops an agent message
+/// whose content is not entirely plaintext when rendering one for a chat
+/// bridge (its `plaintext_agent_message_content`), and the same rule holds
+/// here: encrypted parts are unrenderable, so the caller skips the item.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMessageInputContent {
+    InputText { text: String },
+    EncryptedContent { encrypted_content: String },
+}
+
+/// Input-side `agent_message`: a multi-agent transcript item (codex
+/// `multi_agent_v1`), host-authored and sent verbatim to every Responses
+/// provider.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct AgentMessageItemParam {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub author: String,
+    pub recipient: String,
+    pub content: Vec<AgentMessageInputContent>,
+}
+
+/// Input-side `additional_tools`: codex Responses-Lite framing carries the
+/// tool declarations on an input item instead of top-level `tools`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct AdditionalToolsItemParam {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub role: String,
+    pub tools: Vec<serde_json::Value>,
+}
+
 /// Structured input/output item, discriminated by `type`. Mirrors upstream
 /// `Item` variant-for-variant; only `Message` uses a Dynamo-owned type.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -295,6 +328,14 @@ pub enum Item {
     McpCall(MCPToolCall),
     CustomToolCallOutput(CustomToolCallOutput),
     CustomToolCall(CustomToolCall),
+    /// Codex multi-agent sessions replay sub-agent turns as `agent_message` items (author,
+    /// recipient, content); a transcript echo, so parsing it keeps multi-agent replay from failing
+    /// the whole request as an unknown variant.
+    AgentMessage(AgentMessageItemParam),
+    /// Responses-Lite framing: tools declared mid-conversation by a `developer`/`system` item
+    /// instead of the top-level `tools[]` (Codex sends these). Declared to the model as tools by
+    /// the shared translation crate.
+    AdditionalTools(AdditionalToolsItemParam),
 }
 
 /// Single input item. Untagged; order matters (most specific first).

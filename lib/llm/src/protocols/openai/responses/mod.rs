@@ -1086,7 +1086,7 @@ pub fn chat_completion_to_response(
             && params.reasoning_summary_requested()
         {
             output.push(OutputItem::Reasoning(ReasoningItem {
-                id: format!("rs_{}", Uuid::new_v4().simple()),
+                id: Some(format!("rs_{}", Uuid::new_v4().simple())),
                 summary: vec![SummaryPart::SummaryText(SummaryTextContent {
                     text: reasoning_text,
                 })],
@@ -1254,6 +1254,9 @@ pub fn chat_completion_to_response(
         store: params.store.unwrap_or(false),
     })
 }
+
+#[cfg(test)]
+mod b10_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2144,7 +2147,7 @@ mod tests {
                         status: None,
                     }))),
                     InputItem::Item(Item::Reasoning(ReasoningItem {
-                        id: "rs_1".into(),
+                        id: Some("rs_1".into()),
                         summary: vec![SummaryPart::SummaryText(SummaryTextContent {
                             text: "thinking step 1".into(),
                         })],
@@ -2786,7 +2789,7 @@ thinking
         let schema = ResponseFormatJsonSchema {
             name: "city".into(),
             description: None,
-            schema: Some(serde_json::json!({"type": "object"})),
+            schema: serde_json::json!({"type": "object"}),
             strict: Some(true),
         };
         let mut req = make_response_with_input("structured");

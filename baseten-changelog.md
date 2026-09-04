@@ -1234,6 +1234,24 @@ on optional response fields. This avoids streaming chunks like
 `service_tier: null`, and `system_fingerprint: null` while leaving request-side
 serialization behaviour unchanged.
 
+Wire-type groundwork for the shared normalization crate (BLS, PR stack D1):
+`async-openai` 0.34 -> 0.41.3 (tagged `reasoning_text` content parts — a
+parse-strictness increase, untagged parts now 400; `ReasoningItem.id:
+Option`, lib/llm wraps its ids in `Some`); `AnthropicCreateMessageRequest`
+gains an ordered `unmodeled` passthrough and `AnthropicTool` gains
+`defer_loading`; `AnthropicMessageContent` gets a hand-written `Deserialize`
+so malformed `content` 400s name the actual problem; `SystemContent`
+documents itself as the lossy typed view it is and serializes back in
+Anthropic's own wire shapes; Responses input accepts codex `agent_message`
+and `additional_tools` items — at this slice the lib/llm converter SKIPS both
+(previously the request 400d as an unknown variant), the shared crate later
+declares `additional_tools` as tools; `ChatCompletionResponseMessage.
+reasoning_content` is omitted when absent (OpenAI defines no such field);
+`serde_json` gains `preserve_order` so passthrough fields re-serialize in
+client order. Already on main-v1.2.0 and NOT changed here: non-terminal
+`finish_reason` omission, string `error.code`, `document`/`search_result`
+tool_result blocks. Baseten-specific; not upstreamable.
+
 The `reasoning_effort` field on chat completion requests is normalized through a process-wide alias map before deserialization. Defaults: `"max"` → `"xhigh"`. Override at runtime by setting the `REASONING_EFFORT_ALIASES` env var to a JSON object (e.g. `REASONING_EFFORT_ALIASES='{"max":"xhigh","minimum":"low"}'`); parsed once on first use, silently falls back to the hardcoded defaults if absent or unparseable.
 
 The same alias map applies to `reasoning.effort` on `/v1/responses` requests (`CreateResponse.reasoning` custom deserializer): without it, `{"reasoning": {"effort": "max"}}` was a deserialization 400 on the Responses API while the identical effort succeeded on chat completions. Serve-side reasoning policies map `xhigh` back to the model-native `max` tier, so DeepSeek V4 / GLM clients get identical effort behavior on both APIs (PR #574).

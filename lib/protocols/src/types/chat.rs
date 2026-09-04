@@ -41,6 +41,7 @@ pub use async_openai::types::chat::{
     ChatCompletionRequestDeveloperMessage,
     ChatCompletionRequestDeveloperMessageArgs,
     ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestDeveloperMessageContentPart,
     ChatCompletionRequestFunctionMessage,
     ChatCompletionRequestFunctionMessageArgs,
     ChatCompletionRequestMessageContentPartAudio,
@@ -318,7 +319,9 @@ pub(crate) fn reasoning_effort_aliases() -> &'static HashMap<String, String> {
 /// and parse it as `ReasoningEffort`. The single entry point for every request
 /// surface that accepts an effort (chat `reasoning_effort`, responses
 /// `reasoning.effort`) so all paths share one alias table and one error shape.
-pub(crate) fn parse_reasoning_effort(s: String) -> Result<ReasoningEffort, serde_json::Error> {
+/// Public so out-of-crate ingress translators (`dynamo-api-translation`) resolve
+/// efforts through the same table instead of carrying their own.
+pub fn parse_reasoning_effort(s: String) -> Result<ReasoningEffort, serde_json::Error> {
     let s = reasoning_effort_aliases().get(&s).cloned().unwrap_or(s);
     serde_json::from_value::<ReasoningEffort>(serde_json::Value::String(s))
 }
@@ -814,6 +817,10 @@ pub struct ChatCompletionResponseMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<ChatCompletionResponseMessageAudio>,
     /// Reasoning content produced by the model (DeepSeek-R1, QwQ).
+    /// Skipped when `None`: a non-thinking model's response must not carry a
+    /// `reasoning_content` key at all — OpenAI has no such field, so emitting
+    /// `null` invents one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 }
 
@@ -1011,6 +1018,22 @@ pub struct CreateChatCompletionStreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_message_omits_absent_reasoning_content() {
+        #[allow(deprecated)]
+        let message = ChatCompletionResponseMessage {
+            content: Some(ChatCompletionMessageContent::Text("hi".to_string())),
+            refusal: None,
+            tool_calls: None,
+            role: Role::Assistant,
+            function_call: None,
+            audio: None,
+            reasoning_content: None,
+        };
+        let value = serde_json::to_value(message).unwrap();
+        assert!(value.get("reasoning_content").is_none());
+    }
 
     #[test]
     fn stop_accepts_token_id_array() {

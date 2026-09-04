@@ -795,6 +795,7 @@ mod tests {
     #[test]
     fn test_simple_user_message_conversion() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -839,6 +840,7 @@ mod tests {
     #[test]
     fn test_system_message_prepended() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -923,6 +925,7 @@ mod tests {
     #[test]
     fn test_tool_use_blocks_conversion() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![
@@ -990,6 +993,7 @@ mod tests {
     #[test]
     fn test_stop_sequences_conversion() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -1021,6 +1025,7 @@ mod tests {
     #[test]
     fn test_tools_conversion() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -1037,6 +1042,7 @@ mod tests {
             stream: false,
             metadata: None,
             tools: Some(vec![AnthropicTool {
+                defer_loading: None,
                 name: "get_weather".into(),
                 tool_type: None,
                 description: Some("Get weather info".into()),
@@ -1077,6 +1083,7 @@ mod tests {
     #[test]
     fn test_server_tools_only_drops_tools_and_tool_choice() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -1093,6 +1100,7 @@ mod tests {
             stream: false,
             metadata: None,
             tools: Some(vec![AnthropicTool {
+                defer_loading: None,
                 name: "web_search".into(),
                 tool_type: Some("web_search_20250305".into()),
                 description: None,
@@ -1121,6 +1129,7 @@ mod tests {
     #[test]
     fn test_named_choice_for_filtered_tool_degrades_to_auto() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -1138,6 +1147,7 @@ mod tests {
             metadata: None,
             tools: Some(vec![
                 AnthropicTool {
+                    defer_loading: None,
                     name: "web_search".into(),
                     tool_type: Some("web_search_20250305".into()),
                     description: None,
@@ -1145,6 +1155,7 @@ mod tests {
                     cache_control: None,
                 },
                 AnthropicTool {
+                    defer_loading: None,
                     name: "get_weather".into(),
                     tool_type: None,
                     description: None,
@@ -1434,6 +1445,7 @@ mod tests {
     #[test]
     fn test_thinking_block_becomes_reasoning_content() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -1534,6 +1546,7 @@ mod tests {
         // Conversion should succeed — server_tool_use becomes a tool call,
         // redacted_thinking and web_search_tool_result are preserved gracefully
         let chat_req: NvCreateChatCompletionRequest = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test".into(),
             max_tokens: 100,
             messages: req.messages,
@@ -1860,6 +1873,7 @@ mod tests {
 
     fn make_req(blocks: Vec<AnthropicContentBlock>) -> ChatCompletionRequestAssistantMessage {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -2341,6 +2355,7 @@ mod tests {
     #[test]
     fn test_image_block_becomes_multimodal_content() {
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -2415,6 +2430,7 @@ mod tests {
     fn test_pure_text_stays_text_format() {
         // Verify backwards compatibility: pure text messages don't use Array format.
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![AnthropicMessage {
@@ -2466,6 +2482,7 @@ mod tests {
     fn test_image_with_tool_result_flush() {
         // Image + text should flush as Array before tool_result becomes a Tool message.
         let req = AnthropicCreateMessageRequest {
+            unmodeled: Default::default(),
             model: "test-model".into(),
             max_tokens: 100,
             messages: vec![
