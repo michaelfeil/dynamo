@@ -244,8 +244,11 @@ impl GenerationCoordinator {
         options.primary.wait_for_first_response = true;
         options.primary.tracing_enabled = true;
         options.primary.phase = Some(RouterWorkerPhase::PrefillFirst);
-        // Cancellation is allowed until a usable prefill handoff exists.
-        options.primary.cancellation = CancellationPolicy::Cancellable;
+        // Cancellation is allowed through routing and worker setup. Once the
+        // prefill payload is sent the worker may pin KV for our context; the
+        // prefill stream is detached so a client disconnect cannot strand that
+        // staging before the decode leg takes over.
+        options.primary.cancellation = CancellationPolicy::CancellableUntilWorkerThenDetach;
 
         let prefill = self
             .primary
