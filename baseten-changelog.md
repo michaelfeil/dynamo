@@ -2230,3 +2230,35 @@ the top of this file. New sections should generally represent a substantial
 standalone PR, ideally around 500 LOC or larger, or a distinct future rebase
 decision; smaller follow-ups should be folded into the existing relevant
 section.
+
+## CC pivot: shared `lib/api-translation` crate (`b10-dynamo-api-translation`)
+
+Chat Completions + `baseten_ext` is the canonical normalization contract
+(team decision 2026-08-27). New crate `lib/api-translation` (stack D2),
+ported from tool-bank's `api_translation` module (baseten master @
+a63c05ca16): `adapt_request` ingress for CC/Messages/Responses, `SseParser`
+(CC SSE -> SemanticChunk), `MessageHistoryAccumulator`, the three egress
+framers driven by `SseEmitter`/`BufferedEgress`, and tool-bank's
+dynamo_conformance_tests as the crate suite (render-equivalence oracle behind
+the off-by-default `render-conformance` feature). Server-tool execution stays
+in tool-bank behind the `IngressHooks` seam (server-tool claims, react caps,
+coding-adapter selection); the `DropServerTools` default is standard-dynamo
+behavior (drop hosted tools with a warning, degrade a `tool_choice` naming a
+dropped tool to auto). The ordered `unmodeled` catch-all lives on the crate's
+own `CcRequest { inner, unmodeled }` wrapper, not on the shared wire type
+(a flattened map there makes the Nv wrappers' flatten-inside-flatten collect
+every key into `unsupported_fields`). Port deviations from tool-bank that
+were reverted on review: the ReAct-cap termination is `completed` again
+(tool-bank's anti-retry decision; Codex retries any `incomplete`), and the
+in-flight iteration scope is held (`OpenIterationScope`) so a streamed
+client sees one `iterations[]` entry per index like the buffered body.
+Standard-dynamo leniency the seam adds: a `tool_choice` naming a dropped or
+unsupported tool shape degrades to `auto` with a warning
+(`IngressHooks::degrades_unsupported_tool_choice`, tool-bank keeps its 400),
+and nameless server-tool selection entries are recorded by type so the
+degrade catches them. Inherited tool-bank semantics carried as-is (decided
+2026-09-03): adjacent text blocks and system blocks join with "\n" — see D6
+— unknown user content blocks are skipped by default and 400 only behind
+tool-bank's hooks (D4), and unmodeled passthrough keys are last-wins over
+the translated body. Nothing in lib/llm uses the crate yet (stack D6).
+Baseten-specific; not upstreamable.

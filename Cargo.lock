@@ -991,6 +991,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "b10-dynamo-api-translation"
+version = "1.2.0"
+dependencies = [
+ "dynamo-protocols",
+ "dynamo-renderer",
+ "http 1.4.0",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "backon"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

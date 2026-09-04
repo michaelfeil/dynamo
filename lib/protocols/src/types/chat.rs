@@ -319,7 +319,7 @@ pub(crate) fn reasoning_effort_aliases() -> &'static HashMap<String, String> {
 /// and parse it as `ReasoningEffort`. The single entry point for every request
 /// surface that accepts an effort (chat `reasoning_effort`, responses
 /// `reasoning.effort`) so all paths share one alias table and one error shape.
-/// Public so out-of-crate ingress translators (`dynamo-api-translation`) resolve
+/// Public so out-of-crate ingress translators (`b10-dynamo-api-translation`) resolve
 /// efforts through the same table instead of carrying their own.
 pub fn parse_reasoning_effort(s: String) -> Result<ReasoningEffort, serde_json::Error> {
     let s = reasoning_effort_aliases().get(&s).cloned().unwrap_or(s);
