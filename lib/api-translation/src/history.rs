@@ -34,13 +34,59 @@ pub struct MessageHistoryAccumulator {
 #[derive(Default)]
 pub(crate) struct AssistantMessageBuffer {
     pub text: String,
-    pub thinking: String,
+    /// Reasoning segments: with interleaved tool calls, `thinking[i]` is the reasoning that
+    /// preceded `tool_calls[i]` and one trailing segment follows the last call — the fork's
+    /// `ReasoningContent::Segments` shape, which a segments-aware chat template needs to replay
+    /// interleaved thinking/tool turns byte-exactly (KV-cache prefix). The loop's delta fold only
+    /// ever appends into one open segment, so it still emits the flat `Text` form.
+    pub thinking: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// An explicit (possibly empty) assistant message item was folded in: emit `content` even when
+    /// the text is empty, so the turn boundary survives strict-alternation chat templates instead
+    /// of adjacent user turns silently merging.
+    pub explicit_content: bool,
 }
 
 impl AssistantMessageBuffer {
     fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.thinking.is_empty() && self.tool_calls.is_empty()
+        self.text.is_empty()
+            && self.tool_calls.is_empty()
+            && !self.explicit_content
+            && self.thinking.iter().all(String::is_empty)
+    }
+
+    /// Verbatim reasoning-delta append into the open segment (the loop's stream fold).
+    pub(crate) fn append_thinking_delta(&mut self, delta: &str) {
+        if self.thinking.is_empty() {
+            self.thinking.push(String::new());
+        }
+        self.thinking
+            .last_mut()
+            .expect("just ensured non-empty")
+            .push_str(delta);
+    }
+
+    /// A complete replayed thinking block: blocks within one segment join with `"\n"` (the
+    /// fork/b10 separator ruling for adjacent thinking blocks).
+    pub(crate) fn append_thinking_block(&mut self, block: &str) {
+        if self.thinking.is_empty() {
+            self.thinking.push(String::new());
+        }
+        let segment = self.thinking.last_mut().expect("just ensured non-empty");
+        if !segment.is_empty() {
+            segment.push('\n');
+        }
+        segment.push_str(block);
+    }
+
+    /// Close the current reasoning segment at a replayed tool call (request edge only): reasoning
+    /// after this call belongs to the next segment. Called for every replayed call, so segment
+    /// count stays `tool_calls.len() + 1` whenever any segmenting happened.
+    pub(crate) fn close_thinking_segment(&mut self) {
+        if self.thinking.is_empty() {
+            self.thinking.push(String::new());
+        }
+        self.thinking.push(String::new());
     }
 
     /// Append as one assistant message and reset. An empty buffer appends nothing: it would alter
@@ -58,15 +104,24 @@ impl AssistantMessageBuffer {
         }
         let tool_calls = (!self.tool_calls.is_empty())
             .then(|| self.tool_calls.into_iter().map(Into::into).collect());
+        // Replay fidelity for the KV-cache prefix: carry the model's reasoning verbatim so the
+        // re-render matches; the chat template (not us) decides model-specific strip policy.
+        // A single segment keeps the flat `Text` shape; interleaving emits `Segments`.
+        let reasoning_content = if self.thinking.iter().all(String::is_empty) {
+            None
+        } else if self.thinking.len() == 1 {
+            Some(ReasoningContent::Text(
+                self.thinking.into_iter().next().expect("len checked"),
+            ))
+        } else {
+            Some(ReasoningContent::Segments(self.thinking))
+        };
         #[allow(deprecated)]
         Some(ChatCompletionRequestAssistantMessage {
-            content: (!self.text.is_empty()).then_some(
+            content: (!self.text.is_empty() || self.explicit_content).then_some(
                 ChatCompletionRequestAssistantMessageContent::Text(self.text),
             ),
-            // Replay fidelity for the KV-cache prefix: carry the model's reasoning verbatim so the
-            // re-render matches; the chat template (not us) decides model-specific strip policy.
-            reasoning_content: (!self.thinking.is_empty())
-                .then_some(ReasoningContent::Text(self.thinking)),
+            reasoning_content,
             refusal: None,
             name: None,
             audio: None,
@@ -119,7 +174,7 @@ impl MessageHistoryAccumulator {
     pub fn push(&mut self, chunk: &SemanticChunk) {
         match chunk {
             SemanticChunk::TextDelta(t) => self.assistant_message.text.push_str(t),
-            SemanticChunk::ThinkingDelta(t) => self.assistant_message.thinking.push_str(t),
+            SemanticChunk::ThinkingDelta(t) => self.assistant_message.append_thinking_delta(t),
             SemanticChunk::ToolCall(tc) => self.assistant_message.tool_calls.push(tc.clone()),
             SemanticChunk::Usage(_) | SemanticChunk::Stop { .. } => {}
         }

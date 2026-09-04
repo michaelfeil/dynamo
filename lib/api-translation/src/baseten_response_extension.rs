@@ -22,6 +22,15 @@ pub struct BasetenResponseExtension<Usage: Serialize> {
     pub iterations: Vec<IterationScope<Usage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request: Option<RequestScope>,
+    // TODO(behavior-version): reserve `behavior_version` here — one opaque, stable identifier for
+    // the behavior a request was served by (this crate + chat template + tokenizer + parsers +
+    // model description), stamped on every response's `baseten` extension and on the
+    // `stage.*` log lines, bumped only when something a client can observe changes. Its inputs
+    // live in several repos, so it cannot be computed by this crate alone; the natural source is
+    // the bis-config-registry snapshot id of the deployment (content-addressed over every binding
+    // that shapes behavior), injected into the frontend as an env var. Adding the field itself is
+    // a `baseten_ext` surface change and needs sign-off first (see the extension policy in the
+    // bls plan). Asked for in review: basetenlabs/dynamo#695 (discussion_r3909067082).
 }
 
 /// Hand-written rather than `#[derive(Default)]`: the derive adds a spurious `Usage: Default`
@@ -98,11 +107,6 @@ impl IterationScope<CompletionUsage> {
             debug_msg: self.debug_msg.clone(),
         }
     }
-}
-
-/// What [`IterationScope::debug_msg`] carries when the loop appended its steering message.
-pub fn steering_appended_note(steering_prompt: &str) -> String {
-    format!("appended steering message: {steering_prompt}")
 }
 
 /// One server-tool call's identity, projected once off the dispatched call and shared by the

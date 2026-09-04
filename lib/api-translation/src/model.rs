@@ -25,7 +25,7 @@ pub struct ToolCall {
 pub struct ServerToolCall {
     pub call: ToolCall,
     /// The provider label wire records carry (`mcp_call.server_label`, the extension's
-    /// `provider` field) — for a `baseten__<provider>__<tool>` claim, the `<provider>` segment.
+    /// `provider` field) — the label the claiming consumer supplies for the tool's provider.
     pub provider: String,
 }
 
@@ -203,6 +203,20 @@ pub enum RequestRejection {
 }
 
 impl RequestRejection {
+    /// Closed-vocabulary label for logs and metrics.
+    pub fn class_label(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "malformed",
+            Self::Unsupported(_) => "unsupported",
+        }
+    }
+
+    /// The HTTP status a frontend renders this as. Both are the caller's to fix on this stack
+    /// (`Unsupported` was tool-bank's 501; the fork's error-API conformance maps it to 400).
+    pub fn status(&self) -> http::StatusCode {
+        http::StatusCode::BAD_REQUEST
+    }
+
     pub fn detail(&self) -> &str {
         match self {
             Self::Malformed(detail) | Self::Unsupported(detail) => detail,
@@ -231,7 +245,8 @@ pub enum ReactCapSource {
     ServerDefault,
     /// `baseten.tool_settings.max_react_iterations`, below the ceiling. Raisable further.
     Request,
-    /// The cap equals [`crate::hooks::REACT_ITERATIONS_MAX`], whichever setting produced it: the
+    /// The cap equals the hook's `IngressLimits::max_react_iterations`, whichever setting produced
+    /// it: the
     /// only case no caller can raise.
     ServiceCeiling,
 }

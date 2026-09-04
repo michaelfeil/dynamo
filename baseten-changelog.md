@@ -2284,3 +2284,62 @@ tool-bank, baseten #27828); server-tool call records and outcomes carry the
 billing verdict as tool-bank ships it (`billable`, `sku`, `quantity` present
 only when the call bills; `ToolOutput.verdict` mirrors `BillingVerdict` /
 `UsageReport` as data, baseten #27386). Baseten-specific.
+
+Ingress edges on the shared crate (stack D4) — the validation floor and
+parity fixes live agent traffic and the bx suites taught us, each with a test
+in `request_test.rs`: Messages `temperature`/`top_p` 0..1, thinking budget
+>= 1024 and < max_tokens, client-tool `input_schema` required, orphan
+`tool_result` 400; Responses `temperature` 0..2, orphan `function_call_output`
+400; a trailing assistant turn sets CC `partial: true` (prefill); Anthropic-only
+top-level fields (`service_tier`, `cache_control`, `context_management`, ...)
+dropped with a warning instead of forwarded (`CC_EXTENSION_KEYS` names the
+fork extension surface that rides through); Responses accepts
+`include: ["reasoning.encrypted_content"]` by default (hook-selectable
+refusal for tool-bank) and every `reasoning.summary` value, declares
+`additional_tools` items as CC tools, and 501s `conversation` with the other
+stateful fields; `service_tier` maps one-to-one (`auto` is not `default`);
+interleaved thinking/tool replay emits `ReasoningContent::Segments`; user
+image blocks translate to CC image parts; user `document` blocks and unknown
+assistant blocks/items drop with a warning instead of 400ing; Codex
+`namespace` tool groups flatten to `{ns}__{name}`; `store` is carried; empty
+assistant turns and refusal parts survive as turn boundaries;
+`top_logprobs > 20` is refused; top-level `tool_settings` nesting guard
+restored. Accepted tool-bank deltas pinned with `// CC-pivot: tool-bank
+semantics`. Review follow-ups: Responses replay now closes the reasoning
+segment at every replayed `function_call`/`mcp_call` like the Messages path
+(a `[reasoning, function_call, reasoning]` transcript re-renders byte-exactly);
+the thinking-budget upper bound applies only when the client sent
+`max_tokens` (the deployment template may supply it); Codex namespace
+flattening, `top_logprobs` bounds, and empty-turn/refusal boundaries are
+pinned by tests. Also in this slice: `take_body_user`, unknown `baseten`
+extension members warn+drop, plain `text.format` lowers to no
+`response_format`, `pub adapt_request_json`, `content_kind` removal, `store`
+accepted. Separator ruling (2026-09-03): adjacent text blocks in `system`,
+user, and assistant messages join with "\n" — the deployed converter's
+shape — not tool-bank's "". Standard-dynamo leniency behind
+`IngressHooks::rejects_unsupported_messages_features` (default false;
+tool-bank sets true): untranslatable user content blocks are skipped with a
+warning, and `mcp_servers` / `container` are dropped with a warning, where
+tool-bank 400s. Ingress rejections name the offending JSON member
+(`serde_path_to_error`; Responses `input[i]` parsed per index) and Responses
+`reasoning.effort` resolves through the fork's `REASONING_EFFORT_ALIASES`
+table like chat `reasoning_effort` (`max` -> `xhigh`, no longer a 400; ported
+from tool-bank #27635/#27828). The crate carries no consumer tool namespace
+(review, Marius): server-tool routing is by shape only (CC/Responses
+non-`function` `type`, Anthropic non-`custom` `type` -> the hooks; a plain
+deployment drops with a recorded loss — wire-visible: a CC `web_search_preview`
+entry used to be forwarded verbatim), `RESERVED_TOOL_PREFIX` /
+`reserved_tool_provider` / the reserved-name client-tool guard move to
+tool-bank (guarded at dispatch), the Responses framer takes the provider label
+from the loop's call records, ReAct bounds (`max_react_iterations`,
+`server_tool_iterations_floor`) come from `IngressHooks::limits()` instead of
+crate constants, and the steering-note wording leaves the schema module. Every
+drop, skip, degrade, or fold on the
+ingress path is now a typed `Loss { kind, field, detail }` on
+`AdaptedRequest.losses` (closed `LossKind` vocabulary, labels safe as metric
+labels; `field` is the JSON path, never message content), handed to the new
+`IngressHooks::on_loss` (replaces `on_non_fatal`/`NonFatalCondition`) and
+logged once under `event_name = "ingress.loss"`; `adapt_request_json` emits
+the canonical per-stage line `stage.ingress` (elapsed_ms, outcome,
+error_class/status on rejection, model, losses, loss_kinds), replacing
+`predict.ingress_adapted`. Baseten-specific.

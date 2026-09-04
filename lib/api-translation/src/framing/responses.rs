@@ -42,7 +42,6 @@ use crate::baseten_response_extension::{
     BasetenFrame, BasetenResponseExtension, IterationScope, ServerToolCallOutcome,
 };
 use crate::coding_adapter::{CodingAdapter, RenderedToolCall, ToolCallStatus, ToolCallToRender};
-use crate::hooks::reserved_tool_provider;
 use crate::model::{
     BackendError, ErrorClass, ServerToolCall, Termination, ToolCall, ToolInvocation,
 };
@@ -391,6 +390,7 @@ fn transcript_output(
     coding_adapter: Option<&dyn CodingAdapter>,
 ) -> (Vec<OutputItem>, HashMap<String, Value>) {
     let failed_server_tool_call_ids = response.failed_server_tool_call_ids();
+    let server_tool_providers = response.server_tool_providers();
     let transcript = response.transcript;
     let mut output = Vec::new();
     let mut open_call_slots: HashMap<String, usize> = HashMap::new();
@@ -472,7 +472,11 @@ fn transcript_output(
                         );
                         continue;
                     };
-                    let Some(provider) = reserved_tool_provider(&placeholder.name) else {
+                    // A tool result answering a dispatched server tool re-renders as an mcp_call;
+                    // the provider label comes from the loop's own call records, never from
+                    // parsing the tool's name (the crate knows no tool namespace).
+                    let Some(&provider) = server_tool_providers.get(placeholder.name.as_str())
+                    else {
                         continue;
                     };
                     let (provider, name, arguments) = (

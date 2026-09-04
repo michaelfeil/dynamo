@@ -1,6 +1,12 @@
 use super::*;
 use crate::coding_adapter::{CodingAdapter, RenderedToolCall, ToolCallToRender};
 use crate::hooks::{ClaimedServerTool, DropServerTools, IngressLimits, IngressRewrite};
+use crate::loss::{Loss, LossKind, Losses};
+
+/// tool-bank's selection namespace, as its hooks recognise it; the crate itself knows no prefix.
+const TEST_SERVER_TOOL_PREFIX: &str = "baseten__";
+const REACT_ITERATIONS_MAX: std::num::NonZeroU32 = std::num::NonZeroU32::new(20).unwrap();
+const REACT_ITERATIONS_MIN: std::num::NonZeroU32 = std::num::NonZeroU32::new(2).unwrap();
 use crate::{CcMessage, CcRequest};
 
 /// Test hooks with the shape tool-bank's real impl takes: a fixed registry of claimable
@@ -17,6 +23,8 @@ impl StubHooks {
             limits: IngressLimits {
                 // Under the ceiling, so a request can be seen raising it too.
                 default_react_iterations: NonZeroU32::new(5).unwrap(),
+                max_react_iterations: REACT_ITERATIONS_MAX,
+                server_tool_iterations_floor: REACT_ITERATIONS_MIN,
                 max_tool_calls_per_iteration: NonZeroU32::new(10).unwrap(),
             },
             offered: Vec::new(),
@@ -47,13 +55,18 @@ impl IngressHooks for StubHooks {
         self.limits
     }
 
+    // tool-bank's stance for the tests that predate the seam: refuse what cannot be honored.
+    fn rejects_unsupported_messages_features(&self) -> bool {
+        true
+    }
+
     fn on_server_tool(&mut self, _protocol: ClientProtocol, entry: &Value) -> ToolDisposition {
         let kind = entry
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if !kind.starts_with(RESERVED_TOOL_PREFIX) {
+        if !kind.starts_with(TEST_SERVER_TOOL_PREFIX) {
             // tool-bank's stance: only its own reserved namespace is claimable; a vendor-hosted
             // tool aimed at this endpoint is refused rather than dropped.
             return ToolDisposition::Reject(RequestRejection::malformed(format!(
@@ -107,7 +120,7 @@ fn anthropic_message(v: Value) -> AnthropicMessage {
 /// The CC messages one Anthropic message translates to, in the wire form fed back to the model.
 fn translated(message: &AnthropicMessage) -> Vec<Value> {
     let mut cc_messages = Vec::new();
-    translate_message(message, &mut cc_messages).unwrap();
+    translate_message(message, 0, &mut cc_messages, false, &mut Losses::default()).unwrap();
     cc_messages
         .iter()
         .map(|m| serde_json::to_value(m).unwrap())
@@ -124,7 +137,9 @@ fn translates_tool_use_assistant_to_cc_tool_calls() {
     let out = translated(&msg);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0]["content"], json!("calling"));
-    assert_eq!(out[0]["reasoning_content"], json!("let me"));
+    // Fork Segments semantics: reasoning interleaved with tool calls keeps its position
+    // (segment i precedes call i, plus one trailing segment).
+    assert_eq!(out[0]["reasoning_content"], json!(["let me", ""]));
     assert_eq!(out[0]["tool_calls"][0]["id"], json!("c1"));
     assert_eq!(
         out[0]["tool_calls"][0]["function"]["arguments"],
@@ -215,8 +230,7 @@ fn rejection_separates_our_gaps_from_a_malformed_body() {
             protocol,
             &HeaderMap::new(),
         )
-        .err()
-        .expect("must be refused")
+        .expect_err("must be refused")
     };
     assert!(matches!(
         reject(
@@ -225,7 +239,8 @@ fn rejection_separates_our_gaps_from_a_malformed_body() {
         ),
         RequestRejection::Malformed(_)
     ));
-    // CC allows `n`, and an image block is a valid Messages block: TB simply cannot carry either.
+    // CC allows `n`, and a thinking block is a valid Messages block (just not in a user
+    // message): TB simply cannot carry either.
     assert!(matches!(
         reject(
             json!({"model": "m", "n": 2, "messages": []}),
@@ -236,7 +251,7 @@ fn rejection_separates_our_gaps_from_a_malformed_body() {
     assert!(matches!(
         reject(
             json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}},
+                {"type": "thinking", "thinking": "hm", "signature": ""},
             ]}]}),
             ClientProtocol::Messages
         ),
@@ -292,7 +307,9 @@ fn tool_result_non_base64_image_source_is_refused() {
         ]},
     ]}));
     let mut cc_messages = Vec::new();
-    let refusal = translate_message(&msg, &mut cc_messages).err().unwrap();
+    let refusal = translate_message(&msg, 0, &mut cc_messages, false, &mut Losses::default())
+        .err()
+        .unwrap();
     assert!(
         matches!(refusal, RequestRejection::Unsupported(_)),
         "refusal: {refusal}"
@@ -303,24 +320,19 @@ fn tool_result_non_base64_image_source_is_refused() {
     );
 }
 
-/// Refused, not flattened: neither an empty string nor the block's JSON is the content the caller
-/// sent, and either would have the model answer about input it never received.
+/// Fork parity: an unknown/unparseable tool_result block is carried as coerced JSON text, never a
+/// request error — agent clients replay these verbatim, so refusing would fail real sessions.
 #[test]
-fn tool_result_unknown_block_is_refused() {
+fn tool_result_unknown_block_is_coerced_to_json_text() {
     let msg = anthropic_message(json!({"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "c1", "content": [{"type": "document", "title": "x"}]},
     ]}));
-    let mut cc_messages = Vec::new();
-    let refusal = translate_message(&msg, &mut cc_messages).err().unwrap();
-    assert!(
-        matches!(refusal, RequestRejection::Unsupported(_)),
-        "refusal: {refusal}"
-    );
-    assert!(
-        refusal.detail().contains("tool_result"),
-        "refusal: {refusal}"
-    );
-    assert!(refusal.detail().contains("document"), "refusal: {refusal}");
+    let out = translated(&msg);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0]["role"], json!("tool"));
+    let text = out[0]["content"].as_str().unwrap();
+    assert!(text.contains("document"), "coerced text: {text}");
+    assert!(text.contains("\"x\""), "coerced text: {text}");
 }
 
 #[test]
@@ -388,8 +400,10 @@ fn messages_tool_choice_translated_and_unmodeled_forwarded() {
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
         "tool_choice": {"type": "any"},
-        // Unmodeled Anthropic fields ride through to the model server, not dropped.
+        // `top_k` has a typed home on the fork's CC wrapper, so it rides through.
         "top_k": 5,
+        // `metadata.user_id` is lifted onto the modeled `user` field (sticky-routing key), and
+        // the now-empty `metadata` is dropped rather than serializing a second driftable copy.
         "metadata": {"user_id": "u1"},
     }))
     .unwrap();
@@ -397,7 +411,45 @@ fn messages_tool_choice_translated_and_unmodeled_forwarded() {
     let cc = serde_json::to_value(&adapted.request).unwrap();
     assert_eq!(cc["tool_choice"], "required");
     assert_eq!(cc["top_k"], 5);
-    assert_eq!(cc["metadata"]["user_id"], "u1");
+    assert_eq!(cc["user"], "u1");
+    assert_eq!(cc["metadata"], Value::Null);
+}
+
+/// Anthropic-only top-level fields must not reach the CC body: the deployment's strict reparse
+/// 400s on them (Claude Code's `context_management` did exactly this live). They are dropped —
+/// standard-dynamo behavior — while the fork's own extension keys and `baseten` still work.
+#[test]
+fn messages_anthropic_only_top_level_fields_are_dropped_not_forwarded() {
+    for (key, value) in [
+        ("service_tier", json!("standard_only")),
+        ("cache_control", json!({"type": "ephemeral"})),
+        (
+            "context_management",
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}),
+        ),
+        ("metadata", json!({"user_id": "u1", "session": "s9"})),
+    ] {
+        let adapted = adapt_messages_body(json!({key: value}))
+            .unwrap_or_else(|e| panic!("{key} must adapt, got {e:?}"));
+        let cc = serde_json::to_value(&adapted.request).unwrap();
+        assert!(cc.get(key).is_none(), "{key} leaked onto the CC body: {cc}");
+    }
+    // The fork's CC extension surface still rides through, and `baseten` is still honored.
+    let adapted = adapt_messages_body(json!({
+        "top_k": 7,
+        "priority": {"level": 1},
+        "chat_template_kwargs": {"enable_thinking": true},
+        "nvext": {"ignore_eos": true},
+        "baseten": {"tool_settings": {"max_react_iterations": 3}},
+    }))
+    .unwrap();
+    assert_eq!(adapted.max_react_iterations.get(), 3);
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    assert_eq!(cc["top_k"], 7);
+    assert_eq!(cc["priority"]["level"], 1);
+    assert_eq!(cc["chat_template_kwargs"]["enable_thinking"], true);
+    assert_eq!(cc["nvext"]["ignore_eos"], true);
+    assert!(cc.get("baseten").is_none());
 }
 
 #[test]
@@ -509,8 +561,7 @@ fn baseten_tool_settings_lowers_caps_never_raises() {
     let refused = request_with(Some(
         json!({"tool_settings": {"max_react_iterations": REACT_ITERATIONS_MAX.get() + 1}}),
     ))
-    .err()
-    .expect("above the ceiling must be refused, not clamped");
+    .expect_err("above the ceiling must be refused, not clamped");
     assert!(
         matches!(refused, RequestRejection::Malformed(ref detail) if detail.contains("max_react_iterations")),
         "{refused:?}"
@@ -534,8 +585,7 @@ fn baseten_tool_settings_lowers_caps_never_raises() {
     let refused = request_with(Some(
         json!({"tool_settings": {"max_tool_calls_per_iteration": 11}}),
     ))
-    .err()
-    .expect("above the ceiling must be refused, not clamped");
+    .expect_err("above the ceiling must be refused, not clamped");
     assert!(
         matches!(refused, RequestRejection::Malformed(ref detail) if detail.contains("max_tool_calls_per_iteration")),
         "{refused}"
@@ -572,8 +622,7 @@ fn single_iteration_refused_only_when_a_server_tool_can_be_called() {
         json!([{"type": "function", "function": {"name": "ls", "parameters": {"type": "object"}}}]);
 
     let refused = adapt_with(server_tool.clone(), None, 1)
-        .err()
-        .expect("a single iteration cannot answer from a server-tool result");
+        .expect_err("a single iteration cannot answer from a server-tool result");
     assert!(
         refused.detail().contains("max_react_iterations"),
         "{refused}"
@@ -609,22 +658,37 @@ fn single_iteration_refused_only_when_a_server_tool_can_be_called() {
     );
 }
 
-/// `deny_unknown_fields` on the whole `baseten` namespace: a misspelled or retired knob is a 400, not
-/// a silently ignored setting. `config` on a tool selection is refused by the same mechanism.
+/// Unknown members of the `baseten` namespace are warned about and dropped, never a 400 — fork
+/// deployments historically carried extension members here harmlessly (CC-pivot leniency). The
+/// `tool_settings` object itself stays strict: a misspelled cap knob is a 400, not a silently
+/// ignored setting. `config` on a tool selection is refused by the same mechanism.
 #[test]
-fn unknown_baseten_extension_fields_are_refused() {
+fn baseten_extension_unknown_members_dropped_but_tool_settings_strict() {
+    // Unknown sibling of tool_settings: accepted, dropped with a warn, defaults apply.
+    let adapted = adapt(
+        &serde_json::to_vec(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "baseten": {"tool_setting": {}, "future_knob": 7},
+        }))
+        .unwrap(),
+        ClientProtocol::ChatCompletions,
+        &HeaderMap::new(),
+    )
+    .expect("unknown `baseten` members must not refuse the request");
+    assert!(adapted.request.server_tool_claims.is_empty());
+
     let refuse = |body: Value| {
         adapt(
             &serde_json::to_vec(&body).unwrap(),
             ClientProtocol::ChatCompletions,
             &HeaderMap::new(),
         )
-        .err()
-        .expect("unknown field must be refused")
+        .expect_err("must be refused")
         .detail()
         .to_string()
     };
-    assert!(refuse(json!({"model": "m", "baseten": {"tool_setting": {}}})).contains("baseten"));
+    // Inside tool_settings, strictness holds.
     assert!(
         refuse(json!({"model": "m", "baseten": {"tool_settings": {"max_iterations": 2}}}))
             .contains("baseten")
@@ -668,16 +732,96 @@ fn duplicate_server_tool_selection_is_refused() {
     );
 }
 
-/// TB refuses a block kind it cannot translate rather than dropping it — a silently discarded `image`
-/// would have the model answer about input the caller never sent.
+/// A user block with no CC translation: standard dynamo skips it with a warning (the previous
+/// converter's behavior — the rest of the message still reaches the model); tool-bank's strict
+/// hooks refuse it, since a silently discarded block would have the model answer about input the
+/// caller never sent. (`image` now translates, so an assistant-only block stands in here.)
 #[test]
-fn untranslatable_content_block_is_refused_not_dropped() {
+fn untranslatable_user_block_is_skipped_by_default_and_refused_under_strict_hooks() {
+    let msg = anthropic_message(json!({"role": "user", "content": [
+        {"type": "text", "text": "what is this"},
+        {"type": "thinking", "thinking": "hm", "signature": ""},
+    ]}));
+    let mut lenient = Vec::new();
+    translate_message(&msg, 0, &mut lenient, false, &mut Losses::default()).unwrap();
+    assert_eq!(lenient.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&lenient[0]).unwrap()["content"],
+        "what is this"
+    );
+    let err = translate_message(&msg, 0, &mut Vec::new(), true, &mut Losses::default())
+        .expect_err("strict: refused");
+    assert!(err.detail().contains("thinking"), "{err}");
+}
+
+/// Fork separator ruling: adjacent text blocks — in `system`, a user message, and an assistant
+/// message — join with "\n", the shape the deployed converter always produced. Claude Code sends
+/// a two-block system array on every request, so this is the prompt-cache prefix.
+#[test]
+fn adjacent_text_blocks_join_with_newline() {
+    let adapted = adapt_messages_body(json!({
+        "system": [{"type": "text", "text": "You are Claude."}, {"type": "text", "text": "Be brief."}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
+            {"role": "user", "content": "go"}
+        ]
+    }))
+    .unwrap();
+    let out = serde_json::to_value(&adapted.request.messages).unwrap();
+    assert_eq!(out[0]["content"], "You are Claude.\nBe brief.");
+    assert_eq!(out[1]["content"], "one\ntwo");
+    assert_eq!(out[2]["content"], "a\nb");
+}
+
+/// `mcp_servers` / `container` (Anthropic-hosted features): dropped with a warning by default,
+/// refused under tool-bank's strict hooks.
+#[test]
+fn mcp_servers_dropped_by_default_refused_under_strict_hooks() {
+    let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "mcp_servers": [{"type": "url", "url": "https://x", "name": "x"}]});
+    let ok = adapt_request(
+        &serde_json::to_vec(&body).unwrap(),
+        ClientProtocol::Messages,
+        &HeaderMap::new(),
+        &mut crate::hooks::DropServerTools,
+    );
+    assert!(ok.is_ok(), "{ok:?}");
+    struct Strict;
+    impl IngressHooks for Strict {
+        fn rejects_unsupported_messages_features(&self) -> bool {
+            true
+        }
+    }
+    let err = adapt_request(
+        &serde_json::to_vec(&body).unwrap(),
+        ClientProtocol::Messages,
+        &HeaderMap::new(),
+        &mut Strict,
+    )
+    .expect_err("strict hooks refuse mcp_servers");
+    assert!(err.detail().contains("mcp_servers"), "{err:?}");
+}
+
+/// A user `image` block translates to a CC multimodal image part (fork parity — Claude Code
+/// pastes screenshots into user content).
+#[test]
+fn user_image_block_becomes_cc_image_part() {
     let msg = anthropic_message(json!({"role": "user", "content": [
         {"type": "text", "text": "what is this"},
         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}},
     ]}));
-    let err = translate_message(&msg, &mut Vec::new()).expect_err("image must be refused");
-    assert!(err.detail().contains("image"), "{err}");
+    let out = translated(&msg);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0]["role"], json!("user"));
+    let parts = out[0]["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], json!({"type": "text", "text": "what is this"}));
+    assert_eq!(parts[1]["type"], json!("image_url"));
+    assert_eq!(
+        parts[1]["image_url"]["url"],
+        json!("data:image/png;base64,iVBOR")
+    );
 }
 
 /// An Anthropic-native server tool (versioned `type`) only Anthropic can execute: refused, so the
@@ -696,11 +840,33 @@ fn anthropic_native_server_tool_entry_is_refused() {
         json!({"name": "get_weather", "input_schema": {"type": "object"}}),
         json!({"type": "custom", "name": "get_weather", "input_schema": {"type": "object"}}),
     ] {
-        let cc_tool = json!(client_function_tool(entry).unwrap());
-        assert_eq!(cc_tool["type"], "function");
-        assert_eq!(cc_tool["function"]["name"], "get_weather");
-        assert_eq!(cc_tool["function"]["parameters"]["type"], "object");
+        let cc_tools = json!(client_function_tool(entry).unwrap());
+        assert_eq!(cc_tools[0]["type"], "function");
+        assert_eq!(cc_tools[0]["function"]["name"], "get_weather");
+        assert_eq!(cc_tools[0]["function"]["parameters"]["type"], "object");
     }
+}
+
+/// A user `document` block (Claude Code attaches PDFs this way) is dropped with a warning, not
+/// refused: the model cannot consume it on this stack, and the text beside it must still arrive.
+#[test]
+fn user_document_block_is_dropped_not_refused() {
+    let msg = anthropic_message(json!({"role": "user", "content": [
+        {"type": "document", "title": "spec.pdf",
+         "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}},
+        {"type": "text", "text": "summarize this"},
+    ]}));
+    let out = translated(&msg);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0]["role"], "user");
+    assert_eq!(out[0]["content"], "summarize this");
+
+    let adapted = adapt_messages_body(json!({"messages": [{"role": "user", "content": [
+        {"type": "document", "title": "spec.pdf", "source": {"type": "text", "media_type": "text/plain", "data": "x"}},
+        {"type": "text", "text": "hi"},
+    ]}]}))
+    .expect("document blocks must not 400 the request");
+    assert_eq!(adapted.request.messages.len(), 1);
 }
 
 /// A `system` role inside `messages[]` is a client compatibility shape; it must keep its role rather
@@ -745,7 +911,7 @@ fn tool_choice_disable_parallel_maps_to_cc_parallel_tool_calls() {
 fn responses_input(items: Value) -> Vec<Value> {
     let items: Vec<InputItem> = serde_json::from_value(items).unwrap();
     let mut cc_messages = Vec::new();
-    translate_input_items(&items, &mut cc_messages).unwrap();
+    translate_input_items(&items, &mut cc_messages, &mut Losses::default()).unwrap();
     cc_messages
         .iter()
         .map(|m| serde_json::to_value(m).unwrap())
@@ -753,9 +919,11 @@ fn responses_input(items: Value) -> Vec<Value> {
 }
 
 fn adapt_messages_body(extra: Value) -> Result<AdaptedRequest, RequestRejection> {
+    // 4096: large enough that a thinking budget fixture (2048) stays under max_tokens now that
+    // the Anthropic budget bounds are enforced.
     let mut body = json!({
         "model": "m",
-        "max_tokens": 10,
+        "max_tokens": 4096,
         "messages": [{"role": "user", "content": "hi"}],
     });
     body.as_object_mut()
@@ -846,15 +1014,13 @@ fn messages_anthropic_hosted_execution_fields_are_refused() {
     let mcp_rejection = adapt_messages_body(
         json!({"mcp_servers": [{"type": "url", "url": "https://mcp.example.com", "name": "ex"}]}),
     )
-    .err()
-    .expect("mcp_servers must be refused");
+    .expect_err("mcp_servers must be refused");
     assert!(
         matches!(mcp_rejection, RequestRejection::Unsupported(ref detail) if detail.contains("mcp_servers")),
         "{mcp_rejection:?}"
     );
-    let container_rejection = adapt_messages_body(json!({"container": "cont_1"}))
-        .err()
-        .expect("container must be refused");
+    let container_rejection =
+        adapt_messages_body(json!({"container": "cont_1"})).expect_err("container must be refused");
     assert!(
         matches!(container_rejection, RequestRejection::Unsupported(ref detail) if detail.contains("container")),
         "{container_rejection:?}"
@@ -948,8 +1114,7 @@ fn adapt_responses_max_tool_calls_is_the_loop_budget_not_a_model_field() {
     let zero =
         serde_json::to_vec(&json!({"model": "m", "input": "hi", "max_tool_calls": 0})).unwrap();
     let refused = adapt(&zero, ClientProtocol::Responses, &HeaderMap::new())
-        .err()
-        .expect("a zero budget must be refused, not treated as unbudgeted");
+        .expect_err("a zero budget must be refused, not treated as unbudgeted");
     assert!(refused.detail().contains("max_tool_calls"), "{refused}");
 }
 
@@ -1022,7 +1187,9 @@ fn adapt_responses_reassembles_a_flattened_assistant_turn() {
     assert_eq!(out[0]["role"], "user");
     assert_eq!(out[1]["role"], "assistant");
     assert_eq!(out[1]["content"], "checking");
-    assert_eq!(out[1]["reasoning_content"], "let me check");
+    // Fork Segments semantics (same as the Messages path): the replayed call closes the reasoning
+    // segment, so segment 0 precedes call 0 and one empty trailing segment follows it.
+    assert_eq!(out[1]["reasoning_content"], json!(["let me check", ""]));
     assert_eq!(out[1]["tool_calls"][0]["id"], "c1");
     assert_eq!(
         out[1]["tool_calls"][0]["function"]["arguments"],
@@ -1078,7 +1245,7 @@ fn adapt_responses_mcp_call_carries_its_own_result() {
 #[test]
 fn adapt_responses_item_reference_is_refused() {
     let items: Vec<InputItem> = serde_json::from_value(json!([{"id": "resp_123_item_0"}])).unwrap();
-    let err = translate_input_items(&items, &mut Vec::new())
+    let err = translate_input_items(&items, &mut Vec::new(), &mut Losses::default())
         .err()
         .unwrap();
     assert!(err.contains("item_reference"), "{err}");
@@ -1086,8 +1253,12 @@ fn adapt_responses_item_reference_is_refused() {
 
 #[test]
 fn adapt_responses_stateful_fields_are_refused() {
+    // `store` is accepted and carried onto the CC body (OpenAI SDKs default it to true).
+    let body = serde_json::to_vec(&json!({"model": "m", "input": "hi", "store": true})).unwrap();
+    let adapted = request_only(&body, ClientProtocol::Responses, &HeaderMap::new()).unwrap();
+    assert_eq!(adapted.request.store, Some(true));
+
     for field in [
-        "store",
         "previous_response_id",
         "conversation",
         "background",
@@ -1152,33 +1323,37 @@ fn adapt_responses_translates_text_format_and_reasoning_effort() {
 }
 
 #[test]
-fn adapt_responses_refuses_untranslatable_text_and_reasoning_fields() {
+fn adapt_responses_refuses_untranslatable_text_fields() {
     let err = cc_response_format(
         serde_json::from_value(json!({"format": {"type": "text"}, "verbosity": "low"})).unwrap(),
     )
     .err()
     .unwrap();
     assert!(err.contains("text.verbosity"), "{err}");
-    let err = cc_reasoning_effort(serde_json::from_value(json!({"summary": "detailed"})).unwrap())
-        .err()
-        .unwrap();
-    assert!(err.contains("reasoning.summary"), "{err}");
 }
 
-/// Codex sends `summary: auto` on every request. `auto` leaves the shape to the provider, which TB
-/// answers with the reasoning it already streams as item content, so it passes rather than 400s —
+/// Every `reasoning.summary` level is accepted (Codex sends `auto`; other SDK clients send
+/// `concise`/`detailed`): the summary is an egress rendering decision, never forwarded to the model,
 /// while the effort beside it still reaches the model.
 #[test]
-fn adapt_responses_accepts_reasoning_summary_auto_and_keeps_the_effort() {
-    let effort = cc_reasoning_effort(
-        serde_json::from_value(json!({"summary": "auto", "effort": "high"})).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        serde_json::to_value(effort).unwrap(),
-        json!("high"),
-        "effort must survive an accepted summary"
-    );
+fn adapt_responses_accepts_every_reasoning_summary_and_keeps_the_effort() {
+    for summary in ["auto", "concise", "detailed"] {
+        let effort = cc_reasoning_effort(
+            serde_json::from_value(json!({"summary": summary, "effort": "high"})).unwrap(),
+        )
+        .unwrap_or_else(|e| panic!("summary {summary} must be accepted: {e}"));
+        assert_eq!(
+            serde_json::to_value(effort).unwrap(),
+            json!("high"),
+            "effort must survive an accepted summary"
+        );
+        let adapted =
+            adapt_responses_body(json!({"reasoning": {"summary": summary, "effort": "low"}}))
+                .unwrap();
+        let cc = serde_json::to_value(&adapted.request).unwrap();
+        assert_eq!(cc["reasoning_effort"], "low");
+        assert!(cc.get("reasoning").is_none(), "summary is not forwarded");
+    }
 }
 
 #[test]
@@ -1192,12 +1367,13 @@ fn adapt_responses_reasoning_item_summary_is_folded() {
 
 #[test]
 fn adapt_responses_client_tool_strict_flag_is_forwarded() {
-    let cc_tool = responses_client_function_tool(json!({
+    let cc_tools = responses_client_function_tool(json!({
         "type": "function", "name": "f", "strict": true,
         "parameters": {"type": "object"},
     }))
     .unwrap();
-    assert_eq!(cc_tool.function.strict, Some(true));
+    assert_eq!(cc_tools.len(), 1);
+    assert_eq!(cc_tools[0].function.strict, Some(true));
 }
 
 #[test]
@@ -1430,9 +1606,7 @@ fn rewrite_bound_rejects_zero_and_reads_null_as_absent() {
         .map(|ingress| ingress.request)
     };
     // Zero searches is not a budget the loop can serve.
-    let err = adapt_with(json!(0))
-        .err()
-        .expect("max_uses 0 is not a runnable budget");
+    let err = adapt_with(json!(0)).expect_err("max_uses 0 is not a runnable budget");
     assert!(err.detail().contains("max_uses"), "{err}");
     // Null is the field unset, so the hooks' default stands rather than a 400.
     let defaulted = adapt_with(Value::Null).expect("an explicit null is the field being absent");
@@ -1452,8 +1626,7 @@ fn rewrite_bound_conflicting_with_tool_settings_is_refused() {
         &HeaderMap::new(),
         &mut FakeWebSearchRewrite::new(),
     )
-    .err()
-    .expect("two bounds on one loop must not be resolved by a silent pick");
+    .expect_err("two bounds on one loop must not be resolved by a silent pick");
     assert!(err.detail().contains("send one, not both"), "{err}");
 }
 
@@ -1610,8 +1783,7 @@ fn responses_hosted_web_search_routes_to_the_hooks() {
         ClientProtocol::Responses,
         &HeaderMap::new(),
     )
-    .err()
-    .expect("web_search without a claiming hook must keep the rejection");
+    .expect_err("web_search without a claiming hook must keep the rejection");
     assert!(err.detail().contains("web_search"), "{err}");
 
     let adapted = adapt_request(
@@ -1626,28 +1798,31 @@ fn responses_hosted_web_search_routes_to_the_hooks() {
     assert!(adapted.server_tool_claims.is_empty());
 }
 
-/// A replayed `web_search_call` input item has no CC translation here: refused, never dropped.
-/// (tool-bank's Codex path strips them in its `rewrite_ingress` before typed parsing.)
+/// A replayed `web_search_call` input item has no CC translation here: skipped (fork parity — a
+/// transcript echo must not fail the request), not refused. tool-bank's Codex path still strips
+/// them in its `rewrite_ingress` before typed parsing, so it never reaches this skip.
 #[test]
-fn responses_replayed_web_search_call_items_are_refused() {
+fn responses_replayed_web_search_call_items_are_skipped() {
     let body = serde_json::to_vec(&json!({
         "model": "m",
-        "input": [{
-            "id": "ws_1",
-            "type": "web_search_call",
-            "status": "completed",
-            "action": {
-                "type": "search",
-                "queries": ["first", "second"],
-                "query": "first"
-            }
-        }]
+        "input": [
+            {
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "queries": ["first", "second"],
+                    "query": "first"
+                }
+            },
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ]
     }))
     .unwrap();
-    let rejected = adapt(&body, ClientProtocol::Responses, &HeaderMap::new())
-        .err()
-        .expect("web_search_call replay without a rewriting hook must keep the rejection");
-    assert!(rejected.detail().contains("WebSearchCall"));
+    let adapted = request_only(&body, ClientProtocol::Responses, &HeaderMap::new())
+        .expect("web_search_call replay is skipped, not refused");
+    assert_eq!(adapted.request.messages.len(), 1);
 }
 
 /// The refusal truncates the echoed tool definition, which is client-controlled text: the pad sweep
@@ -1657,7 +1832,8 @@ fn adapt_responses_refusal_truncates_non_ascii_tool_definition() {
     for pad in 0..8 {
         let description = format!("{}{}", "a".repeat(pad), "é".repeat(200));
         let err = responses_client_function_tool(json!({
-            "type": "namespace", "name": "crm", "description": description, "tools": [],
+            "type": "custom", "name": "crm", "description": description,
+            "format": {"type": "text"},
         }))
         .err()
         .unwrap();
@@ -1671,4 +1847,635 @@ fn adapt_responses_refusal_truncates_non_ascii_tool_definition() {
             err.detail().len()
         );
     }
+}
+
+// --- Fork validation floor (CC-pivot: suite-validated ingress conformance, kept over TB) --------
+
+fn adapt_responses_body(extra: Value) -> Result<AdaptedRequest, RequestRejection> {
+    let mut body = json!({"model": "m", "input": "hi"});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    request_only(
+        &serde_json::to_vec(&body).unwrap(),
+        ClientProtocol::Responses,
+        &HeaderMap::new(),
+    )
+}
+
+/// `service_tier` maps one-to-one: `auto` (platform picks) and `default` (explicitly the default
+/// tier) are different requests, and the response echoes whichever was sent, so folding one into the
+/// other would silently change routing and make the echo lie.
+#[test]
+fn adapt_responses_service_tier_maps_one_to_one() {
+    for tier in ["auto", "default", "flex", "scale", "priority"] {
+        let adapted = adapt_responses_body(json!({"service_tier": tier})).unwrap();
+        assert_eq!(
+            json!(adapted.request.service_tier),
+            json!(tier),
+            "service_tier `{tier}` must reach CC unchanged"
+        );
+    }
+    let adapted = adapt_responses_body(json!({})).unwrap();
+    assert!(
+        adapted.request.service_tier.is_none(),
+        "absent stays absent"
+    );
+}
+
+/// Responses replay segments reasoning around tool calls exactly like the Messages path: segment i
+/// precedes call i, so `[reasoning, function_call, reasoning]` re-renders byte-exactly for a
+/// segments-aware template (KV-cache prefix) instead of collapsing to one flat string.
+#[test]
+fn adapt_responses_replay_segments_reasoning_around_tool_calls() {
+    let out = responses_input(json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+        {"type": "reasoning", "id": "r1", "summary": [], "content": [{"type": "reasoning_text", "text": "first"}]},
+        {"type": "function_call", "call_id": "c1", "name": "lookup", "arguments": "{}"},
+        {"type": "reasoning", "id": "r2", "summary": [], "content": [{"type": "reasoning_text", "text": "second"}]},
+        {"type": "function_call_output", "call_id": "c1", "output": "42"},
+    ]));
+    assert_eq!(out[1]["role"], "assistant");
+    assert_eq!(out[1]["reasoning_content"], json!(["first", "second"]));
+    assert_eq!(out[1]["tool_calls"][0]["id"], "c1");
+    assert_eq!(out[2]["role"], "tool");
+}
+
+/// Codex declares MCP apps as `namespace` tool groups. Members flatten to `{ns}__{name}` function
+/// tools on the declaration side, and a replayed `function_call` carrying `namespace` refolds onto
+/// the same flat name — otherwise every echoed call would be an orphan for the tool it names.
+#[test]
+fn adapt_responses_namespace_group_flattens_and_echo_refolds() {
+    let adapted = adapt_responses_body(json!({
+        "tools": [{"type": "namespace", "name": "crm", "description": "CRM tools", "tools": [
+            {"type": "function", "name": "lookup", "description": "look up", "parameters": {"type": "object"}}
+        ]}],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            {"type": "function_call", "call_id": "c1", "name": "lookup", "namespace": "crm", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+        ]
+    }))
+    .unwrap();
+    let tools = serde_json::to_value(adapted.request.tools.as_ref().unwrap()).unwrap();
+    assert_eq!(tools[0]["function"]["name"], "crm__lookup");
+    let messages = serde_json::to_value(&adapted.request.messages).unwrap();
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["name"],
+        "crm__lookup"
+    );
+}
+
+/// `top_logprobs` outside 0..=20 is refused up front (OpenAI 400s at 21); 20 rides through.
+#[test]
+fn adapt_responses_top_logprobs_bounds() {
+    assert!(adapt_responses_body(json!({"top_logprobs": 20})).is_ok());
+    let err = adapt_responses_body(json!({"top_logprobs": 21})).unwrap_err();
+    assert!(matches!(err, RequestRejection::Malformed(_)), "{err:?}");
+    let err = adapt_responses_body(json!({"top_logprobs": "5"})).unwrap_err();
+    assert!(matches!(err, RequestRejection::Malformed(_)), "{err:?}");
+}
+
+/// An explicit but empty assistant message item survives as a turn boundary (`content: ""`), so two
+/// user turns around it do not merge under a strict-alternation template; a refusal part folds
+/// into the assistant text.
+#[test]
+fn adapt_responses_empty_assistant_turn_and_refusal_keep_boundaries() {
+    let out = responses_input(json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "one"}]},
+        {"type": "message", "role": "assistant", "content": []},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "two"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "no"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "three"}]},
+    ]));
+    assert_eq!(out.len(), 5);
+    assert_eq!(out[1]["role"], "assistant");
+    assert_eq!(out[1]["content"], "");
+    assert_eq!(out[3]["content"], "no");
+}
+
+/// The thinking-budget upper bound needs a `max_tokens` to compare against; a request that leaves
+/// `max_tokens` to the deployment template is accepted, the lower bound still applies.
+#[test]
+fn adapt_messages_thinking_budget_without_max_tokens_is_accepted() {
+    let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 2048}});
+    let ok = request_only(
+        &serde_json::to_vec(&body).unwrap(),
+        ClientProtocol::Messages,
+        &HeaderMap::new(),
+    );
+    assert!(ok.is_ok(), "{ok:?}");
+    body["thinking"]["budget_tokens"] = json!(512);
+    let err = request_only(
+        &serde_json::to_vec(&body).unwrap(),
+        ClientProtocol::Messages,
+        &HeaderMap::new(),
+    );
+    assert!(
+        matches!(err, Err(RequestRejection::Malformed(_))),
+        "{err:?}"
+    );
+}
+
+/// Codex Responses-Lite framing declares tools on an `additional_tools` input item instead of (or
+/// in addition to) top-level `tools`. Those declarations must reach the CC tool list — otherwise a
+/// `tool_choice: "required"` beside them 400s as "requires a tool call, but no tools" — and a name
+/// declared in both places is advertised once (top-level first).
+#[test]
+fn responses_additional_tools_item_declares_cc_tools() {
+    let adapted = adapt_responses_body(json!({
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+                {"type": "function", "name": "shared", "description": "from item",
+                 "parameters": {"type": "object"}},
+            ]},
+            {"role": "user", "content": "hi"},
+        ],
+        "tools": [
+            {"type": "function", "name": "shared", "description": "top-level",
+             "parameters": {"type": "object"}},
+        ],
+        "tool_choice": "required",
+    }))
+    .expect("additional_tools declarations satisfy tool_choice: required");
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    assert_eq!(cc["tool_choice"], "required");
+    let names: Vec<&str> = cc["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["shared", "lookup"],
+        "top-level first, duplicate dropped"
+    );
+    assert_eq!(
+        cc["tools"][0]["function"]["description"], "top-level",
+        "the top-level declaration wins the clash"
+    );
+    // The item itself is a declaration, not transcript: only the user message remains.
+    assert_eq!(cc["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(cc["messages"][0]["role"], "user");
+}
+
+/// Codex's default request carries `include: ["reasoning.encrypted_content"]`. Standard dynamo
+/// (the default hooks) accepts it — the include is dropped with a warning, never forwarded — while
+/// hooks that opt in (tool-bank) still refuse it.
+#[test]
+fn responses_encrypted_reasoning_include_is_dropped_unless_hooks_reject_it() {
+    let body = serde_json::to_vec(&json!({
+        "model": "m", "input": "hi",
+        "include": ["reasoning.encrypted_content"],
+    }))
+    .unwrap();
+    let adapted = adapt_request(
+        &body,
+        ClientProtocol::Responses,
+        &HeaderMap::new(),
+        &mut DropServerTools,
+    )
+    .expect("default hooks accept the Codex default include");
+    let cc = serde_json::to_value(&adapted.request.request).unwrap();
+    assert!(
+        cc.get("include").is_none(),
+        "include never reaches the CC body"
+    );
+
+    struct RejectingHooks;
+    impl IngressHooks for RejectingHooks {
+        fn rejects_encrypted_reasoning_include(&self) -> bool {
+            true
+        }
+    }
+    let err = adapt_request(
+        &body,
+        ClientProtocol::Responses,
+        &HeaderMap::new(),
+        &mut RejectingHooks,
+    )
+    .expect_err("opted-in hooks keep tool-bank's refusal");
+    assert!(
+        err.detail().contains("reasoning.encrypted_content"),
+        "{err:?}"
+    );
+}
+
+/// Anthropic bounds temperature at 1; the OpenAI surfaces allow up to 2. The same value must be a
+/// 400 on one wire and valid on the other.
+#[test]
+fn temperature_ranges_differ_per_wire() {
+    let err = adapt_messages_body(json!({"temperature": 1.5}))
+        .expect_err("1.5 is outside Anthropic's 0..=1 range");
+    assert!(err.detail().contains("between 0 and 1"), "{err}");
+
+    adapt_responses_body(json!({"temperature": 1.5})).expect("1.5 is inside OpenAI's 0..=2 range");
+
+    let err = adapt_responses_body(json!({"temperature": 2.1}))
+        .expect_err("2.1 is outside OpenAI's 0..=2 range");
+    assert!(err.detail().contains("between 0 and 2"), "{err}");
+}
+
+#[test]
+fn top_p_out_of_range_is_refused_on_both_wires() {
+    for build in [adapt_messages_body, adapt_responses_body] {
+        let err = build(json!({"top_p": 1.5})).expect_err("top_p is 0..=1 on both wires");
+        assert!(
+            err.detail().contains("top_p must be between 0 and 1"),
+            "{err}"
+        );
+        build(json!({"top_p": 0.9})).expect("in-range top_p must pass");
+    }
+}
+
+#[test]
+fn messages_thinking_budget_below_floor_is_refused() {
+    let err = adapt_messages_body(json!({"thinking": {"type": "enabled", "budget_tokens": 100}}))
+        .expect_err("Anthropic floors the manual budget at 1024");
+    assert!(err.detail().contains("at least 1024"), "{err}");
+}
+
+#[test]
+fn messages_thinking_budget_at_or_above_max_tokens_is_refused() {
+    // The fixture's max_tokens is 4096; the budget must be strictly below it.
+    let err = adapt_messages_body(json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}))
+        .expect_err("budget >= max_tokens leaves no room for output");
+    assert!(err.detail().contains("less than max_tokens"), "{err}");
+}
+
+#[test]
+fn messages_tool_without_input_schema_is_refused() {
+    let err = adapt_messages_body(json!({"tools": [{"name": "x"}]}))
+        .expect_err("a client tool without input_schema has no callable shape");
+    assert!(err.detail().contains("input_schema"), "{err}");
+}
+
+/// An orphan tool_result (no preceding tool_use with that id) is a corrupted transcript: 400, not
+/// a nonsensical forward. The matched pair on the same body shape passes.
+#[test]
+fn messages_orphan_tool_result_is_refused_and_matched_pair_passes() {
+    let orphan = json!({"messages": [
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "c-orphan", "content": "R"}
+        ]},
+    ]});
+    let err = adapt_messages_body(orphan).expect_err("orphan tool_result must 400");
+    assert!(err.detail().contains("no preceding tool call"), "{err}");
+    assert!(err.detail().contains("c-orphan"), "{err}");
+
+    let matched = json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "c1", "name": "f", "input": {}}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "c1", "content": "R"}
+        ]},
+    ]});
+    adapt_messages_body(matched).expect("a tool_result answering its tool_use must pass");
+}
+
+#[test]
+fn responses_orphan_function_call_output_is_refused() {
+    let err = adapt_responses_body(json!({"input": [
+        {"type": "function_call_output", "call_id": "c9", "output": "x"}
+    ]}))
+    .expect_err("orphan function_call_output must 400");
+    assert!(err.detail().contains("no preceding tool call"), "{err}");
+    assert!(err.detail().contains("c9"), "{err}");
+}
+
+/// Anthropic prefill: a trailing assistant message means "continue this message". The lowered
+/// trailing CC assistant message carries `partial: true`; a non-trailing assistant does not.
+#[test]
+fn messages_trailing_assistant_marks_prefill_partial() {
+    let adapted = adapt_messages_body(json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "The answer is"},
+    ]}))
+    .unwrap();
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    let messages = cc["messages"].as_array().unwrap();
+    assert_eq!(messages.last().unwrap()["partial"], json!(true));
+
+    // Not trailing: the assistant turn is history, not a prefill to continue.
+    let adapted = adapt_messages_body(json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "The answer is"},
+        {"role": "user", "content": "go on"},
+    ]}))
+    .unwrap();
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    for message in cc["messages"].as_array().unwrap() {
+        assert!(
+            message.get("partial").is_none(),
+            "no message may carry partial: {message}"
+        );
+    }
+}
+
+/// tool-bank's original nesting guard, restored: a top-level `tool_settings` is a 400 naming the
+/// right home, not a silently defaulted cap plus an unknown key forwarded to the model.
+#[test]
+fn top_level_tool_settings_is_a_nesting_error_on_every_protocol() {
+    for protocol in [
+        ClientProtocol::ChatCompletions,
+        ClientProtocol::Messages,
+        ClientProtocol::Responses,
+    ] {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "input": "hi",
+            "tool_settings": {"max_react_iterations": 3},
+        });
+        let err = adapt(
+            &serde_json::to_vec(&body).unwrap(),
+            protocol,
+            &HeaderMap::new(),
+        )
+        .expect_err("top-level tool_settings must be refused");
+        assert!(
+            matches!(err, RequestRejection::Malformed(_)),
+            "{protocol:?}: {err}"
+        );
+        assert!(
+            err.detail().contains("baseten.tool_settings"),
+            "{protocol:?}: {err}"
+        );
+    }
+    // Nested correctly it is honored, not refused.
+    let ok = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "baseten": {"tool_settings": {"max_react_iterations": 3}},
+    });
+    adapt(
+        &serde_json::to_vec(&ok).unwrap(),
+        ClientProtocol::ChatCompletions,
+        &HeaderMap::new(),
+    )
+    .expect("nested tool_settings is valid");
+}
+
+/// `input[]` is an untagged enum, so serde alone reports only "data did not match any variant of
+/// untagged enum InputParam" — no index, no field. Three prod callers hit that message and could not
+/// act on it.
+#[test]
+fn a_malformed_input_item_rejection_names_its_index() {
+    let chat_completions_shaped_content_part = json!({
+        "input": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+    });
+    let rejection = adapt_responses_body(chat_completions_shaped_content_part)
+        .expect_err("a `text` content part is not a Responses input part");
+    let RequestRejection::Malformed(detail) = &rejection else {
+        panic!("{rejection:?}");
+    };
+    assert!(detail.contains("input[0]"), "{detail}");
+}
+
+#[test]
+fn malformed_member_rejections_name_the_member_on_every_ingress() {
+    let messages = adapt_messages_body(json!({"max_tokens": "ten"}))
+        .expect_err("a string `max_tokens` must be refused");
+    assert!(
+        matches!(messages, RequestRejection::Malformed(ref detail) if detail.contains("max_tokens")),
+        "{messages:?}"
+    );
+    let cc_body = serde_json::to_vec(&json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": "hot",
+    }))
+    .unwrap();
+    let chat_completions =
+        request_only(&cc_body, ClientProtocol::ChatCompletions, &HeaderMap::new())
+            .expect_err("a string `temperature` must be refused");
+    let detail = format!("{chat_completions:?}");
+    assert!(detail.contains("temperature"), "{detail}");
+    let responses = adapt_responses_body(json!({"reasoning": {"effort": "sideways"}}))
+        .expect_err("an unknown effort must be refused");
+    assert!(
+        matches!(responses, RequestRejection::Malformed(ref detail) if detail.contains("reasoning.effort")),
+        "{responses:?}"
+    );
+}
+
+/// `serde_path_to_error` renders a path without a leading dot, so composition must add exactly one
+/// separator — never zero (`input[0]content`) and never two (`input[0]..content`).
+#[test]
+fn a_composed_member_path_carries_one_separator() {
+    let nested_failure = json!({"model": "m", "input": "hi", "reasoning": {"effort": 5}});
+    let rejection: Result<super::ResponsesRequest, _> =
+        super::parse_client_json(ClientProtocol::Responses, "input[0]", nested_failure);
+    let RequestRejection::Malformed(detail) = rejection.err().expect("a numeric effort is refused")
+    else {
+        panic!("expected a malformed rejection");
+    };
+    assert!(detail.contains("`input[0].reasoning.effort`"), "{detail}");
+}
+
+/// Responses `reasoning.effort` goes through the fork's alias table like chat `reasoning_effort`:
+/// `max` (DeepSeek V4 / GLM clients) canonicalizes to `xhigh` instead of failing the upstream enum.
+/// main-v1.2.0's own `CreateResponse` accepted it; the crate must not regress that.
+#[test]
+fn responses_reasoning_effort_max_canonicalizes_like_chat() {
+    let adapted = adapt_responses_body(json!({"reasoning": {"effort": "max"}}))
+        .expect("`max` is a documented client spelling");
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    assert_eq!(cc["reasoning_effort"], "xhigh");
+}
+
+/// Every drop/degrade/skip on the ingress path is a typed [`Loss`] on the adapted request — the
+/// answer to "what did this request lose becoming Chat Completions?" as data, not log grep.
+#[test]
+fn losses_record_server_tool_drop_tool_choice_degrade_and_field_drops() {
+    let body = serde_json::to_vec(&json!({
+        "model": "m", "max_tokens": 64,
+        "messages": [{"role": "user", "content": "ZEBRA_CONTENT_MARKER"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "tool_choice": {"type": "tool", "name": "web_search"},
+        "cache_control": {"type": "ephemeral"},
+        "service_tier": "standard_only",
+        "baseten": {"not_a_member": 1},
+    }))
+    .unwrap();
+    let mut hooks = DropServerTools;
+    let adapted = adapt_request(
+        &body,
+        ClientProtocol::Messages,
+        &HeaderMap::new(),
+        &mut hooks,
+    )
+    .expect("drops are non-fatal")
+    .request;
+    let kinds: Vec<(LossKind, usize)> = crate::loss::count_by_kind(&adapted.losses);
+    assert_eq!(
+        kinds,
+        vec![
+            (LossKind::ServerToolDropped, 1),
+            (LossKind::ToolChoiceDegraded, 1),
+            (LossKind::RequestFieldDropped, 2),
+            (LossKind::ExtensionFieldDropped, 1),
+        ],
+        "{:?}",
+        adapted.losses
+    );
+    let fields: Vec<&str> = adapted
+        .losses
+        .iter()
+        .map(|loss| loss.field.as_str())
+        .collect();
+    assert!(fields.contains(&"tools[0]"), "{fields:?}");
+    assert!(fields.contains(&"tool_choice"), "{fields:?}");
+    assert!(fields.contains(&"cache_control"), "{fields:?}");
+    assert!(fields.contains(&"service_tier"), "{fields:?}");
+    assert!(fields.contains(&"baseten.not_a_member"), "{fields:?}");
+    for loss in &adapted.losses {
+        assert!(
+            !loss.detail.contains("ZEBRA_CONTENT_MARKER"),
+            "detail must not carry message content: {loss:?}"
+        );
+    }
+}
+
+/// A clean request records nothing: the empty list is the common case a counter must not inflate.
+#[test]
+fn a_fully_translatable_request_records_no_losses() {
+    let adapted = adapt_messages_body(json!({})).unwrap();
+    assert!(adapted.losses.is_empty(), "{:?}", adapted.losses);
+}
+
+/// The consumer's counter hook sees exactly the recorded list, in order.
+#[test]
+fn every_loss_reaches_the_on_loss_hook() {
+    #[derive(Default)]
+    struct Counting(Vec<Loss>);
+    impl IngressHooks for Counting {
+        fn on_loss(&mut self, loss: &Loss) {
+            self.0.push(loss.clone());
+        }
+    }
+    let body = serde_json::to_vec(&json!({
+        "model": "m",
+        "input": [
+            {"type": "compaction", "encrypted_content": "..."},
+            {"role": "user", "content": "hi"},
+        ],
+        "include": ["reasoning.encrypted_content"],
+    }))
+    .unwrap();
+    let mut hooks = Counting::default();
+    let adapted = adapt_request(
+        &body,
+        ClientProtocol::Responses,
+        &HeaderMap::new(),
+        &mut hooks,
+    )
+    .unwrap()
+    .request;
+    assert_eq!(hooks.0, adapted.losses);
+    assert_eq!(
+        crate::loss::count_by_kind(&adapted.losses),
+        vec![
+            (LossKind::ReplayItemIgnored, 1),
+            (LossKind::IncludeIgnored, 1)
+        ],
+        "{:?}",
+        adapted.losses
+    );
+    let ignored = adapted
+        .losses
+        .iter()
+        .find(|loss| loss.kind == LossKind::ReplayItemIgnored)
+        .unwrap();
+    assert_eq!(ignored.field, "input[0]");
+}
+
+/// Skipped Messages content blocks name their position so the customer log line can be joined back
+/// to the request the client sent.
+#[test]
+fn skipped_content_blocks_name_message_and_block_index() {
+    let adapted = adapt_messages_body(json!({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "ok"},
+                {"type": "redacted_thinking", "data": "xxx"},
+            ]},
+            {"role": "user", "content": [
+                {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "d"}},
+                {"type": "text", "text": "and?"},
+            ]},
+        ],
+    }))
+    .unwrap();
+    let fields: Vec<&str> = adapted
+        .losses
+        .iter()
+        .map(|loss| loss.field.as_str())
+        .collect();
+    assert_eq!(
+        fields,
+        vec!["messages[1].content[1]", "messages[2].content[0]"],
+        "{:?}",
+        adapted.losses
+    );
+    assert!(
+        adapted
+            .losses
+            .iter()
+            .all(|loss| loss.kind == LossKind::ContentBlockSkipped)
+    );
+}
+
+/// Routing is by shape only: a Chat Completions `tools[]` entry whose `type` is not `function`
+/// (an OpenAI-hosted `web_search_preview`, a tool-bank selection, ...) reaches the hooks; the
+/// standard-dynamo default drops it with a recorded loss instead of forwarding it to an engine
+/// that cannot execute it. (Previously only reserved-typed entries were routed and any other
+/// non-function entry was forwarded verbatim.)
+#[test]
+fn cc_non_function_tool_entries_route_to_the_hooks_and_drop_by_default() {
+    let body = serde_json::to_vec(&json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "web_search_preview"},
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+        ],
+    }))
+    .unwrap();
+    let mut hooks = DropServerTools;
+    let adapted = adapt_request(
+        &body,
+        ClientProtocol::ChatCompletions,
+        &HeaderMap::new(),
+        &mut hooks,
+    )
+    .unwrap()
+    .request;
+    let tools = serde_json::to_value(adapted.request.tools.as_ref().unwrap()).unwrap();
+    assert_eq!(tools.as_array().unwrap().len(), 1, "{tools}");
+    assert_eq!(tools[0]["function"]["name"], "lookup");
+    assert_eq!(
+        crate::loss::count_by_kind(&adapted.losses),
+        vec![(LossKind::ServerToolDropped, 1)]
+    );
+}
+
+/// The crate knows no tool namespace: a client tool named like a consumer's server-tool selection
+/// is an ordinary function tool here. Guarding a consumer's namespace against spoofing is the
+/// consumer's job at dispatch time (tool-bank refuses a model call to an unclaimed `baseten__*`
+/// name in its loop).
+#[test]
+fn client_tools_named_like_a_consumer_namespace_are_ordinary_function_tools() {
+    let adapted = adapt_messages_body(json!({
+        "tools": [{"name": "baseten__acme__lookup", "input_schema": {"type": "object"}}],
+    }))
+    .unwrap();
+    let tools = serde_json::to_value(adapted.request.tools.as_ref().unwrap()).unwrap();
+    assert_eq!(tools[0]["function"]["name"], "baseten__acme__lookup");
+    assert!(adapted.losses.is_empty(), "{:?}", adapted.losses);
 }

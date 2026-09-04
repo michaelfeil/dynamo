@@ -190,7 +190,12 @@ pub(crate) fn event_names(frames: &[Frame]) -> Vec<String> {
 }
 
 pub(crate) fn server_tool_call(call: ToolCall) -> ServerToolCall {
-    let provider = crate::hooks::reserved_tool_provider(&call.name)
+    // Fixture names follow tool-bank's `<prefix>__<provider>__<tool>` shape; the middle segment is
+    // the provider label a claiming consumer would supply.
+    let provider = call
+        .name
+        .split("__")
+        .nth(1)
         .expect("fixture tool name is qualified")
         .to_string();
     ServerToolCall { call, provider }

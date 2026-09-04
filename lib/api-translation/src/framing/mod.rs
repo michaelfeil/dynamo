@@ -15,7 +15,7 @@ mod responses;
 
 pub use responses::ResponsesParams;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dynamo_protocols::error::{ApiError, WrappedError};
 use dynamo_protocols::types::CompletionUsage;
@@ -329,6 +329,20 @@ pub struct BufferedResponse<'a> {
 impl BufferedResponse<'_> {
     /// The ids of the server-tool calls that failed. The CC transcript's `tool` messages carry no
     /// error flag, so buffered renderers read it from the iteration records.
+    /// Provider label per dispatched server-tool name, from the loop's own call records.
+    pub(crate) fn server_tool_providers(&self) -> HashMap<&str, &str> {
+        self.iterations
+            .iter()
+            .flat_map(|iteration| &iteration.server_tool_calls)
+            .map(|record| {
+                (
+                    record.identity.name.as_str(),
+                    record.identity.provider.as_str(),
+                )
+            })
+            .collect()
+    }
+
     fn failed_server_tool_call_ids(&self) -> HashSet<&str> {
         self.iterations
             .iter()

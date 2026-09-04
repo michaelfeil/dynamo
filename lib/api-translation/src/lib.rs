@@ -15,6 +15,7 @@ pub mod coding_adapter;
 pub mod framing;
 pub mod history;
 pub mod hooks;
+pub mod loss;
 pub mod model;
 pub mod request;
 pub mod sse_emitter;
@@ -29,6 +30,12 @@ mod dynamo_conformance_tests;
 pub(crate) mod test_utils;
 
 use crate::model::ToolCall;
+
+/// What adaptation did not carry through, and the closed set of kinds a counter can be labeled by.
+pub use crate::loss::{Loss, LossKind};
+/// The client-facing error class, re-exported so callers can select it without reaching into
+/// [`model`]. Each protocol renders it as its own `error.type` word on the response edge.
+pub use crate::model::ErrorClass;
 
 /// The canonical internal wire types (the fork's `dynamo-protocols`). `Cc*` names track the
 /// DoR vocabulary — the client protocol is translated to these at the request edge and back at the
@@ -126,10 +133,6 @@ mod cc_request_tests {
     }
 }
 
-/// The reserved `tools[].type` namespace that selects a Baseten server tool, and the prefix client
-/// tool names may not use.
-pub const RESERVED_TOOL_PREFIX: &str = "baseten__";
-
 /// Anthropic's own id shape for a server-executed tool use, which its clients match results on.
 /// Minted on egress by a Messages coding adapter and stripped back off on ingress, so a replayed
 /// turn resolves to the same call id the model issued.
@@ -151,8 +154,8 @@ pub enum ClientProtocol {
     Responses,
 }
 
-/// The kind of content a chunk carries — the axis both the egress block framing and a loop's
-/// phase timeline key off, so neither restates [`SemanticChunk`]'s variants.
+/// Reported per raw model delta by the parser ([`sse_parser::SseDataYield`]); the axis a loop's
+/// phase timeline keys off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentKind {
     Thinking,
@@ -174,17 +177,4 @@ pub enum SemanticChunk {
     Stop {
         finish_reason: dynamo_protocols::types::FinishReason,
     },
-}
-
-impl SemanticChunk {
-    /// `None` for the chunks that carry no content (usage, stop) and so must not perturb whatever
-    /// content block or phase is open.
-    pub fn content_kind(&self) -> Option<ContentKind> {
-        match self {
-            SemanticChunk::ThinkingDelta(_) => Some(ContentKind::Thinking),
-            SemanticChunk::TextDelta(_) => Some(ContentKind::Text),
-            SemanticChunk::ToolCall(_) => Some(ContentKind::ToolCall),
-            SemanticChunk::Usage(_) | SemanticChunk::Stop { .. } => None,
-        }
-    }
 }
