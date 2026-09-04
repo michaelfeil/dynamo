@@ -8,7 +8,9 @@ use dynamo_protocols::types::CompletionUsage;
 use serde::Serialize;
 
 use crate::CcMessage;
-use crate::model::{ServerToolCall, ServerToolCallStatus, Termination, ToolOutput};
+use crate::model::{
+    BillingVerdict, ServerToolCall, ServerToolCallStatus, Termination, ToolOutput, UsageReport,
+};
 
 /// Independent fields per scope rather than a one-of, so a frame carrying both loses neither.
 /// `Usage` is the client protocol's own usage type; every other field is identical across protocols
@@ -103,14 +105,56 @@ pub fn steering_appended_note(steering_prompt: &str) -> String {
     format!("appended steering message: {steering_prompt}")
 }
 
-/// One server-tool call, keyed by the model's own `id` so a client merges the dispatch and completion
-/// records. No result: `continuation_messages` already carries it, once.
+/// One server-tool call's identity, projected once off the dispatched call and shared by the
+/// per-iteration record and the request roll-up.
 #[derive(Serialize, Clone)]
-pub struct ServerToolCallRecord {
+pub struct CallIdentity {
     pub id: String,
     /// The provider half of the qualified name, same split as the metric label.
     pub provider: String,
     pub name: String,
+}
+
+impl CallIdentity {
+    fn from_call(server_call: &ServerToolCall) -> Self {
+        Self {
+            id: server_call.call.id.clone(),
+            provider: server_call.provider.clone(),
+            name: server_call.call.name.clone(),
+        }
+    }
+}
+
+/// The billing verdict as the wire carries it: `quantity` present only when the call bills (a
+/// charge quantity on a free call would read as a lie). The projection rule lives here, once.
+#[derive(Serialize, Clone)]
+pub struct WireVerdict {
+    pub billable: bool,
+    /// What this call charges against — the provider's report; absent when the provider gives none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sku: Option<String>,
+    /// The quantity the call bills at — the provider's report, else 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<f64>,
+}
+
+impl WireVerdict {
+    fn from_verdict(verdict: &BillingVerdict) -> Self {
+        let billable = verdict.billable && !matches!(verdict.usage, UsageReport::Unsupported);
+        Self {
+            billable,
+            sku: verdict.usage.sku().map(str::to_string),
+            quantity: billable.then_some(verdict.usage.quantity().unwrap_or(1.0)),
+        }
+    }
+}
+
+/// One server-tool call, keyed by the model's own `id` so a client merges the dispatch and completion
+/// records. No result: `continuation_messages` already carries it, once.
+#[derive(Serialize, Clone)]
+pub struct ServerToolCallRecord {
+    #[serde(flatten)]
+    pub identity: CallIdentity,
     pub arguments: String,
     /// `null` until the call completes, so a client never has to read meaning into a missing field.
     pub is_error: Option<bool>,
@@ -118,25 +162,19 @@ pub struct ServerToolCallRecord {
     /// the shape CC clients already parse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ServerToolCallStatus>,
-    /// The reached-processing billing rule's verdict; absent while running.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub billable: Option<bool>,
-    /// What the provider reports this call charging against; `None` while running or unreported.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sku: Option<String>,
+    /// The billing verdict (only successful calls bill); absent while running.
+    #[serde(flatten)]
+    pub verdict: Option<WireVerdict>,
 }
 
 impl ServerToolCallRecord {
     pub fn dispatched(server_call: &ServerToolCall) -> Self {
         Self {
-            id: server_call.call.id.clone(),
-            provider: server_call.provider.clone(),
-            name: server_call.call.name.clone(),
+            identity: CallIdentity::from_call(server_call),
             arguments: server_call.call.raw_args.clone(),
             is_error: None,
             status: None,
-            billable: None,
-            sku: None,
+            verdict: None,
         }
     }
 
@@ -144,8 +182,7 @@ impl ServerToolCallRecord {
         Self {
             is_error: Some(output.is_error()),
             status: Some(output.status),
-            billable: Some(output.billable),
-            sku: output.sku.clone(),
+            verdict: Some(WireVerdict::from_verdict(&output.verdict)),
             ..Self::dispatched(server_call)
         }
     }
@@ -185,27 +222,20 @@ impl Termination {
 /// blocks.
 #[derive(Serialize, Clone)]
 pub struct ServerToolCallOutcome {
-    pub id: String,
-    /// The provider half of the qualified name, same split as the metric label.
-    pub provider: String,
-    pub name: String,
+    #[serde(flatten)]
+    pub identity: CallIdentity,
     pub status: ServerToolCallStatus,
-    /// The reached-processing billing rule's verdict (see [`ToolOutput::billable`]).
-    pub billable: bool,
-    /// What the provider reports this call charging against; `None` when unreported.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sku: Option<String>,
+    /// The billing verdict (see [`ToolOutput::verdict`]).
+    #[serde(flatten)]
+    pub verdict: WireVerdict,
 }
 
 impl ServerToolCallOutcome {
     pub fn completed(server_call: &ServerToolCall, output: &ToolOutput) -> Self {
         Self {
-            id: server_call.call.id.clone(),
-            provider: server_call.provider.clone(),
-            name: server_call.call.name.clone(),
+            identity: CallIdentity::from_call(server_call),
             status: output.status,
-            billable: output.billable,
-            sku: output.sku.clone(),
+            verdict: WireVerdict::from_verdict(&output.verdict),
         }
     }
 }

@@ -36,6 +36,14 @@ pub struct RenderedToolCall {
     pub lifecycle_events: Vec<&'static str>,
 }
 
+/// The declaration a namespaced tool was hoisted from: the `(name, namespace)` pair the client's
+/// registry dispatches on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolIdentity {
+    pub name: String,
+    pub namespace: String,
+}
+
 pub trait CodingAdapter: Send + Sync {
     /// `None` for a call this adapter did not expand: it renders the protocol's usual way.
     fn render_tool_call(&self, call: &ToolCallToRender<'_>) -> Option<RenderedToolCall>;
@@ -48,5 +56,10 @@ pub trait CodingAdapter: Send + Sync {
     /// Default identity: only a protocol whose typed body cannot carry the client's shape splices.
     fn splice_rendered_calls(&self, body: Value, _rendered: &HashMap<String, Value>) -> Value {
         body
+    }
+    /// The declaration a namespaced tool was hoisted from, so egress can stamp the call item
+    /// back into the client's registry key. Default `None`: the call's own name passes through.
+    fn resolve_tool_identity(&self, _tool_name: &str) -> Option<ToolIdentity> {
+        None
     }
 }

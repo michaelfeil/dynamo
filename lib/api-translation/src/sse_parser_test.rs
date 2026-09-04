@@ -3,8 +3,8 @@
 //! emitter's job, tested there). Plus TB regressions: split-chunk merge, eager dispatch, truncation.
 
 use super::*;
-use crate::SemanticChunk;
 use crate::test_utils::*;
+use crate::{ContentKind, SemanticChunk};
 use serde_json::json;
 
 #[test]
@@ -69,27 +69,39 @@ fn thinking_text_then_tool() {
 fn streamed_args_surface_once_when_json_completes() {
     let mut p = SseParser::default();
     let mut out = Vec::new();
-    out.extend(p.push_and_yield(&chunk(
-        tool_delta(0, Some("call-1"), Some("Write"), Some("")),
-        None,
-    )));
+    out.extend(
+        p.push_and_yield(&chunk(
+            tool_delta(0, Some("call-1"), Some("Write"), Some("")),
+            None,
+        ))
+        .chunks,
+    );
     assert!(out.is_empty(), "no tool_call before args parse");
-    out.extend(p.push_and_yield(&chunk(
-        tool_delta(0, None, None, Some(r#"{"file_path":"w.txt""#)),
-        None,
-    )));
-    out.extend(p.push_and_yield(&chunk(
-        tool_delta(0, None, None, Some(r#", "content":"M2.5""#)),
-        None,
-    )));
+    out.extend(
+        p.push_and_yield(&chunk(
+            tool_delta(0, None, None, Some(r#"{"file_path":"w.txt""#)),
+            None,
+        ))
+        .chunks,
+    );
+    out.extend(
+        p.push_and_yield(&chunk(
+            tool_delta(0, None, None, Some(r#", "content":"M2.5""#)),
+            None,
+        ))
+        .chunks,
+    );
     assert!(
         out.iter()
             .all(|r| !matches!(r.as_ref().unwrap(), SemanticChunk::ToolCall(_)))
     );
-    out.extend(p.push_and_yield(&chunk(
-        tool_delta(0, None, None, Some("}")),
-        Some("tool_calls"),
-    )));
+    out.extend(
+        p.push_and_yield(&chunk(
+            tool_delta(0, None, None, Some("}")),
+            Some("tool_calls"),
+        ))
+        .chunks,
+    );
     let completed: Vec<_> = out
         .iter()
         .filter(|r| matches!(r.as_ref().unwrap(), SemanticChunk::ToolCall(_)))
@@ -107,27 +119,92 @@ fn streamed_args_surface_once_when_json_completes() {
     );
 }
 
+/// Thinking and text deltas report their kinds too, in the delta's field order.
+#[test]
+fn thinking_and_text_deltas_report_their_content_kinds() {
+    let mut p = SseParser::default();
+    assert_eq!(
+        p.push_and_yield(&chunk(json!({"reasoning_content": "hmm"}), None))
+            .delta_content_kinds,
+        vec![ContentKind::Thinking]
+    );
+    assert_eq!(
+        p.push_and_yield(&chunk(
+            json!({"reasoning_content": "hm", "content": "ok"}),
+            None
+        ))
+        .delta_content_kinds,
+        vec![ContentKind::Thinking, ContentKind::Text]
+    );
+}
+
+/// One delta carrying several tool calls is one contiguous tool-call phase: a single kind.
+#[test]
+fn multiple_tool_calls_in_one_delta_report_one_tool_call_kind() {
+    let mut p = SseParser::default();
+    let mut parallel_calls_delta = tool_delta(0, Some("c1"), Some("A"), Some("{}"));
+    let second_call = tool_delta(1, Some("c2"), Some("B"), Some("{}"));
+    let calls = parallel_calls_delta["tool_calls"].as_array_mut().unwrap();
+    calls.push(second_call["tool_calls"][0].clone());
+    let pushed = p.push_and_yield(&chunk(parallel_calls_delta, None));
+    assert_eq!(pushed.delta_content_kinds, vec![ContentKind::ToolCall]);
+}
+
+/// The phase-timing contract: a tool-call arg delta reports `ContentKind::ToolCall` on arrival,
+/// chunks or not — the completed `ToolCall` chunk comes whole args later.
+#[test]
+fn tool_arg_deltas_report_their_content_kind_before_the_chunk() {
+    let mut p = SseParser::default();
+    let opener = p.push_and_yield(&chunk(
+        tool_delta(0, Some("call-1"), Some("Write"), Some(r#"{"file_path""#)),
+        None,
+    ));
+    assert!(opener.chunks.is_empty(), "no tool_call before args parse");
+    assert_eq!(opener.delta_content_kinds, vec![ContentKind::ToolCall]);
+    let closer = p.push_and_yield(&chunk(
+        tool_delta(0, None, None, Some(r#":"w.txt"}"#)),
+        Some("tool_calls"),
+    ));
+    assert_eq!(closer.delta_content_kinds, vec![ContentKind::ToolCall]);
+    assert!(
+        matches!(closer.chunks.as_slice(), [Ok(SemanticChunk::ToolCall(_))]),
+        "complete args yield the ToolCall"
+    );
+}
+
 /// `}`/`{` inside a string argument, split across chunks, plus an escaped quote: the eager-dispatch
 /// gate is string- and escape-aware, so it waits for the real container to close.
 #[test]
 fn braces_inside_a_string_argument_do_not_dispatch_early() {
     let mut p = SseParser::default();
     let mut out = Vec::new();
-    out.extend(p.push_and_yield(&chunk(
-        tool_delta(0, Some("call-1"), Some("Grep"), Some(r#"{"pattern":"a}"#)),
-        None,
-    )));
-    out.extend(p.push_and_yield(&chunk(tool_delta(0, None, None, Some("b{c")), None)));
-    out.extend(p.push_and_yield(&chunk(tool_delta(0, None, None, Some(r#"\"q\""#)), None)));
+    out.extend(
+        p.push_and_yield(&chunk(
+            tool_delta(0, Some("call-1"), Some("Grep"), Some(r#"{"pattern":"a}"#)),
+            None,
+        ))
+        .chunks,
+    );
+    out.extend(
+        p.push_and_yield(&chunk(tool_delta(0, None, None, Some("b{c")), None))
+            .chunks,
+    );
+    out.extend(
+        p.push_and_yield(&chunk(tool_delta(0, None, None, Some(r#"\"q\""#)), None))
+            .chunks,
+    );
     assert!(
         out.iter()
             .all(|r| !matches!(r.as_ref().unwrap(), SemanticChunk::ToolCall(_))),
         "dispatched while the string was still open"
     );
-    out.extend(p.push_and_yield(&chunk(
-        tool_delta(0, None, None, Some(r#""}"#)),
-        Some("tool_calls"),
-    )));
+    out.extend(
+        p.push_and_yield(&chunk(
+            tool_delta(0, None, None, Some(r#""}"#)),
+            Some("tool_calls"),
+        ))
+        .chunks,
+    );
     let calls: Vec<_> = out
         .iter()
         .filter(|r| matches!(r.as_ref().unwrap(), SemanticChunk::ToolCall(_)))
@@ -262,7 +339,9 @@ fn usage_folds_into_finish() {
 fn malformed_chunk_truncates_in_error() {
     let mut p = SseParser::default();
     let junk = format!("{{not json {}", "x".repeat(500));
-    let out = p.push_and_yield(&junk);
+    let pushed = p.push_and_yield(&junk);
+    assert!(pushed.delta_content_kinds.is_empty());
+    let out = pushed.chunks;
     match &out[0] {
         Err(TranslationError::UpstreamUnavailable { detail: msg, .. }) => {
             assert!(msg.contains("decode failed"));
@@ -275,7 +354,7 @@ fn malformed_chunk_truncates_in_error() {
 #[test]
 fn done_sentinel_yields_nothing() {
     let mut p = SseParser::default();
-    assert!(p.push_and_yield("[DONE]").is_empty());
+    assert!(p.push_and_yield("[DONE]").chunks.is_empty());
 }
 
 /// Byte-exact args: the ToolCall carries the model's verbatim arg string (spaces preserved), not a
@@ -308,8 +387,9 @@ fn preserves_raw_arg_bytes() {
 #[test]
 fn coded_client_error_chunk_keeps_status_and_message() {
     let mut p = SseParser::default();
-    let out =
-        p.push_and_yield(r#"{"error":{"message":"Tool calls cutoff by max_tokens.","code":400}}"#);
+    let out = p
+        .push_and_yield(r#"{"error":{"message":"Tool calls cutoff by max_tokens.","code":400}}"#)
+        .chunks;
     match &out[0] {
         Err(TranslationError::UpstreamResponse { status, body, .. }) => {
             assert_eq!(*status, http::StatusCode::BAD_REQUEST);
@@ -319,11 +399,46 @@ fn coded_client_error_chunk_keeps_status_and_message() {
     }
 }
 
+/// The same status spelled as a decimal string (OpenAI-style error frames) is read identically.
+#[test]
+fn string_coded_error_chunk_is_read_like_the_numeric_code() {
+    let mut p = SseParser::default();
+    let out = p
+        .push_and_yield(r#"{"error":{"message":"Tool calls cutoff by max_tokens.","code":"400"}}"#)
+        .chunks;
+    match &out[0] {
+        Err(TranslationError::UpstreamResponse { status, body, .. }) => {
+            assert_eq!(*status, http::StatusCode::BAD_REQUEST);
+            assert!(body.contains("Tool calls cutoff"), "body: {body}");
+        }
+        other => panic!("expected UpstreamResponse, got {other:?}"),
+    }
+    let mut p = SseParser::default();
+    let out = p
+        .push_and_yield(r#"{"error":{"message":"framework error","code":"500"}}"#)
+        .chunks;
+    assert!(matches!(
+        &out[0],
+        Err(TranslationError::UpstreamUnavailable { .. })
+    ));
+    // A non-numeric string is not a status: no status to mirror, so it degrades like an uncoded frame.
+    let mut p = SseParser::default();
+    let out = p
+        .push_and_yield(r#"{"error":{"message":"x","code":"invalid_request_error"}}"#)
+        .chunks;
+    assert!(matches!(
+        &out[0],
+        Err(TranslationError::UpstreamUnavailable { .. })
+    ));
+}
+
 /// A 5xx `code` is upstream degradation, where the retry advice is right.
 #[test]
 fn coded_server_error_chunk_stays_unavailable() {
     let mut p = SseParser::default();
-    let out = p.push_and_yield(r#"{"error":{"message":"framework error","code":500}}"#);
+    let out = p
+        .push_and_yield(r#"{"error":{"message":"framework error","code":500}}"#)
+        .chunks;
     assert!(matches!(
         &out[0],
         Err(TranslationError::UpstreamUnavailable { .. })
@@ -338,7 +453,7 @@ fn uncoded_error_chunk_is_unavailable_without_its_message() {
     let mut p = SseParser::default();
     let out = p.push_and_yield(
         r#"{"error":{"message":"Tool calls cutoff by max_tokens","type":"internal_server_error"}}"#,
-    );
+    ).chunks;
     match &out[0] {
         Err(TranslationError::UpstreamUnavailable { detail, .. }) => {
             assert!(!detail.contains("Tool calls cutoff"), "{detail}");

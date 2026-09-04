@@ -2,7 +2,7 @@ use serde_json::json;
 
 use super::*;
 use crate::SemanticChunk;
-use crate::model::{ServerToolCallStatus, ToolOutput};
+use crate::model::{BillingVerdict, ServerToolCallStatus, ToolOutput};
 use crate::model::{ToolCall, ToolInvocation};
 
 fn tc(id: &str, name: &str, args: serde_json::Value) -> SemanticChunk {
@@ -26,8 +26,7 @@ fn invocation(call_id: &str, content: serde_json::Value) -> ToolInvocation {
         output: ToolOutput {
             content,
             status: ServerToolCallStatus::Succeeded,
-            billable: true,
-            sku: None,
+            verdict: BillingVerdict::billable_unreported(),
         },
     }
 }

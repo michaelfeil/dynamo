@@ -31,7 +31,7 @@ use crate::baseten_response_extension::{
     BasetenFrame, BasetenResponseExtension, IterationScope, ServerToolCallOutcome,
 };
 use crate::coding_adapter::{CodingAdapter, ToolCallStatus, ToolCallToRender, ToolResultToRender};
-use crate::model::{ServerToolCall, Termination, ToolCall, ToolInvocation, ToolOutput};
+use crate::model::{ErrorClass, ServerToolCall, Termination, ToolCall, ToolInvocation, ToolOutput};
 use crate::wire::{next_id_seq, sse_frame, to_json_string};
 use crate::{CcMessage, SemanticChunk};
 
@@ -87,14 +87,28 @@ impl ProtocolEnvelope for MessagesEnvelope {
 }
 
 /// Anthropic's error body, the shape both the buffered error and the `error` SSE event carry.
-pub(super) fn error_json(message: &str) -> String {
+pub(super) fn error_json(class: ErrorClass, message: &str) -> String {
     to_json_string(&AnthropicErrorResponse {
         object_type: "error".to_string(),
         error: AnthropicErrorBody {
-            error_type: "api_error".to_string(),
+            error_type: anthropic_error_type(class).to_string(),
             message: message.to_string(),
         },
     })
+}
+
+/// Anthropic's documented `error.type` vocabulary, its closed set — one word per class.
+fn anthropic_error_type(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::InvalidRequest => "invalid_request_error",
+        ErrorClass::Authentication => "authentication_error",
+        ErrorClass::Permission => "permission_error",
+        ErrorClass::NotFound => "not_found_error",
+        ErrorClass::RequestTooLarge => "request_too_large",
+        ErrorClass::RateLimited => "rate_limit_error",
+        ErrorClass::Overloaded => "overloaded_error",
+        ErrorClass::Internal => "api_error",
+    }
 }
 
 /// The transcript only ever holds arguments the parser already proved to be JSON, so a parse failure
@@ -103,7 +117,10 @@ pub(super) fn error_json(message: &str) -> String {
 fn tool_call_input(call_id: &str, arguments: &str) -> serde_json::Value {
     serde_json::from_str(arguments).unwrap_or_else(|error| {
         debug_assert!(false, "transcript tool args must parse: {error}");
-        tracing::error!("tool call `{call_id}` has unparseable arguments in history: {error}");
+        tracing::error!(
+            event_name = "messages.unparseable_tool_args",
+            "Tool call `{call_id}` has unparseable arguments in history: {error}"
+        );
         serde_json::json!({})
     })
 }
@@ -544,7 +561,10 @@ impl StreamFraming for MessagesFraming {
         // Unreachable while the loop stages after draining a call, which always starts the message and
         // always emits an extras-preserving frame before the next one.
         if !self.started {
-            tracing::warn!("iteration scope dropped before message_start (call cadence changed?)");
+            tracing::warn!(
+                event_name = "framing.iteration_scope_dropped",
+                "iteration scope dropped before message_start (call cadence changed?)"
+            );
             return Vec::new();
         }
         self.pending_baseten.iterations.extend(
@@ -552,6 +572,12 @@ impl StreamFraming for MessagesFraming {
                 .stage(staged.scope(anthropic_usage)),
         );
         Vec::new()
+    }
+
+    fn close_iteration(&mut self) {
+        self.pending_baseten
+            .iterations
+            .extend(self.open_iteration_scope.close());
     }
 
     fn finish(
@@ -584,8 +610,13 @@ impl StreamFraming for MessagesFraming {
     }
 
     // No code slot: Anthropic's `error.type` is a closed vocabulary, not ours to extend.
-    fn error_sse_frame(&mut self, _error_code: Option<&str>, message: &str) -> String {
-        sse_frame(Some("error"), &error_json(message))
+    fn error_sse_frame(
+        &mut self,
+        class: ErrorClass,
+        _error_code: Option<&str>,
+        message: &str,
+    ) -> String {
+        sse_frame(Some("error"), &error_json(class, message))
     }
 }
 

@@ -9,7 +9,9 @@ use crate::baseten_response_extension::{
     IterationScope, ServerToolCallOutcome, ServerToolCallRecord,
 };
 use crate::framing::{BufferedResponse, CompletedIteration, ProtocolEnvelope};
-use crate::model::{BackendError, ServerToolCall, Termination, ToolCall, TranslationError};
+use crate::model::{
+    BackendError, ErrorClass, ServerToolCall, Termination, ToolCall, TranslationError,
+};
 use crate::sse_emitter::SseEmitter;
 use crate::{CcMessage, SemanticChunk, SseFrameTx};
 
@@ -108,6 +110,14 @@ impl ClientEgress {
         }
     }
 
+    /// The iteration has staged everything it will. Buffered keys scopes by index, so it needs no
+    /// close.
+    pub fn close_iteration(&mut self) {
+        if let Self::Streaming(emitter) = self {
+            emitter.close_iteration();
+        }
+    }
+
     /// `transcript` is the loop's own messages, which only the buffered body needs: a streaming client
     /// already received them frame by frame.
     pub async fn finish(
@@ -145,11 +155,12 @@ impl ClientEgress {
     /// body, not in-band.
     pub fn streaming_error_sse_frame(
         &mut self,
+        class: ErrorClass,
         error_code: Option<&str>,
         message: &str,
     ) -> Option<String> {
         match self {
-            Self::Streaming(emitter) => Some(emitter.error_sse_frame(error_code, message)),
+            Self::Streaming(emitter) => Some(emitter.error_sse_frame(class, error_code, message)),
             Self::Buffered(_) => None,
         }
     }

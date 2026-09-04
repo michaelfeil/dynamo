@@ -9,7 +9,9 @@ use dynamo_protocols::types::CompletionUsage;
 
 use crate::baseten_response_extension::ServerToolCallOutcome;
 use crate::framing::{CompletedIteration, StreamFraming};
-use crate::model::{BackendError, ServerToolCall, Termination, ToolCall, TranslationError};
+use crate::model::{
+    BackendError, ErrorClass, ServerToolCall, Termination, ToolCall, TranslationError,
+};
 use crate::{SemanticChunk, SseFrameTx};
 
 pub struct SseEmitter {
@@ -86,6 +88,10 @@ impl SseEmitter {
         .await
     }
 
+    pub fn close_iteration(&mut self) {
+        self.framing.close_iteration();
+    }
+
     pub async fn finish(
         &mut self,
         termination: Termination,
@@ -114,8 +120,13 @@ impl SseEmitter {
 
     /// Returned, not sent: the caller bounds the send with its own timeout ([`super::SseFrameTx`]
     /// reserve), which `send_all` does not.
-    pub fn error_sse_frame(&mut self, error_code: Option<&str>, message: &str) -> String {
-        self.framing.error_sse_frame(error_code, message)
+    pub fn error_sse_frame(
+        &mut self,
+        class: ErrorClass,
+        error_code: Option<&str>,
+        message: &str,
+    ) -> String {
+        self.framing.error_sse_frame(class, error_code, message)
     }
 
     /// Takes the channel rather than `&self`: a `&SseEmitter` held across the await would require the
@@ -132,4 +143,5 @@ impl SseEmitter {
 
 #[cfg(test)]
 #[path = "sse_emitter_test.rs"]
+#[allow(clippy::unwrap_used)]
 mod tests;

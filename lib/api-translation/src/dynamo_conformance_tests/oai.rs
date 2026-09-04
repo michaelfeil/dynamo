@@ -25,7 +25,7 @@ use minijinja::value::Value as JinjaValue;
 use serde_json::{Value, json};
 
 use crate::history::MessageHistoryAccumulator;
-use crate::model::{ServerToolCallStatus, ToolOutput};
+use crate::model::{BillingVerdict, ServerToolCallStatus, ToolOutput, UsageReport};
 use crate::model::{ToolCall, ToolInvocation};
 use crate::request::build_next_request;
 use crate::sse_parser::SseParser;
@@ -147,7 +147,7 @@ fn drive_turn(accumulator: &mut MessageHistoryAccumulator, sse_payloads: &[Strin
     let mut parser = SseParser::default();
     let mut chunks: Vec<SemanticChunk> = Vec::new();
     for payload in sse_payloads {
-        for chunk in parser.push_and_yield(payload) {
+        for chunk in parser.push_and_yield(payload).chunks {
             chunks.push(chunk.expect("parser push"));
         }
     }
@@ -261,8 +261,7 @@ fn invocation(call_id: &str, name: &str, content: serde_json::Value) -> ToolInvo
         output: ToolOutput {
             content,
             status: ServerToolCallStatus::Succeeded,
-            billable: true,
-            sku: None,
+            verdict: BillingVerdict::billable_unreported(),
         },
     }
 }

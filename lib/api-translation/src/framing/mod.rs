@@ -19,30 +19,56 @@ use std::collections::HashSet;
 
 use dynamo_protocols::error::{ApiError, WrappedError};
 use dynamo_protocols::types::CompletionUsage;
+use http::StatusCode;
 
 use crate::baseten_response_extension::{
     IterationScope, ServerToolCallOutcome, ServerToolCallRecord,
 };
 use crate::coding_adapter::CodingAdapter;
-use crate::model::{BackendError, ServerToolCall, Termination, ToolCall, ToolInvocation};
+use crate::model::{
+    BackendError, ErrorClass, ServerToolCall, Termination, ToolCall, ToolInvocation,
+};
 use crate::wire::{sse_frame, to_json_string};
 use crate::{CcMessage, ClientProtocol, SemanticChunk};
 
 /// OpenAI's error shape (`{"error": {...}}`), identical on CC and Responses — shared rather than
 /// duplicated per envelope.
-fn openai_error_json(error_code: Option<&str>, message: &str) -> String {
+fn openai_error_json(class: ErrorClass, error_code: Option<&str>, message: &str) -> String {
     to_json_string(&WrappedError {
         error: ApiError {
             message: message.to_string(),
-            r#type: Some("api_error".to_string()),
+            r#type: Some(openai_error_type(class).to_string()),
             param: None,
             code: error_code.map(str::to_owned),
         },
     })
 }
 
-fn openai_error_sse_frame(error_code: Option<&str>, message: &str) -> String {
-    sse_frame(None, &openai_error_json(error_code, message))
+/// OpenAI's `error.type` vocabulary. SDKs read it as the retryability signal (`api_error`
+/// conventionally retries), so a caller fault must not carry it.
+fn openai_error_type(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::RateLimited => "rate_limit_error",
+        ErrorClass::InvalidRequest
+        | ErrorClass::Authentication
+        | ErrorClass::Permission
+        | ErrorClass::NotFound
+        | ErrorClass::RequestTooLarge => "invalid_request_error",
+        ErrorClass::Overloaded | ErrorClass::Internal => "api_error",
+    }
+}
+
+fn openai_error_sse_frame(class: ErrorClass, error_code: Option<&str>, message: &str) -> String {
+    sse_frame(None, &openai_error_json(class, error_code, message))
+}
+
+/// The status a buffered path would have answered for this backend failure, used only to pick the
+/// error-type word on the in-band error frame. Falls back to 500 when the upstream reported none.
+fn backend_error_status(error: &BackendError) -> StatusCode {
+    error
+        .http_status
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// One iteration's `baseten` scope before a protocol shapes it, so [`StreamFraming`] needs one
@@ -70,11 +96,19 @@ impl StagedIteration<'_> {
 /// or the stream finishes. One iteration's parts arrive in different frames (a steering
 /// `debug_msg` before the model call, `usage` after it), and flushing them as they come hands a
 /// streamed client two `iterations[]` entries at one index where the buffered body merges them.
-pub(crate) struct OpenIterationScope<Usage: serde::Serialize>(Option<IterationScope<Usage>>);
+pub(crate) struct OpenIterationScope<Usage: serde::Serialize> {
+    open: Option<IterationScope<Usage>>,
+    /// The last index [`Self::close`] released. Staging into it again would build a second entry at
+    /// one index, which the open scope can no longer catch.
+    released: Option<u32>,
+}
 
 impl<Usage: serde::Serialize> Default for OpenIterationScope<Usage> {
     fn default() -> Self {
-        Self(None)
+        Self {
+            open: None,
+            released: None,
+        }
     }
 }
 
@@ -82,7 +116,12 @@ impl<Usage: serde::Serialize> OpenIterationScope<Usage> {
     /// Merges into the open scope on a matching index; a new index closes the open scope and
     /// returns it, complete and ready to flush.
     pub(crate) fn stage(&mut self, scope: IterationScope<Usage>) -> Option<IterationScope<Usage>> {
-        match &mut self.0 {
+        debug_assert!(
+            self.released.is_none_or(|released| scope.index > released),
+            "iteration {} staged after its scope was released",
+            scope.index
+        );
+        match &mut self.open {
             Some(open) if open.index == scope.index => {
                 debug_assert!(
                     open.usage.is_none() || scope.usage.is_none(),
@@ -99,7 +138,7 @@ impl<Usage: serde::Serialize> OpenIterationScope<Usage> {
                 None
             }
             _ => {
-                if let Some(open) = &self.0 {
+                if let Some(open) = &self.open {
                     debug_assert!(
                         open.index < scope.index,
                         "iteration scopes staged out of order: {} after {}",
@@ -107,13 +146,17 @@ impl<Usage: serde::Serialize> OpenIterationScope<Usage> {
                         open.index
                     );
                 }
-                self.0.replace(scope)
+                self.open.replace(scope)
             }
         }
     }
 
     pub(crate) fn close(&mut self) -> Option<IterationScope<Usage>> {
-        self.0.take()
+        let closed = self.open.take();
+        if let Some(scope) = &closed {
+            self.released = Some(scope.index);
+        }
+        closed
     }
 }
 
@@ -153,6 +196,11 @@ pub trait StreamFraming: Send {
             debug_msg: Some(message),
         })
     }
+
+    /// Every part of the iteration is staged, so its scope can ride the next extras-preserving
+    /// frame instead of waiting for the next iteration to displace it. CC keeps the default: it
+    /// frames each scope on its own chunk, so nothing is ever left open.
+    fn close_iteration(&mut self) {}
     /// Close the response with terminal stop, cumulative usage, and the request-level server-tool
     /// transcript (every completed call, in dispatch order across iterations).
     fn finish(
@@ -163,12 +211,21 @@ pub trait StreamFraming: Send {
     ) -> Vec<String>;
     /// The terminal error frame, mid-stream. On the live framing (`&mut self`), not the stateless
     /// envelope: Responses' `sequence_number` must continue from the frames already sent.
-    fn error_sse_frame(&mut self, error_code: Option<&str>, message: &str) -> String;
+    fn error_sse_frame(
+        &mut self,
+        class: ErrorClass,
+        error_code: Option<&str>,
+        message: &str,
+    ) -> String;
     /// Terminal backend failure: the stream is over and this error is why. CC and Messages render
     /// their single protocol error frame; Responses overrides with the spec failure envelope
     /// (`response.failed` carrying the partial output) and the truncation rescue.
     fn finish_with_backend_error(&mut self, error: &BackendError) -> Vec<String> {
-        vec![self.error_sse_frame(error.error_code.as_deref(), &error.message)]
+        vec![self.error_sse_frame(
+            ErrorClass::from_status(backend_error_status(error)),
+            error.error_code.as_deref(),
+            &error.message,
+        )]
     }
 }
 
@@ -203,10 +260,12 @@ impl ClientProtocol {
     /// function of the protocol alone, so the pre-flight path reaches it with no request in flight.
     /// Messages has no code slot: Anthropic's `error.type` is a closed vocabulary, not ours to
     /// extend.
-    pub fn error_json(self, error_code: Option<&str>, message: &str) -> String {
+    pub fn error_json(self, class: ErrorClass, error_code: Option<&str>, message: &str) -> String {
         match self {
-            Self::ChatCompletions | Self::Responses => openai_error_json(error_code, message),
-            Self::Messages => messages::error_json(message),
+            Self::ChatCompletions | Self::Responses => {
+                openai_error_json(class, error_code, message)
+            }
+            Self::Messages => messages::error_json(class, message),
         }
     }
 }
@@ -275,7 +334,7 @@ impl BufferedResponse<'_> {
             .iter()
             .flat_map(|iteration| &iteration.server_tool_calls)
             .filter(|record| record.is_error == Some(true))
-            .map(|record| record.id.as_str())
+            .map(|record| record.identity.id.as_str())
             .collect()
     }
 }
@@ -287,7 +346,7 @@ mod tests {
     use crate::baseten_response_extension::ServerToolCallRecord;
     use crate::coding_adapter::CodingAdapter;
     use crate::history::MessageHistoryAccumulator;
-    use crate::model::{ServerToolCallStatus, ToolOutput};
+    use crate::model::{BillingVerdict, ServerToolCallStatus, ToolOutput, UsageReport};
     use crate::test_utils::FakeResponsesSearchAdapter;
     use dynamo_protocols::types::FinishReason;
     use serde_json::Value;
@@ -327,8 +386,7 @@ mod tests {
             output: ToolOutput {
                 content: json!("RESULT"),
                 status: ServerToolCallStatus::Succeeded,
-                billable: true,
-                sku: None,
+                verdict: BillingVerdict::billable_unreported(),
             },
         }]);
         accumulator.push(&SemanticChunk::TextDelta("final answer".into()));
@@ -347,8 +405,7 @@ mod tests {
             output: ToolOutput {
                 content: json!("tool execution failed: connect timeout"),
                 status: ServerToolCallStatus::Failed,
-                billable: true,
-                sku: None,
+                verdict: BillingVerdict::billable_unreported(),
             },
         }]);
         accumulator.push(&SemanticChunk::TextDelta("could not search".into()));
@@ -362,8 +419,7 @@ mod tests {
                 &ToolOutput {
                     content: json!("tool execution failed: connect timeout"),
                     status: ServerToolCallStatus::Failed,
-                    billable: true,
-                    sku: None,
+                    verdict: BillingVerdict::billable_unreported(),
                 },
             )],
             continuation_messages: Vec::new(),
@@ -493,6 +549,91 @@ mod tests {
         );
     }
 
+    /// Without `close_iteration` a scope waits for the next iteration to displace it, so on a
+    /// 2-iteration request both land on the terminal frame instead of interleaving. Messages only:
+    /// on Responses the three delta events cannot carry extras (`preserves_extra_fields`), so its
+    /// scope rides the next item or envelope frame rather than the next text delta.
+    #[test]
+    fn a_closed_iteration_scope_rides_the_next_frame_not_the_terminal_one() {
+        let usage = usage();
+        let mut framing = ClientProtocol::Messages
+            .envelope(None, Default::default())
+            .stream_framing("m".to_string());
+        framing.on_chunk(&SemanticChunk::TextDelta("one".into()));
+        framing.emit_iteration_usage(0, &usage);
+        framing.close_iteration();
+
+        let interleaved = framing.on_chunk(&SemanticChunk::TextDelta("two".into()));
+        let carried = interleaved
+            .iter()
+            .map(|frame| frame_json(frame))
+            .any(|body| body["baseten"]["iterations"][0]["index"] == json!(0));
+        assert!(
+            carried,
+            "iteration 0 must ride the next frame: {interleaved:?}"
+        );
+
+        let terminal = framing.finish(Termination::Model(FinishReason::Stop), &usage, &[]);
+        assert!(
+            !terminal
+                .iter()
+                .map(|frame| frame_json(frame))
+                .any(|body| body["baseten"]["iterations"][0]["index"] == json!(0)),
+            "iteration 0 already shipped, so the terminal frame must not repeat it"
+        );
+    }
+
+    /// The released-index guard: with the open slot empty, `stage` can no longer see that an index
+    /// already shipped, so without it a late staging silently builds a second entry at one index.
+    #[test]
+    #[should_panic(expected = "iteration 0 staged after its scope was released")]
+    fn staging_into_a_released_iteration_trips() {
+        let usage = usage();
+        let mut framing = ClientProtocol::Messages
+            .envelope(None, Default::default())
+            .stream_framing("m".to_string());
+        framing.on_chunk(&SemanticChunk::TextDelta("hi".into()));
+        framing.emit_iteration_usage(0, &usage);
+        framing.close_iteration();
+        framing.emit_iteration_debug_msg(0, "too late");
+    }
+
+    /// SEG keeps the MAX of each frame's top-level `usage` and never sums (`applyCumulative` ->
+    /// `updateMax` in `go/tokencounting/processor.go`), so a per-iteration usage on that path would
+    /// bill the largest iteration instead of the total. Only the terminal frame may carry one.
+    #[test]
+    fn only_the_terminal_frame_carries_a_nonzero_top_level_usage() {
+        let usage = usage();
+        for protocol in [
+            ClientProtocol::ChatCompletions,
+            ClientProtocol::Messages,
+            ClientProtocol::Responses,
+        ] {
+            let mut framing = protocol
+                .envelope(None, Default::default())
+                .stream_framing("m".to_string());
+            let mut pre_terminal = framing.on_chunk(&SemanticChunk::TextDelta("hi".into()));
+            pre_terminal.extend(framing.emit_iteration_usage(0, &usage));
+            pre_terminal.extend(framing.emit_iteration_debug_msg(0, "steered"));
+            framing.close_iteration();
+            pre_terminal.extend(framing.on_chunk(&SemanticChunk::TextDelta("more".into())));
+
+            for frame in &pre_terminal {
+                let body = frame_json(frame);
+                for candidate in [&body["usage"], &body["response"]["usage"]] {
+                    let metered = ["input_tokens", "output_tokens", "prompt_tokens"]
+                        .into_iter()
+                        .filter_map(|field| candidate[field].as_u64())
+                        .any(|tokens| tokens > 0);
+                    assert!(
+                        !metered,
+                        "{protocol:?}: SEG would meter this frame: {frame}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The terminal `request` scope carries the whole server-tool transcript — `sku` and
     /// `is_error` included — on every protocol, streaming and buffered.
     #[test]
@@ -503,8 +644,14 @@ mod tests {
             &ToolOutput {
                 content: json!("RESULT"),
                 status: ServerToolCallStatus::Succeeded,
-                billable: true,
-                sku: Some("search-pro".into()),
+                verdict: BillingVerdict {
+                    billable: true,
+                    usage: UsageReport::Reported {
+                        sku: Some("search-pro".into()),
+                        quantity: 2.0,
+                    },
+                    usage_expected: true,
+                },
             },
         )];
         records.push(ServerToolCallOutcome::completed(
@@ -512,8 +659,7 @@ mod tests {
             &ToolOutput {
                 content: json!("not executed: budget spent"),
                 status: ServerToolCallStatus::Refused,
-                billable: false,
-                sku: None,
+                verdict: BillingVerdict::not_billable(),
             },
         ));
         let request_scope_of = |baseten_carriers: [&Value; 2]| {
@@ -545,9 +691,14 @@ mod tests {
             assert_eq!(request_scope["server_tool_calls"][0]["sku"], "search-pro");
             assert_eq!(request_scope["server_tool_calls"][0]["status"], "succeeded");
             assert_eq!(request_scope["server_tool_calls"][0]["billable"], true);
+            assert_eq!(request_scope["server_tool_calls"][0]["quantity"], 2.0);
             assert_eq!(request_scope["server_tool_calls"][1]["status"], "refused");
             assert_eq!(request_scope["server_tool_calls"][1]["billable"], false);
             assert!(request_scope["server_tool_calls"][1]["sku"].is_null());
+            assert!(
+                request_scope["server_tool_calls"][1]["quantity"].is_null(),
+                "a non-billable call carries no charge quantity"
+            );
 
             let body =
                 protocol
@@ -597,13 +748,18 @@ mod tests {
     }
 
     /// CC's error frame is the bare OpenAI `{"error": {...}}` object; Messages' is Anthropic's
-    /// named `event: error`. (Responses' typed error event is pinned in its own module's tests.)
+    /// named `event: error`. (Responses' `response.failed` envelope is pinned in its own module's
+    /// tests.)
     #[test]
     fn cc_and_messages_error_frames_carry_their_protocol_shapes() {
         let cc_frame = ClientProtocol::ChatCompletions
             .envelope(None, Default::default())
             .stream_framing("m".to_string())
-            .error_sse_frame(Some("upstream_error"), "upstream unavailable");
+            .error_sse_frame(
+                ErrorClass::Internal,
+                Some("upstream_error"),
+                "upstream unavailable",
+            );
         let cc_body: Value =
             serde_json::from_str(cc_frame.strip_prefix("data: ").unwrap().trim_end()).unwrap();
         assert_eq!(cc_body["error"]["message"], "upstream unavailable");
@@ -613,13 +769,69 @@ mod tests {
         let messages_frame = ClientProtocol::Messages
             .envelope(None, Default::default())
             .stream_framing("m".to_string())
-            .error_sse_frame(Some("upstream_error"), "upstream unavailable");
+            .error_sse_frame(
+                ErrorClass::Internal,
+                Some("upstream_error"),
+                "upstream unavailable",
+            );
         let (event_line, data_line) = messages_frame.trim_end().split_once('\n').unwrap();
         assert_eq!(event_line, "event: error");
         let messages_body: Value =
             serde_json::from_str(data_line.strip_prefix("data: ").unwrap()).unwrap();
         assert_eq!(messages_body["type"], "error");
         assert_eq!(messages_body["error"]["message"], "upstream unavailable");
+    }
+
+    /// Exhaustive over `ErrorClass`, so a new class cannot ship without both protocol words.
+    #[test]
+    fn error_type_tracks_error_class() {
+        for (class, cc_type, messages_type) in [
+            (
+                ErrorClass::InvalidRequest,
+                "invalid_request_error",
+                "invalid_request_error",
+            ),
+            (
+                ErrorClass::Authentication,
+                "invalid_request_error",
+                "authentication_error",
+            ),
+            (
+                ErrorClass::Permission,
+                "invalid_request_error",
+                "permission_error",
+            ),
+            (
+                ErrorClass::NotFound,
+                "invalid_request_error",
+                "not_found_error",
+            ),
+            (
+                ErrorClass::RequestTooLarge,
+                "invalid_request_error",
+                "request_too_large",
+            ),
+            (
+                ErrorClass::RateLimited,
+                "rate_limit_error",
+                "rate_limit_error",
+            ),
+            (ErrorClass::Overloaded, "api_error", "overloaded_error"),
+            (ErrorClass::Internal, "api_error", "api_error"),
+        ] {
+            let cc_body: Value = serde_json::from_str(
+                &ClientProtocol::ChatCompletions.error_json(class, None, "boom"),
+            )
+            .unwrap();
+            assert_eq!(cc_body["error"]["type"], cc_type, "CC {class:?}");
+            let messages_body: Value =
+                serde_json::from_str(&ClientProtocol::Messages.error_json(class, None, "boom"))
+                    .unwrap();
+            assert_eq!(
+                messages_body["error"]["type"], messages_type,
+                "Messages {class:?}"
+            );
+        }
     }
 
     fn buffered(protocol: ClientProtocol, transcript: &[CcMessage]) -> Value {
@@ -684,8 +896,14 @@ mod tests {
                 &ToolOutput {
                     content: json!("RESULT"),
                     status: ServerToolCallStatus::Succeeded,
-                    billable: true,
-                    sku: Some("search.pro".to_string()),
+                    verdict: BillingVerdict {
+                        billable: true,
+                        usage: UsageReport::Reported {
+                            sku: Some("search.pro".to_string()),
+                            quantity: 1.0,
+                        },
+                        usage_expected: true,
+                    },
                 },
             )],
             continuation_messages: two_iteration_transcript(),
@@ -762,8 +980,7 @@ mod tests {
             &ToolOutput {
                 content: json!("RESULT"),
                 status: ServerToolCallStatus::Succeeded,
-                billable: true,
-                sku: None,
+                verdict: BillingVerdict::billable_unreported(),
             },
         );
         let serialized = serde_json::to_value(&record).expect("record serializes");

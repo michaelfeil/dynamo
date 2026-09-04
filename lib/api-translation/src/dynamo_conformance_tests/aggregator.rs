@@ -69,10 +69,13 @@ fn parallel_tool_calls_interleaved_aggregate_independently() {
 #[test]
 fn fragment_only_chunks_without_opener_errors() {
     let mut p = SseParser::default();
-    for r in p.push_and_yield(&chunk(
-        tool_delta(0, None, None, Some(r#"{"orphaned":true}"#)),
-        Some("stop"),
-    )) {
+    for r in p
+        .push_and_yield(&chunk(
+            tool_delta(0, None, None, Some(r#"{"orphaned":true}"#)),
+            Some("stop"),
+        ))
+        .chunks
+    {
         assert!(
             r.is_ok(),
             "no eager dispatch/error mid-stream (id/name absent)"

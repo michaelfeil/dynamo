@@ -24,16 +24,23 @@ use dynamo_protocols::types::{
 };
 use serde_json::Value;
 
-use crate::SemanticChunk;
 use crate::model::{ToolCall, TranslationError};
 use crate::util::truncate;
+use crate::{ContentKind, SemanticChunk};
 
 /// A mid-stream `{"error":{...}}` frame, which the backend serializes in-band because its headers
 /// are already sent. A 4xx `code` is the caller's to act on (MAPI answers a tool-call cutoff by
 /// `max_tokens` with 400), so its status and message carry through; anything else is degradation
 /// with no status to mirror.
 fn mid_stream_error_frame(error_frame: &Value, message: &str) -> TranslationError {
-    let frame_code = error_frame.get("code").and_then(Value::as_u64);
+    // Backends disagree on the type: dynamo emits a number, OpenAI-style frames carry a decimal
+    // string ("400"); both mean the same status.
+    let frame_code = error_frame.get("code").and_then(|code| {
+        code.as_u64().or_else(|| {
+            code.as_str()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+        })
+    });
     let client_error_status = frame_code
         .and_then(|code| u16::try_from(code).ok())
         .and_then(|code| http::StatusCode::from_u16(code).ok())
@@ -58,7 +65,25 @@ fn model_unavailable(error_code: &'static str, detail: String) -> TranslationErr
 
 const DONE: &str = "[DONE]";
 
-type ChunkResult = Result<SemanticChunk, TranslationError>;
+pub(crate) type ChunkResult = Result<SemanticChunk, TranslationError>;
+
+#[derive(Default)]
+pub struct SseDataYield {
+    pub chunks: Vec<ChunkResult>,
+    /// Content kinds the raw delta carried, in the delta's field order (thinking, text, tool
+    /// calls). A tool-call delta reports its kind here while its chunk surfaces only once the args
+    /// complete, so phase timing must key off kinds, not chunks.
+    pub delta_content_kinds: Vec<ContentKind>,
+}
+
+impl SseDataYield {
+    fn single_error(error: TranslationError) -> Self {
+        Self {
+            chunks: vec![Err(error)],
+            delta_content_kinds: Vec::new(),
+        }
+    }
+}
 
 /// One parser per model turn: tool indexing is the model's per-response CC index, which restarts
 /// each model call.
@@ -127,9 +152,9 @@ impl SseParser {
     /// Decode + fold one SSE `data:` payload. `[DONE]` yields nothing (the stream ends when the
     /// byte source closes). A decode failure yields one model-unavailable error with a truncated
     /// body (a raw upstream body in a client error frame is info-leak + noise).
-    pub fn push_and_yield(&mut self, data: &str) -> Vec<ChunkResult> {
+    pub fn push_and_yield(&mut self, data: &str) -> SseDataYield {
         if data.trim() == DONE {
-            return Vec::new();
+            return SseDataYield::default();
         }
         let chunk: CreateChatCompletionStreamResponse = match serde_json::from_str(data) {
             Ok(c) => c,
@@ -142,34 +167,40 @@ impl SseParser {
                     && let Some(error_frame) = frame.get("error")
                     && let Some(message) = error_frame.get("message").and_then(Value::as_str)
                 {
-                    return vec![Err(mid_stream_error_frame(error_frame, message))];
+                    return SseDataYield::single_error(mid_stream_error_frame(
+                        error_frame,
+                        message,
+                    ));
                 }
-                return vec![Err(model_unavailable(
+                return SseDataYield::single_error(model_unavailable(
                     "model_chunk_undecodable",
                     format!(
                         "chat.completion.chunk decode failed: {e}; data: {}",
                         truncate(data, 256)
                     ),
-                ))];
+                ));
             }
         };
         self.push_chunk(chunk)
     }
 
-    fn push_chunk(&mut self, chunk: CreateChatCompletionStreamResponse) -> Vec<ChunkResult> {
+    fn push_chunk(&mut self, chunk: CreateChatCompletionStreamResponse) -> SseDataYield {
         // Usage may ride the finish chunk or a trailing choices-empty chunk; buffer for `flush_and_yield`.
         if let Some(usage) = chunk.usage {
             self.usage = Some(usage);
         }
-        let mut out = Vec::new();
+        let mut yielded = SseDataYield::default();
         let Some(choice) = chunk.choices.into_iter().next() else {
-            return out;
+            return yielded;
         };
         let delta = choice.delta;
 
         if let Some(reasoning) = delta.reasoning_content.filter(|s| !s.is_empty()) {
             self.saw_output = true;
-            out.push(Ok(SemanticChunk::ThinkingDelta(reasoning)));
+            yielded.delta_content_kinds.push(ContentKind::Thinking);
+            yielded
+                .chunks
+                .push(Ok(SemanticChunk::ThinkingDelta(reasoning)));
         }
         if let Some(text) = delta
             .content
@@ -177,16 +208,22 @@ impl SseParser {
             .filter(|s| !s.is_empty())
         {
             self.saw_output = true;
-            out.push(Ok(SemanticChunk::TextDelta(text)));
+            yielded.delta_content_kinds.push(ContentKind::Text);
+            yielded.chunks.push(Ok(SemanticChunk::TextDelta(text)));
         }
+        let mut saw_tool_call_delta = false;
         for call in delta.tool_calls.into_iter().flatten() {
             self.saw_output = true;
-            self.accumulate_tool_call(call, &mut out);
+            saw_tool_call_delta = true;
+            self.accumulate_tool_call(call, &mut yielded.chunks);
+        }
+        if saw_tool_call_delta {
+            yielded.delta_content_kinds.push(ContentKind::ToolCall);
         }
         if let Some(finish) = choice.finish_reason {
             self.finish_reason = Some(finish);
         }
-        out
+        yielded
     }
 
     /// The model may split `id`/`name`/`arguments` across chunks (Kimi/MAPI), so each is optional
@@ -224,8 +261,9 @@ impl SseParser {
                 // Per-chunk on a dribbling model, so debug; callers wanting a drop metric wrap
                 // the parser (tool-bank counts these in its own observability layer).
                 tracing::debug!(
-                    tool_id = %self.tools[pos].id,
-                    "dropping tool-call content after eager dispatch (spurious past a complete value)"
+                    event_name = "parser.post_dispatch_drop",
+                    "dropping tool-call content for `{}` after eager dispatch (spurious past a complete value)",
+                    self.tools[pos].id,
                 );
             }
             return;
@@ -323,6 +361,7 @@ impl SseParser {
             Some(s) => s,
             None if self.saw_output => {
                 tracing::warn!(
+                    event_name = "model.stream_truncated",
                     "upstream closed without a finish_reason after output; treating as length-truncated"
                 );
                 FinishReason::Length

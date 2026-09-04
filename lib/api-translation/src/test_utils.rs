@@ -50,7 +50,7 @@ pub(crate) fn tool_delta(
 pub(crate) fn collect(parser: &mut SseParser, datas: &[String]) -> Vec<SemanticChunk> {
     let mut out = Vec::new();
     for d in datas {
-        for r in parser.push_and_yield(d) {
+        for r in parser.push_and_yield(d).chunks {
             out.push(r.expect("push error"));
         }
     }

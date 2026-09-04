@@ -48,16 +48,74 @@ pub enum ServerToolCallStatus {
     Refused,
 }
 
+/// What the provider reported for a call's charge, as the caller's loop validated it. Data only:
+/// how a report is obtained and priced is the caller's (tool-bank's) policy.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageReport {
+    /// No usage block came back.
+    Unreported,
+    /// The provider's SKU (`None` when it reported none) and charge quantity.
+    Reported { sku: Option<String>, quantity: f64 },
+    /// A block was present but cannot be represented (fractional or garbage quantity); the wire
+    /// renders such a call as not billable rather than re-pricing it.
+    Unsupported,
+}
+
+impl UsageReport {
+    pub fn sku(&self) -> Option<&str> {
+        match self {
+            Self::Reported { sku, .. } => sku.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn quantity(&self) -> Option<f64> {
+        match self {
+            Self::Reported { quantity, .. } => Some(*quantity),
+            _ => None,
+        }
+    }
+}
+
+/// The caller's billing verdict on a completed call, shared verbatim by the wire transcript and the
+/// caller's billing records. `usage_expected`: the provider was configured to report usage, so
+/// `Unreported` from it is a contract violation rather than a legitimate fallback.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BillingVerdict {
+    pub billable: bool,
+    pub usage: UsageReport,
+    pub usage_expected: bool,
+}
+
+impl BillingVerdict {
+    /// A call that bills at the default quantity with no provider report — the common test shape.
+    pub fn billable_unreported() -> Self {
+        Self {
+            billable: true,
+            usage: UsageReport::Unreported,
+            usage_expected: false,
+        }
+    }
+
+    /// A call that does not bill (failed, refused).
+    pub fn not_billable() -> Self {
+        Self {
+            billable: false,
+            usage: UsageReport::Unreported,
+            usage_expected: false,
+        }
+    }
+}
+
 /// A server tool's structured result, as the caller's loop produced it. A non-`Succeeded` status
 /// has its `content` passed to the model verbatim to self-correct.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: Value,
     pub status: ServerToolCallStatus,
-    /// The caller's reached-processing billing verdict, echoed on the wire transcript.
-    pub billable: bool,
-    /// Provider vocabulary, passed through unmapped; `None` when the provider reports no usage.
-    pub sku: Option<String>,
+    /// The caller's billing verdict, echoed on the wire transcript (see
+    /// [`crate::baseten_extension::WireVerdict`]).
+    pub verdict: BillingVerdict,
 }
 
 impl ToolOutput {
@@ -71,6 +129,39 @@ impl ToolOutput {
         match &self.content {
             Value::String(s) => s.clone(),
             other => other.to_string(),
+        }
+    }
+}
+
+/// The client-facing remedy class of a failed request — the fault axis beside the HTTP `status`.
+/// Each protocol renders it as its own `error.type` vocabulary; clients' retry wrappers act on that
+/// word, so it must never claim a server fault for a caller mistake or the reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    InvalidRequest,
+    Authentication,
+    Permission,
+    NotFound,
+    RequestTooLarge,
+    RateLimited,
+    Overloaded,
+    Internal,
+}
+
+impl ErrorClass {
+    /// For statuses the crate did not author (a mirrored upstream response, a pre-projection guard):
+    /// the class the status implies. Callers that know better pick their class directly.
+    pub fn from_status(status: http::StatusCode) -> Self {
+        // 529 is Baseten's non-IANA overload status (see `predict::client`).
+        match status.as_u16() {
+            401 => Self::Authentication,
+            403 => Self::Permission,
+            404 => Self::NotFound,
+            413 => Self::RequestTooLarge,
+            429 => Self::RateLimited,
+            529 => Self::Overloaded,
+            _ if status.is_client_error() => Self::InvalidRequest,
+            _ => Self::Internal,
         }
     }
 }

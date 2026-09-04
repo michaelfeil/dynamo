@@ -153,7 +153,7 @@ pub enum ClientProtocol {
 
 /// The kind of content a chunk carries — the axis both the egress block framing and a loop's
 /// phase timeline key off, so neither restates [`SemanticChunk`]'s variants.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentKind {
     Thinking,
     Text,

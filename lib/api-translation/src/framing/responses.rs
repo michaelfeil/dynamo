@@ -43,7 +43,9 @@ use crate::baseten_response_extension::{
 };
 use crate::coding_adapter::{CodingAdapter, RenderedToolCall, ToolCallStatus, ToolCallToRender};
 use crate::hooks::reserved_tool_provider;
-use crate::model::{BackendError, ServerToolCall, Termination, ToolCall, ToolInvocation};
+use crate::model::{
+    BackendError, ErrorClass, ServerToolCall, Termination, ToolCall, ToolInvocation,
+};
 use crate::util::unix_secs;
 use crate::wire::{next_id_seq, sse_frame, to_json_string, to_json_value};
 use crate::{CcMessage, SemanticChunk};
@@ -76,6 +78,10 @@ pub struct ResponsesParams {
     pub prompt_cache_key: Option<String>,
     pub prompt_cache_retention: Option<PromptCacheRetention>,
     pub safety_identifier: Option<String>,
+    /// Echoed verbatim: the spec puts the request's `metadata` on the response body.
+    pub metadata: Option<HashMap<String, String>>,
+    /// Echoed as sent; the spec default (0) applies only when the request omitted it.
+    pub top_logprobs: Option<u8>,
 }
 
 impl ResponsesParams {
@@ -106,6 +112,8 @@ impl ResponsesParams {
             prompt_cache_key: field(body, "prompt_cache_key"),
             prompt_cache_retention: field(body, "prompt_cache_retention"),
             safety_identifier: field(body, "safety_identifier"),
+            metadata: field(body, "metadata"),
+            top_logprobs: field(body, "top_logprobs"),
         }
     }
 
@@ -279,7 +287,7 @@ fn make_response(
         incomplete_details,
         instructions: params.instructions.clone().map(Instructions::Text),
         max_output_tokens: params.max_output_tokens,
-        metadata: Some(HashMap::new()),
+        metadata: Some(params.metadata.clone().unwrap_or_default()),
         model,
         object: "response".to_string(),
         output,
@@ -302,7 +310,7 @@ fn make_response(
             .clone()
             .or(Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto))),
         tools: Some(params.normalized_tools()),
-        top_logprobs: Some(0),
+        top_logprobs: Some(params.top_logprobs.unwrap_or(0)),
         top_p: params.top_p.or(Some(1.0)),
         truncation: Some(params.truncation.unwrap_or(Truncation::Disabled)),
         usage,
@@ -432,9 +440,11 @@ fn transcript_output(
                         rendered_calls.insert(call.id.clone(), rendered.item);
                         continue;
                     }
+                    let (name, namespace) = call_identity(coding_adapter, &call.function.name);
                     output.push(function_call_item(
                         &call.id,
-                        &call.function.name,
+                        &name,
+                        namespace.as_deref(),
                         &call.function.arguments,
                         OutputStatus::Completed,
                     ));
@@ -455,7 +465,11 @@ fn transcript_output(
                             "slot for `{}` is not a function_call",
                             tool.tool_call_id
                         );
-                        tracing::error!("slot for `{}` is not a function_call", tool.tool_call_id);
+                        tracing::error!(
+                            event_name = "responses.slot_not_function_call",
+                            "Slot for `{}` is not a function_call",
+                            tool.tool_call_id
+                        );
                         continue;
                     };
                     let Some(provider) = reserved_tool_provider(&placeholder.name) else {
@@ -511,13 +525,34 @@ fn message_item(id: String, text: &str, status: OutputStatus) -> OutputItem {
     })
 }
 
+/// The wire name a call carried, split into the `(name, namespace)` the client dispatches on:
+/// a namespaced tool resolves to its declaration, everything else passes as itself.
+fn call_identity(
+    coding_adapter: Option<&dyn CodingAdapter>,
+    tool_name: &str,
+) -> (String, Option<String>) {
+    coding_adapter
+        .and_then(|adapter| adapter.resolve_tool_identity(tool_name))
+        .map_or_else(
+            || (tool_name.to_string(), None),
+            |identity| (identity.name, Some(identity.namespace)),
+        )
+}
+
 /// The model's verbatim argument bytes, never a reserialize — byte-exact cache prefix, same
-/// invariant `cc_tool_call` (in `cc.rs`) keeps for ChatCompletions.
-fn function_call_item(id: &str, name: &str, raw_args: &str, status: OutputStatus) -> OutputItem {
+/// invariant `cc_tool_call` (in `cc.rs`) keeps for ChatCompletions. The namespace is the client's
+/// own declaration for the tool, restamped so a registry keyed on `(name, namespace)` resolves.
+fn function_call_item(
+    id: &str,
+    name: &str,
+    namespace: Option<&str>,
+    raw_args: &str,
+    status: OutputStatus,
+) -> OutputItem {
     OutputItem::FunctionCall(FunctionToolCall {
         arguments: raw_args.to_string(),
         call_id: id.to_string(),
-        namespace: None,
+        namespace: namespace.map(str::to_string),
         name: name.to_string(),
         id: Some(id.to_string()),
         status: Some(status),
@@ -567,7 +602,8 @@ fn render_with_slot(
     serde_json::from_value(rendered.item.clone())
         .inspect_err(|error| {
             tracing::error!(
-                "rendered tool call `{}` is not a Responses output item: {error}",
+                event_name = "responses.render_invalid_item",
+                "Rendered tool call `{}` is not a Responses output item: {error}",
                 call.id
             );
         })
@@ -899,7 +935,10 @@ impl ResponsesFraming {
                     false,
                     "resolved item {call_id:?} has no recorded placeholder"
                 );
-                tracing::error!("resolved item {call_id:?} has no recorded placeholder");
+                tracing::error!(
+                    event_name = "responses.placeholder_missing",
+                    "Resolved item {call_id:?} has no recorded placeholder"
+                );
                 self.output.push(item);
             }
         }
@@ -999,9 +1038,16 @@ impl StreamFraming for ResponsesFraming {
                 }
                 // A server tool's result later replaces this via `emit_completed_iteration`;
                 // the item id is `call.id` on every event.
+                let (name, namespace) = call_identity(self.coding_adapter.as_deref(), &call.name);
                 let output_index = self.open_item(
                     &mut frames,
-                    &function_call_item(&call.id, &call.name, "", OutputStatus::InProgress),
+                    &function_call_item(
+                        &call.id,
+                        &name,
+                        namespace.as_deref(),
+                        "",
+                        OutputStatus::InProgress,
+                    ),
                 );
                 frames.push(self.event_frame(
                     ResponsesEvent::FunctionCallArgumentsDelta,
@@ -1009,14 +1055,15 @@ impl StreamFraming for ResponsesFraming {
                 ));
                 frames.push(self.event_frame(
                     ResponsesEvent::FunctionCallArgumentsDone,
-                    serde_json::json!({"output_index": output_index, "item_id": call.id, "name": call.name, "arguments": call.raw_args}),
+                    serde_json::json!({"output_index": output_index, "item_id": call.id, "name": &name, "arguments": call.raw_args}),
                 ));
                 self.record_item_done(
                     &mut frames,
                     output_index,
                     function_call_item(
                         &call.id,
-                        &call.name,
+                        &name,
+                        namespace.as_deref(),
                         &call.raw_args,
                         OutputStatus::Completed,
                     ),
@@ -1048,7 +1095,11 @@ impl StreamFraming for ResponsesFraming {
             let call = &server_call.call;
             let Some(output_index) = self.open_calls.remove(&call.id) else {
                 debug_assert!(false, "result for undispatched call `{}`", call.id);
-                tracing::error!("result for undispatched call `{}`", call.id);
+                tracing::error!(
+                    event_name = "responses.undispatched_result",
+                    "Result for undispatched call `{}`",
+                    call.id
+                );
                 continue;
             };
             let resolved = if output.is_error() {
@@ -1107,6 +1158,7 @@ impl StreamFraming for ResponsesFraming {
     fn stage_iteration(&mut self, staged: StagedIteration<'_>) -> Vec<String> {
         if !self.started {
             tracing::warn!(
+                event_name = "framing.iteration_scope_dropped",
                 "iteration scope dropped before response.created (call cadence changed?)"
             );
             return Vec::new();
@@ -1116,6 +1168,12 @@ impl StreamFraming for ResponsesFraming {
                 .stage(staged.scope(responses_usage)),
         );
         Vec::new()
+    }
+
+    fn close_iteration(&mut self) {
+        self.pending_baseten
+            .iterations
+            .extend(self.open_iteration_scope.close());
     }
 
     fn finish(
@@ -1206,21 +1264,36 @@ impl StreamFraming for ResponsesFraming {
         frames
     }
 
-    /// Not the bare `openai_error_sse_frame` shape CC uses: every Responses SSE frame is a
-    /// discriminated union on `type`, so an untagged error object fails the `openai` SDK's parse
-    /// (`ResponseErrorEvent` is the real, distinct `type: "error"` event, {sequence_number, code,
-    /// message, param} — nothing like ChatCompletions' plain error body).
-    fn error_sse_frame(&mut self, error_code: Option<&str>, message: &str) -> String {
-        sse_frame(
-            Some("error"),
-            &to_json_string(&serde_json::json!({
-                "type": "error",
-                "sequence_number": self.take_sequence_number(),
-                "code": error_code,
-                "message": message,
-                "param": Option::<&str>::None,
-            })),
-        )
+    /// `response.failed` — the terminal envelope SDK accumulators and Codex read failure from
+    /// (`get_final_response` / `incomplete_details` parsing), where a bare `error` event would make
+    /// the `openai` SDK raise mid-iteration and drop the accumulated output. `_class` has no slot:
+    /// the Responses error object is `{code, message}` only.
+    fn error_sse_frame(
+        &mut self,
+        _class: ErrorClass,
+        error_code: Option<&str>,
+        message: &str,
+    ) -> String {
+        // One concatenated SSE payload: the trait returns a single String; frames concatenate legally.
+        let mut frames = Vec::new();
+        self.ensure_started(&mut frames);
+        self.close_open(&mut frames);
+        // `error_code` is total on projected errors; "error" is a never-expected backstop.
+        debug_assert!(error_code.is_some(), "projected error without error_code");
+        let error_object = ErrorObject {
+            code: error_code.unwrap_or("error").to_string(),
+            message: message.to_string(),
+        };
+        let output = std::mem::take(&mut self.output);
+        let response = self.make_response(output, Status::Failed, None, Some(error_object), None);
+        let baseten = std::mem::take(&mut self.pending_baseten);
+        let response = finished_body(
+            self.coding_adapter.as_deref(),
+            response,
+            &self.rendered_calls,
+        );
+        frames.push(self.envelope_frame(ResponsesEvent::Failed, response, Some(baseten)));
+        frames.concat()
     }
 }
 
@@ -1270,6 +1343,51 @@ mod tests {
             serde_json::from_str(data.strip_prefix("data: ").unwrap().trim_end()).unwrap();
         assert_eq!(body["type"], name);
         body
+    }
+
+    /// Resolves one hoisted name back to its `(name, namespace)` declaration; every other call
+    /// passes through as itself (default `resolve_tool_identity`).
+    struct NamespaceStampAdapter;
+    impl CodingAdapter for NamespaceStampAdapter {
+        fn render_tool_call(&self, _call: &ToolCallToRender<'_>) -> Option<RenderedToolCall> {
+            None
+        }
+        fn resolve_tool_identity(
+            &self,
+            tool_name: &str,
+        ) -> Option<crate::coding_adapter::ToolIdentity> {
+            (tool_name == "multi_agent_v1__spawn_agent").then(|| {
+                crate::coding_adapter::ToolIdentity {
+                    name: "spawn_agent".to_string(),
+                    namespace: "multi_agent_v1".to_string(),
+                }
+            })
+        }
+    }
+
+    /// A namespaced tool's streamed call is stamped back to the client's `(name, namespace)`
+    /// registry key, not the hoisted wire name codex dispatched it under.
+    #[test]
+    fn responses_stamps_a_namespaced_call_with_its_declaration() {
+        let mut framing = ResponsesFraming::new(
+            "m".to_string(),
+            Some(Box::new(NamespaceStampAdapter)),
+            ResponsesParams::default(),
+        );
+        let frames = framing.on_chunk(&SemanticChunk::ToolCall(crate::model::ToolCall {
+            id: "call_1".to_string(),
+            name: "multi_agent_v1__spawn_agent".to_string(),
+            args: json!({}),
+            raw_args: "{}".to_string(),
+        }));
+        let added = frames
+            .iter()
+            .map(|frame| frame_body(frame))
+            .find(|body| body["type"] == "response.output_item.added")
+            .expect("an output_item.added frame");
+        assert_eq!(added["item"]["type"], "function_call");
+        assert_eq!(added["item"]["name"], "spawn_agent");
+        assert_eq!(added["item"]["namespace"], "multi_agent_v1");
     }
 
     #[test]
@@ -1360,17 +1478,37 @@ mod tests {
 
     /// Continues `sequence_number` from the frames already sent (shape rationale on the impl).
     #[test]
-    fn error_sse_frame_is_a_tagged_error_event_with_a_live_sequence_number() {
+    fn error_sse_frame_is_a_response_failed_envelope_with_a_live_sequence_number() {
         let mut framing = ResponsesFraming::new("m".to_string(), None, ResponsesParams::default());
         let frames_before_error = framing.on_chunk(&SemanticChunk::TextDelta("hi".into()));
-        let frame = framing.error_sse_frame(Some("model_streamed_error"), "upstream unavailable");
-        let body = frame_body(&frame);
-        assert_eq!(body["type"], "error");
-        assert_eq!(body["message"], "upstream unavailable");
-        assert_eq!(body["code"], "model_streamed_error");
+        let error_payload = framing.error_sse_frame(
+            ErrorClass::Internal,
+            Some("model_streamed_error"),
+            "upstream unavailable",
+        );
+        let terminal = error_payload
+            .split("\n\n")
+            .filter(|frame| !frame.is_empty())
+            .last()
+            .unwrap()
+            .to_string()
+            + "\n\n";
+        assert!(
+            terminal.starts_with("event: response.failed\n"),
+            "{terminal}"
+        );
+        let body = frame_body(&terminal);
+        assert_eq!(body["type"], "response.failed");
+        assert_eq!(body["response"]["status"], "failed");
+        assert_eq!(body["response"]["error"]["code"], "model_streamed_error");
+        assert_eq!(body["response"]["error"]["message"], "upstream unavailable");
         assert_eq!(
-            body["sequence_number"].as_u64().unwrap(),
-            frames_before_error.len() as u64
+            body["response"]["output"][0]["content"][0]["text"], "hi",
+            "the open item's partial text rides the failed envelope"
+        );
+        assert!(
+            body["sequence_number"].as_u64().unwrap() > frames_before_error.len() as u64,
+            "sequence continues past the close frames"
         );
     }
 }
@@ -1385,6 +1523,11 @@ mod graft_tests {
             "input": "hi",
             "temperature": 0.5,
             "store": true,
+            "presence_penalty": 0.75,
+            "frequency_penalty": 0.25,
+            "top_logprobs": 5,
+            "metadata": {"job": "x"},
+            "service_tier": "auto",
             "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}],
         }))
     }
@@ -1421,11 +1564,25 @@ mod graft_tests {
         assert_eq!(response["top_p"], 1.0, "spec default");
         assert_eq!(response["tool_choice"], "auto", "spec default");
         assert_eq!(response["truncation"], "disabled", "spec default");
-        assert_eq!(response["top_logprobs"], 0, "spec default");
-        assert_eq!(response["service_tier"], "auto", "spec default");
+        assert_eq!(
+            response["top_logprobs"], 5,
+            "param echoed, not the spec default"
+        );
+        assert_eq!(
+            response["metadata"],
+            json!({"job": "x"}),
+            "param echoed verbatim"
+        );
+        assert_eq!(response["service_tier"], "auto", "param echoed");
         assert_eq!(response["store"], true, "injected from the request");
-        assert_eq!(response["presence_penalty"], 0.0, "injected default");
-        assert_eq!(response["frequency_penalty"], 0.0, "injected default");
+        assert_eq!(
+            response["presence_penalty"], 0.75,
+            "injected from the request"
+        );
+        assert_eq!(
+            response["frequency_penalty"], 0.25,
+            "injected from the request"
+        );
         assert_eq!(response["tools"][0]["name"], "get_weather");
         assert_eq!(response["tools"][0]["strict"], true, "normalized");
         for key in dynamo_protocols::types::responses::SPEC_NULLABLE_REQUIRED_RESPONSE_FIELDS {

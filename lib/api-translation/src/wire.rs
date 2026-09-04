@@ -51,12 +51,24 @@ pub(crate) fn to_json_string<T: serde::Serialize>(value: &T) -> String {
     escaped
 }
 
-/// Process-unique suffix for a synthetic response id (monotonic; resets per process). Each protocol
-/// builds its own id format around this in [`crate::framing`].
-pub(crate) fn next_id_seq() -> u64 {
+/// Suffix for a synthetic response/item id: a per-process prefix (hex of nanos-since-epoch mixed
+/// with the pid, fixed at first use) joined to a monotonic counter, so ids stay ordered within a
+/// process and never collide across replicas or restarts — a bare counter yielded `resp_0` on every
+/// replica. Each protocol builds its own id format around this in [`crate::framing`].
+pub(crate) fn next_id_seq() -> String {
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
+    static PREFIX: OnceLock<String> = OnceLock::new();
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
+    let prefix = PREFIX.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = u64::from(std::process::id()).rotate_left(40);
+        format!("{:x}", nanos ^ pid)
+    });
+    format!("{prefix}{:x}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -87,6 +99,19 @@ mod tests {
             "a\u{2028}b\u{85}c\u{2029}d",
             "escaping must not change the decoded value"
         );
+    }
+
+    /// Ids are unique within the process (monotonic counter) and carry a process-unique prefix,
+    /// so two replicas never mint the same `resp_`/`msg_` id.
+    #[test]
+    fn id_seq_is_prefixed_and_monotonic() {
+        let a = next_id_seq();
+        let b = next_id_seq();
+        assert_ne!(a, b);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        // Same process prefix (the counter is at most a few trailing hex digits here).
+        assert!(a.len() > 8, "{a}");
+        assert_eq!(a[..8], b[..8], "{a} vs {b}");
     }
 
     #[test]

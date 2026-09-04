@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use crate::coding_adapter::CodingAdapter;
 use crate::framing::CompletedIteration;
 use crate::history::tool_result_message;
-use crate::model::{ServerToolCallStatus, ToolOutput};
+use crate::model::{BillingVerdict, ServerToolCallStatus, ToolOutput};
 use crate::model::{Termination, ToolInvocation};
 use crate::test_utils::{
     FakeMessagesSearchAdapter, FakeResponsesSearchAdapter, drive, drive_with_coding_adapter,
@@ -24,8 +24,7 @@ fn invocation(id: &str, tool: &str, content: serde_json::Value) -> ToolInvocatio
         output: ToolOutput {
             content,
             status: ServerToolCallStatus::Succeeded,
-            billable: true,
-            sku: None,
+            verdict: BillingVerdict::billable_unreported(),
         },
     }
 }
@@ -184,7 +183,13 @@ async fn cc_react_cap_finishes_as_length_with_termination_event() {
     })
     .await;
     assert_eq!(frames[0].data["choices"][0]["delta"]["role"], "assistant");
-    assert_eq!(frames[0].data["choices"][0]["finish_reason"], Value::Null);
+    // Non-terminal chunks omit `finish_reason` (protocols da7411528). Assert on key absence:
+    // `Value` indexing yields `Null` for a missing key too, so an `== Null` check pins nothing.
+    assert!(
+        frames[0].data["choices"][0].get("finish_reason").is_none(),
+        "non-terminal chunk must omit finish_reason: {}",
+        frames[0].data["choices"][0]
+    );
     let fin = &frames[1].data;
     assert_eq!(fin["choices"][0]["finish_reason"], "length");
     assert_eq!(
@@ -643,8 +648,7 @@ async fn responses_without_coding_adapter_preserves_mcp_call_behavior() {
                 output: ToolOutput {
                     content: json!("RESULT"),
                     status: ServerToolCallStatus::Succeeded,
-                    billable: true,
-                    sku: None,
+                    verdict: BillingVerdict::billable_unreported(),
                 },
             }],
             continuation_messages: &[],
@@ -684,8 +688,7 @@ async fn responses_failed_server_tool_resolves_to_failed_mcp_call() {
                 output: ToolOutput {
                     content: json!("tool execution failed: connect timeout"),
                     status: ServerToolCallStatus::Failed,
-                    billable: true,
-                    sku: None,
+                    verdict: BillingVerdict::billable_unreported(),
                 },
             }],
             continuation_messages: &[],
@@ -772,8 +775,7 @@ async fn messages_coding_adapter_streams_native_web_search_with_stable_indices()
                             r#"{"payload":{"results":[{"title":"Rust","url":"https://example.com/rust","text":"hidden"}]}}"#
                         ),
                         status: ServerToolCallStatus::Succeeded,
-                billable: true,
-                        sku: None,
+                verdict: BillingVerdict::billable_unreported(),
                     },
                 }],
                 continuation_messages: &[],
@@ -849,8 +851,7 @@ async fn messages_coding_adapter_streams_the_error_result_block_for_a_failed_cal
                     output: ToolOutput {
                         content: json!({"error": "upstream refused"}),
                         status: ServerToolCallStatus::Failed,
-                        billable: true,
-                        sku: None,
+                        verdict: BillingVerdict::billable_unreported(),
                     },
                 }],
                 continuation_messages: &[],
@@ -901,8 +902,7 @@ async fn responses_coding_adapter_emits_web_search_call_lifecycle_with_stable_id
                     output: ToolOutput {
                         content: json!({"results": ["hidden"]}),
                         status: ServerToolCallStatus::Succeeded,
-                        billable: true,
-                        sku: None,
+                        verdict: BillingVerdict::billable_unreported(),
                     },
                 }],
                 continuation_messages: &[],
@@ -1037,8 +1037,7 @@ async fn responses_coding_adapter_marks_a_failed_search_failed() {
                     output: ToolOutput {
                         content: json!("provider unavailable"),
                         status: ServerToolCallStatus::Failed,
-                        billable: true,
-                        sku: None,
+                        verdict: BillingVerdict::billable_unreported(),
                     },
                 }],
                 continuation_messages: &[],

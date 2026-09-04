@@ -23,7 +23,7 @@ use crate::baseten_response_extension::{
     BasetenFrame, BasetenResponseExtension, IterationScope, ServerToolCallOutcome,
     ServerToolCallRecord,
 };
-use crate::model::{ServerToolCall, Termination, ToolCall};
+use crate::model::{ErrorClass, ServerToolCall, Termination, ToolCall};
 use crate::util::unix_secs;
 use crate::wire::{next_id_seq, sse_frame, to_json_string};
 use crate::{CcMessage, SemanticChunk};
@@ -359,7 +359,12 @@ impl StreamFraming for CcFraming {
         frames
     }
 
-    fn error_sse_frame(&mut self, error_code: Option<&str>, message: &str) -> String {
-        openai_error_sse_frame(error_code, message)
+    fn error_sse_frame(
+        &mut self,
+        class: ErrorClass,
+        error_code: Option<&str>,
+        message: &str,
+    ) -> String {
+        openai_error_sse_frame(class, error_code, message)
     }
 }

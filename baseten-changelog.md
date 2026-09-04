@@ -2262,3 +2262,25 @@ degrade catches them. Inherited tool-bank semantics carried as-is (decided
 tool-bank's hooks (D4), and unmodeled passthrough keys are last-wins over
 the translated body. Nothing in lib/llm uses the crate yet (stack D6).
 Baseten-specific; not upstreamable.
+every key into `unsupported_fields`). Nothing in lib/llm uses the crate yet
+(stack D6). Baseten-specific; not upstreamable.
+
+Egress conformance grafts over the shared crate's tool-bank framing (stack
+D5): status-aware public error framing (OpenAI/Anthropic `error.type` by HTTP
+status class — 429 rate_limit, 4xx invalid_request/authentication/permission/
+not_found/request_too_large, 529 overloaded, 5xx api_error; Responses stream
+failures as `response.failed` with string codes plus the "cutoff by
+max_tokens" -> `response.incomplete` rescue); the Responses envelope echoes
+`metadata`, `top_logprobs`, `presence_penalty`, `frequency_penalty`,
+`service_tier` as sent (spec defaults only when omitted);
+`cache_write_tokens` in Responses usage and explicit
+`cache_creation_input_tokens: 0` in Anthropic usage; process-unique synthetic
+ids; mid-stream `error.code` parsed as number or decimal string; the
+`CodingAdapter` tool-identity seam the Responses framer resolves through;
+non-terminal chat chunks pinned to OMIT `finish_reason`; streamed
+`baseten.iterations[]` scopes released when their iteration closes
+(`StreamFraming::close_iteration`) instead of one iteration late (ported from
+tool-bank, baseten #27828); server-tool call records and outcomes carry the
+billing verdict as tool-bank ships it (`billable`, `sku`, `quantity` present
+only when the call bills; `ToolOutput.verdict` mirrors `BillingVerdict` /
+`UsageReport` as data, baseten #27386). Baseten-specific.
