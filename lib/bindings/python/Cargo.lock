@@ -908,6 +908,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "b10-dynamo-api-translation"
+version = "1.2.0"
+dependencies = [
+ "dynamo-protocols",
+ "http 1.4.0",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "backon"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2155,6 +2170,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "b10-dynamo-api-translation",
  "base64 0.22.1",
  "bincode 2.0.1",
  "bitflags 2.11.1",
@@ -2184,6 +2200,7 @@ dependencies = [
  "futures-util",
  "galil-seiferas",
  "hf-hub 0.4.3",
+ "http 1.4.0",
  "image",
  "ipnet",
  "json-five",

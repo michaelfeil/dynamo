@@ -2343,3 +2343,35 @@ logged once under `event_name = "ingress.loss"`; `adapt_request_json` emits
 the canonical per-stage line `stage.ingress` (elapsed_ms, outcome,
 error_class/status on rejection, model, losses, loss_kinds), replacing
 `predict.ingress_adapted`. Baseten-specific.
+
+## CC pivot: frontends on `b10-dynamo-api-translation` (ingress)
+
+The Messages and Responses handlers in lib/llm canonicalize through the shared
+crate (stack D6): they take the client's own JSON (`Json<Value>`, typed view
+parsed alongside — never a re-serialized struct, which had sent the system
+prompt to the model as `{"text": ...}`), call `adapt_request_json` with
+`DropServerTools`, and hand the canonical CC body to the existing wire-edge
+re-parse into the Nv wrapper (stream forcing, chat_template_kwargs
+distribution, residual-unmodeled drain into `unsupported_fields` preserved).
+Conversion rejections map to 400; the deliberate stateful-field 501s stay in
+`validate_response_unsupported_fields`. The old lib/llm Messages->CC and
+Responses->CC converters are deleted. The switchover is INGRESS-ONLY: lib/llm
+keeps its Anthropic and Responses stream converters for egress (the crate's
+framing is consumed by tool-bank); routing frontend egress through the crate is
+the named follow-up. `ResponseParams` echoes `metadata`, `top_logprobs`, and
+the penalties (projected from the raw body) so the frontend envelope agrees
+with the crate's. Template defaults: the template's `model` still applies
+before canonicalization; its `temperature` / `max_completion_tokens` apply to
+the canonical CC request AFTER the Anthropic wire validation, so an
+OpenAI-ranged template temperature no longer 400s templated `/v1/messages`
+requests for a value the client never sent. Disclosed global wire change:
+`ErrorMessage.code` serializes as a string on every OpenAI-shaped endpoint
+including `/v1/chat/completions`.
+The handlers count the crate's typed ingress losses on
+`{prefix}_b10_ingress_losses_total{model,endpoint,kind}` (the request still
+succeeds, so this counter is where a quiet degradation becomes visible) and
+the canonicalizers emit the per-stage line `stage.canonicalize` (elapsed_ms,
+outcome, model, losses, loss_kinds) around the crate's own `stage.ingress`.
+Validated live on FDE GLM-5.2 across the bx
+behavior suites and real Claude Code / Codex sessions. Baseten-specific; not
+upstreamable.

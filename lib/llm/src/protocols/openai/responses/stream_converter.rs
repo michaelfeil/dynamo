@@ -9,7 +9,6 @@
 //! `response.output_text.done` -> `response.content_part.done` ->
 //! `response.output_item.done` -> `response.completed` -> `[DONE]`
 
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::response::sse::Event;
@@ -150,7 +149,7 @@ impl ResponseStreamConverter {
             output,
             // Echo request params with spec-required defaults for omitted fields
             background: Some(false),
-            metadata: Some(HashMap::new()),
+            metadata: Some(self.params.metadata.clone().unwrap_or_default()),
             parallel_tool_calls: self.params.parallel_tool_calls.or(Some(true)),
             temperature: self.params.temperature.or(Some(1.0)),
             text: Some(self.params.text.clone().unwrap_or(ResponseTextParam {
@@ -190,7 +189,7 @@ impl ResponseStreamConverter {
             reasoning: self.params.reasoning.clone(),
             safety_identifier: self.params.safety_identifier.clone(),
             service_tier: Some(self.params.service_tier.unwrap_or(ServiceTier::Auto)),
-            top_logprobs: Some(0),
+            top_logprobs: Some(self.params.top_logprobs.unwrap_or(0)),
             usage: self.usage.clone(),
         }
     }
@@ -1808,6 +1807,34 @@ mod tests {
 
         let response = conv.make_response(Status::Completed, vec![]);
         assert_eq!(response.previous_response_id, None);
+    }
+
+    /// The terminal streaming envelope echoes `metadata`, `top_logprobs`, and
+    /// the raw-body sampling penalties exactly as the one-shot envelope does
+    /// (see `test_response_echoes_metadata_top_logprobs_and_penalties`), so the
+    /// two producers cannot report different request parameters.
+    #[test]
+    fn test_stream_terminal_envelope_echoes_metadata_top_logprobs_and_penalties() {
+        let params = ResponseParams {
+            metadata: Some(std::collections::HashMap::from([(
+                "job".to_string(),
+                "x".to_string(),
+            )])),
+            top_logprobs: Some(5),
+            presence_penalty: Some(0.75),
+            frequency_penalty: Some(0.25),
+            ..Default::default()
+        };
+        let mut conv = ResponseStreamConverter::new("test-model".into(), params);
+        let _ = conv.emit_start_events();
+        let events = conv.emit_end_events();
+        let terminal = event_data(events.last().expect("a terminal event"));
+        assert_eq!(terminal["type"], "response.completed");
+        let response = &terminal["response"];
+        assert_eq!(response["metadata"], serde_json::json!({"job": "x"}));
+        assert_eq!(response["top_logprobs"], 5);
+        assert_eq!(response["presence_penalty"], 0.75);
+        assert_eq!(response["frequency_penalty"], 0.25);
     }
 
     #[test]

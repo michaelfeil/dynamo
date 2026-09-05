@@ -104,7 +104,35 @@ pub(crate) struct ErrorMessage {
     message: String,
     #[serde(rename = "type")]
     error_type: String,
+    /// Serialized as a STRING: OpenAI's error envelope types `code` as
+    /// string-or-null, and typed SDK validators reject a JSON number
+    /// (observed as ~47 failing contract cells). Kept numeric in memory;
+    /// deserialization accepts both forms for compatibility.
+    #[serde(
+        serialize_with = "serialize_code_as_string",
+        deserialize_with = "deserialize_code_lenient"
+    )]
     code: u16,
+}
+
+fn serialize_code_as_string<S: serde::Serializer>(
+    code: &u16,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&code.to_string())
+}
+
+fn deserialize_code_lenient<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u16, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(u16),
+        Str(String),
+    }
+    match NumOrStr::deserialize(de)? {
+        NumOrStr::Num(n) => Ok(n),
+        NumOrStr::Str(s) => s.parse::<u16>().map_err(serde::de::Error::custom),
+    }
 }
 
 fn map_error_code_to_error_type(code: StatusCode) -> String {
@@ -1783,12 +1811,42 @@ pub fn validate_completion_fields_generic(
 async fn handler_responses(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut request): Json<NvCreateResponse>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    // Parse the typed view off the same JSON (kept alongside, see
+    // `ResponsesBody`). The axum `Json<T>` rejection this replaces was a 422
+    // the error middleware rewrote to 400; same status and message shape.
+    let mut request = NvCreateResponse::deserialize(&body).map_err(|err| {
+        tracing::info!(
+            status_code = StatusCode::BAD_REQUEST.as_u16(),
+            reason = "request_body_deserialization_failed",
+            message = %err,
+            unified_model_logs = true,
+            "rejecting OpenAI request during JSON deserialization"
+        );
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorMessage {
+                message: format!("Failed to deserialize the JSON body into the target type: {err}"),
+                error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                code: StatusCode::BAD_REQUEST.as_u16(),
+            }),
+        )
+    })?;
+
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
+    // Mirror the override onto the client's JSON, which is what gets
+    // canonicalized; untouched when no routing header was present.
+    if let Some(nvext) = &request.nvext
+        && let Some(fields) = body.as_object_mut()
+        && let Ok(nvext_json) = serde_json::to_value(nvext)
+        && fields.get("nvext") != Some(&nvext_json)
+    {
+        fields.insert("nvext".to_string(), nvext_json);
+    }
 
     // create the context for the request
     let context_id = get_or_create_context_id(&headers);
@@ -1807,7 +1865,7 @@ async fn handler_responses(
         endpoint: Endpoint::Responses.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(request, context_id, &headers)?;
+    let request = context_from_headers(ResponsesBody { request, body }, context_id, &headers)?;
     let context = request.context();
 
     // create the connection handles
@@ -1835,11 +1893,48 @@ async fn handler_responses(
     response
 }
 
+/// A Responses request in both forms the pipeline needs: the typed wrapper
+/// (validation, echo params, template defaults) and the JSON exactly as the
+/// client sent it, which is what the canonicalizer consumes — never a
+/// re-serialization of the typed view. Mutations (template defaults, header
+/// routing overrides) are applied to both.
+pub(crate) struct ResponsesBody {
+    pub request: NvCreateResponse,
+    pub body: serde_json::Value,
+}
+
+impl ResponsesBody {
+    fn apply_template_defaults(&mut self, template: &RequestTemplate) {
+        let inner = &mut self.request.inner;
+        let Some(fields) = self.body.as_object_mut() else {
+            return;
+        };
+        if inner.model.as_deref().unwrap_or("").is_empty() {
+            inner.model = Some(template.model.clone());
+            fields.insert("model".to_string(), serde_json::json!(template.model));
+        }
+        if inner.temperature.is_none() {
+            inner.temperature = Some(template.temperature);
+            fields.insert(
+                "temperature".to_string(),
+                serde_json::json!(template.temperature),
+            );
+        }
+        if inner.max_output_tokens.is_none() {
+            inner.max_output_tokens = Some(template.max_completion_tokens);
+            fields.insert(
+                "max_output_tokens".to_string(),
+                serde_json::json!(template.max_completion_tokens),
+            );
+        }
+    }
+}
+
 #[tracing::instrument(level = "debug", skip_all, fields(request_id = %request.id()))]
 async fn responses(
     state: Arc<service_v2::State>,
     template: Option<RequestTemplate>,
-    mut request: Context<NvCreateResponse>,
+    mut request: Context<ResponsesBody>,
     mut stream_handle: ConnectionHandle,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
@@ -1850,20 +1945,12 @@ async fn responses(
     // backend adapter compute the dynamic generation cap from its effective
     // prompt length.
     if let Some(template) = template {
-        if request.inner.model.as_deref().unwrap_or("").is_empty() {
-            request.inner.model = Some(template.model.clone());
-        }
-        if request.inner.temperature.is_none() {
-            request.inner.temperature = Some(template.temperature);
-        }
-        if request.inner.max_output_tokens.is_none() {
-            request.inner.max_output_tokens = Some(template.max_completion_tokens);
-        }
+        request.apply_template_defaults(&template);
     }
-    tracing::trace!("Received responses request: {:?}", request.inner);
+    tracing::trace!("Received responses request: {:?}", request.request.inner);
 
-    let model = request.inner.model.clone().unwrap_or_default();
-    let streaming = request.inner.stream.unwrap_or(false);
+    let model = request.request.inner.model.clone().unwrap_or_default();
+    let streaming = request.request.inner.stream.unwrap_or(false);
     let metric_model = state.manager().metric_model_for(&model).to_string();
 
     // Create http_queue_guard early - tracks time waiting to be processed
@@ -1878,62 +1965,99 @@ async fn responses(
     // Handle unsupported fields - if Some(resp) is returned by validate_unsupported_fields,
     // then a field was used that is unsupported. We will log an error message
     // and early return a 501 NOT_IMPLEMENTED status code.
-    if let Some(resp) = validate_response_unsupported_fields(&request) {
+    if let Some(resp) = validate_response_unsupported_fields(&request.request) {
         inflight_guard.mark_error(ErrorType::NotImplemented);
         return Ok(resp.into_response());
     }
 
     // Extract request parameters before into_parts() consumes the request.
-    // These are echoed back in the Response object per the OpenAI spec.
+    // These are echoed back in the Response object per the OpenAI spec. The
+    // typed view is the source for everything it models; the two sampling
+    // penalties are not on `CreateResponse`, so they are projected from the
+    // client's own JSON (kept alongside the typed view in `ResponsesBody`),
+    // otherwise the response would report 0.0 for a request that set them.
+    let typed = &request.request;
+    let raw_f32 = |name: &str| -> Option<f32> {
+        request
+            .body
+            .get(name)
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+    };
     let response_params = ResponseParams {
-        model: request.inner.model.clone(),
-        temperature: request.inner.temperature,
-        top_p: request.inner.top_p,
-        max_output_tokens: request.inner.max_output_tokens,
-        parallel_tool_calls: request.inner.parallel_tool_calls,
-        store: request.inner.store,
-        tools: request.inner.tools.clone(),
-        tool_choice: request.inner.tool_choice.clone(),
-        instructions: request.inner.instructions.clone(),
-        reasoning: request.inner.reasoning.clone(),
-        text: request.inner.text.clone(),
-        service_tier: request.inner.service_tier,
-        include: request.inner.include.clone(),
-        truncation: request.inner.truncation,
-        // Upstream `CreateResponse` doesn't carry these yet; plumbed through so
-        // the response serializer can default to 0.0 without hardcoding at the
-        // build site. When upstream (or our shadow) adds the fields, sourcing
-        // from the request becomes a one-line change here.
-        presence_penalty: None,
-        frequency_penalty: None,
+        model: typed.inner.model.clone(),
+        temperature: typed.inner.temperature,
+        top_p: typed.inner.top_p,
+        max_output_tokens: typed.inner.max_output_tokens,
+        parallel_tool_calls: typed.inner.parallel_tool_calls,
+        store: typed.inner.store,
+        tools: typed.inner.tools.clone(),
+        tool_choice: typed.inner.tool_choice.clone(),
+        instructions: typed.inner.instructions.clone(),
+        reasoning: typed.inner.reasoning.clone(),
+        text: typed.inner.text.clone(),
+        service_tier: typed.inner.service_tier,
+        include: typed.inner.include.clone(),
+        truncation: typed.inner.truncation,
+        presence_penalty: raw_f32("presence_penalty"),
+        frequency_penalty: raw_f32("frequency_penalty"),
         // Pass-through metadata — accepted on the request, echoed back on the
         // response so the caller can confirm receipt. Dynamo doesn't act on
         // these; see `validate_response_unsupported_fields` for rationale.
-        prompt_cache_key: request.inner.prompt_cache_key.clone(),
-        prompt_cache_retention: request.inner.prompt_cache_retention,
-        safety_identifier: request.inner.safety_identifier.clone(),
+        prompt_cache_key: typed.inner.prompt_cache_key.clone(),
+        prompt_cache_retention: typed.inner.prompt_cache_retention,
+        safety_identifier: typed.inner.safety_identifier.clone(),
+        metadata: typed.inner.metadata.clone(),
+        top_logprobs: typed.inner.top_logprobs,
     };
     let request_id = request.id().to_string();
-    let (orig_request, context) = request.into_parts();
+    let (
+        ResponsesBody {
+            request: orig_request,
+            body,
+        },
+        context,
+    ) = request.into_parts();
 
-    let unified_request: UnifiedRequest = orig_request.try_into().map_err(|e: anyhow::Error| {
-        tracing::error!(
-            request_id,
-            error = %e,
-            "Failed to convert NvCreateResponse to UnifiedRequest",
-        );
-        let err_response = ErrorMessage::not_implemented_error(
-            VALIDATION_PREFIX.to_string()
-                + "Failed to convert responses request: "
-                + &e.to_string(),
-        );
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-        err_response
-    })?;
+    // The canonicalizer reads the client's own JSON; the typed wrapper only
+    // supplies the response-side context.
+    let unified_request =
+        UnifiedRequest::from_responses_body(&orig_request, body).map_err(|e: anyhow::Error| {
+            tracing::error!(
+                request_id,
+                error = %e,
+                "Failed to convert NvCreateResponse to UnifiedRequest",
+            );
+            // Rejections from the shared api-translation crate
+            // (`RequestRejection::{Malformed, Unsupported}`) are both client
+            // errors (400, tool-bank semantics) — the crate documents them as
+            // such, and a blanket 501 here turned plain invalid input into
+            // "Error making prediction" (observed live on responses-contract).
+            // Deliberately-unimplemented stateful features keep their 501 via
+            // `validate_response_unsupported_fields`, which runs before this
+            // conversion.
+            let err_response = (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorMessage {
+                    message: format!("{VALIDATION_PREFIX}Failed to convert responses request: {e}"),
+                    error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                    code: StatusCode::BAD_REQUEST.as_u16(),
+                }),
+            );
+            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+            err_response
+        })?;
     // Extract the API context before consuming the UnifiedRequest — this
     // carries Responses-specific fields (previous_response_id, store, etc.)
     // that the stream converter needs for faithful response reconstruction.
     let responses_ctx = unified_request.responses_context().cloned();
+    // b10: what canonicalization dropped/degraded, by kind — the request still
+    // succeeds, so this counter is the only place the degradation is visible.
+    state.metrics_clone().b10_inc_ingress_losses(
+        &metric_model,
+        Endpoint::Responses,
+        &unified_request.losses,
+    );
     let mut chat_request = unified_request.into_inner();
 
     // Always use internal streaming for aggregation.
@@ -2083,7 +2207,11 @@ async fn responses(
 
         // Wrap with disconnect monitoring: detects client disconnects, cancels generation,
         // and defers inflight_guard.mark_ok() until the stream completes.
-        let stream = monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle, true);
+        // NO [DONE] sentinel: OpenAI's Responses SSE ends on the terminal typed
+        // event (response.completed / .incomplete / .failed) with no [DONE];
+        // emitting one makes typed clients see a trailing unparseable frame.
+        let stream =
+            monitor_for_disconnects(full_stream, ctx, inflight_guard, stream_handle, false);
 
         let mut sse_stream = Sse::new(stream);
         if let Some(keep_alive) = state.sse_keep_alive() {
@@ -2178,6 +2306,13 @@ pub fn validate_response_unsupported_fields(
     if inner.prompt.is_some() {
         return Some(ErrorMessage::not_implemented_error(
             VALIDATION_PREFIX.to_string() + "`prompt` is not supported.",
+        ));
+    }
+    // Same stateful class as `previous_response_id`: nothing here persists a
+    // conversation, so continuing one is unimplemented (501), not malformed.
+    if inner.conversation.is_some() {
+        return Some(ErrorMessage::not_implemented_error(
+            VALIDATION_PREFIX.to_string() + "`conversation` is not supported.",
         ));
     }
     // Reject directive fields that change semantics if silently dropped.
@@ -3228,13 +3363,32 @@ mod tests {
                 }),
             ),
             ("max_tool_calls", Box::new(|r| r.max_tool_calls = Some(5))),
+            // Sibling stateful field: must 501 here like `previous_response_id`,
+            // not fall through to the converter's 400.
+            (
+                "conversation",
+                Box::new(|r| {
+                    r.conversation = Some(
+                        serde_json::from_value(serde_json::json!({"id": "conv_123"}))
+                            .or_else(|_| serde_json::from_value(serde_json::json!("conv_123")))
+                            .expect("a ConversationParam shape"),
+                    )
+                }),
+            ),
         ];
 
         for (field, set_field) in unsupported_cases {
             let mut req = make_base_request();
             (set_field)(&mut req.inner);
             let result = validate_response_unsupported_fields(&req);
-            assert!(result.is_some(), "Expected rejection for `{field}`");
+            let response = result
+                .unwrap_or_else(|| panic!("Expected rejection for `{field}`"))
+                .into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "`{field}` must be a 501, not a 400"
+            );
         }
     }
 

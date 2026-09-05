@@ -4,13 +4,11 @@
 use super::*;
 use dynamo_protocols::types::ChatCompletionRequestMessage;
 
-/// Codex multi-agent `agent_message` and Responses-Lite `additional_tools` input items parse
-/// (they used to fail the whole request as unknown variants). At this layer they are SKIPPED
-/// by the converter with a debug log — the agent turn and the tool declarations do not reach
-/// the chat template. `additional_tools` gains a real consumer in the shared crate; this pins
-/// the interim behaviour so it is a stated choice, not an accident.
+/// Through the shared crate, Codex multi-agent `agent_message` and Responses-Lite
+/// `additional_tools` input items are honored: the agent message becomes an assistant turn and
+/// the declared tools reach the CC tool list (D1 only parsed and skipped them).
 #[test]
-fn agent_message_and_additional_tools_items_parse_and_are_skipped() {
+fn agent_message_and_additional_tools_items_are_honored() {
     let req: NvCreateResponse = serde_json::from_value(serde_json::json!({
         "model": "m",
         "input": [
@@ -23,17 +21,11 @@ fn agent_message_and_additional_tools_items_parse_and_are_skipped() {
     }))
     .unwrap();
     let chat_req: NvCreateChatCompletionRequest = req.try_into().unwrap();
-    assert_eq!(
-        chat_req.inner.messages.len(),
-        1,
-        "only the user turn survives"
-    );
+    assert_eq!(chat_req.inner.messages.len(), 2, "agent turn + user turn");
     assert!(matches!(
         chat_req.inner.messages[0],
-        ChatCompletionRequestMessage::User(_)
+        ChatCompletionRequestMessage::Assistant(_)
     ));
-    assert!(
-        chat_req.inner.tools.is_none(),
-        "additional_tools are not declared here"
-    );
+    let tools = serde_json::to_value(chat_req.inner.tools.as_ref().expect("declared")).unwrap();
+    assert_eq!(tools[0]["function"]["name"], "lookup");
 }

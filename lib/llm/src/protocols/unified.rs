@@ -146,6 +146,55 @@ pub struct CacheBreakpoint {
 
 /// API-agnostic request wrapper that preserves the full context from any
 /// API surface while remaining compatible with the existing preprocessor.
+/// b10: the engine-bound request plus what canonicalization could not carry
+/// through. Produced by the Messages/Responses body canonicalizers.
+#[derive(Debug)]
+pub struct Canonicalized {
+    pub request: NvCreateChatCompletionRequest,
+    pub losses: Vec<b10_dynamo_api_translation::Loss>,
+}
+
+/// b10: the canonical per-stage log line for the frontend's canonicalize
+/// stage (shared-crate ingress + wire-edge re-parse), one per request:
+/// structured, closed vocabularies only, joinable on the request-id span
+/// field. `stage.ingress` (emitted by the crate) is the inner part of this
+/// timing.
+pub fn b10_log_canonicalize_stage(
+    protocol: &'static str,
+    started: std::time::Instant,
+    result: &anyhow::Result<Canonicalized>,
+) {
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match result {
+        Ok(canonical) => tracing::info!(
+            target: "http",
+            event_name = "stage.canonicalize",
+            stage = "canonicalize",
+            protocol,
+            outcome = "ok",
+            elapsed_ms,
+            model = %canonical.request.inner.model,
+            messages = canonical.request.inner.messages.len(),
+            losses = canonical.losses.len(),
+            loss_kinds = %b10_dynamo_api_translation::loss::count_by_kind(&canonical.losses)
+                .iter()
+                .map(|(kind, n)| format!("{kind}={n}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            "request canonicalized"
+        ),
+        Err(error) => tracing::info!(
+            target: "http",
+            event_name = "stage.canonicalize",
+            stage = "canonicalize",
+            protocol,
+            outcome = "rejected",
+            elapsed_ms,
+            "request canonicalization rejected: {error}"
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UnifiedRequest {
     /// The core request in OpenAI Chat Completions format.
@@ -155,6 +204,11 @@ pub struct UnifiedRequest {
     /// Which API surface originated this request, plus API-specific fields
     /// that were dropped during conversion to `NvCreateChatCompletionRequest`.
     pub api_context: ApiContext,
+
+    /// b10: what canonicalization did not carry through (the shared crate's
+    /// typed loss record). Empty on the Chat Completions path and on a clean
+    /// request; the handler counts these by kind.
+    pub losses: Vec<b10_dynamo_api_translation::Loss>,
 }
 
 impl From<NvCreateChatCompletionRequest> for UnifiedRequest {
@@ -162,40 +216,43 @@ impl From<NvCreateChatCompletionRequest> for UnifiedRequest {
         Self {
             inner: req,
             api_context: ApiContext::ChatCompletions,
+            losses: Vec::new(),
         }
     }
 }
 
-impl TryFrom<AnthropicCreateMessageRequest> for UnifiedRequest {
-    type Error = anyhow::Error;
-
-    fn try_from(req: AnthropicCreateMessageRequest) -> Result<Self, Self::Error> {
-        // Capture API-specific fields BEFORE the lossy conversion
+impl UnifiedRequest {
+    /// Build from a Messages request: the typed struct supplies the API
+    /// context (thinking, cache breakpoints, ...); `body` — the request JSON
+    /// exactly as the client sent it — is what gets canonicalized, so the
+    /// model never sees a re-serialization of the typed projection.
+    pub fn from_anthropic_body(
+        req: &AnthropicCreateMessageRequest,
+        body: serde_json::Value,
+    ) -> anyhow::Result<Self> {
         let anthropic_ctx = AnthropicContext {
             thinking: req.thinking.clone(),
-            cache_breakpoints: extract_cache_breakpoints(&req),
-            disable_parallel_tool_use: extract_disable_parallel_tool_use(&req),
+            cache_breakpoints: extract_cache_breakpoints(req),
+            disable_parallel_tool_use: extract_disable_parallel_tool_use(req),
             metadata: req.metadata.clone(),
             service_tier: req.service_tier.clone(),
             container: req.container.clone(),
             output_config: req.output_config.clone(),
         };
-
-        // Perform the existing lossy conversion
-        let inner: NvCreateChatCompletionRequest = req.try_into()?;
-
+        let canonical = super::anthropic::types::canonicalize_anthropic_body(body)?;
         Ok(Self {
-            inner,
+            inner: canonical.request,
             api_context: ApiContext::Anthropic(anthropic_ctx),
+            losses: canonical.losses,
         })
     }
-}
 
-impl TryFrom<NvCreateResponse> for UnifiedRequest {
-    type Error = anyhow::Error;
-
-    fn try_from(req: NvCreateResponse) -> Result<Self, Self::Error> {
-        // Capture API-specific fields BEFORE the lossy conversion
+    /// Build from a Responses request; see [`Self::from_anthropic_body`] for
+    /// the typed-context / raw-body split.
+    pub fn from_responses_body(
+        req: &NvCreateResponse,
+        body: serde_json::Value,
+    ) -> anyhow::Result<Self> {
         let responses_ctx = ResponsesContext {
             previous_response_id: req.inner.previous_response_id.clone(),
             truncation: req.inner.truncation,
@@ -203,14 +260,34 @@ impl TryFrom<NvCreateResponse> for UnifiedRequest {
             include: req.inner.include.clone(),
             store: req.inner.store.unwrap_or(false),
         };
-
-        // Perform the existing lossy conversion
-        let inner: NvCreateChatCompletionRequest = req.try_into()?;
-
+        let canonical = super::openai::responses::canonicalize_responses_body(body)?;
         Ok(Self {
-            inner,
+            inner: canonical.request,
             api_context: ApiContext::Responses(responses_ctx),
+            losses: canonical.losses,
         })
+    }
+}
+
+/// Typed-struct entry for callers without the client's bytes (re-serializes
+/// the struct); the HTTP handler uses [`UnifiedRequest::from_anthropic_body`].
+impl TryFrom<AnthropicCreateMessageRequest> for UnifiedRequest {
+    type Error = anyhow::Error;
+
+    fn try_from(req: AnthropicCreateMessageRequest) -> Result<Self, Self::Error> {
+        let body = serde_json::to_value(&req)?;
+        Self::from_anthropic_body(&req, body)
+    }
+}
+
+/// Typed-struct entry for callers without the client's bytes (re-serializes
+/// the wrapper); the HTTP handler uses [`UnifiedRequest::from_responses_body`].
+impl TryFrom<NvCreateResponse> for UnifiedRequest {
+    type Error = anyhow::Error;
+
+    fn try_from(req: NvCreateResponse) -> Result<Self, Self::Error> {
+        let body = serde_json::to_value(&req)?;
+        Self::from_responses_body(&req, body)
     }
 }
 
@@ -571,9 +648,8 @@ mod tests {
         use super::super::anthropic::types::*;
 
         let req = AnthropicCreateMessageRequest {
-            unmodeled: Default::default(),
             model: "claude-sonnet-4-20250514".to_string(),
-            max_tokens: 1024,
+            max_tokens: 8192,
             messages: vec![AnthropicMessage {
                 role: AnthropicRole::User,
                 content: AnthropicMessageContent::Text {
@@ -597,6 +673,7 @@ mod tests {
             service_tier: None,
             container: None,
             output_config: None,
+            unmodeled: Default::default(),
         };
 
         let unified = UnifiedRequest::try_from(req).unwrap();
@@ -616,10 +693,12 @@ mod tests {
     #[test]
     fn test_responses_context_preserved() {
         // Construct an NvCreateResponse via JSON to satisfy all required fields
+        // CC-pivot: tool-bank semantics — `previous_response_id` is refused by the shared
+        // crate's stateless conversion (the HTTP handler 501s it even earlier), so it can no
+        // longer ride a convertible request into the context.
         let json = serde_json::json!({
             "model": "gpt-4o",
             "input": "What is the capital of France?",
-            "previous_response_id": "resp_abc123",
             "store": true,
             "truncation": "auto",
             "reasoning": {
@@ -633,7 +712,7 @@ mod tests {
         let unified = UnifiedRequest::try_from(req).unwrap();
 
         let ctx = unified.responses_context().unwrap();
-        assert_eq!(ctx.previous_response_id.as_deref(), Some("resp_abc123"));
+        assert_eq!(ctx.previous_response_id, None);
         assert!(ctx.store);
         assert!(ctx.truncation.is_some());
         assert!(ctx.reasoning.is_some());

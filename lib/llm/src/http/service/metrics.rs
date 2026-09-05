@@ -249,6 +249,10 @@ struct MetricsHandlerState {
     drt_metrics: Option<dynamo_runtime::metrics::MetricsRegistry>,
 }
 
+/// b10: metric-name suffix for the ingress-loss counter (Baseten-only; not in upstream's
+/// `frontend_service` constants).
+pub const B10_INGRESS_LOSSES_TOTAL: &str = "b10_ingress_losses_total";
+
 pub struct Metrics {
     request_started_counter: IntCounterVec,
     request_counter: IntCounterVec,
@@ -284,6 +288,8 @@ pub struct Metrics {
     model_migration_max_seq_len_exceeded_total: IntCounterVec,
     model_cancellation_total: IntCounterVec,
     model_rejection_total: IntCounterVec,
+    /// b10: what ingress canonicalization could not carry to the model, by closed `LossKind` label.
+    b10_ingress_losses_total: IntCounterVec,
 }
 
 // Inflight tracks requests from HTTP handler start until complete response is finished.
@@ -766,6 +772,16 @@ impl Metrics {
         )
         .unwrap();
 
+        // b10: Baseten-only. Labels are closed vocabularies (`kind` = LossKind::as_label).
+        let b10_ingress_losses_total = IntCounterVec::new(
+            Opts::new(
+                frontend_metric_name(B10_INGRESS_LOSSES_TOTAL),
+                "Request parts ingress canonicalization dropped, skipped, or degraded before the model saw them, by kind",
+            ),
+            &["model", "endpoint", "kind"],
+        )
+        .unwrap();
+
         Metrics {
             request_started_counter,
             request_counter,
@@ -792,6 +808,7 @@ impl Metrics {
             model_migration_max_seq_len_exceeded_total,
             model_cancellation_total,
             model_rejection_total,
+            b10_ingress_losses_total,
         }
     }
 
@@ -950,6 +967,7 @@ impl Metrics {
         ))?;
         registry.register(Box::new(self.model_cancellation_total.clone()))?;
         registry.register(Box::new(self.model_rejection_total.clone()))?;
+        registry.register(Box::new(self.b10_ingress_losses_total.clone()))?;
 
         Ok(())
     }
@@ -1066,6 +1084,27 @@ impl Metrics {
         self.model_rejection_total
             .with_label_values(&[model, &endpoint.to_string()])
             .inc();
+    }
+
+    /// b10: count ingress losses for one request, one increment per (kind, occurrences).
+    pub fn b10_inc_ingress_losses(
+        &self,
+        model: &str,
+        endpoint: Endpoint,
+        losses: &[b10_dynamo_api_translation::Loss],
+    ) {
+        for (kind, n) in b10_dynamo_api_translation::loss::count_by_kind(losses) {
+            self.b10_ingress_losses_total
+                .with_label_values(&[model, &endpoint.to_string(), kind.as_label()])
+                .inc_by(n as u64);
+        }
+    }
+
+    /// b10: current ingress-loss count for one (model, endpoint, kind).
+    pub fn b10_get_ingress_loss_count(&self, model: &str, endpoint: Endpoint, kind: &str) -> u64 {
+        self.b10_ingress_losses_total
+            .with_label_values(&[model, &endpoint.to_string(), kind])
+            .get()
     }
 
     /// Get the current rejection count for a model and endpoint
@@ -1801,6 +1840,44 @@ async fn handler_metrics(State(state): State<Arc<MetricsHandlerState>>) -> impl 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// b10: one increment per (kind, occurrences); a clean request touches no series.
+    #[test]
+    fn b10_ingress_losses_count_by_kind() {
+        use b10_dynamo_api_translation::{Loss, LossKind};
+        let metrics = Metrics::new();
+        let loss = |kind: LossKind, field: &str| Loss {
+            kind,
+            field: field.to_string(),
+            detail: "dropped".to_string(),
+        };
+        metrics.b10_inc_ingress_losses(
+            "m",
+            Endpoint::AnthropicMessages,
+            &[
+                loss(LossKind::RequestFieldDropped, "cache_control"),
+                loss(LossKind::RequestFieldDropped, "service_tier"),
+                loss(LossKind::ServerToolDropped, "tools[0]"),
+            ],
+        );
+        metrics.b10_inc_ingress_losses("m", Endpoint::Responses, &[]);
+        let count = |endpoint: Endpoint, kind: LossKind| {
+            metrics.b10_get_ingress_loss_count("m", endpoint, kind.as_label())
+        };
+        assert_eq!(
+            count(Endpoint::AnthropicMessages, LossKind::RequestFieldDropped),
+            2
+        );
+        assert_eq!(
+            count(Endpoint::AnthropicMessages, LossKind::ServerToolDropped),
+            1
+        );
+        assert_eq!(
+            count(Endpoint::AnthropicMessages, LossKind::ToolChoiceDegraded),
+            0
+        );
+        assert_eq!(count(Endpoint::Responses, LossKind::RequestFieldDropped), 0);
+    }
 
     #[test]
     fn test_round_to_sig_figs() {

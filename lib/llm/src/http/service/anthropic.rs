@@ -7,6 +7,7 @@
 //! chat completions, processed by the existing engine, and responses/streams
 //! are converted back to Anthropic format.
 
+use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use axum::{
 use dynamo_runtime::config::{env_is_truthy, environment_names::llm as env_llm};
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context, context::stamp_request_start};
 use futures::{StreamExt, stream};
+use serde::Deserialize;
 use tracing::Instrument;
 
 use super::{
@@ -142,12 +144,42 @@ async fn anthropic_error_middleware(request: Request<Body>, next: Next) -> Respo
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// A Messages request in both forms the pipeline needs: the typed struct
+/// (validation, metrics, template defaults, the response converter's
+/// context) and the JSON exactly as the client sent it, which is what the
+/// canonicalizer consumes. The typed struct is a lossy projection (system
+/// blocks joined, tool definitions typed), so the model-bound body must come
+/// from `body`, never from re-serializing `request`. Any mutation applied to
+/// one (template defaults, preamble strip) is applied to both.
+pub(crate) struct AnthropicMessagesBody {
+    pub request: AnthropicCreateMessageRequest,
+    pub body: serde_json::Value,
+}
+
 /// Top-level HTTP handler for POST /v1/messages.
 async fn handler_anthropic_messages(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(request): Json<AnthropicCreateMessageRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, Response> {
+    // Parse the typed view off the same JSON (kept alongside, see
+    // `AnthropicMessagesBody`). The axum `Json<T>` rejection this replaces
+    // was a 422 the error middleware rewrote to 400; same status and message
+    // shape here.
+    let request = AnthropicCreateMessageRequest::deserialize(&body).map_err(|err| {
+        tracing::info!(
+            status_code = StatusCode::BAD_REQUEST.as_u16(),
+            reason = "request_body_deserialization_failed",
+            message = %err,
+            unified_model_logs = true,
+            "rejecting Anthropic request during JSON deserialization"
+        );
+        anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("Failed to deserialize the JSON body into the target type: {err}"),
+        )
+    })?;
     // Validate required fields
     if request.messages.is_empty() {
         return Err(anthropic_error(
@@ -206,7 +238,11 @@ async fn handler_anthropic_messages(
         .and_then(|metadata| metadata.get("user_id"))
         .and_then(|value| value.as_str())
         .map(str::to_owned);
-    let mut request = Context::with_id_and_metadata(request, context_id, metadata);
+    let mut request = Context::with_id_and_metadata(
+        AnthropicMessagesBody { request, body },
+        context_id,
+        metadata,
+    );
     if let Some(session_id) = baseten_session_affinity_from_request(&headers, user_id.as_deref()) {
         insert_session_affinity(&mut request, session_id);
     }
@@ -240,36 +276,35 @@ async fn handler_anthropic_messages(
 async fn anthropic_messages(
     state: Arc<service_v2::State>,
     template: Option<RequestTemplate>,
-    mut request: Context<AnthropicCreateMessageRequest>,
+    mut request: Context<AnthropicMessagesBody>,
     mut stream_handle: ConnectionHandle,
 ) -> Result<Response, Response> {
-    let streaming = request.stream;
+    let streaming = request.request.stream;
     let request_id = request.id().to_string();
 
-    // Apply template defaults before capturing model (must happen first so
-    // engine lookup and metrics use the resolved model name).
-    if let Some(template) = template {
-        if request.model.is_empty() {
-            request.model = template.model.clone();
-        }
-        if request.temperature.is_none() {
-            request.temperature = Some(template.temperature);
-        }
-        if request.max_tokens == 0 {
-            request.max_tokens = template.max_completion_tokens;
-        }
+    // The template's model applies before capturing it (engine lookup and metrics use the
+    // resolved name). Its sampling defaults are applied AFTER canonicalization, onto the CC
+    // request: templates are trusted operator config, and injecting an OpenAI-ranged template
+    // temperature into the Anthropic body would fail the wire's own 0..1 validation for a value
+    // the client never sent.
+    if let Some(template) = template.as_ref() {
+        apply_template_model(&mut request, template);
     }
 
     // Strip Claude Code billing preamble from system prompt if enabled
     if env_is_truthy(env_llm::DYN_STRIP_ANTHROPIC_PREAMBLE) {
-        strip_billing_preamble(&mut request.system);
+        strip_billing_preamble(&mut request.request.system);
+        strip_billing_preamble_json(request.body.get_mut("system"));
     }
 
-    let model = request.model.clone();
+    let model = request.request.model.clone();
     let metric_model = state.manager().metric_model_for(&model).to_string();
     let http_queue_guard = state.metrics_clone().create_http_queue_guard(&metric_model);
 
-    tracing::trace!("Received Anthropic messages request: {:?}", &*request);
+    tracing::trace!(
+        "Received Anthropic messages request: {:?}",
+        &request.request
+    );
 
     // Look up engine and parsing options early so we know whether a reasoning
     // parser is configured before converting the request.
@@ -284,7 +319,13 @@ async fn anthropic_messages(
             )
         })?;
 
-    let (orig_request, context) = request.into_parts();
+    let (
+        AnthropicMessagesBody {
+            request: orig_request,
+            body,
+        },
+        context,
+    ) = request.into_parts();
     let model_for_resp = orig_request.model.clone();
 
     // Check if the Anthropic request explicitly disabled thinking.
@@ -293,27 +334,40 @@ async fn anthropic_messages(
         .as_ref()
         .is_some_and(|t| t.thinking_type == "disabled");
 
-    // Convert Anthropic request -> UnifiedRequest -> Chat Completion request
-    let unified_request: UnifiedRequest = orig_request.try_into().map_err(|e: anyhow::Error| {
-        // The error goes in the message body, not only a structured field:
-        // the customer-log pipeline stores just the message, and structured
-        // fields are dropped.
-        tracing::error!(
-            request_id,
-            "Failed to convert AnthropicCreateMessageRequest to UnifiedRequest: {e}",
-        );
-        anthropic_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            &format!("Failed to convert request: {}", e),
-        )
-    })?;
+    // Convert Anthropic request -> UnifiedRequest -> Chat Completion request.
+    // The canonicalizer reads the client's own JSON; the typed struct only
+    // supplies the response-side context.
+    let unified_request =
+        UnifiedRequest::from_anthropic_body(&orig_request, body).map_err(|e: anyhow::Error| {
+            // The error goes in the message body, not only a structured field:
+            // the customer-log pipeline stores just the message, and structured
+            // fields are dropped.
+            tracing::error!(
+                request_id,
+                "Failed to convert AnthropicCreateMessageRequest to UnifiedRequest: {e}",
+            );
+            anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Failed to convert request: {}", e),
+            )
+        })?;
 
     // Extract the API context before consuming the UnifiedRequest — this
     // carries Anthropic-specific fields (thinking config, cache breakpoints,
     // etc.) that the stream converter needs for faithful response reconstruction.
     let anthropic_ctx = unified_request.anthropic_context().cloned();
+    // b10: what canonicalization dropped/degraded, by kind — the request still
+    // succeeds, so this counter is the only place the degradation is visible.
+    state.metrics_clone().b10_inc_ingress_losses(
+        &metric_model,
+        Endpoint::AnthropicMessages,
+        &unified_request.losses,
+    );
     let mut chat_request = unified_request.into_inner();
+    if let Some(template) = template.as_ref() {
+        apply_template_sampling_defaults(&mut chat_request, template);
+    }
 
     // When a reasoning parser is configured and the client hasn't explicitly
     // disabled thinking, assume the model's chat template will inject `<think>`.
@@ -764,13 +818,66 @@ async fn get_model(
 /// to every system prompt. This varies per session and per release, wasting tokens
 /// and preventing prompt prefix caching on the target model.
 fn strip_billing_preamble(system: &mut Option<SystemContent>) {
-    if let Some(content) = system {
-        let trimmed = content.text.trim_start();
-        if trimmed.starts_with("x-anthropic-billing-header:")
-            && let Some(newline_pos) = trimmed.find('\n')
-        {
-            content.text = trimmed[newline_pos + 1..].to_string();
+    if let Some(content) = system
+        && let Some(stripped) = strip_billing_preamble_text(&content.text)
+    {
+        content.text = stripped;
+    }
+}
+
+/// The text with its leading `x-anthropic-billing-header:` line removed, or
+/// `None` when there is no preamble to strip.
+fn strip_billing_preamble_text(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("x-anthropic-billing-header:") {
+        return None;
+    }
+    let newline_pos = trimmed.find('\n')?;
+    Some(trimmed[newline_pos + 1..].to_string())
+}
+
+/// Same strip over the client's own `system` JSON (string, or the first text
+/// block of an array) so the canonicalized body matches the typed view.
+fn strip_billing_preamble_json(system: Option<&mut serde_json::Value>) {
+    let text_slot = match system {
+        Some(serde_json::Value::String(_)) => system,
+        Some(serde_json::Value::Array(blocks)) => {
+            blocks.first_mut().and_then(|b| b.get_mut("text"))
         }
+        _ => None,
+    };
+    if let Some(slot) = text_slot
+        && let Some(text) = slot.as_str()
+        && let Some(stripped) = strip_billing_preamble_text(text)
+    {
+        *slot = serde_json::Value::String(stripped);
+    }
+}
+
+/// Template defaults, applied to the typed view and the client's JSON alike
+/// so the canonicalized body carries them.
+fn apply_template_model(request: &mut AnthropicMessagesBody, template: &RequestTemplate) {
+    let AnthropicMessagesBody { request, body } = request;
+    let Some(fields) = body.as_object_mut() else {
+        return;
+    };
+    if request.model.is_empty() {
+        request.model = template.model.clone();
+        fields.insert("model".to_string(), serde_json::json!(template.model));
+    }
+}
+
+/// Template sampling defaults land on the canonical CC request, after the Anthropic wire
+/// validation ran on the client's own fields: only values the client omitted are filled in.
+fn apply_template_sampling_defaults(
+    chat_request: &mut NvCreateChatCompletionRequest,
+    template: &RequestTemplate,
+) {
+    if chat_request.inner.temperature.is_none() {
+        chat_request.inner.temperature = Some(template.temperature);
+    }
+    if chat_request.inner.max_completion_tokens.is_none() {
+        chat_request.inner.max_completion_tokens = Some(template.max_completion_tokens);
     }
 }
 
@@ -815,4 +922,26 @@ fn anthropic_error(status: StatusCode, error_type: &str, message: &str) -> Respo
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod template_default_tests {
+    use super::*;
+
+    #[test]
+    fn template_sampling_defaults_fill_only_omitted_cc_fields() {
+        let template = RequestTemplate {
+            model: "m".into(),
+            temperature: 1.2,
+            max_completion_tokens: 512,
+        };
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": 0.3
+            }))
+            .unwrap();
+        apply_template_sampling_defaults(&mut request, &template);
+        assert_eq!(request.inner.temperature, Some(0.3));
+        assert_eq!(request.inner.max_completion_tokens, Some(512));
+    }
 }

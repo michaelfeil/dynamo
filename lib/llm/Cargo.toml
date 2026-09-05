@@ -70,6 +70,7 @@ dynamo-tokens = { workspace = true }
 aho-corasick = "1.1"
 anyhow = { workspace = true }
 dynamo-protocols = { workspace = true }
+b10-dynamo-api-translation = { workspace = true }
 dynamo-parsers = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
@@ -140,6 +141,9 @@ clap = { version = "4.5.49", features = ["derive"], optional = true }
 indicatif = { version = "0.18.0", optional = true }
 
 # http-service
+# `http` is the shared api-translation crate's ingress signature type (HeaderMap);
+# same major as axum's re-export.
+http = "1"
 axum = { workspace = true }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { workspace = true }
