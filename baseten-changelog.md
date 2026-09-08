@@ -1490,6 +1490,13 @@ both router guards alive through the returned stream. The Python extension
 only converts serialized worker maps, exposes admission metadata, and adapts
 the response stream.
 
+Preserve error annotations before filtering metadata-only messages (#768):
+prefill failures retain their original error, bootstrap failures are forwarded
+without treating them as successful transfer, and decode errors terminate the
+stream after one error item. This restores the legacy Python adapter's
+error-before-data handling. Cancellation shielding and bootstrap EOF behavior
+remain unchanged; keep the error/cleanup regression coverage when replaying.
+
 Aggregate routing, worker setup, and streaming follow parent cancellation.
 Prefill-first follows parent cancellation through the prefill response, shields
 the prefill-to-decode routing and connection handoff, then links the decode

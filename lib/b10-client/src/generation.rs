@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use dynamo_kv_router::protocols::RoutingConstraints;
 use dynamo_runtime::pipeline::{EngineStream, ResponseStream};
 use dynamo_runtime::protocols::annotated::Annotated;
+use dynamo_runtime::protocols::maybe_error::MaybeError;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use rmpv::Value;
@@ -390,6 +391,10 @@ impl GenerationCoordinator {
             yield Annotated::from_data(prefill_response);
 
             match next_visible_annotated(&mut decode_stream).await {
+                Some(error) if error.is_error() => {
+                    yield error;
+                    return;
+                }
                 Some(_bootstrap) => {
                     // Decode readiness proves KV transfer completed. The two
                     // guard operations are idempotent for both mark timings.
@@ -405,8 +410,12 @@ impl GenerationCoordinator {
             }
 
             while let Some(item) = decode_stream.next().await {
-                if item.data.is_some() {
+                let is_error = item.is_error();
+                if is_error || item.data.is_some() {
                     yield item;
+                }
+                if is_error {
+                    return;
                 }
             }
         };
@@ -495,6 +504,11 @@ async fn next_visible_data(
     name: &str,
 ) -> Result<Value> {
     while let Some(item) = stream.next().await {
+        // Python's AsyncResponseStream checked errors before exposing data to
+        // the legacy coordinator. Preserve the original failure at this boundary.
+        if let Some(error) = item.err() {
+            return Err(error.into());
+        }
         if let Some(data) = item.data {
             return Ok(data);
         }
@@ -506,7 +520,7 @@ async fn next_visible_annotated(
     stream: &mut EngineStream<Annotated<Value>>,
 ) -> Option<Annotated<Value>> {
     while let Some(item) = stream.next().await {
-        if item.data.is_some() {
+        if item.is_error() || item.data.is_some() {
             return Some(item);
         }
     }

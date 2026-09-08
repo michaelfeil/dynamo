@@ -93,7 +93,7 @@ struct RouterGuardClientForTesting {
     available_instance_ids: Mutex<Vec<u64>>,
     instance_ids: Mutex<Vec<u64>>,
     responses: Mutex<VecDeque<Result<RsRouterResponse, String>>>,
-    stream_chunks_queue: Mutex<Option<VecDeque<Vec<rmpv::Value>>>>,
+    stream_chunks_queue: Mutex<Option<VecDeque<Vec<RsAnnotated<rmpv::Value>>>>>,
     respect_cancel: Mutex<CancelRespect>,
     auto_remove_on_error: AtomicBool,
     stream_items_polled: Arc<AtomicUsize>,
@@ -154,6 +154,15 @@ impl RouterGuardClientForTesting {
         *self.mark_free_callback_delay.lock().unwrap() = delay;
     }
     fn set_stream_chunks(&self, chunks: Vec<Vec<rmpv::Value>>) {
+        self.set_annotated_stream_chunks(
+            chunks
+                .into_iter()
+                .map(|items| items.into_iter().map(RsAnnotated::from_data).collect())
+                .collect(),
+        );
+    }
+
+    fn set_annotated_stream_chunks(&self, chunks: Vec<Vec<RsAnnotated<rmpv::Value>>>) {
         *self.stream_chunks_queue.lock().unwrap() = Some(chunks.into());
     }
 
@@ -314,11 +323,9 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         if let Some(chunks_queue) = self.stream_chunks_queue.lock().unwrap().as_mut()
             && let Some(chunks) = chunks_queue.pop_front()
         {
-            let annotated: Vec<RsAnnotated<rmpv::Value>> =
-                chunks.into_iter().map(RsAnnotated::from_data).collect();
             let ctx_for_filter = context.clone();
             let stream_items_polled = self.stream_items_polled.clone();
-            let stream = stream::iter(annotated)
+            let stream = stream::iter(chunks)
                 .inspect(move |_| {
                     stream_items_polled.fetch_add(1, Ordering::AcqRel);
                 })
@@ -3114,6 +3121,161 @@ async fn generation_transport(
     .unwrap();
     let client = Arc::new(crate::RemoteGenerationCoordinator::new(server.endpoint_url()).unwrap());
     (client, Some(server))
+}
+
+#[tokio::test]
+async fn generation_coordinator_preserves_prefill_error() {
+    generation_error_scenario("prefill").await;
+}
+
+#[tokio::test]
+async fn generation_coordinator_preserves_bootstrap_error() {
+    generation_error_scenario("bootstrap").await;
+}
+
+#[tokio::test]
+async fn generation_coordinator_preserves_decode_error() {
+    generation_error_scenario("decode").await;
+}
+
+#[tokio::test]
+async fn generation_coordinator_preserves_eof_cancellation_and_cleanup() {
+    for phase in ["bootstrap_eof", "bootstrap_stop", "stop", "drop"] {
+        generation_error_scenario(phase).await;
+    }
+}
+
+async fn generation_error_scenario(phase: &str) {
+    use dynamo_runtime::error::{DynamoError, ErrorType};
+    use dynamo_runtime::protocols::maybe_error::MaybeError;
+
+    let prefill_router =
+        RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+    let decode_router =
+        RouterGuardClientForTesting::new(vec![8], vec![8], vec![route_response_new(2)]);
+    let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+    let error: RsAnnotated<rmpv::Value> = RsAnnotated::from_err(
+        DynamoError::builder()
+            .error_type(ErrorType::ResponseTimeout)
+            .message("injected backend inactivity timeout")
+            .build(),
+    );
+    let metadata = RsAnnotated::from_annotation("metrics", &"ignored").unwrap();
+    let handoff = RsAnnotated::from_data(jv!({"outputs": [{
+        "finish_reason": "not_finished",
+        "disaggregated_params": {"request_type": "context_only", "ctx_request_id": 9}
+    }]}));
+    prefill_worker.set_annotated_stream_chunks(vec![if phase == "prefill" {
+        vec![metadata.clone(), error.clone(), handoff]
+    } else {
+        vec![handoff]
+    }]);
+    let bootstrap = RsAnnotated::from_data(jv!({"bootstrap": true}));
+    let token = RsAnnotated::from_data(jv!({"token": 42}));
+    decode_worker.set_annotated_stream_chunks(vec![match phase {
+        "bootstrap" => vec![metadata.clone(), error.clone(), bootstrap, token],
+        "bootstrap_eof" => vec![metadata.clone()],
+        _ => vec![
+            bootstrap,
+            metadata,
+            token,
+            error.clone(),
+            RsAnnotated::from_data(jv!({"must_not_be_seen": true})),
+        ],
+    }]);
+    // Failed bootstrap must not signal successful transfer completion.
+    let coordinator = GenerationCoordinator::new(
+        Arc::new(
+            RouterWorkerCoordinator::new(prefill_router.clone(), prefill_worker, TEST_BLOCK_SIZE)
+                .unwrap(),
+        ),
+        Some(Arc::new(
+            RouterWorkerCoordinator::new(
+                decode_router.clone(),
+                decode_worker.clone(),
+                TEST_BLOCK_SIZE,
+            )
+            .unwrap(),
+        )),
+        DisaggregationStrategy::PrefillFirst,
+        PrefillMarkTiming::AfterTransfer,
+        7,
+    )
+    .unwrap();
+    let context = build_test_context(phase);
+    let outcome = coordinator
+        .generate(
+            context.clone(),
+            GenerationRequest {
+                routing_request: RouterRequestNew::default(),
+                primary_worker_request: make_worker_request(),
+                decode_worker_request: Some(make_worker_request()),
+            },
+            GenerationOptions::default(),
+        )
+        .await;
+    if phase == "prefill" {
+        let err = outcome.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected backend inactivity timeout")
+        );
+        assert!(err.downcast_ref::<DynamoError>().is_some());
+        assert_eq!(decode_worker.method_call_count("generate"), 0);
+    } else {
+        let GenerationOutcome::Connected(mut generated) = outcome.unwrap() else {
+            panic!("expected connected");
+        };
+        assert!(generated.stream.next().await.unwrap().data.is_some());
+        if phase == "bootstrap_stop" {
+            // Preserve the legacy helper's EOF failure before readiness;
+            // changing this cancellation policy is a separate concern.
+            context.inner().stop_generating();
+        }
+        if phase == "stop" {
+            // Stop after successful bootstrap/data. The underlying worker
+            // stream closes cleanly, and no new EOF error should be invented.
+            assert!(generated.stream.next().await.unwrap().data.is_some());
+            context.inner().stop_generating();
+            assert!(generated.stream.next().await.is_none());
+        } else if phase != "drop" {
+            let remaining = generated.stream.by_ref().collect::<Vec<_>>().await;
+            assert_eq!(remaining.len(), if phase == "decode" { 2 } else { 1 });
+            let observed = remaining.last().unwrap();
+            assert!(observed.is_error());
+            if phase == "bootstrap_eof" || phase == "bootstrap_stop" {
+                assert!(
+                    observed
+                        .clone()
+                        .ok()
+                        .unwrap_err()
+                        .contains("decode bootstrap stream ended")
+                );
+            } else {
+                assert_eq!(
+                    serde_json::to_value(observed).unwrap(),
+                    serde_json::to_value(&error).unwrap()
+                );
+            }
+        }
+        drop(generated);
+        wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2)).await;
+        assert_eq!(decode_router.method_call_count("mark_free"), 1);
+    }
+    wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(prefill_router.method_call_count("mark_free"), 1);
+    if [
+        "prefill",
+        "bootstrap",
+        "bootstrap_eof",
+        "bootstrap_stop",
+        "drop",
+    ]
+    .contains(&phase)
+    {
+        assert_eq!(prefill_router.method_call_count("mark_prefill"), 0);
+    }
 }
 
 #[tokio::test]
