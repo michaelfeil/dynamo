@@ -2567,16 +2567,10 @@ mod local_indexer_tests {
         assert!(matches!(result, Err(KvRouterError::IndexerOffline)));
         assert_eq!(local_indexer.buffer_len(), 0);
 
-        match local_indexer.get_events_in_id_range(None, None).await {
-            WorkerKvQueryResponse::TreeDump {
-                events,
-                last_event_id,
-            } => {
-                assert!(events.is_empty());
-                assert_eq!(last_event_id, 0);
-            }
-            other => panic!("Expected TreeDump, got: {other:?}"),
-        }
+        assert!(matches!(
+            local_indexer.get_events_in_id_range(None, None).await,
+            WorkerKvQueryResponse::Error(_)
+        ));
     }
 
     #[tokio::test]

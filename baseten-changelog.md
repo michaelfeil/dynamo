@@ -636,6 +636,19 @@ worker-query KV recovery to complete before registering the serving `generate`
 endpoint. This is intentionally scoped to the local-indexer/event-plane path;
 the deprecated JetStream recovery path is left unchanged.
 
+Worker recovery snapshots include device, host-pinned, and disk cache state.
+Failed tier dumps return errors instead of caching incomplete snapshots.
+Lower-tier removal batches apply valid removals even when other hashes are
+missing or duplicated. Preserve these invariants when rebasing (#758).
+
+Worker-query recovery selectively ports two behaviors from upstream
+[ai-dynamo/dynamo#13053](https://github.com/ai-dynamo/dynamo/pull/13053): explicit
+`Error` responses use the existing bounded exponential-backoff retries, preserving
+indexed state and the cursor on exhaustion; regression coverage verifies that
+ahead-of-watermark snapshots converge with duplicate live-tail replay and removals
+across device, host-pinned, and disk tiers. No residency-domain or wire changes
+are required for these ports.
+
 The router bookkeeping protocol now accepts a `request_id` payload override for
 `MarkPrefill`, matching the existing `MarkFree` behavior when the transport
 context id cannot be used. `PotentialLoads` responses also report the current

@@ -996,6 +996,11 @@ impl WorkerQueryClient {
                 .query_worker(worker_id, dp_rank, target, start_event_id, end_event_id)
                 .await
             {
+                // Legacy workers report non-authoritative snapshot failures through Error.
+                // Retry these just like transport failures; never admit them as empty dumps.
+                Ok(WorkerKvQueryResponse::Error(message)) => {
+                    last_error = Some(anyhow::anyhow!(message));
+                }
                 Ok(resp) => {
                     if attempt > 0 {
                         tracing::info!(
@@ -1006,15 +1011,15 @@ impl WorkerQueryClient {
                 }
                 Err(e) => {
                     last_error = Some(e);
-                    if attempt < RECOVERY_MAX_RETRIES - 1 {
-                        let backoff_ms = RECOVERY_INITIAL_BACKOFF_MS * 2_u64.pow(attempt);
-                        tracing::warn!(
-                            "Worker {worker_id} dp_rank {dp_rank} query failed on attempt {attempt}, \
-                             retrying after {backoff_ms}ms"
-                        );
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    }
                 }
+            }
+            if attempt < RECOVERY_MAX_RETRIES - 1 {
+                let backoff_ms = RECOVERY_INITIAL_BACKOFF_MS * 2_u64.pow(attempt);
+                tracing::warn!(
+                    "Worker {worker_id} dp_rank {dp_rank} query failed on attempt {attempt}, \
+                     retrying after {backoff_ms}ms"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
         }
 
@@ -2005,11 +2010,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_failed_recovery_clears_pending_without_applying_buffered_events() {
         let (client, transport, kv_indexer) =
             make_test_client("failed-recovery-clears-pending").await;
         let key = (1, 0);
+
+        kv_indexer.apply_event(make_store_event(1, 0, 10)).await;
+        kv_indexer.flush().await;
 
         {
             let worker_state = client.get_or_create_worker_state(key.0);
@@ -2027,11 +2035,30 @@ mod tests {
                 response: Ok(WorkerKvQueryResponse::Error("query failed".to_string())),
             },
         );
+        for _ in 1..RECOVERY_MAX_RETRIES {
+            transport.push_action(
+                key,
+                MockQueryAction {
+                    started: None,
+                    release: None,
+                    response: Ok(WorkerKvQueryResponse::Error("query failed".to_string())),
+                },
+            );
+        }
 
         client.handle_live_event(make_store_event(1, 0, 15)).await;
         started.notified().await;
         client.handle_live_event(make_store_event(1, 0, 16)).await;
         release.notify_waiters();
+
+        for attempt in 0..RECOVERY_MAX_RETRIES - 1 {
+            wait_for(|| transport.call_count() > attempt as usize).await;
+            // Sleep yields to the recovery task before moving past its backoff.
+            tokio::time::sleep(Duration::from_millis(
+                RECOVERY_INITIAL_BACKOFF_MS * 2_u64.pow(attempt) + 10,
+            ))
+            .await;
+        }
 
         wait_for(|| {
             rank_state_matches(&client, key, |state| {
@@ -2044,8 +2071,11 @@ mod tests {
 
         kv_indexer.flush().await;
         let events = kv_indexer.dump_events().await.unwrap();
-        assert!(events.is_empty());
-        assert_eq!(transport.calls(), vec![(key, Some(11), None)]);
+        assert_eq!(stored_block_hashes(&events), vec![10]);
+        assert_eq!(
+            transport.calls(),
+            vec![(key, Some(11), None); RECOVERY_MAX_RETRIES as usize]
+        );
     }
 
     #[tokio::test]
@@ -2137,6 +2167,111 @@ mod tests {
         let events = kv_indexer.dump_events().await.unwrap();
         assert_eq!(stored_block_hashes(&events), vec![0, 11]);
         assert_eq!(transport.call_count(), 1);
+    }
+
+    // Ported from ai-dynamo/dynamo#13053: a dump can contain mutations newer
+    // than its watermark, so recovery must tolerate duplicate tail replay.
+    #[tokio::test]
+    async fn ahead_tree_dump_and_duplicate_tail_replay_converge() {
+        use dynamo_kv_router::protocols::{KvCacheRemoveData, StorageTier};
+
+        for tier in [
+            StorageTier::Device,
+            StorageTier::HostPinned,
+            StorageTier::Disk,
+        ] {
+            let (client, transport, _) = make_test_client(&format!("ahead-dump-{tier:?}")).await;
+            let key = (1, 0);
+            let store = |id| {
+                let mut event = make_store_event(1, 0, id);
+                event.storage_tier = tier;
+                event
+            };
+            let remove = RouterEvent::with_storage_tier(
+                1,
+                KvCacheEvent {
+                    event_id: 4,
+                    dp_rank: 0,
+                    data: KvCacheEventData::Removed(KvCacheRemoveData {
+                        block_hashes: vec![ExternalSequenceBlockHash(2)],
+                    }),
+                },
+                tier,
+            );
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            transport.push_action(
+                key,
+                MockQueryAction {
+                    started: Some(started.clone()),
+                    release: Some(release.clone()),
+                    // Captured after removal 4, but with the earlier watermark 1.
+                    response: Ok(WorkerKvQueryResponse::TreeDump {
+                        events: vec![store(1), store(3)],
+                        last_event_id: 1,
+                    }),
+                },
+            );
+            client.handle_discovered_worker(1, 0).await;
+            started.notified().await;
+            for event in [store(2), store(3), remove, store(5)] {
+                client.handle_live_event(event).await;
+            }
+            release.notify_waiters();
+            wait_for(|| {
+                rank_state_matches(&client, key, |state| {
+                    state.last_applied_id() == Some(5) && !state.recovery_inflight
+                })
+            })
+            .await;
+
+            let events = if tier == StorageTier::Device {
+                client.indexer.dump_events().await.unwrap()
+            } else {
+                let Indexer::KvIndexer { lower_tier, .. } = &client.indexer else {
+                    unreachable!();
+                };
+                let mut events = Vec::new();
+                for indexer in lower_tier.all() {
+                    events.extend(indexer.dump_events().await.unwrap());
+                }
+                events
+            };
+            assert_eq!(stored_block_hashes(&events), vec![1, 3, 5], "{tier:?}");
+            assert_eq!(transport.call_count(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_dump_failure_is_retried_before_success() {
+        let (client, transport, kv_indexer) = make_test_client("dump-failure-retry").await;
+        let key = (1, 0);
+        for response in [
+            WorkerKvQueryResponse::Error("snapshot temporarily unavailable".to_string()),
+            WorkerKvQueryResponse::TreeDump {
+                events: vec![make_store_event(1, 0, 7)],
+                last_event_id: 7,
+            },
+        ] {
+            transport.push_action(
+                key,
+                MockQueryAction {
+                    started: None,
+                    release: None,
+                    response: Ok(response),
+                },
+            );
+        }
+        client.handle_discovered_worker(1, 0).await;
+        wait_for(|| {
+            rank_state_matches(&client, key, |state| {
+                state.last_applied_id() == Some(7) && !state.recovery_inflight
+            })
+        })
+        .await;
+        assert_eq!(transport.calls(), vec![(key, None, None); 2]);
+        let events = kv_indexer.dump_events().await.unwrap();
+        assert_eq!(stored_block_hashes(&events), vec![7]);
     }
 
     #[tokio::test]
