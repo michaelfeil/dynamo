@@ -420,6 +420,12 @@ ERROR. The `PUBLISH_FINAL` error counter stays unconditional for dashboard
 continuity. Observed at ~1/min on tool-call-heavy Kimi serving as pure log
 noise; likely upstreamable.
 
+The TCP request-plane writer now discards frames whose caller already abandoned
+the request and dropped its response receiver, instead of delivering them
+minutes later to a caller that no longer exists (basetenlabs/dynamo#763). Late
+delivery made the KV router book scheduler state that nothing freed until the
+600 s stale-request reaper.
+
 ## PATCH-003: NATS, JetStream, and Discovery Compatibility
 
 Status: `redesign`

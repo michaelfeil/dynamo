@@ -462,6 +462,14 @@ impl TcpConnection {
                 encoded_batch.clear();
                 response_batch.clear();
                 while let Some(req) = submit_queue.pop() {
+                    // Caller abandoned this request and dropped the receiver, so
+                    // nothing will read the response. Sending it anyway makes the
+                    // server hold state for a request no one owns. Drop the frame
+                    // with its sender so the reader's response ordering still
+                    // matches what was written.
+                    if req.response_tx.is_closed() {
+                        continue;
+                    }
                     encoded_batch.push(req.encoded_data);
                     response_batch.push(req.response_tx);
                 }
@@ -632,6 +640,13 @@ impl TcpConnection {
     }
 
     /// Send a request via lock-free SegQueue push (~20-40ns)
+    ///
+    /// Dropping this future closes the response receiver, and the writer then
+    /// discards the frame if it has not been written yet -- what you want for a
+    /// timeout or a cancellation, but it also means dropping the future is NOT
+    /// fire-and-forget: the request may never be sent. Fire-and-forget has to
+    /// keep the future alive until the frame is on the wire, e.g. by driving it
+    /// on a `tokio::spawn` task rather than abandoning it here.
     async fn send_request(&self, payload: Bytes, headers: &Headers) -> Result<Bytes> {
         use crate::pipeline::network::codec::TcpRequestMessage;
 
@@ -724,6 +739,7 @@ impl TcpConnection {
         // Await response. On timeout the enclosing future is dropped here:
         // `_inflight_guard` drops → fetch_sub(Release) runs automatically.
         // `_permit` drops     → semaphore slot is released automatically.
+        // `response_tx` closes → the writer discards the frame if still unsent.
         let result = response_rx
             .await
             .map_err(|_| anyhow::anyhow!("Reader task closed"))?;
@@ -2468,6 +2484,114 @@ mod tests {
         );
 
         cancel_token.cancel();
+    }
+
+    /// Server that counts complete request frames it reads and never replies.
+    /// Used to assert that a frame did NOT reach the wire.
+    async fn b10_spawn_frame_counting_server() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let frames = Arc::new(AtomicUsize::new(0));
+        let frames_clone = frames.clone();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let frames = frames_clone.clone();
+                tokio::spawn(async move {
+                    let (mut read_half, _write_half) = tokio::io::split(stream);
+                    loop {
+                        // path
+                        let mut len_buf = [0u8; 2];
+                        if read_half.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let mut path_buf = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+                        if read_half.read_exact(&mut path_buf).await.is_err() {
+                            break;
+                        }
+                        // headers
+                        let mut len_buf = [0u8; 2];
+                        if read_half.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let mut headers_buf = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+                        if read_half.read_exact(&mut headers_buf).await.is_err() {
+                            break;
+                        }
+                        // payload
+                        let mut len_buf = [0u8; 4];
+                        if read_half.read_exact(&mut len_buf).await.is_err() {
+                            break;
+                        }
+                        let mut payload_buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+                        if read_half.read_exact(&mut payload_buf).await.is_err() {
+                            break;
+                        }
+                        frames.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        (addr, frames)
+    }
+
+    /// A caller that times out drops its response receiver while the frame is
+    /// still sitting in the submit queue. The writer must discard it rather than
+    /// deliver a request nobody owns -- in production the late delivery made the
+    /// router book scheduler state that only the 600s stale-request reaper freed.
+    #[tokio::test]
+    async fn b10_abandoned_frame_is_withdrawn_before_send() {
+        let (addr, frames_seen) = b10_spawn_frame_counting_server().await;
+
+        let mut conn = TcpConnection::connect(addr, Duration::from_secs(5), 10)
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        conn.post_enqueue_barrier = Some(barrier.clone());
+        let conn = Arc::new(conn);
+
+        // Let the writer finish its startup spin and park on the notify, so the
+        // only thing that can drain the queue is our explicit wake below.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let request = {
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                let mut headers = Headers::new();
+                headers.insert("x-endpoint-path".to_string(), "test".to_string());
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    conn.send_request(Bytes::from("abandoned"), &headers),
+                )
+                .await
+            })
+        };
+
+        // Release the caller past the submit-queue push. It then parks on the
+        // second barrier wait, which we never satisfy, so its 50ms timeout fires
+        // and drops the future -- closing the response receiver while the frame is
+        // still queued. The writer was never notified, mirroring a frame stranded
+        // behind a blocked socket.
+        barrier.wait().await;
+        let result = request.await.unwrap();
+        assert!(
+            result.is_err(),
+            "caller should have timed out while the frame was still queued"
+        );
+
+        // Wake the writer the way a later request or an unblocked socket would.
+        // This is the moment production delivered the abandoned frame, 7 minutes late.
+        conn.writer_notify.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            frames_seen.load(Ordering::SeqCst),
+            0,
+            "abandoned frame must never reach the wire"
+        );
+        conn.writer_handle.abort();
+        conn.reader_handle.abort();
     }
 
     #[tokio::test]
