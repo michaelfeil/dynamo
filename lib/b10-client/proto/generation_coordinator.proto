@@ -1,0 +1,161 @@
+syntax = "proto3";
+
+package dynamo.b10.generation.v1;
+
+// Source of truth for generated Rust messages and cross-language clients.
+// HTTP responses are a sequence of messages prefixed by a
+// four-byte big-endian message length.
+
+message NewRequest
+{
+  reserved 7, 8, 12;
+  reserved "sampling", "streaming", "user";
+  string model = 1;
+  repeated uint32 tokens = 2 [packed = true];
+  optional string lora = 3;
+  optional MmRoutingArgs mm_routing_args = 4;
+  optional Routing routing = 5;
+  optional MmPayloads mm_payloads = 6;
+  optional string cache_salt = 9;
+  optional sint32 engine_priority = 10;
+  optional string service_tier = 11;
+  bool enable_potential_loads_next_check = 13;
+  // Named MessagePack map: required sampling_params, optional
+  // dynamic_temperature_rules and prompt_logprobs. Values are backend-defined.
+  bytes sampling_msgpack = 14;
+  string request_id = 15;
+  optional TraceContext trace_context = 16;
+  map<string, string> metadata = 17;
+}
+
+message Routing
+{
+  optional string session_id = 1;
+  bool do_not_queue = 2;
+  double priority_jump = 3;
+  uint32 priority_load_shed_percent = 4;
+  repeated uint64 allowed_worker_ids = 5 [packed = true];
+  optional RoutingConstraints constraints = 6;
+}
+
+message RoutingConstraints
+{
+  repeated string required_taints = 1;
+  repeated WeightedTaint preferred_taints = 2;
+}
+message WeightedTaint
+{
+  string taint = 1;
+  float weight = 2;
+}
+
+message MmRoutingArgs
+{
+  repeated MmRoutingBlock blocks = 1;
+}
+message MmRoutingBlock
+{
+  bool present = 1;
+  repeated MmRoutingObject objects = 2;
+}
+message MmRoutingObject
+{
+  uint64 mm_hash = 1;
+  repeated TokenRange offsets = 2;
+}
+message TokenRange
+{
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+message MmPayloads
+{
+  repeated bytes embeddings = 1;
+  repeated MmKwarg kwargs = 2;
+  sint64 media_token_id = 3;
+  repeated string hashes = 4;
+  repeated uint64 positions = 5 [packed = true];
+  repeated uint64 lengths = 6 [packed = true];
+  repeated NativeMmInput native_inputs = 7;
+}
+message MmKwarg
+{
+  oneof value
+  {
+    bytes bytes = 1;
+    string string = 2;
+  }
+}
+message NativeMmInput
+{
+  string kind = 1;
+  string url = 2;
+}
+
+message TraceContext
+{
+  string trace_id = 1;
+  string span_id = 2;
+  optional string parent_id = 3;
+  optional string tracestate = 4;
+  optional string x_request_id = 5;
+  optional string request_id = 6;
+}
+
+message GenerationResponseFrame
+{
+  oneof frame
+  {
+    Admission admission = 1;
+    DeniedGeneration denied = 2;
+    bytes chunk_msgpack = 3;
+    ProtocolError error = 4;
+  }
+}
+
+message Admission
+{
+  uint64 estimated_overlap_tokens = 1;
+  uint64 best_overlap_blocks = 2;
+  uint64 prefill_worker_id = 3;
+  uint32 prefill_dp_rank = 4;
+  optional uint64 decode_worker_id = 5;
+  optional uint32 decode_dp_rank = 6;
+}
+
+message DeniedGeneration
+{
+  DeniedRequest denied = 1;
+  optional Admission admission = 2;
+}
+
+message DeniedRequest
+{
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    ROUTER_BACKPRESSURE = 1;
+    REQUIRED_COMPONENTS_DOWN = 2;
+    NEXT_ROUTER_BACKPRESSURE = 3;
+    NEXT_ROUTER_UNREACHABLE = 4;
+    PROTOCOL_ERROR = 5;
+    CANCELLED = 6;
+    FIRST_WORKER_EVENT_FAILED = 7;
+  }
+  Kind kind = 1;
+  optional string reason = 2;
+  optional string name = 3;
+  optional string error = 4;
+  optional string received = 5;
+  uint64 queued_isl_tokens = 6;
+  optional uint64 max_queued_isl_tokens = 7;
+  uint64 queue_depth = 8;
+  uint64 pending_isl_tokens = 9;
+  uint64 total_prefill_tokens = 10;
+  uint64 total_decode_blocks = 11;
+}
+
+message ProtocolError
+{
+  string message = 1;
+}

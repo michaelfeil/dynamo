@@ -1497,6 +1497,24 @@ stream back to the parent cancellation context after the connection exists.
 Keep the cancellation and guard-lifecycle tests with the Rust implementation
 when replaying this API.
 
+v1.2 remote generation coordinator:
+
+The generation coordinator now has a common Rust client trait with local and
+remote implementations. The remote path uses a versioned, typed protobuf over
+HTTP; sampling is the only extensible MessagePack request section. A native
+Hyper/Axum service wraps the local coordinator and exposes `/health` plus the
+streaming `/v1/coordinate` endpoint. Python controls service startup and
+shutdown through PyO3 but is not present on the request path. The Python remote
+constructor accepts a named endpoint map and requires exactly one backend for
+now, preserving the API shape for future parallel potential-load probes and
+session-aware multi-endpoint selection. Block size and disaggregated request-ID
+machine identity remain service-local configuration rather than wire fields.
+
+Replay the protobuf schema, native client/service, PyO3 lifecycle bindings, and
+the broad client/server streaming tests together. Before claiming the intended
+sub-2 ms proxy overhead, run an optimized p50/p99 benchmark in the integration
+image; correctness tests alone do not establish the latency target.
+
 Validation:
 
 Compile Python bindings, import `dynamo.runtime`, validate type stubs, and run

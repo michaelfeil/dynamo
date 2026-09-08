@@ -681,23 +681,45 @@ class RouterWorkerCoordinator:
         """
         ...
 
-
 class GenerationCoordinator:
-    """Coordinates aggregate or prefill-first generation in Rust."""
+    """Coordinates generation as a local server or remote client."""
 
     def __init__(
         self,
         *,
-        primary_worker_client: Client,
-        primary_router_client: Client,
-        next_worker_client: Client | None = None,
-        next_router_client: Client | None = None,
+        primary_worker_client: Client | str,
+        primary_router_client: Client | str,
+        next_worker_client: Client | str | None = None,
+        next_router_client: Client | str | None = None,
         disaggregation_strategy: Any | None = None,
         model_name: str,
         kv_block_size: int,
-        disagg_request_id_machine_id: int,
+        disagg_request_id_machine_id: int | None = None,
         prefill_mark_timing: Any | None = None,
+        runtime: DistributedRuntime | None = None,
     ) -> None: ...
+    async def start(self) -> None:
+        """Resolve endpoint strings; also called by serve() and generate()."""
+        ...
+
+    @classmethod
+    def remote(cls, backends: Dict[str, str]) -> GenerationCoordinator:
+        """Connect to exactly one named remote generation-coordinator backend."""
+        ...
+
+    @property
+    def is_client(self) -> bool: ...
+
+    @property
+    def is_server(self) -> bool: ...
+
+    async def serve(self, host: str = "0.0.0.0", port: int = 8080) -> str:
+        """Bind the native HTTP entry point and return its URL."""
+        ...
+
+    async def shutdown(self) -> None:
+        """Gracefully stop the HTTP entry point if it is running."""
+        ...
 
     async def generate(
         self,
@@ -708,8 +730,6 @@ class GenerationCoordinator:
         enable_potential_loads_next_check: bool = False,
         annotated: bool = False,
     ) -> GeneratedRequest | DeniedGenerationRequest: ...
-
-
 class DeniedGenerationRequest:
     """A generation denial with optional completed-prefill admission metadata."""
 

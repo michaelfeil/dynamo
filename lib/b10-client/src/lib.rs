@@ -12,6 +12,9 @@ mod coordinator;
 mod generation;
 mod guard;
 mod payload_copy;
+pub mod protocol;
+mod remote;
+mod service;
 mod types;
 
 #[cfg(test)]
@@ -24,12 +27,14 @@ pub use coordinator::{
 };
 pub use generation::{
     DeniedGenerationRequest, DisaggregationStrategy, GeneratedRequest, GenerationAdmission,
-    GenerationCoordinator, GenerationOptions, GenerationOutcome, GenerationRequest,
-    POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD, POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE,
-    POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD, POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD,
-    PrefillMarkTiming,
+    GenerationCoordinator, GenerationCoordinatorClient, GenerationOptions, GenerationOutcome,
+    GenerationRequest, POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
+    POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE, POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
+    POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD, PrefillMarkTiming,
 };
 pub use guard::RouterRequestGuard;
+pub use remote::RemoteGenerationCoordinator;
+pub use service::{GenerationCoordinatorService, RunningGenerationCoordinatorService};
 pub use types::{
     AdmittedRequestTimings, CancellationPolicy, DeniedRequest, MinReplicaAvailable,
     PotentialLoadsCheck, RouteOptions, RouterRequestNew, RouterWorkerPhase,

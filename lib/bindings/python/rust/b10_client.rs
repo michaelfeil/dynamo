@@ -3,7 +3,9 @@
 //! Routing, admission, worker connection, cancellation, and guard cleanup live
 //! in `dynamo-b10-client`. This module converts Python inputs, records routed
 //! worker metadata, and exposes the returned stream as an async Python object.
+mod startup;
 mod types;
+use startup::{CoordinatorClient, CoordinatorStartup};
 
 // Re-export the pyclasses registered in `lib.rs::add_class::<...>` so they
 // resolve as `crate::b10_client::Foo` (the crate-root path lib.rs expects).
@@ -20,15 +22,16 @@ use crate::{AsyncResponseStream, Client, context, process_stream, to_pyerr};
 use dynamo_b10_client::{
     CancellationPolicy as CoreCancellationPolicy,
     DisaggregationStrategy as CoreDisaggregationStrategy,
-    GenerationCoordinator as CoreGenerationCoordinator, GenerationOptions,
-    GenerationOutcome as CoreGenerationOutcome, GenerationRequest, JsonPushRouter,
-    JsonRouterGuardClient, MinReplicaAvailable, POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
-    POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE, POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
-    POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD, PotentialLoadsCheck,
-    PrefillMarkTiming as CorePrefillMarkTiming, RequestContext, RouteAndConnectOutcome,
-    RouteOptions, RouterRequestGuard, RouterRequestNew,
-    RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
-    RouterWorkerPhase as CoreRouterWorkerPhase, stream_with_optional_prefill_mark,
+    GenerationCoordinator as CoreGenerationCoordinator,
+    GenerationCoordinatorClient as CoreGenerationCoordinatorClient,
+    GenerationCoordinatorService as CoreGenerationCoordinatorService, GenerationOptions,
+    GenerationOutcome as CoreGenerationOutcome, GenerationRequest, JsonRouterGuardClient,
+    MinReplicaAvailable, PotentialLoadsCheck, PrefillMarkTiming as CorePrefillMarkTiming,
+    RemoteGenerationCoordinator, RequestContext, RouteAndConnectOutcome, RouteOptions,
+    RouterRequestGuard, RouterRequestNew, RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
+    RouterWorkerPhase as CoreRouterWorkerPhase,
+    RunningGenerationCoordinatorService as CoreRunningGenerationCoordinatorService,
+    stream_with_optional_prefill_mark,
 };
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints};
 use dynamo_runtime::pipeline::EngineStream;
@@ -36,6 +39,9 @@ use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyType;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,8 +157,10 @@ fn generation_python_stream(
 /// `PyRouterRequestNew`.
 #[pyclass]
 pub(crate) struct GenerationCoordinator {
-    inner: Arc<CoreGenerationCoordinator>,
-    next_router: Option<JsonPushRouter>,
+    startup: Option<Arc<CoordinatorStartup>>,
+    inner: Arc<dyn CoreGenerationCoordinatorClient>,
+    service: Option<Arc<CoreGenerationCoordinatorService>>,
+    running_service: Arc<tokio::sync::Mutex<Option<CoreRunningGenerationCoordinatorService>>>,
 }
 
 #[pymethods]
@@ -167,20 +175,22 @@ impl GenerationCoordinator {
         disaggregation_strategy=None,
         model_name,
         kv_block_size,
-        disagg_request_id_machine_id,
+        disagg_request_id_machine_id=None,
         prefill_mark_timing=None,
+        runtime=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        primary_worker_client: Client,
-        primary_router_client: Client,
-        next_worker_client: Option<Client>,
-        next_router_client: Option<Client>,
+        primary_worker_client: &Bound<'_, PyAny>,
+        primary_router_client: &Bound<'_, PyAny>,
+        next_worker_client: Option<&Bound<'_, PyAny>>,
+        next_router_client: Option<&Bound<'_, PyAny>>,
         disaggregation_strategy: Option<&Bound<'_, PyAny>>,
         model_name: String,
         kv_block_size: u32,
-        disagg_request_id_machine_id: u64,
+        disagg_request_id_machine_id: Option<u64>,
         prefill_mark_timing: Option<&Bound<'_, PyAny>>,
+        runtime: Option<&crate::DistributedRuntime>,
     ) -> PyResult<Self> {
         let _ = model_name;
         let strategy = match enum_value(disaggregation_strategy)?.as_deref() {
@@ -210,39 +220,129 @@ impl GenerationCoordinator {
                 "next_worker_client and next_router_client are required for disaggregated generation",
             ));
         }
-        let primary = Arc::new(
-            CoreRouterWorkerCoordinator::from_push_routers(
-                primary_router_client.router,
-                primary_worker_client.router,
-                kv_block_size,
-            )
-            .map_err(to_pyerr)?,
-        );
-        let next_router = next_router_client
-            .as_ref()
-            .map(|client| client.router.clone());
-        let next = next_router_client
-            .zip(next_worker_client)
-            .map(|(router, worker)| {
-                CoreRouterWorkerCoordinator::from_push_routers(
-                    router.router,
-                    worker.router,
-                    kv_block_size,
-                )
-                .map(Arc::new)
-            });
-        let next = next.transpose().map_err(to_pyerr)?;
-        let inner = CoreGenerationCoordinator::new(
-            primary,
-            next,
+        if kv_block_size == 0 {
+            return Err(PyValueError::new_err("kv_block_size must be positive"));
+        }
+        let machine_id = disagg_request_id_machine_id
+            .or_else(|| runtime.map(|runtime| runtime.inner().connection_id()))
+            .ok_or_else(|| {
+                PyValueError::new_err("disagg_request_id_machine_id is required without runtime")
+            })?;
+        let startup = Arc::new(CoordinatorStartup {
+            _runtime: runtime.map(|runtime| Arc::new(runtime.inner().clone())),
+            primary_worker: CoordinatorClient::parse(primary_worker_client, runtime)?,
+            primary_router: CoordinatorClient::parse(primary_router_client, runtime)?,
+            next_worker: next_worker_client
+                .map(|client| CoordinatorClient::parse(client, runtime))
+                .transpose()?,
+            next_router: next_router_client
+                .map(|client| CoordinatorClient::parse(client, runtime))
+                .transpose()?,
             strategy,
             mark_timing,
-            disagg_request_id_machine_id,
-        )
-        .map_err(to_pyerr)?;
+            block_size: kv_block_size,
+            machine_id,
+            ready: tokio::sync::OnceCell::new(),
+        });
+        let inner: Arc<dyn CoreGenerationCoordinatorClient> = startup.clone();
+        let service = Arc::new(CoreGenerationCoordinatorService::new(
+            Arc::clone(&inner),
+            strategy,
+        ));
         Ok(Self {
+            startup: Some(startup),
+            inner,
+            service: Some(service),
+            running_service: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    /// Connect to exactly one named remote generation coordinator backend.
+    ///
+    /// The returned object exposes the same `generate()` method as the local
+    /// constructor. Endpoint discovery and multi-endpoint selection are left
+    /// to a future client implementation.
+    #[classmethod]
+    fn remote(_cls: &Bound<'_, PyType>, mut backends: BTreeMap<String, String>) -> PyResult<Self> {
+        if backends.len() != 1 {
+            return Err(PyValueError::new_err(
+                "remote generation currently requires exactly one named backend",
+            ));
+        }
+        let (name, url) = backends.pop_first().expect("length checked above");
+        if name.is_empty() {
+            return Err(PyValueError::new_err(
+                "remote generation backend name cannot be empty",
+            ));
+        }
+        let inner = RemoteGenerationCoordinator::new(url).map_err(to_pyerr)?;
+        Ok(Self {
+            startup: None,
             inner: Arc::new(inner),
-            next_router,
+            service: None,
+            running_service: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    #[getter]
+    fn is_client(&self) -> bool {
+        self.service.is_none()
+    }
+
+    #[getter]
+    fn is_server(&self) -> bool {
+        self.service.is_some()
+    }
+
+    /// Resolve endpoint strings once. Also performed by serve() and generate().
+    fn start<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let startup = self.startup.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Some(startup) = startup {
+                startup.start().await.map_err(to_pyerr)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Bind the native HTTP entry point in the background. Direct `generate()`
+    /// calls remain available on the same coordinator.
+    #[pyo3(signature = (host="0.0.0.0", port=8080))]
+    fn serve<'p>(&self, py: Python<'p>, host: &str, port: u16) -> PyResult<Bound<'p, PyAny>> {
+        let service = self.service.as_ref().cloned().ok_or_else(|| {
+            PyValueError::new_err("a remote generation coordinator is client-only")
+        })?;
+        let host = host
+            .parse::<IpAddr>()
+            .map_err(|error| PyValueError::new_err(format!("invalid bind host: {error}")))?;
+        let address = SocketAddr::new(host, port);
+        let running = Arc::clone(&self.running_service);
+        let startup = self.startup.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Some(startup) = startup {
+                startup.start().await.map_err(to_pyerr)?;
+            }
+            let mut slot = running.lock().await;
+            if slot.is_some() {
+                return Err(PyValueError::new_err(
+                    "generation coordinator server is already running",
+                ));
+            }
+            let server = service.start(address).await.map_err(to_pyerr)?;
+            let endpoint_url = server.endpoint_url();
+            *slot = Some(server);
+            Ok(endpoint_url)
+        })
+    }
+
+    fn shutdown<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let running = Arc::clone(&self.running_service);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let server = running.lock().await.take();
+            if let Some(server) = server {
+                server.shutdown().await.map_err(to_pyerr)?;
+            }
+            Ok(())
         })
     }
 
@@ -276,22 +376,6 @@ impl GenerationCoordinator {
         let decode_worker_request = decode_worker_args
             .map(|args| pythonize::depythonize(&args.into_bound(py)))
             .transpose()?;
-        let potential_loads_check = if enable_potential_loads_next_check {
-            let router = self.next_router.clone().ok_or_else(|| {
-                PyValueError::new_err(
-                    "potential loads next check requires a downstream router client",
-                )
-            })?;
-            Some(PotentialLoadsCheck {
-                router: Arc::new(JsonRouterGuardClient::new(router)),
-                queue_depth_threshold: POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD,
-                prefill_tokens_threshold: POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
-                decode_tokens_threshold: POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
-                load_percentile: POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE,
-            })
-        } else {
-            None
-        };
         let core_context = RequestContext::new(
             context.inner(),
             context.trace_context().cloned(),
@@ -309,10 +393,7 @@ impl GenerationCoordinator {
                         decode_worker_request,
                     },
                     GenerationOptions {
-                        primary: RouteOptions {
-                            potential_loads_check,
-                            ..Default::default()
-                        },
+                        enable_potential_loads_next_check,
                         ..Default::default()
                     },
                 )

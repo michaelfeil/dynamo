@@ -3094,166 +3094,246 @@ fn generation_coordinator(
     .expect("generation coordinator")
 }
 
+async fn generation_transport(
+    coordinator: GenerationCoordinator,
+    remote: bool,
+) -> (
+    Arc<dyn crate::GenerationCoordinatorClient>,
+    Option<crate::RunningGenerationCoordinatorService>,
+) {
+    let coordinator: Arc<dyn crate::GenerationCoordinatorClient> = Arc::new(coordinator);
+    if !remote {
+        return (coordinator, None);
+    }
+    let server = Arc::new(crate::GenerationCoordinatorService::new(
+        coordinator,
+        DisaggregationStrategy::PrefillFirst,
+    ))
+    .start("127.0.0.1:0".parse().unwrap())
+    .await
+    .unwrap();
+    let client = Arc::new(crate::RemoteGenerationCoordinator::new(server.endpoint_url()).unwrap());
+    (client, Some(server))
+}
+
 #[tokio::test]
 async fn generation_coordinator_prefill_first_moves_handoff_and_drops_bootstrap() {
-    let prefill_router =
-        RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
-    prefill_worker.set_stream_chunks(vec![vec![jv!({
-        "request_id": "req",
-        "finished": false,
-        "outputs": [{
-            "finish_reason": "not_finished",
-            "token_ids_diff": [11],
-            "disaggregated_params": {
-                "request_type": "context_only",
-                "ctx_request_id": 1234
+    for remote in [false, true] {
+        let prefill_router =
+            RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+        let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+        prefill_worker.set_stream_chunks(vec![vec![jv!({
+            "request_id": "req",
+            "finished": false,
+            "outputs": [{
+                "finish_reason": "not_finished",
+                "token_ids_diff": [11],
+                "disaggregated_params": {
+                    "request_type": "context_only",
+                    "ctx_request_id": 1234
+                }
+            }],
+            "added_topology_routing_constraints": {
+                "required_taints": ["rack=a"]
             }
-        }],
-        "added_topology_routing_constraints": {
-            "required_taints": ["rack=a"]
-        }
-    })]]);
-    let decode_router =
-        RouterGuardClientForTesting::new(vec![8], vec![8], vec![route_response_new(2)]);
-    let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
-    decode_worker.set_stream_chunks(vec![vec![jv!({"bootstrap": true}), jv!({"decode": true})]]);
-    let coordinator = generation_coordinator(
-        prefill_router.clone(),
-        prefill_worker.clone(),
-        Some(decode_router.clone()),
-        Some(decode_worker.clone()),
-        DisaggregationStrategy::PrefillFirst,
-    );
+        })]]);
+        let decode_router = RouterGuardClientForTesting::new(
+            vec![8],
+            vec![8],
+            vec![potential_loads_response(1, 1, 0, 0), route_response_new(2)],
+        );
+        let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+        decode_worker
+            .set_stream_chunks(vec![vec![jv!({"bootstrap": true}), jv!({"decode": true})]]);
+        let coordinator = generation_coordinator(
+            prefill_router.clone(),
+            prefill_worker.clone(),
+            Some(decode_router.clone()),
+            Some(decode_worker.clone()),
+            DisaggregationStrategy::PrefillFirst,
+        );
 
-    let outcome = coordinator
-        .generate(
-            build_test_context("generation-prefill-first"),
-            GenerationRequest {
-                routing_request: RouterRequestNew {
-                    tokens: vec![1, 2, 3],
-                    priority_jump: 0.5,
-                    priority_load_shed_percent: 10,
+        let (coordinator, server) = generation_transport(coordinator, remote).await;
+
+        let outcome = coordinator
+            .generate(
+                build_test_context("generation-prefill-first"),
+                GenerationRequest {
+                    routing_request: RouterRequestNew {
+                        tokens: vec![1, 2, 3],
+                        priority_jump: 0.5,
+                        priority_load_shed_percent: 10,
+                        ..Default::default()
+                    },
+                    primary_worker_request: jv!({
+                        "model": "test-model",
+                        "streaming": true,
+                        "sampling_params": {"temperature": 0.2},
+                        "dynamic_temperature_rules": [{"after": 4, "temperature": 0.1}],
+                        "prompt_logprobs": 2,
+                        "mm_args": {"mm_kwargs": ["image-kwargs"]}
+                    }),
+                    decode_worker_request: Some(jv!({"method": "generate", "prompt": "hello"})),
+                },
+                GenerationOptions {
+                    enable_potential_loads_next_check: true,
                     ..Default::default()
                 },
-                primary_worker_request: make_worker_request(),
-                decode_worker_request: Some(jv!({"method": "generate", "prompt": "hello"})),
-            },
-            GenerationOptions::default(),
-        )
-        .await
-        .expect("generation starts");
-    let GenerationOutcome::Connected(generated) = outcome else {
-        panic!("expected connected generation: {outcome:?}");
-    };
-    assert_eq!(generated.admission.prefill_worker_id, 1);
-    assert_eq!(generated.admission.decode_worker_id, Some(2));
-    let responses = generated.stream.collect::<Vec<_>>().await;
+            )
+            .await
+            .expect("generation starts");
+        let GenerationOutcome::Connected(generated) = outcome else {
+            panic!("expected connected generation: {outcome:?}");
+        };
+        assert_eq!(generated.admission.prefill_worker_id, 1);
+        assert_eq!(generated.admission.decode_worker_id, Some(2));
+        let responses = generated.stream.collect::<Vec<_>>().await;
 
-    assert_eq!(responses.len(), 2, "prefill + decode, without bootstrap");
-    let prefill = responses[0].data.as_ref().unwrap();
-    assert!(prefill["outputs"][0]["finish_reason"].is_nil());
-    assert_eq!(
-        prefill["outputs"][0]["disaggregated_params"]["disagg_request_id"].as_u64(),
-        Some(1234)
-    );
-    assert_eq!(
-        responses[1].data.as_ref().unwrap()["decode"].as_bool(),
-        Some(true)
-    );
-    assert_eq!(
-        prefill_worker.calls()[0].1["disaggregation_mode"].as_str(),
-        Some("prefill")
-    );
-    let decode_call = &decode_worker.calls()[0].1;
-    assert_eq!(decode_call["disaggregation_mode"].as_str(), Some("decode"));
-    assert_eq!(
-        decode_call["disaggregated_params"]["disagg_request_id"].as_u64(),
-        Some(1234)
-    );
-    assert_eq!(
-        decode_router.calls()[0].1["routing_constraints"]["required_taints"][0].as_str(),
-        Some("rack=a")
-    );
-    assert!(decode_router.calls()[0].1["priority_jump"].is_nil());
-    assert!(decode_router.calls()[0].1["priority_load_shed_percent"].is_nil());
-    wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
-    wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2)).await;
+        assert_eq!(responses.len(), 2, "prefill + decode, without bootstrap");
+        let prefill = responses[0].data.as_ref().unwrap();
+        assert!(prefill["outputs"][0]["finish_reason"].is_nil());
+        assert_eq!(
+            prefill["outputs"][0]["disaggregated_params"]["disagg_request_id"].as_u64(),
+            Some(1234)
+        );
+        assert_eq!(
+            responses[1].data.as_ref().unwrap()["decode"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            prefill_worker.calls()[0].1["disaggregation_mode"].as_str(),
+            Some("prefill")
+        );
+        let decode_call = &decode_worker.calls()[0].1;
+        if remote {
+            assert_eq!(
+                decode_call["sampling_params"]["temperature"].as_f64(),
+                Some(0.2)
+            );
+            assert_eq!(decode_call["prompt_logprobs"].as_i64(), Some(2));
+            assert_eq!(
+                decode_call["dynamic_temperature_rules"][0]["after"].as_i64(),
+                Some(4)
+            );
+            assert!(decode_call["mm_args"].is_nil());
+            assert_eq!(
+                prefill_worker.calls()[0].1["mm_args"]["mm_kwargs"][0].as_str(),
+                Some("image-kwargs")
+            );
+        }
+        assert_eq!(decode_call["disaggregation_mode"].as_str(), Some("decode"));
+        assert_eq!(
+            decode_call["disaggregated_params"]["disagg_request_id"].as_u64(),
+            Some(1234)
+        );
+        assert_eq!(decode_router.method_call_count("potential_loads"), 1);
+        let decode_route = decode_router
+            .calls()
+            .into_iter()
+            .find(|(_, request)| request["method"].as_str() == Some("new"))
+            .expect("decode route")
+            .1;
+        assert_eq!(
+            decode_route["routing_constraints"]["required_taints"][0].as_str(),
+            Some("rack=a")
+        );
+        assert!(decode_route["priority_jump"].is_nil());
+        assert!(decode_route["priority_load_shed_percent"].is_nil());
+        wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
+        wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2)).await;
+        if let Some(server) = server {
+            server.shutdown().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]
 async fn generation_coordinator_decode_denial_retains_prefill_admission() {
-    let prefill_router = RouterGuardClientForTesting::new(
-        vec![7],
-        vec![7],
-        vec![Ok(RsRouterResponse::New {
-            worker_id: 1,
-            dp_rank: 3,
-            overlap_blocks: 2,
-            best_overlap_blocks: 5,
-            dp_strict_rank: false,
-        })],
-    );
-    let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
-    prefill_worker.set_stream_chunks(vec![vec![jv!({
-        "outputs": [{
-            "finish_reason": "not_finished",
-            "disaggregated_params": {"request_type": "context_only", "ctx_request_id": 9}
-        }]
-    })]]);
-    let decode_router = RouterGuardClientForTesting::new(
-        vec![8],
-        vec![8],
-        vec![backpressure_response(
-            RouterBackpressureReason::DoNotQueue,
-            10,
-            Some(100),
-        )],
-    );
-    let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
-    let coordinator = generation_coordinator(
-        prefill_router.clone(),
-        prefill_worker,
-        Some(decode_router),
-        Some(decode_worker),
-        DisaggregationStrategy::PrefillFirst,
-    );
+    for remote in [false, true] {
+        let prefill_router = RouterGuardClientForTesting::new(
+            vec![7],
+            vec![7],
+            vec![Ok(RsRouterResponse::New {
+                worker_id: 1,
+                dp_rank: 3,
+                overlap_blocks: 2,
+                best_overlap_blocks: 5,
+                dp_strict_rank: false,
+            })],
+        );
+        let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+        prefill_worker.set_stream_chunks(vec![vec![jv!({
+            "outputs": [{
+                "finish_reason": "not_finished",
+                "disaggregated_params": {"request_type": "context_only", "ctx_request_id": 9}
+            }]
+        })]]);
+        let decode_router = RouterGuardClientForTesting::new(
+            vec![8],
+            vec![8],
+            vec![backpressure_response(
+                RouterBackpressureReason::DoNotQueue,
+                10,
+                Some(100),
+            )],
+        );
+        let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+        let coordinator = generation_coordinator(
+            prefill_router.clone(),
+            prefill_worker,
+            Some(decode_router),
+            Some(decode_worker),
+            DisaggregationStrategy::PrefillFirst,
+        );
 
-    let outcome = coordinator
-        .generate(
-            build_test_context("generation-decode-denied"),
-            GenerationRequest {
-                routing_request: RouterRequestNew {
-                    tokens: vec![1, 2, 3],
-                    ..Default::default()
+        let (coordinator, server) = generation_transport(coordinator, remote).await;
+
+        let outcome = coordinator
+            .generate(
+                build_test_context("generation-decode-denied"),
+                GenerationRequest {
+                    routing_request: RouterRequestNew {
+                        tokens: vec![1, 2, 3],
+                        ..Default::default()
+                    },
+                    primary_worker_request: jv!({
+                        "model": "test-model",
+                        "streaming": true,
+                        "sampling_params": {"temperature": 0.2},
+                        "dynamic_temperature_rules": [{"after": 4, "temperature": 0.1}],
+                        "prompt_logprobs": 2,
+                        "mm_args": {"mm_kwargs": ["image-kwargs"]}
+                    }),
+                    decode_worker_request: Some(make_worker_request()),
                 },
-                primary_worker_request: make_worker_request(),
-                decode_worker_request: Some(make_worker_request()),
-            },
-            GenerationOptions::default(),
-        )
-        .await
-        .expect("decode denial is typed");
+                GenerationOptions::default(),
+            )
+            .await
+            .expect("decode denial is typed");
 
-    let GenerationOutcome::Denied(denied) = outcome else {
-        panic!("expected decode denial: {outcome:?}");
-    };
-    assert!(matches!(
-        denied.denied,
-        DeniedRequest::RouterBackpressure { .. }
-    ));
-    assert_eq!(
-        denied.admission,
-        Some(crate::GenerationAdmission {
-            estimated_overlap_tokens: 2 * u64::from(TEST_BLOCK_SIZE),
-            best_overlap_blocks: 5,
-            prefill_worker_id: 1,
-            prefill_dp_rank: 3,
-            decode_worker_id: None,
-            decode_dp_rank: None,
-        })
-    );
-    wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
+        let GenerationOutcome::Denied(denied) = outcome else {
+            panic!("expected decode denial: {outcome:?}");
+        };
+        assert!(matches!(
+            denied.denied,
+            DeniedRequest::RouterBackpressure { .. }
+        ));
+        assert_eq!(
+            denied.admission,
+            Some(crate::GenerationAdmission {
+                estimated_overlap_tokens: 2 * u64::from(TEST_BLOCK_SIZE),
+                best_overlap_blocks: 5,
+                prefill_worker_id: 1,
+                prefill_dp_rank: 3,
+                decode_worker_id: None,
+                decode_dp_rank: None,
+            })
+        );
+        wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
+        if let Some(server) = server {
+            server.shutdown().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]

@@ -10,14 +10,16 @@
 //! stay at the language binding and are passed here as opaque MessagePack maps.
 
 use crate::{
-    CancellationPolicy, RequestContext, RouteAndConnectOutcome, RouteOptions, RouterRequestNew,
-    RouterWorkerCoordinator, RouterWorkerPhase, stream_with_optional_prefill_mark,
+    CancellationPolicy, PotentialLoadsCheck, RequestContext, RouteAndConnectOutcome, RouteOptions,
+    RouterRequestNew, RouterWorkerCoordinator, RouterWorkerPhase,
+    stream_with_optional_prefill_mark,
 };
 use anyhow::{Context, Result, bail};
 use dynamo_kv_router::protocols::RoutingConstraints;
 use dynamo_runtime::pipeline::{EngineStream, ResponseStream};
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use rmpv::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +72,8 @@ pub struct GenerationRequest {
 pub struct GenerationOptions {
     pub primary: RouteOptions,
     pub decode: RouteOptions,
+    /// Probe the downstream router before admitting prefill.
+    pub enable_potential_loads_next_check: bool,
 }
 
 /// Admission metadata from the prefill-bearing route.
@@ -152,9 +156,25 @@ impl GenerationCoordinator {
         &self,
         context: RequestContext,
         request: GenerationRequest,
-        options: GenerationOptions,
+        mut options: GenerationOptions,
     ) -> Result<GenerationOutcome> {
         validate_generation_request(&request, self.strategy)?;
+        if options.enable_potential_loads_next_check {
+            let next = self
+                .next
+                .as_ref()
+                .context("potential-load checking requires a downstream router")?;
+            options
+                .primary
+                .potential_loads_check
+                .get_or_insert_with(|| PotentialLoadsCheck {
+                    router: next.router(),
+                    queue_depth_threshold: POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD,
+                    prefill_tokens_threshold: POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
+                    decode_tokens_threshold: POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
+                    load_percentile: POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE,
+                });
+        }
         match self.strategy {
             DisaggregationStrategy::Aggregated => {
                 self.generate_aggregated(context, request, options.primary)
@@ -394,6 +414,32 @@ impl GenerationCoordinator {
             stream: ResponseStream::new(Box::pin(output), context.inner()),
             admission,
         }))
+    }
+}
+
+/// Common interface implemented by in-process and remote generation clients.
+///
+/// Requests are owned so bindings can choose the implementation once during
+/// construction and use one object-safe API for every generation.
+pub trait GenerationCoordinatorClient: Send + Sync {
+    fn generate(
+        &self,
+        context: RequestContext,
+        request: GenerationRequest,
+        options: GenerationOptions,
+    ) -> BoxFuture<'_, Result<GenerationOutcome>>;
+}
+
+impl GenerationCoordinatorClient for GenerationCoordinator {
+    fn generate(
+        &self,
+        context: RequestContext,
+        request: GenerationRequest,
+        options: GenerationOptions,
+    ) -> BoxFuture<'_, Result<GenerationOutcome>> {
+        Box::pin(GenerationCoordinator::generate(
+            self, context, request, options,
+        ))
     }
 }
 

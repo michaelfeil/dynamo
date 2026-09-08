@@ -91,6 +91,10 @@ pub struct RouterWorkerCoordinator {
 }
 
 impl RouterWorkerCoordinator {
+    pub(crate) fn router(&self) -> Arc<dyn RouterGuardClient> {
+        Arc::clone(&self.router)
+    }
+
     pub fn new(
         router: Arc<dyn RouterGuardClient>,
         worker: Arc<dyn RouterGuardClient>,

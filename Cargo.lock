@@ -2404,16 +2404,22 @@ version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "axum 0.8.4",
+ "bytes",
  "dynamo-kv-router",
  "dynamo-llm",
  "dynamo-runtime",
  "futures",
+ "prost 0.13.5",
+ "prost-build 0.13.5",
  "rand 0.9.4",
+ "reqwest 0.12.28",
  "rmp-serde",
  "rmpv",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

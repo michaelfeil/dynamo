@@ -204,6 +204,28 @@ macro_rules! emit_at_level {
 }
 
 impl DistributedTraceContext {
+    /// Reconstruct a distributed trace context received over an internal
+    /// transport. Timing fields start unset and are populated locally.
+    pub fn new(
+        trace_id: String,
+        span_id: String,
+        parent_id: Option<String>,
+        tracestate: Option<String>,
+        x_request_id: Option<String>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self {
+            trace_id,
+            span_id,
+            parent_id,
+            tracestate,
+            start: None,
+            end: None,
+            x_request_id,
+            request_id,
+        }
+    }
+
     /// Create a traceparent string from the context
     pub fn create_traceparent(&self) -> String {
         format!("00-{}-{}-01", self.trace_id, self.span_id)
