@@ -2479,3 +2479,60 @@ fn client_tools_named_like_a_consumer_namespace_are_ordinary_function_tools() {
     assert_eq!(tools[0]["function"]["name"], "baseten__acme__lookup");
     assert!(adapted.losses.is_empty(), "{:?}", adapted.losses);
 }
+
+/// Adjacent `input_text` parts keep their boundary: they join with `"\n"`, the same separator the
+/// Messages side applies to adjacent text blocks and what the deployed Responses converter
+/// produced by handing the template a part list. Concatenating with no separator ran the last word
+/// of one part into the first word of the next — 22 production requests per model in the
+/// c1c5a788995d replay.
+#[test]
+fn adapt_responses_adjacent_text_parts_join_with_newline() {
+    let out = responses_input(json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "first"},
+            {"type": "input_text", "text": "second"},
+        ]},
+        {"type": "message", "role": "system", "content": [
+            {"type": "input_text", "text": "sys one"},
+            {"type": "input_text", "text": "sys two"},
+        ]},
+        {"role": "developer", "content": [
+            {"type": "input_text", "text": "dev one"},
+            {"type": "input_text", "text": "dev two"},
+        ]},
+    ]));
+    assert_eq!(out[0]["content"], "first\nsecond");
+    assert_eq!(out[1]["content"], "sys one\nsys two");
+    assert_eq!(out[2]["content"], "dev one\ndev two");
+}
+
+/// The separator sits between parts, not around them, so an empty part still contributes its
+/// boundary — a per-part template render emitted that blank line too.
+#[test]
+fn adapt_responses_empty_text_part_still_contributes_its_boundary() {
+    let out = responses_input(json!([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": ""},
+            {"type": "input_text", "text": "body"},
+        ]},
+    ]));
+    assert_eq!(out[0]["content"], "\nbody");
+}
+
+/// A `function_call_output` carrying several text parts joins them the same way; a single-part or
+/// plain-string output is untouched.
+#[test]
+fn adapt_responses_function_call_output_parts_join_with_newline() {
+    let out = responses_input(json!([
+        {"type": "function_call", "call_id": "c1", "name": "look", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": [
+            {"type": "input_text", "text": "line one"},
+            {"type": "input_text", "text": "line two"},
+        ]},
+    ]));
+    let tool_message = out
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("tool message");
+    assert_eq!(tool_message["content"], "line one\nline two");
+}

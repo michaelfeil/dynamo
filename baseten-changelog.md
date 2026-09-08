@@ -2375,3 +2375,19 @@ outcome, model, losses, loss_kinds) around the crate's own `stage.ingress`.
 Validated live on FDE GLM-5.2 across the bx
 behavior suites and real Claude Code / Codex sessions. Baseten-specific; not
 upstreamable.
+
+Two ingress corrections from replaying 1,000 requests across 12 production
+configs against the pre-pivot converters. Adjacent Responses `input_text` parts
+join with `"\n"` (`flatten_input_content`, the all-text branch of
+`user_input_content`, and `function_call_output_text`): they were concatenated
+with no separator, where the deleted converter kept the part list and every chat
+template rendered a newline between parts, so the last word of one part ran into
+the first word of the next on 22 production requests per model. The Messages
+side already applied that separator (`flatten_text`), so the two ingress paths
+had disagreed. And both handlers take the client's body as raw bytes
+(`http::service::RawJson`) and parse the typed view off those bytes through
+`serde_path_to_error` (`http::service::deserialize_body`), restoring the field
+path and the position the axum `Json<T>` rejection carried:
+"messages[6].role: unknown variant `tool`, ... at line 1 column 64" rather than
+"unknown variant `tool`". `RawJson` replaces `Json<serde_json::Value>` in those
+two handlers and keeps its content-type and syntax-error rejections unchanged.

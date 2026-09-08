@@ -32,8 +32,9 @@ use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    RouteDoc,
+    RawJson, RouteDoc,
     b10_rate_limiter::check_rate_limit,
+    deserialize_body,
     disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
     error::HttpError,
     metadata::extract_metadata_from_http,
@@ -1811,15 +1812,19 @@ pub fn validate_completion_fields_generic(
 async fn handler_responses(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(mut body): Json<serde_json::Value>,
+    RawJson {
+        bytes,
+        value: mut body,
+    }: RawJson,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
-    // Parse the typed view off the same JSON (kept alongside, see
-    // `ResponsesBody`). The axum `Json<T>` rejection this replaces was a 422
-    // the error middleware rewrote to 400; same status and message shape.
-    let mut request = NvCreateResponse::deserialize(&body).map_err(|err| {
+    // Parse the typed view off the same bytes the `Value` came from (kept
+    // alongside, see `ResponsesBody`). The axum `Json<T>` rejection this
+    // replaces was a 422 the error middleware rewrote to 400; same status and
+    // message, including the field path and position.
+    let mut request = deserialize_body::<NvCreateResponse>(bytes).map_err(|err| {
         tracing::info!(
             status_code = StatusCode::BAD_REQUEST.as_u16(),
             reason = "request_body_deserialization_failed",

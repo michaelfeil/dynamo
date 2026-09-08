@@ -28,12 +28,12 @@ use axum::{
 use dynamo_runtime::config::{env_is_truthy, environment_names::llm as env_llm};
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context, context::stamp_request_start};
 use futures::{StreamExt, stream};
-use serde::Deserialize;
 use tracing::Instrument;
 
 use super::{
-    RouteDoc,
+    RawJson, RouteDoc,
     b10_rate_limiter::check_rate_limit,
+    deserialize_body,
     disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
     metrics::{CancellationLabels, Endpoint, process_response_and_observe_metrics},
     service_v2,
@@ -160,13 +160,13 @@ pub(crate) struct AnthropicMessagesBody {
 async fn handler_anthropic_messages(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    RawJson { bytes, value: body }: RawJson,
 ) -> Result<Response, Response> {
-    // Parse the typed view off the same JSON (kept alongside, see
-    // `AnthropicMessagesBody`). The axum `Json<T>` rejection this replaces
-    // was a 422 the error middleware rewrote to 400; same status and message
-    // shape here.
-    let request = AnthropicCreateMessageRequest::deserialize(&body).map_err(|err| {
+    // Parse the typed view off the same bytes the `Value` came from (kept
+    // alongside, see `AnthropicMessagesBody`). The axum `Json<T>` rejection
+    // this replaces was a 422 the error middleware rewrote to 400; same
+    // status and message here, including the field path and position.
+    let request = deserialize_body::<AnthropicCreateMessageRequest>(bytes).map_err(|err| {
         tracing::info!(
             status_code = StatusCode::BAD_REQUEST.as_u16(),
             reason = "request_body_deserialization_failed",

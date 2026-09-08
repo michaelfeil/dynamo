@@ -2203,11 +2203,17 @@ fn user_input_content(
     parts: &[InputContent],
 ) -> Result<ChatCompletionRequestUserMessageContent, String> {
     let mut text = String::new();
+    let mut first_text = true;
     let mut cc_parts: Vec<ChatCompletionRequestUserMessageContentPart> = Vec::new();
     let mut has_image = false;
     for part in parts {
         match part {
             InputContent::InputText(part) => {
+                // Same `"\n"` separator as `flatten_input_content`: the collapsed form must read
+                // like the part array the multimodal branch keeps.
+                if !std::mem::take(&mut first_text) {
+                    text.push('\n');
+                }
                 text.push_str(&part.text);
                 cc_parts.push(ChatCompletionRequestUserMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText {
@@ -2283,13 +2289,25 @@ fn unsupported_input_content_part(kind: &str) -> String {
     format!("unsupported input content part type: {kind}")
 }
 
-/// Text-only content parts, concatenated. An image/file part is refused, never dropped — same
-/// stance `unsupported_block` takes for an untranslatable Anthropic block.
+/// Text-only content parts joined with `"\n"` — the same adjacent-block separator ruling
+/// `flatten_text` applies on the Messages side, and what the deployed Responses converter
+/// produced by handing the template a part list it rendered one per line. Concatenating with no
+/// separator runs the last word of one part into the first word of the next. An image/file part
+/// is refused, never dropped — same stance `unsupported_block` takes for an untranslatable
+/// Anthropic block.
 fn flatten_input_content(parts: &[InputContent]) -> Result<String, String> {
     let mut text = String::new();
+    let mut first = true;
     for part in parts {
         match part {
-            InputContent::InputText(part) => text.push_str(&part.text),
+            InputContent::InputText(part) => {
+                // Separator between parts, not around them: an empty part still contributes its
+                // boundary, exactly as a per-part template render did.
+                if !std::mem::take(&mut first) {
+                    text.push('\n');
+                }
+                text.push_str(&part.text);
+            }
             InputContent::InputImage(_) => {
                 return Err(unsupported_input_content_part("input_image"));
             }
@@ -2300,16 +2318,17 @@ fn flatten_input_content(parts: &[InputContent]) -> Result<String, String> {
 }
 
 /// A `function_call_output`'s output as the single text form the history append shares: a
-/// structured part list is accepted only if every part is text.
+/// structured part list is accepted only if every part is text, and the parts join with `"\n"`
+/// like every other adjacent-text-part flatten here.
 fn function_call_output_text(output: &FunctionCallOutput) -> Result<String, String> {
     use dynamo_protocols::types::responses::UpstreamInputContent;
     match output {
         FunctionCallOutput::Text(text) => Ok(text.clone()),
         // Carries upstream's original `InputContent`, not the Dynamo-relaxed shadow — same variants.
-        FunctionCallOutput::Content(parts) => parts
+        FunctionCallOutput::Content(parts) => Ok(parts
             .iter()
             .map(|part| match part {
-                UpstreamInputContent::InputText(part) => Ok(part.text.clone()),
+                UpstreamInputContent::InputText(part) => Ok(part.text.as_str()),
                 UpstreamInputContent::InputImage(_) => {
                     Err(unsupported_input_content_part("input_image"))
                 }
@@ -2317,7 +2336,8 @@ fn function_call_output_text(output: &FunctionCallOutput) -> Result<String, Stri
                     Err(unsupported_input_content_part("input_file"))
                 }
             })
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n")),
     }
 }
 
