@@ -1954,28 +1954,21 @@ fn adapt_responses_empty_assistant_turn_and_refusal_keep_boundaries() {
     assert_eq!(out[3]["content"], "no");
 }
 
-/// The thinking-budget upper bound needs a `max_tokens` to compare against; a request that leaves
-/// `max_tokens` to the deployment template is accepted, the lower bound still applies.
+/// The thinking-budget bound needs a `max_tokens` to compare against, so a request that leaves
+/// `max_tokens` to the deployment template carries any budget it names.
 #[test]
 fn adapt_messages_thinking_budget_without_max_tokens_is_accepted() {
     let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
         "thinking": {"type": "enabled", "budget_tokens": 2048}});
-    let ok = request_only(
-        &serde_json::to_vec(&body).unwrap(),
-        ClientProtocol::Messages,
-        &HeaderMap::new(),
-    );
-    assert!(ok.is_ok(), "{ok:?}");
-    body["thinking"]["budget_tokens"] = json!(512);
-    let err = request_only(
-        &serde_json::to_vec(&body).unwrap(),
-        ClientProtocol::Messages,
-        &HeaderMap::new(),
-    );
-    assert!(
-        matches!(err, Err(RequestRejection::Malformed(_))),
-        "{err:?}"
-    );
+    for budget in [2048, 512] {
+        body["thinking"]["budget_tokens"] = json!(budget);
+        let adapted = request_only(
+            &serde_json::to_vec(&body).unwrap(),
+            ClientProtocol::Messages,
+            &HeaderMap::new(),
+        );
+        assert!(adapted.is_ok(), "budget {budget}: {adapted:?}");
+    }
 }
 
 /// Codex Responses-Lite framing declares tools on an `additional_tools` input item instead of (or
@@ -2091,11 +2084,20 @@ fn top_p_out_of_range_is_refused_on_both_wires() {
     }
 }
 
+/// Anthropic's 1024 floor is theirs, not ours: the engines cap reasoning at
+/// whatever count they are given.
 #[test]
-fn messages_thinking_budget_below_floor_is_refused() {
-    let err = adapt_messages_body(json!({"thinking": {"type": "enabled", "budget_tokens": 100}}))
-        .expect_err("Anthropic floors the manual budget at 1024");
-    assert!(err.detail().contains("at least 1024"), "{err}");
+fn messages_thinking_budget_below_anthropics_floor_is_served() {
+    for budget in [1, 100, 1023] {
+        let adapted =
+            adapt_messages_body(json!({"thinking": {"type": "enabled", "budget_tokens": budget}}))
+                .unwrap_or_else(|err| panic!("budget {budget} must be served: {err:?}"));
+        let cc = serde_json::to_value(&adapted.request).unwrap();
+        assert_eq!(
+            cc["chat_template_kwargs"]["thinking_budget"], budget,
+            "budget {budget}"
+        );
+    }
 }
 
 #[test]

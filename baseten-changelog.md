@@ -2304,10 +2304,17 @@ billing verdict as tool-bank ships it (`billable`, `sku`, `quantity` present
 only when the call bills; `ToolOutput.verdict` mirrors `BillingVerdict` /
 `UsageReport` as data, baseten #27386). Baseten-specific.
 
+Anthropic's 1024 floor on `thinking.budget_tokens` is not enforced. That floor is
+a fact about their models; the engines here cap reasoning at whatever token count
+they are given, so a smaller budget is a request they can serve and refusing it
+turns a working parameter into a 400. The upper bound stays: a budget at or above
+`max_tokens` leaves no room for an answer, so reasoning consumes the completion
+and the client gets `content: null` with `finish_reason: "length"`.
+
 Ingress edges on the shared crate (stack D4) — the validation floor and
 parity fixes live agent traffic and the bx suites taught us, each with a test
 in `request_test.rs`: Messages `temperature`/`top_p` 0..1, thinking budget
->= 1024 and < max_tokens, client-tool `input_schema` required, orphan
+< max_tokens, client-tool `input_schema` required, orphan
 `tool_result` 400; Responses `temperature` 0..2, orphan `function_call_output`
 400; a trailing assistant turn sets CC `partial: true` (prefill); Anthropic-only
 top-level fields (`service_tier`, `cache_control`, `context_management`, ...)

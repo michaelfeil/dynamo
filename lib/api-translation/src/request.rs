@@ -711,26 +711,18 @@ fn adapt_messages(
             "top_p must be between 0 and 1, got {p}"
         )));
     }
-    // Anthropic bounds the manual thinking budget: >= 1024 and strictly less than max_tokens.
-    // (Budget with a non-`enabled` mode is refused in `parse_messages_thinking`.)
+    // A budget at or above `max_tokens` leaves reasoning no room for an answer:
+    // the client gets `content: null` with `finish_reason: "length"`. Applies
+    // only when the client sent a `max_tokens`; the template may supply one.
     if let Some(thinking) = &messages_request.thinking
         && thinking.thinking_type == "enabled"
         && let Some(budget) = thinking.budget_tokens
+        && let Some(max_tokens) = messages_request.max_tokens
+        && budget >= max_tokens
     {
-        if budget < 1024 {
-            return Err(RequestRejection::malformed(format!(
-                "thinking.budget_tokens must be at least 1024, got {budget}"
-            )));
-        }
-        // Anthropic requires `max_tokens`; the typed request keeps it optional (the deployment's
-        // template may supply it), so the upper bound applies only when the client sent one.
-        if let Some(max_tokens) = messages_request.max_tokens
-            && budget >= max_tokens
-        {
-            return Err(RequestRejection::malformed(format!(
-                "thinking.budget_tokens ({budget}) must be less than max_tokens ({max_tokens})"
-            )));
-        }
+        return Err(RequestRejection::malformed(format!(
+            "thinking.budget_tokens ({budget}) must be less than max_tokens ({max_tokens})"
+        )));
     }
 
     let mut cc_messages: Vec<CcMessage> = Vec::new();
