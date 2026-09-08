@@ -71,24 +71,25 @@ pub struct ZmqPubTransport {
 impl ZmqPubTransport {
     /// Create a new ZMQ publisher by binding to an endpoint.
     ///
-    /// If port is 0, finds an available port using TcpListener first,
-    /// then binds ZMQ to that port.
+    /// Port 0 lets ZMQ atomically allocate and bind an ephemeral port.
     ///
     /// Returns the transport and the actual bound endpoint.
     pub async fn bind(endpoint: &str, topic: &str) -> Result<(Self, String)> {
-        let actual_endpoint = if endpoint.ends_with(":0") {
-            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
-            let actual_addr = listener.local_addr()?;
-            let port = actual_addr.port();
-            drop(listener);
-
-            format!("tcp://0.0.0.0:{port}")
+        let bind_endpoint = if let Some(address) = endpoint
+            .strip_prefix("tcp://")
+            .and_then(|address| address.strip_suffix(":0"))
+        {
+            format!("tcp://{address}:*")
         } else {
             endpoint.to_string()
         };
 
         let ctx = Context::new();
-        let socket = configure_publish_builder(publish(&ctx)).bind(&actual_endpoint)?;
+        let socket = configure_publish_builder(publish(&ctx)).bind(&bind_endpoint)?;
+        let actual_endpoint = socket
+            .get_socket()
+            .get_last_endpoint()?
+            .map_err(|_| anyhow!("ZMQ bound endpoint is not valid UTF-8"))?;
 
         tracing::info!(
             endpoint = %actual_endpoint,
@@ -364,19 +365,29 @@ mod tests {
     use crate::transports::event_plane::{EventEnvelope, MsgpackCodec};
     use tokio::time::{Duration, timeout};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_zmq_pubsub_basic() {
-        let port = 25555;
-        let endpoint = format!("tcp://127.0.0.1:{port}");
         let topic = "test-topic";
-
-        let (publisher, _actual_endpoint) = ZmqPubTransport::bind(&endpoint, topic)
-            .await
-            .expect("Failed to create publisher");
+        let publishers = futures::future::try_join_all((0..16).map(|_| {
+            tokio::spawn(async move { ZmqPubTransport::bind("tcp://127.0.0.1:0", topic).await })
+        }))
+        .await
+        .expect("Publisher task must complete")
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .expect("Concurrent publishers must receive distinct ports");
+        let endpoints: std::collections::HashSet<_> =
+            publishers.iter().map(|(_, endpoint)| endpoint).collect();
+        assert_eq!(endpoints.len(), publishers.len());
+        for endpoint in &endpoints {
+            assert!(endpoint.starts_with("tcp://127.0.0.1:"));
+            assert!(!endpoint.ends_with(":0"));
+        }
+        let (publisher, endpoint) = &publishers[0];
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let subscriber = ZmqSubTransport::connect(&endpoint, topic)
+        let subscriber = ZmqSubTransport::connect(endpoint, topic)
             .await
             .expect("Failed to create subscriber");
 
@@ -412,11 +423,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_zmq_multiple_messages() {
-        let port = 25556;
-        let endpoint = format!("tcp://127.0.0.1:{port}");
         let topic = "multi-test";
 
-        let (publisher, _) = ZmqPubTransport::bind(&endpoint, topic).await.unwrap();
+        let (publisher, endpoint) = ZmqPubTransport::bind("tcp://127.0.0.1:0", topic)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let subscriber = ZmqSubTransport::connect(&endpoint, topic).await.unwrap();
