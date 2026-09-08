@@ -426,6 +426,13 @@ minutes later to a caller that no longer exists (basetenlabs/dynamo#763). Late
 delivery made the KV router book scheduler state that nothing freed until the
 600 s stale-request reaper.
 
+The TCP request sender ports upstream ai-dynamo/dynamo#10519 (commit
+`867f530414d380599c0b9a317d39d848e2364094`): split header/payload frames,
+small-chunk coalescing, and byte-bounded vectored writes remove large payload
+copies without changing the wire protocol. Preserve the abandoned-request
+check from #763 when replaying this port. Message-size limits are unchanged;
+this replaces the need for the retained send-scratch fix proposed in #761.
+
 ## PATCH-003: NATS, JetStream, and Discovery Compatibility
 
 Status: `redesign`
