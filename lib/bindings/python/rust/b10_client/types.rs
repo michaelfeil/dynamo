@@ -12,6 +12,7 @@ use dynamo_b10_client::{
     DeniedRequest as CoreDeniedRequest, GenerationAdmission, RouterRequestGuard,
     RouterWorkerPhase as CoreRouterWorkerPhase,
 };
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use std::collections::HashSet;
@@ -394,8 +395,21 @@ impl DeniedGenerationRequest {
 
 #[pymethods]
 impl DeniedGenerationRequest {
+    /// The denial reason as a typed `DeniedRequest.<Variant>` instance.
+    ///
+    /// Must go through `into_py_any`, not `Py::new`: for a pyo3 complex enum,
+    /// `Py::new` produces an instance of the *base* class only (the pyo3 guide
+    /// documents the two as inconsistent), so `isinstance(denied,
+    /// DeniedRequest.RouterBackpressure)` was always False and every denial
+    /// -- including plain router backpressure -- surfaced to callers as the
+    /// generic "framework denied request with unknown response" 500 instead
+    /// of a 429. `route_and_worker` already returns denials via `into_py_any`;
+    /// this keeps the coordinated path consistent with it. The downcast back
+    /// to `Py<DeniedRequest>` keeps the Rust signature (and the `_core.pyi`
+    /// stub, `-> DeniedRequest`) honest: every variant class extends the base.
     fn denied_request(&self, py: Python<'_>) -> PyResult<Py<DeniedRequest>> {
-        Py::new(py, self.denied.clone())
+        let variant = self.denied.clone().into_py_any(py)?.into_bound(py);
+        Ok(variant.downcast_into::<DeniedRequest>()?.unbind())
     }
 
     fn estimated_overlap_tokens(&self) -> Option<u64> {

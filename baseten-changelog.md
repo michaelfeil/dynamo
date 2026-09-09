@@ -1517,6 +1517,21 @@ stream back to the parent cancellation context after the connection exists.
 Keep the cancellation and guard-lifecycle tests with the Rust implementation
 when replaying this API.
 
+Return a typed denial variant from `DeniedGenerationRequest.denied_request()`
+(#780): the Python extension built the reason with `Py::new` on the
+`DeniedRequest` pyo3 complex enum, which produces an instance of the base class
+only (pyo3 documents `Py::new` and `.into_pyobject` as inconsistent for complex
+enums). Callers discriminating with `isinstance(denied,
+DeniedRequest.RouterBackpressure)` therefore never matched, and every denial on
+the coordinated path -- router backpressure included -- surfaced as a generic
+500 instead of a 429. The accessor now converts with `into_py_any` (as
+`route_and_worker` already did) and downcasts back to `Py<DeniedRequest>` so
+the Rust signature and the `_core.pyi` stub stay honest. When replaying: never
+construct a complex-enum pyclass for Python with `Py::new`; add a binding-level
+test that asserts `isinstance(denied_request(), DeniedRequest.<Variant>)` for
+every variant, since the harness-side unit tests use a fake denial object and
+did not catch this.
+
 v1.2 remote generation coordinator:
 
 The generation coordinator now has a common Rust client trait with local and
