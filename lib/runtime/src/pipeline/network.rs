@@ -43,7 +43,7 @@ static REQUEST_PLANE_PAYLOAD_CODEC: OnceLock<RequestPlanePayloadCodec> = OnceLoc
 
 /// Read the configured TCP max message size once and share it across client,
 /// server, and zero-copy decoder code paths.
-pub(crate) fn get_tcp_max_message_size() -> usize {
+pub fn get_tcp_max_message_size() -> usize {
     *TCP_MAX_MESSAGE_SIZE.get_or_init(|| {
         std::env::var("DYN_TCP_MAX_MESSAGE_SIZE")
             .ok()

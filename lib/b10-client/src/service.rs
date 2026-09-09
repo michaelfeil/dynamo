@@ -22,6 +22,7 @@ use axum::http::{Response, StatusCode, header};
 use axum::routing::{get, post};
 use dynamo_runtime::pipeline::AsyncEngineContext;
 use dynamo_runtime::pipeline::context::Controller;
+use dynamo_runtime::pipeline::network::get_tcp_max_message_size;
 use futures::{StreamExt, stream};
 use prost::Message;
 use std::convert::Infallible;
@@ -30,7 +31,6 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
 pub const COORDINATE_PATH: &str = "/v1/coordinate";
 pub const HEALTH_PATH: &str = "/health";
 
@@ -64,7 +64,7 @@ impl GenerationCoordinatorService {
         let app = Router::new()
             .route(COORDINATE_PATH, post(coordinate))
             .route(HEALTH_PATH, get(health))
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .layer(DefaultBodyLimit::max(get_tcp_max_message_size()))
             .with_state(self);
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
