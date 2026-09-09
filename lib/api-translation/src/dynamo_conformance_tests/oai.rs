@@ -379,7 +379,7 @@ fn fork_extensions_reach_render_without_corruption() {
         "absent enable_thinking renders the false branch"
     );
 
-    // `thinking_budget` (Anthropic `budget_tokens` -> `chat_template_kwargs`) threads through too.
+    // A client-named `thinking_budget` kwarg threads through to the template too.
     let with_budget: CcRequest = serde_json::from_value(json!({
         "model": "probe",
         "messages": [{"role": "user", "content": "hi"}],

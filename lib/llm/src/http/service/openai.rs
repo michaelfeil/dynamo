@@ -1999,7 +1999,7 @@ async fn responses(
         tools: typed.inner.tools.clone(),
         tool_choice: typed.inner.tool_choice.clone(),
         instructions: typed.inner.instructions.clone(),
-        reasoning: typed.inner.reasoning.clone(),
+        reasoning: typed.inner.reasoning.as_ref().map(Into::into),
         text: typed.inner.text.clone(),
         service_tier: typed.inner.service_tier,
         include: typed.inner.include.clone(),

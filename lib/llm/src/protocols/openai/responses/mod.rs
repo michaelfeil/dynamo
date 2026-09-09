@@ -2280,17 +2280,22 @@ thinking
 
     #[test]
     fn test_reasoning_effort_mapped_to_chat_completion() {
-        use dynamo_protocols::types::ReasoningEffort;
-        use dynamo_protocols::types::responses::Reasoning;
+        use dynamo_protocols::types::B10ReasoningEffort;
+        use dynamo_protocols::types::responses::B10ReasoningParam;
 
-        let mut req = make_response_with_input("think hard");
-        req.inner.reasoning = Some(Reasoning {
-            effort: Some(ReasoningEffort::Medium),
-            ..Default::default()
-        });
+        // `max` also covers the round trip: this conversion re-serializes the
+        // Responses body and re-parses it as Chat Completions, so an effort the
+        // upstream enum cannot spell has to survive both halves.
+        for effort in [B10ReasoningEffort::Medium, B10ReasoningEffort::Max] {
+            let mut req = make_response_with_input("think hard");
+            req.inner.reasoning = Some(B10ReasoningParam {
+                effort: Some(effort.clone()),
+                ..Default::default()
+            });
 
-        let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
-        assert_eq!(chat.inner.reasoning_effort, Some(ReasoningEffort::Medium));
+            let chat: NvCreateChatCompletionRequest = req.try_into().unwrap();
+            assert_eq!(chat.inner.reasoning_effort, Some(effort));
+        }
     }
 
     #[test]

@@ -1284,9 +1284,42 @@ client order. Already on main-v1.2.0 and NOT changed here: non-terminal
 `finish_reason` omission, string `error.code`, `document`/`search_result`
 tool_result blocks. Baseten-specific; not upstreamable.
 
-The `reasoning_effort` field on chat completion requests is normalized through a process-wide alias map before deserialization. Defaults: `"max"` → `"xhigh"`. Override at runtime by setting the `REASONING_EFFORT_ALIASES` env var to a JSON object (e.g. `REASONING_EFFORT_ALIASES='{"max":"xhigh","minimum":"low"}'`); parsed once on first use, silently falls back to the hardcoded defaults if absent or unparseable.
+Reasoning effort is carried, not judged. `B10ReasoningEffort` types the seven
+canonical levels (`B10_REASONING_EFFORT_LEVELS`: `none`, `minimal`, `low`,
+`medium`, `high`, `xhigh`, `max`) and carries every other value — an unknown
+word, a boolean, a number — verbatim in `Other`. It replaces upstream's
+`ReasoningEffort` on chat `reasoning_effort`, on Responses `reasoning.effort`
+(via `B10ReasoningParam`, which keeps that surface's vocabulary identical to
+chat's), and on Anthropic `output_config.effort`. Only the deployment's
+per-model reasoning policy knows which levels a model distinguishes, so this
+layer rejecting a spelling 400s values some models can serve — which is what
+the `REASONING_EFFORT_ALIASES` alias map and its `max` -> `xhigh` fold did.
+That map, its env-var override and its two per-surface hooks are removed, so
+`max` now reaches the serve side as `max`. There is deliberately no `Default`:
+upstream's enum defaults to `medium`, which makes "sent nothing" and "asked for
+medium" indistinguishable and unreachable for the policy's own default. The
+`/v1/responses` echo still converts through upstream's enum, where `max` has no
+variant and reports as `xhigh`, and a non-level omits `effort`. Supersedes the
+alias-map behavior added in #574.
 
-The same alias map applies to `reasoning.effort` on `/v1/responses` requests (`CreateResponse.reasoning` custom deserializer): without it, `{"reasoning": {"effort": "max"}}` was a deserialization 400 on the Responses API while the identical effort succeeded on chat completions. Serve-side reasoning policies map `xhigh` back to the model-native `max` tier, so DeepSeek V4 / GLM clients get identical effort behavior on both APIs (PR #574).
+Anthropic thinking controls land on first-class Chat Completions fields rather
+than in `chat_template_kwargs`, which is a rendering input while these are
+policy inputs the serve side reads before it decides what the template gets.
+`thinking.type` `enabled`/`disabled` -> `thinking` (`BasetenExt.thinking`, now
+in `CC_EXTENSION_KEYS`); `thinking.budget_tokens` -> `thinking_token_budget`,
+the field both engines enforce, where it previously became a
+`chat_template_kwargs.thinking_budget` that no template, renderer or engine
+reads — so an Anthropic-SDK client's budget had no effect on any model.
+`adaptive` is thinking on, like `enabled`, and carries no budget: it is the only
+mode on Anthropic 4.7+ models, so it does not mean "maybe", and depth comes from
+`output_config.effort` when the client sends one -- which the Anthropic coding
+harnesses do -- and from the deployment's default level when it does not. No
+level is invented for it. This keeps the canonicalized request and the Messages
+handler's SGLang text path saying the same thing, where that path forces
+`chat_template_kwargs.enable_thinking` alongside `prompt_injected_reasoning` to
+keep the parser aligned with a prompt it never renders. Anthropic dialect-shape
+checks are unchanged (budget < `max_tokens`, budget only with
+`type: enabled`, unknown `type` refused).
 
 The request-side assistant message accepts `reasoning` as a serde alias for `reasoning_content`, so prior-turn reasoning sent under either wire name (OpenRouter/newer-vLLM `reasoning` or DeepSeek/vLLM-legacy `reasoning_content`) deserializes into the canonical field and re-renders into the chat template.
 
@@ -2401,9 +2434,9 @@ tool-bank sets true): untranslatable user content blocks are skipped with a
 warning, and `mcp_servers` / `container` are dropped with a warning, where
 tool-bank 400s. Ingress rejections name the offending JSON member
 (`serde_path_to_error`; Responses `input[i]` parsed per index) and Responses
-`reasoning.effort` resolves through the fork's `REASONING_EFFORT_ALIASES`
-table like chat `reasoning_effort` (`max` -> `xhigh`, no longer a 400; ported
-from tool-bank #27635/#27828). The crate carries no consumer tool namespace
+`reasoning.effort` shares chat `reasoning_effort`'s permissive
+`B10ReasoningEffort` (see the reasoning-effort entry above; ported from
+tool-bank #27635/#27828, then made pass-through). The crate carries no consumer tool namespace
 (review, Marius): server-tool routing is by shape only (CC/Responses
 non-`function` `type`, Anthropic non-`custom` `type` -> the hooks; a plain
 deployment drops with a recorded loss — wire-visible: a CC `web_search_preview`

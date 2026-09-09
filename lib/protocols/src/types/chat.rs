@@ -5,9 +5,7 @@
 // extensions on top. Types prefixed with `Dynamo` or entirely absent from the
 // upstream spec are documented with the rationale for the extension.
 
-use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::OnceLock;
 
 use derive_builder::Builder;
 use futures::Stream;
@@ -293,52 +291,123 @@ where
     }
 }
 
-// Maps non-standard `reasoning_effort` alias values to their canonical
-// counterparts before deserialising.
-//
-// Defaults: `"max"` → `"xhigh"`, `"minimum"` → `"low"`.
-// Override at runtime by setting the `REASONING_EFFORT_ALIASES` environment
-// variable to a JSON object, e.g. `{"max":"xhigh","minimum":"low"}`.
-// The env-var value is parsed once and cached for the lifetime of the process.
-static REASONING_EFFORT_ALIASES: OnceLock<HashMap<String, String>> = OnceLock::new();
+/// The canonical reasoning-effort spellings. `none` turns thinking off; the
+/// other six are levels, weakest to strongest.
+///
+/// One vocabulary with the serve side, whose copy is `VALID_REASONING_EFFORTS`
+/// in the baseten repo's
+/// `mp/baseten_dynamo/cache_aware_routing_trtllm/src/common/reasoning_effort.py`.
+/// Which of these a given model accepts is that policy's business, not this
+/// crate's.
+pub const B10_REASONING_EFFORT_LEVELS: [&str; 7] =
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-pub(crate) fn reasoning_effort_aliases() -> &'static HashMap<String, String> {
-    REASONING_EFFORT_ALIASES.get_or_init(|| {
-        if let Ok(val) = std::env::var("REASONING_EFFORT_ALIASES") {
-            if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&val) {
-                return map;
-            }
+/// A reasoning effort as the client sent it.
+///
+/// Only the serve side holds the per-model policy that says which levels a
+/// model distinguishes, so this type carries the request's value instead of
+/// judging it: a canonical level becomes its variant, and anything else — an
+/// unknown word, a boolean, a number — rides through in [`Self::Other`] byte
+/// for byte, to be snapped onto the model's levels or refused there with a
+/// message naming them.
+///
+/// Matching is exact, so `"Max"` is an `Other` rather than `Max`: case folding
+/// is a client-spelling rule, and those belong with the policy that owns the
+/// rest of them.
+///
+/// Deliberately no `Default`: picking a level is a policy decision, not a
+/// parsing one.
+#[derive(Clone, Debug, PartialEq)]
+pub enum B10ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    /// A value that is not one of [`B10_REASONING_EFFORT_LEVELS`], preserved
+    /// exactly as received.
+    Other(serde_json::Value),
+}
+
+impl B10ReasoningEffort {
+    /// The canonical spelling, or `None` for a value that is not a level.
+    pub fn as_level(&self) -> Option<&'static str> {
+        match self {
+            Self::None => Some("none"),
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Xhigh => Some("xhigh"),
+            Self::Max => Some("max"),
+            Self::Other(_) => None,
         }
-        [("max".to_string(), "xhigh".to_string())]
-            .into_iter()
-            .collect()
-    })
+    }
+
+    /// The effort a client sent, canonical or not. Infallible by construction:
+    /// judging a spelling takes the per-model policy this crate does not have.
+    pub fn from_client_value(value: serde_json::Value) -> Self {
+        let level = value.as_str().and_then(Self::from_level);
+        level.unwrap_or(Self::Other(value))
+    }
+
+    /// The level a canonical spelling names, or `None` for anything else.
+    fn from_level(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// The nearest value the async-openai `ReasoningEffort` enum can spell.
+    ///
+    /// For the `/v1/responses` echo only -- the request keeps whatever the
+    /// client sent, since [`Serialize`] writes `Other` back verbatim. Two
+    /// values narrow here because the response type cannot hold them: `max`
+    /// echoes as `xhigh`, the strongest that enum has, and a non-level echoes
+    /// nothing, so the field is omitted rather than reporting an effort the
+    /// client did not ask for.
+    pub fn to_async_openai(&self) -> Option<ReasoningEffort> {
+        match self {
+            Self::None => Some(ReasoningEffort::None),
+            Self::Minimal => Some(ReasoningEffort::Minimal),
+            Self::Low => Some(ReasoningEffort::Low),
+            Self::Medium => Some(ReasoningEffort::Medium),
+            Self::High => Some(ReasoningEffort::High),
+            Self::Xhigh | Self::Max => Some(ReasoningEffort::Xhigh),
+            Self::Other(_) => None,
+        }
+    }
 }
 
-/// Canonicalize a reasoning-effort string through `REASONING_EFFORT_ALIASES`
-/// and parse it as `ReasoningEffort`. The single entry point for every request
-/// surface that accepts an effort (chat `reasoning_effort`, responses
-/// `reasoning.effort`) so all paths share one alias table and one error shape.
-/// Public so out-of-crate ingress translators (`b10-dynamo-api-translation`) resolve
-/// efforts through the same table instead of carrying their own.
-pub fn parse_reasoning_effort(s: String) -> Result<ReasoningEffort, serde_json::Error> {
-    let s = reasoning_effort_aliases().get(&s).cloned().unwrap_or(s);
-    serde_json::from_value::<ReasoningEffort>(serde_json::Value::String(s))
+impl Serialize for B10ReasoningEffort {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Other(value) => value.serialize(serializer),
+            Self::None => serializer.serialize_str("none"),
+            Self::Minimal => serializer.serialize_str("minimal"),
+            Self::Low => serializer.serialize_str("low"),
+            Self::Medium => serializer.serialize_str("medium"),
+            Self::High => serializer.serialize_str("high"),
+            Self::Xhigh => serializer.serialize_str("xhigh"),
+            Self::Max => serializer.serialize_str("max"),
+        }
+    }
 }
 
-fn deserialize_reasoning_effort_opt<'de, D>(
-    deserializer: D,
-) -> Result<Option<ReasoningEffort>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error as _;
-    let opt = Option::<String>::deserialize(deserializer)?;
-    match opt {
-        None => Ok(None),
-        Some(s) => parse_reasoning_effort(s)
-            .map(Some)
-            .map_err(D::Error::custom),
+impl<'de> Deserialize<'de> for B10ReasoningEffort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from_client_value(serde_json::Value::deserialize(
+            deserializer,
+        )?))
     }
 }
 
@@ -857,12 +926,8 @@ pub struct CreateChatCompletionRequest {
     pub mm_processor_kwargs: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_reasoning_effort_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<B10ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1420,5 +1485,70 @@ mod tests {
             parts[1],
             ChatCompletionRequestUserMessageContentPart::ImageUrl(_)
         ));
+    }
+
+    #[test]
+    fn every_canonical_level_round_trips_to_its_variant() {
+        for level in B10_REASONING_EFFORT_LEVELS {
+            let parsed: B10ReasoningEffort =
+                serde_json::from_value(serde_json::json!(level)).unwrap();
+            assert_eq!(parsed.as_level(), Some(level), "level {level}");
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                serde_json::json!(level),
+                "level {level} re-serializes"
+            );
+        }
+    }
+
+    #[test]
+    fn off_ladder_values_are_carried_verbatim() {
+        // Values with no variant on the upstream enum: spellings clients send,
+        // and the non-string shapes a client can put in the field.
+        for raw in [
+            serde_json::json!("ultra"),
+            serde_json::json!("persistent"),
+            serde_json::json!("turbo"),
+            serde_json::json!("Max"),
+            serde_json::json!(""),
+            serde_json::json!(true),
+            serde_json::json!(4096),
+        ] {
+            let parsed: B10ReasoningEffort = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(parsed, B10ReasoningEffort::Other(raw.clone()), "{raw}");
+            assert_eq!(parsed.as_level(), None, "{raw}");
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                raw,
+                "{raw} re-serializes byte for byte"
+            );
+        }
+    }
+
+    #[test]
+    fn only_max_folds_when_echoed_through_the_upstream_enum() {
+        for level in B10_REASONING_EFFORT_LEVELS {
+            let parsed: B10ReasoningEffort =
+                serde_json::from_value(serde_json::json!(level)).unwrap();
+            let echoed = parsed.to_async_openai().expect("a level always echoes");
+            let expected = if level == "max" { "xhigh" } else { level };
+            assert_eq!(
+                serde_json::to_value(echoed).unwrap(),
+                serde_json::json!(expected),
+                "level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_is_absent_rather_than_defaulted_when_unset() {
+        // The upstream enum defaults to `medium`; a request that named no
+        // effort must stay distinguishable from one that asked for `medium`,
+        // or the policy's own default can never apply.
+        let req: CreateChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({"messages": [], "model": "m"})).unwrap();
+        assert_eq!(req.reasoning_effort, None);
+        let body = serde_json::to_value(&req).unwrap();
+        assert!(!body.as_object().unwrap().contains_key("reasoning_effort"));
     }
 }

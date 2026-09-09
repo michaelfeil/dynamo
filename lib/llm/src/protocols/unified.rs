@@ -256,7 +256,7 @@ impl UnifiedRequest {
         let responses_ctx = ResponsesContext {
             previous_response_id: req.inner.previous_response_id.clone(),
             truncation: req.inner.truncation,
-            reasoning: req.inner.reasoning.clone(),
+            reasoning: req.inner.reasoning.as_ref().map(Into::into),
             include: req.inner.include.clone(),
             store: req.inner.store.unwrap_or(false),
         };
@@ -688,6 +688,57 @@ mod tests {
         // Verify it still works as a preprocessor input
         assert_eq!(unified.model(), "claude-sonnet-4-20250514");
         assert!(unified.extract_text().is_some());
+    }
+
+    /// The Anthropic thinking controls have to survive the whole ingress, not just the
+    /// canonicalizer: the CC body is re-parsed at the wire edge, where an unmodeled key is
+    /// dropped and `thinking` has to fit the strict `Thinking` struct. Asserting on the
+    /// canonicalizer's JSON alone would miss that seam.
+    #[test]
+    fn b10_anthropic_thinking_controls_reach_the_typed_request() {
+        use crate::protocols::openai::baseten_ext::ThinkingType;
+
+        for (thinking, expected_type, expected_budget) in [
+            (
+                serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+                Some(ThinkingType::Enabled),
+                Some(2048),
+            ),
+            (
+                serde_json::json!({"type": "disabled"}),
+                Some(ThinkingType::Disabled),
+                None,
+            ),
+            // `adaptive` asks for thinking and names no depth, so it writes the
+            // switch and no budget.
+            (
+                serde_json::json!({"type": "adaptive"}),
+                Some(ThinkingType::Enabled),
+                None,
+            ),
+        ] {
+            let body = serde_json::json!({
+                "model": "m",
+                "max_tokens": 8192,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": thinking,
+            });
+            let typed: AnthropicCreateMessageRequest =
+                serde_json::from_value(body.clone()).expect("a valid Messages body");
+            let chat = UnifiedRequest::from_anthropic_body(&typed, body)
+                .expect("canonicalization succeeds")
+                .into_inner();
+
+            assert_eq!(
+                chat.baseten_ext.thinking.map(|t| t.thinking_type),
+                expected_type,
+            );
+            assert_eq!(chat.baseten_ext.thinking_token_budget, expected_budget);
+            assert!(
+                chat.chat_template_args.is_none(),
+                "the switch is a policy input, not a template kwarg"
+            );
+        }
     }
 
     #[test]

@@ -24,12 +24,12 @@
 use std::collections::HashMap;
 
 use dynamo_protocols::types::responses::{
-    ErrorObject, FunctionToolCall, IncompleteDetails, InputTokenDetails, Instructions, MCPToolCall,
-    MCPToolCallStatus, OutputContent, OutputItem, OutputMessage, OutputMessageContent,
-    OutputStatus, OutputTextContent, OutputTokenDetails, PromptCacheRetention, Reasoning,
-    ReasoningItem, ReasoningItemContent, ReasoningTextContent, Response, ResponseTextParam,
-    ResponseUsage, ServiceTier, Status, TextResponseFormatConfiguration, Tool, ToolChoiceOptions,
-    ToolChoiceParam, Truncation,
+    B10ReasoningEffort, ErrorObject, FunctionToolCall, IncompleteDetails, InputTokenDetails,
+    Instructions, MCPToolCall, MCPToolCallStatus, OutputContent, OutputItem, OutputMessage,
+    OutputMessageContent, OutputStatus, OutputTextContent, OutputTokenDetails,
+    PromptCacheRetention, Reasoning, ReasoningItem, ReasoningItemContent, ReasoningTextContent,
+    Response, ResponseTextParam, ResponseUsage, ServiceTier, Status,
+    TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam, Truncation,
 };
 use dynamo_protocols::types::{CompletionUsage, FinishReason};
 use serde_json::{Value, json};
@@ -102,7 +102,18 @@ impl ResponsesParams {
             tools: field(body, "tools").unwrap_or_default(),
             tool_choice: field(body, "tool_choice"),
             instructions: field(body, "instructions"),
-            reasoning: field(body, "reasoning"),
+            // Projected a field at a time, so one half cannot discard the other: an effort
+            // the echo type cannot spell must not take `summary` with it, and `summary` is
+            // what decides whether the reasoning item is emitted at all.
+            reasoning: body
+                .get("reasoning")
+                .filter(|value| value.is_object())
+                .map(|reasoning| Reasoning {
+                    effort: field::<B10ReasoningEffort>(reasoning, "effort")
+                        .as_ref()
+                        .and_then(B10ReasoningEffort::to_async_openai),
+                    summary: field(reasoning, "summary"),
+                }),
             text: field(body, "text"),
             service_tier: field(body, "service_tier"),
             truncation: field(body, "truncation"),
@@ -1520,6 +1531,50 @@ mod tests {
 #[cfg(test)]
 mod graft_tests {
     use super::*;
+
+    /// The echo is built from the raw body, so it must accept every effort the ingress accepts.
+    /// Parsing it into a type that cannot spell one drops the whole block leniently, taking
+    /// `summary` with it and withholding the reasoning item the client asked for.
+    #[test]
+    fn echoed_reasoning_survives_an_effort_the_upstream_enum_cannot_spell() {
+        let params = ResponsesParams::from_body(&json!({
+            "reasoning": {"effort": "max", "summary": "auto"}
+        }));
+        let reasoning = params.reasoning.expect("the block must survive");
+        assert_eq!(
+            reasoning.effort,
+            Some(dynamo_protocols::types::ReasoningEffort::Xhigh),
+            "`max` reports as the strongest level the echo type has"
+        );
+        assert_eq!(
+            reasoning.summary,
+            Some(dynamo_protocols::types::responses::ReasoningSummary::Auto)
+        );
+
+        let off_ladder = ResponsesParams::from_body(&json!({
+            "reasoning": {"effort": "turbo", "summary": "auto"}
+        }))
+        .reasoning
+        .expect("the block must survive an unknown effort too");
+        assert_eq!(off_ladder.effort, None, "nothing to echo for a non-level");
+        assert_eq!(
+            off_ladder.summary,
+            Some(dynamo_protocols::types::responses::ReasoningSummary::Auto)
+        );
+
+        // The halves are independent in both directions: a summary this type
+        // cannot spell must not discard the effort either.
+        let bad_summary = ResponsesParams::from_body(&json!({
+            "reasoning": {"effort": "high", "summary": "verbose"}
+        }))
+        .reasoning
+        .expect("the block must survive an unknown summary");
+        assert_eq!(
+            bad_summary.effort,
+            Some(dynamo_protocols::types::ReasoningEffort::High)
+        );
+        assert_eq!(bad_summary.summary, None);
+    }
 
     fn params() -> ResponsesParams {
         ResponsesParams::from_body(&json!({

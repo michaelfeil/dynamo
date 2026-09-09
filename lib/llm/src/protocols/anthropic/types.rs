@@ -23,9 +23,8 @@ use crate::protocols::openai::chat_completions::{
 ///
 /// Goes through the shared api-translation crate (tool-bank's ingress).
 /// Server-tool-shaped tools are dropped with a warning inside the crate
-/// (standard-dynamo behavior); the client's `thinking` config lands in
-/// `chat_template_kwargs.enable_thinking`/`thinking_budget` on the adapted
-/// body. The handler threads the parsed body here rather than re-serializing
+/// (standard-dynamo behavior); the client's `thinking` config lands on the
+/// adapted body's own `thinking` and `thinking_token_budget` fields. The handler threads the parsed body here rather than re-serializing
 /// its typed `AnthropicCreateMessageRequest`: the typed struct is a lossy
 /// projection (joined system blocks, typed tool definitions, ...), and what
 /// the canonicalizer sees must be what the client wrote.

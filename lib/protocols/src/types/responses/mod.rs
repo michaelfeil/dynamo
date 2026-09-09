@@ -44,8 +44,8 @@ pub use async_openai::types::responses::InputContent as UpstreamInputContent;
 
 // Re-export from parent module for backward compat.
 pub use crate::types::ImageDetail;
-pub use crate::types::ReasoningEffort;
 pub use crate::types::ResponseFormatJsonSchema;
+pub use crate::types::{B10ReasoningEffort, ReasoningEffort};
 
 // Backward-compatible type aliases for Dynamo consumer code migration.
 pub type Input = InputParam;
@@ -365,35 +365,32 @@ impl Default for InputParam {
 // CreateResponse (owned, uses Dynamo-owned InputParam)
 // ---------------------------------------------------------------------------
 
-// `reasoning.effort` runs through `crate::types::chat::parse_reasoning_effort`
-// — the same alias table (`REASONING_EFFORT_ALIASES`, default `"max"` →
-// `"xhigh"`) and parse path as top-level `reasoning_effort` on chat
-// completions, so both surfaces stay behaviour-identical. Upstream's
-// `ReasoningEffort` enum has no `max`, but DeepSeek V4 / GLM clients send it,
-// and Baseten's serve-side reasoning policy maps `xhigh` back to the model's
-// native `max` tier. Without this, `{"reasoning": {"effort": "max"}}` is a
-// deserialization 400 on `/v1/responses` while the identical effort succeeds
-// on `/v1/chat/completions`. (`Reasoning` is the upstream struct, so the
-// canonicalization hooks in here rather than as a field attribute.)
-fn deserialize_reasoning_param_opt<'de, D>(deserializer: D) -> Result<Option<Reasoning>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error as _;
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    match value {
-        None => Ok(None),
-        Some(mut v) => {
-            if let Some(effort) = v.as_object_mut().and_then(|obj| obj.get_mut("effort"))
-                && let Some(s) = effort.as_str()
-            {
-                let canonical = crate::types::chat::parse_reasoning_effort(s.to_string())
-                    .map_err(D::Error::custom)?;
-                *effort = serde_json::to_value(&canonical).map_err(D::Error::custom)?;
-            }
-            serde_json::from_value::<Reasoning>(v)
-                .map(Some)
-                .map_err(D::Error::custom)
+/// Responses `reasoning`, request side.
+///
+/// Structurally the upstream `Reasoning`, but `effort` is the permissive
+/// [`B10ReasoningEffort`], so `/v1/responses` and `/v1/chat/completions` accept
+/// exactly the same efforts. The upstream enum cannot spell `max`, and a value
+/// only the serve-side policy can judge must not be refused at deserialization.
+///
+/// The response object keeps the upstream [`Reasoning`]; [`From`] converts for
+/// the echo, where `max` becomes `xhigh` (the strongest the upstream enum has)
+/// and a non-level omits `effort` entirely.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct B10ReasoningParam {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<B10ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ReasoningSummary>,
+}
+
+impl From<&B10ReasoningParam> for Reasoning {
+    fn from(param: &B10ReasoningParam) -> Self {
+        Self {
+            effort: param
+                .effort
+                .as_ref()
+                .and_then(B10ReasoningEffort::to_async_openai),
+            summary: param.summary.clone(),
         }
     }
 }
@@ -431,12 +428,8 @@ pub struct CreateResponse {
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<PromptCacheRetention>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_reasoning_param_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub reasoning: Option<Reasoning>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<B10ReasoningParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -468,24 +461,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reasoning_effort_max_aliases_to_xhigh() {
+    fn reasoning_effort_max_survives_to_the_worker() {
         let json = serde_json::json!({
             "input": "hi",
             "reasoning": {"effort": "max"}
         });
         let req: CreateResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(req.reasoning.unwrap().effort, Some(ReasoningEffort::Xhigh));
+        assert_eq!(
+            req.reasoning.unwrap().effort,
+            Some(B10ReasoningEffort::Max),
+            "the serve-side policy must see the client's word, not an alias of it"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_max_echoes_as_xhigh() {
+        let param = B10ReasoningParam {
+            effort: Some(B10ReasoningEffort::Max),
+            summary: None,
+        };
+        assert_eq!(
+            Reasoning::from(&param).effort,
+            Some(ReasoningEffort::Xhigh),
+            "the upstream echo type cannot spell `max`"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_off_ladder_omits_the_echo() {
+        let param = B10ReasoningParam {
+            effort: Some(B10ReasoningEffort::Other(serde_json::json!("turbo"))),
+            summary: None,
+        };
+        assert_eq!(Reasoning::from(&param).effort, None);
     }
 
     #[test]
     fn reasoning_effort_canonical_values_pass_through() {
         for (raw, expected) in [
-            ("none", ReasoningEffort::None),
-            ("minimal", ReasoningEffort::Minimal),
-            ("low", ReasoningEffort::Low),
-            ("medium", ReasoningEffort::Medium),
-            ("high", ReasoningEffort::High),
-            ("xhigh", ReasoningEffort::Xhigh),
+            ("none", B10ReasoningEffort::None),
+            ("minimal", B10ReasoningEffort::Minimal),
+            ("low", B10ReasoningEffort::Low),
+            ("medium", B10ReasoningEffort::Medium),
+            ("high", B10ReasoningEffort::High),
+            ("xhigh", B10ReasoningEffort::Xhigh),
+            ("max", B10ReasoningEffort::Max),
         ] {
             let json = serde_json::json!({
                 "input": "hi",
@@ -512,12 +532,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_unknown_value_still_errors() {
+    fn reasoning_effort_off_ladder_reaches_the_worker_verbatim() {
         let json = serde_json::json!({
             "input": "hi",
             "reasoning": {"effort": "turbo"}
         });
-        assert!(serde_json::from_value::<CreateResponse>(json).is_err());
+        let req: CreateResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            req.reasoning.unwrap().effort,
+            Some(B10ReasoningEffort::Other(serde_json::json!("turbo")))
+        );
     }
 
     #[test]

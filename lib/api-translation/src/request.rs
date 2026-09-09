@@ -633,6 +633,7 @@ pub const CC_EXTENSION_KEYS: &[&str] = &[
     "dynamic_temperature",
     "priority",
     "reasoning",
+    "thinking",
     "thinking_token_budget",
     "mocker_config",
     "media_io_kwargs",
@@ -879,12 +880,25 @@ fn parse_messages_thinking(thinking: ThinkingConfig) -> Result<MessagesThinking,
     }
 }
 
-/// The request's untranslated fields, plus the reasoning enablement CC carries as a vendor field.
+/// The request's untranslated fields, plus the thinking controls CC carries as vendor fields.
 ///
-/// Anthropic `thinking` -> `chat_template_kwargs.enable_thinking` (Kimi K2.x gates the
-/// `reasoning_content` channel on it) — `disabled` translates too, or an explicit opt-out would
-/// silently vanish and leave the model default in charge. `budget_tokens` -> `thinking_budget` is
-/// best-effort: an OpenAI endpoint has no native budget field and Kimi honors it only loosely.
+/// Both land on first-class CC fields rather than in `chat_template_kwargs`, because a template
+/// kwarg is a *rendering* input and these are *policy* inputs — the serve side reads them before
+/// it decides which kwargs the model's template gets, and it writes `enable_thinking` itself.
+///
+/// - `thinking.type` `enabled`/`disabled` -> `thinking` (`BasetenExt.thinking`), which the serve
+///   side reads ahead of every other switch. `disabled` translates too, or an explicit opt-out
+///   would silently vanish and leave the model default in charge.
+/// - `adaptive` is thinking on, like `enabled`, and writes no budget: it is the only mode on
+///   Anthropic 4.7+ models, so it does not mean "maybe", and depth comes from
+///   `output_config.effort` when the client sends one and from the deployment's default level
+///   when it does not. Leaving the switch unwritten would let a default-off deployment answer a
+///   request whose client is asking to think.
+/// - `budget_tokens` -> `thinking_token_budget`, the field both engines enforce (TRT-LLM via
+///   `ThinkingBudgetLogitsProcessor`, SGLang via `custom_params.thinking_budget`). A client that
+///   named that field itself keeps its value, so a request carrying both budgets runs the CC one
+///   and it is not held to Anthropic's bounds — the more specific field wins, as for every other
+///   key here.
 fn unmodeled_fields(
     mut unmodeled: serde_json::Map<String, Value>,
     thinking: Option<ThinkingConfig>,
@@ -892,42 +906,41 @@ fn unmodeled_fields(
     let Some(thinking) = thinking else {
         return Ok(unmodeled);
     };
-    let mut translated_kwargs = serde_json::Map::new();
+    let mut translated: Vec<(&str, Value)> = Vec::new();
     match parse_messages_thinking(thinking)? {
         MessagesThinking::Enabled { budget_tokens } => {
-            translated_kwargs.insert("enable_thinking".to_string(), json!(true));
+            translated.push(("thinking", json!({"type": "enabled"})));
             if let Some(budget_tokens) = budget_tokens {
-                translated_kwargs.insert("thinking_budget".to_string(), json!(budget_tokens));
+                translated.push(("thinking_token_budget", json!(budget_tokens)));
             }
         }
         MessagesThinking::Adaptive => {
-            translated_kwargs.insert("enable_thinking".to_string(), json!(true));
+            translated.push(("thinking", json!({"type": "enabled"})));
         }
         MessagesThinking::Disabled => {
-            translated_kwargs.insert("enable_thinking".to_string(), json!(false));
+            translated.push(("thinking", json!({"type": "disabled"})));
         }
     }
-    // The client's own kwargs win per key (more specific), but must not erase the rest of the translation.
-    match unmodeled
-        .entry("chat_template_kwargs")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()))
-    {
-        Value::Object(client_kwargs) => {
-            for (key, value) in translated_kwargs {
-                client_kwargs.entry(key).or_insert(value);
-            }
-        }
-        _ => return Err("`chat_template_kwargs` must be a JSON object".to_string()),
+    // The client's own value wins per key (more specific), but must not erase the rest.
+    for (key, value) in translated {
+        unmodeled.entry(key.to_string()).or_insert(value);
     }
     Ok(unmodeled)
 }
 
-/// Anthropic `output_config`: `effort` -> CC `reasoning_effort` (low|medium|high|max, plus the
-/// `xhigh` Claude Code itself sends; both land on CC's `xhigh`), `format`
+/// Anthropic `output_config`: `effort` -> CC `reasoning_effort`, `format`
 /// (structured output) -> CC `response_format`.
+///
+/// The effort is carried, not judged. Anthropic documents `low|medium|high|max`, clients also send
+/// CC's own `xhigh`, and `none` is how a client turns thinking off; only the deployment's per-model
+/// policy knows which levels a model has, so every spelling reaches it rather than being matched
+/// against a vocabulary this layer cannot evaluate.
 #[derive(Deserialize)]
 struct MessagesOutputConfig {
-    effort: Option<String>,
+    /// Typed as the permissive effort, not `String`, so a boolean or numeric
+    /// effort reaches the serve side here as it does on chat and Responses
+    /// rather than failing this struct's deserialization first.
+    effort: Option<dynamo_protocols::types::B10ReasoningEffort>,
     format: Option<MessagesOutputFormat>,
     #[serde(flatten)]
     unmodeled: serde_json::Map<String, Value>,
@@ -946,12 +959,11 @@ fn messages_output_config(
     output_config: Option<MessagesOutputConfig>,
 ) -> Result<
     (
-        Option<dynamo_protocols::types::ReasoningEffort>,
+        Option<dynamo_protocols::types::B10ReasoningEffort>,
         Option<dynamo_protocols::types::ResponseFormat>,
     ),
     RequestRejection,
 > {
-    use dynamo_protocols::types::ReasoningEffort;
     let Some(output_config) = output_config else {
         return Ok((None, None));
     };
@@ -960,19 +972,7 @@ fn messages_output_config(
             "unsupported `output_config` field {unknown_key:?}"
         )));
     }
-    let reasoning_effort = output_config
-        .effort
-        .map(|effort| match effort.as_str() {
-            "low" => Ok(ReasoningEffort::Low),
-            "medium" => Ok(ReasoningEffort::Medium),
-            "high" => Ok(ReasoningEffort::High),
-            // Anthropic documents `max`; Claude Code sends CC's own spelling.
-            "max" | "xhigh" => Ok(ReasoningEffort::Xhigh),
-            other => Err(RequestRejection::Unsupported(format!(
-                "unsupported `output_config.effort` {other:?}"
-            ))),
-        })
-        .transpose()?;
+    let reasoning_effort = output_config.effort;
     let response_format = output_config
         .format
         .map(messages_response_format)
@@ -1610,27 +1610,19 @@ impl Default for ResponsesInput {
     }
 }
 
-/// Responses `reasoning`, local rather than the upstream struct so `effort` resolves through the
-/// fork's alias table (`REASONING_EFFORT_ALIASES`, `max` -> `xhigh` by default) exactly like chat
-/// `reasoning_effort`: upstream's enum has no `max`, which DeepSeek V4 / GLM clients send, and the
-/// serve-side policy maps `xhigh` back to the model's native tier. One vocabulary across ingresses.
+/// Responses `reasoning`, local rather than the upstream struct so `effort` is the same permissive
+/// type as chat `reasoning_effort`: upstream's enum has no `max`, and every spelling belongs to the
+/// serve-side policy to snap or refuse. One vocabulary across ingresses.
+///
+/// `summary` stays a `Value` rather than the typed `ReasoningSummary` of `B10ReasoningParam`: it is
+/// read only to be logged and never forwarded, so an unknown value should not fail a request whose
+/// effort this layer would otherwise have carried.
 #[derive(Deserialize)]
 struct ResponsesReasoning {
-    #[serde(default, deserialize_with = "responses_reasoning_effort")]
-    effort: Option<dynamo_protocols::types::ReasoningEffort>,
+    #[serde(default)]
+    effort: Option<dynamo_protocols::types::B10ReasoningEffort>,
     #[serde(default)]
     summary: Option<Value>,
-}
-
-fn responses_reasoning_effort<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<dynamo_protocols::types::ReasoningEffort>, D::Error> {
-    match Option::<String>::deserialize(deserializer)? {
-        None => Ok(None),
-        Some(effort) => dynamo_protocols::types::parse_reasoning_effort(effort)
-            .map(Some)
-            .map_err(|e| serde::de::Error::custom(format!("invalid `reasoning.effort`: {e}"))),
-    }
 }
 
 /// Responses request. `input`/`tool_choice` are the vendored types (typed directly: unlike
@@ -1865,7 +1857,7 @@ fn cc_response_format(
 /// 400 a request the response layer can satisfy.
 fn cc_reasoning_effort(
     reasoning: ResponsesReasoning,
-) -> Result<Option<dynamo_protocols::types::ReasoningEffort>, String> {
+) -> Result<Option<dynamo_protocols::types::B10ReasoningEffort>, String> {
     if let Some(summary) = reasoning.summary {
         tracing::debug!(
             ?summary,

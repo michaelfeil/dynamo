@@ -937,31 +937,59 @@ fn adapt_messages_body(extra: Value) -> Result<AdaptedRequest, RequestRejection>
     .map(|ingress| ingress.request)
 }
 
+/// The budget lands on `thinking_token_budget`, the field both engines enforce, and the switch on
+/// `thinking`. Neither is a chat-template kwarg: the serve side reads them to decide what the
+/// template gets, and writes the template's own kwargs itself.
 #[test]
-fn messages_thinking_enabled_with_budget_translates_to_kwargs() {
+fn messages_thinking_enabled_with_budget_lands_on_first_class_fields() {
     let adapted =
         adapt_messages_body(json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}))
             .unwrap();
     let cc = serde_json::to_value(&adapted.request).unwrap();
-    assert_eq!(cc["chat_template_kwargs"]["enable_thinking"], true);
-    assert_eq!(cc["chat_template_kwargs"]["thinking_budget"], 2048);
+    assert_eq!(cc["thinking"], json!({"type": "enabled"}));
+    assert_eq!(cc["thinking_token_budget"], 2048);
+    assert!(
+        cc.get("chat_template_kwargs").is_none(),
+        "the switch is a policy input; the serve side writes the template's kwargs: {cc}"
+    );
 }
 
-/// `adaptive` is the only thinking mode on Anthropic 4.7+ models, so refusing it locks out current
-/// Anthropic-SDK clients. It carries no budget; depth comes from `output_config.effort`.
+/// `adaptive` is the only thinking mode on Anthropic 4.7+ models, so it is not "maybe": it asks
+/// for thinking and lets the model choose the depth. It carries no budget, and the level comes
+/// from `output_config.effort` when the client sends one — which the coding harnesses do — and
+/// from the deployment's default when it does not.
 #[test]
-fn messages_thinking_adaptive_enables_thinking_without_budget() {
+fn messages_thinking_adaptive_asks_for_thinking_without_naming_a_depth() {
     let adapted = adapt_messages_body(json!({"thinking": {"type": "adaptive"}})).unwrap();
     let cc = serde_json::to_value(&adapted.request).unwrap();
-    assert_eq!(cc["chat_template_kwargs"]["enable_thinking"], true);
-    assert!(cc["chat_template_kwargs"].get("thinking_budget").is_none());
+    assert_eq!(cc["thinking"], json!({"type": "enabled"}));
+    assert!(cc.get("thinking_token_budget").is_none(), "{cc}");
+    assert!(
+        cc.get("reasoning_effort").is_none(),
+        "the depth is not ours to pick: {cc}"
+    );
+    assert!(cc.get("chat_template_kwargs").is_none(), "{cc}");
+}
+
+/// The shape the Anthropic coding harnesses actually send: `adaptive` plus an explicit effort.
+/// The mode turns thinking on and the effort scopes it, which is Anthropic's own division.
+#[test]
+fn messages_adaptive_with_an_effort_keeps_both() {
+    let adapted = adapt_messages_body(json!({
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+    }))
+    .unwrap();
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    assert_eq!(cc["thinking"], json!({"type": "enabled"}));
+    assert_eq!(cc["reasoning_effort"], "high");
 }
 
 #[test]
-fn messages_thinking_disabled_translates_to_kwargs() {
+fn messages_thinking_disabled_translates_to_a_first_class_switch() {
     let adapted = adapt_messages_body(json!({"thinking": {"type": "disabled"}})).unwrap();
     let cc = serde_json::to_value(&adapted.request).unwrap();
-    assert_eq!(cc["chat_template_kwargs"]["enable_thinking"], false);
+    assert_eq!(cc["thinking"], json!({"type": "disabled"}));
 }
 
 #[test]
@@ -982,28 +1010,39 @@ fn messages_thinking_budget_outside_enabled_is_refused() {
     }
 }
 
-/// The client's own `chat_template_kwargs` merges per key with the thinking translation — the
-/// client wins on collision, but its presence must not erase the rest of the translation.
+/// A client that spelled a control itself wins on that key, but its presence must not erase the
+/// rest of the translation. Its `chat_template_kwargs` ride through untouched; the translation
+/// writes no template kwargs.
 #[test]
-fn messages_thinking_merges_per_key_with_client_kwargs() {
+fn messages_thinking_merges_per_key_with_client_sent_controls() {
     let adapted = adapt_messages_body(json!({
         "thinking": {"type": "enabled", "budget_tokens": 2048},
+        "thinking_token_budget": 512,
         "chat_template_kwargs": {"enable_thinking": false, "custom_flag": 1},
     }))
     .unwrap();
     let cc = serde_json::to_value(&adapted.request).unwrap();
+    assert_eq!(
+        cc["thinking_token_budget"], 512,
+        "the client's own value wins"
+    );
+    assert_eq!(cc["thinking"], json!({"type": "enabled"}));
     assert_eq!(cc["chat_template_kwargs"]["enable_thinking"], false);
     assert_eq!(cc["chat_template_kwargs"]["custom_flag"], 1);
-    assert_eq!(cc["chat_template_kwargs"]["thinking_budget"], 2048);
 }
 
+/// Every effort reaches the serve side spelled as the client sent it: the levels Anthropic
+/// documents, CC's own `xhigh`, `none` for thinking off, and an unknown word — the model's own
+/// levels are the only thing that can judge any of them.
 #[test]
-fn messages_output_config_effort_translates_to_reasoning_effort() {
-    // `xhigh` is what Claude Code sends; without it every Claude Code turn 400s.
-    for (effort, cc_effort) in [("low", "low"), ("max", "xhigh"), ("xhigh", "xhigh")] {
-        let adapted = adapt_messages_body(json!({"output_config": {"effort": effort}})).unwrap();
+fn messages_output_config_effort_reaches_the_worker_verbatim() {
+    for effort in [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "turbo",
+    ] {
+        let adapted = adapt_messages_body(json!({"output_config": {"effort": effort}}))
+            .unwrap_or_else(|err| panic!("effort {effort} must not be refused here: {err:?}"));
         let cc = serde_json::to_value(&adapted.request).unwrap();
-        assert_eq!(cc["reasoning_effort"], cc_effort, "effort {effort}");
+        assert_eq!(cc["reasoning_effort"], effort, "effort {effort}");
     }
 }
 
@@ -2093,10 +2132,7 @@ fn messages_thinking_budget_below_anthropics_floor_is_served() {
             adapt_messages_body(json!({"thinking": {"type": "enabled", "budget_tokens": budget}}))
                 .unwrap_or_else(|err| panic!("budget {budget} must be served: {err:?}"));
         let cc = serde_json::to_value(&adapted.request).unwrap();
-        assert_eq!(
-            cc["chat_template_kwargs"]["thinking_budget"], budget,
-            "budget {budget}"
-        );
+        assert_eq!(cc["thinking_token_budget"], budget, "budget {budget}");
     }
 }
 
@@ -2257,10 +2293,10 @@ fn malformed_member_rejections_name_the_member_on_every_ingress() {
             .expect_err("a string `temperature` must be refused");
     let detail = format!("{chat_completions:?}");
     assert!(detail.contains("temperature"), "{detail}");
-    let responses = adapt_responses_body(json!({"reasoning": {"effort": "sideways"}}))
-        .expect_err("an unknown effort must be refused");
+    let responses = adapt_responses_body(json!({"max_output_tokens": "lots"}))
+        .expect_err("a string `max_output_tokens` must be refused");
     assert!(
-        matches!(responses, RequestRejection::Malformed(ref detail) if detail.contains("reasoning.effort")),
+        matches!(responses, RequestRejection::Malformed(ref detail) if detail.contains("max_output_tokens")),
         "{responses:?}"
     );
 }
@@ -2269,25 +2305,28 @@ fn malformed_member_rejections_name_the_member_on_every_ingress() {
 /// separator — never zero (`input[0]content`) and never two (`input[0]..content`).
 #[test]
 fn a_composed_member_path_carries_one_separator() {
-    let nested_failure = json!({"model": "m", "input": "hi", "reasoning": {"effort": 5}});
+    let nested_failure = json!({"model": "m", "input": "hi", "text": {"format": {"type": 5}}});
     let rejection: Result<super::ResponsesRequest, _> =
         super::parse_client_json(ClientProtocol::Responses, "input[0]", nested_failure);
-    let RequestRejection::Malformed(detail) = rejection.err().expect("a numeric effort is refused")
+    let RequestRejection::Malformed(detail) =
+        rejection.err().expect("a numeric format type is refused")
     else {
         panic!("expected a malformed rejection");
     };
-    assert!(detail.contains("`input[0].reasoning.effort`"), "{detail}");
+    assert!(detail.contains("`input[0].text.format.type`"), "{detail}");
 }
 
-/// Responses `reasoning.effort` goes through the fork's alias table like chat `reasoning_effort`:
-/// `max` (DeepSeek V4 / GLM clients) canonicalizes to `xhigh` instead of failing the upstream enum.
-/// main-v1.2.0's own `CreateResponse` accepted it; the crate must not regress that.
+/// Responses `reasoning.effort` and chat `reasoning_effort` are one vocabulary, and it is the
+/// client's: `max` (DeepSeek V4 / GLM clients) reaches the serve side as `max`, not as an alias of
+/// it, so the per-model policy sees the word that was actually sent.
 #[test]
-fn responses_reasoning_effort_max_canonicalizes_like_chat() {
-    let adapted = adapt_responses_body(json!({"reasoning": {"effort": "max"}}))
-        .expect("`max` is a documented client spelling");
-    let cc = serde_json::to_value(&adapted.request).unwrap();
-    assert_eq!(cc["reasoning_effort"], "xhigh");
+fn responses_reasoning_effort_reaches_the_worker_verbatim() {
+    for effort in ["none", "max", "xhigh", "ultra"] {
+        let adapted = adapt_responses_body(json!({"reasoning": {"effort": effort}}))
+            .unwrap_or_else(|err| panic!("effort {effort} must not be refused here: {err:?}"));
+        let cc = serde_json::to_value(&adapted.request).unwrap();
+        assert_eq!(cc["reasoning_effort"], effort, "effort {effort}");
+    }
 }
 
 /// Every drop/degrade/skip on the ingress path is a typed [`Loss`] on the adapted request — the
@@ -2537,4 +2576,27 @@ fn adapt_responses_function_call_output_parts_join_with_newline() {
         .find(|m| m["role"] == "tool")
         .expect("tool message");
     assert_eq!(tool_message["content"], "line one\nline two");
+}
+
+/// Every surface carries a non-string effort the same way. Anthropic's used to
+/// fail this struct's deserialization before the pass-through could run, so a
+/// boolean or numeric effort was a 400 there and an `Other` on chat.
+#[test]
+fn messages_output_config_carries_a_non_string_effort_like_the_other_surfaces() {
+    for effort in [json!(true), json!(4096), json!("turbo")] {
+        let messages = adapt_messages_body(json!({"output_config": {"effort": effort}}))
+            .unwrap_or_else(|err| panic!("effort {effort} must not be refused here: {err:?}"));
+        let responses = adapt_responses_body(json!({"reasoning": {"effort": effort}}))
+            .unwrap_or_else(|err| panic!("effort {effort} must not be refused here: {err:?}"));
+        assert_eq!(
+            serde_json::to_value(&messages.request).unwrap()["reasoning_effort"],
+            effort,
+            "messages"
+        );
+        assert_eq!(
+            serde_json::to_value(&responses.request).unwrap()["reasoning_effort"],
+            effort,
+            "responses"
+        );
+    }
 }

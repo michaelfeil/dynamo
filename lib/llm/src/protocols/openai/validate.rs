@@ -579,13 +579,13 @@ pub fn validate_tool_choice(
     Ok(())
 }
 
-/// Validates reasoning effort parameter
+/// Validates reasoning effort parameter.
 pub fn validate_reasoning_effort(
-    _reasoning_effort: &Option<dynamo_protocols::types::ReasoningEffort>,
+    _reasoning_effort: &Option<dynamo_protocols::types::B10ReasoningEffort>,
 ) -> Result<(), anyhow::Error> {
-    // TODO ADD HERE
-    // ReasoningEffort is an enum, so if it exists, it's valid by definition
-    // This function is here for completeness and future validation needs
+    // Intentionally nothing to check: which efforts a model accepts is the
+    // deployment's per-model reasoning policy, which this layer cannot see.
+    // `B10ReasoningEffort` carries every value through to it, canonical or not.
     Ok(())
 }
 
