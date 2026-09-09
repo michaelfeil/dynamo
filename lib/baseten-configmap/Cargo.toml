@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "baseten-configmap"
+description = "Shared snapshot readers for Baseten mounted configuration files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = "1"
+serde = { workspace = true }
+serde_yaml = "0.9"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

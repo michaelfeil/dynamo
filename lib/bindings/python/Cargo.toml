@@ -38,6 +38,7 @@ nvtx = ["dynamo-runtime/nvtx"]
 lightseek-mm = ["dynamo-llm/lightseek-mm"]
 
 [dependencies]
+baseten-configmap = { path = "../../baseten-configmap" }
 aiconfigurator-core = { git = "https://github.com/ai-dynamo/aiconfigurator.git", rev = "69b3cff352303b95e5196a28966ae1ee4a3a3955", package = "aiconfigurator-core", optional = true }
 dynamo-runtime = { path = "../../runtime" }
 dynamo-mocker = { path = "../../mocker" }

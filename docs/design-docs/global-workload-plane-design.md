@@ -1155,7 +1155,7 @@ requests in one session get distinct IDs and never collide. At
   `lib/gwp/src/tokens.rs`
 - Preprocessor + chat-template glue: `lib/llm/src/preprocessor.rs`,
   `lib/llm/src/preprocessor/prompt.rs:190` (`deepseek_formatter_for`)
-- Hot-reloadable config pattern: `lib/llm/src/kv_router/b10hotreloadablecm.rs`
+- Shared configuration readers: `lib/baseten-configmap/`
 - Standalone HTTP indexer service: `lib/kv-router/src/standalone_indexer/`
 - Baseten planner service (per-graph, `deep/health` + `detailed_load_data`):
   `baseten_dynamo/cache_aware_routing_trtllm/src/common/planner_common.py`

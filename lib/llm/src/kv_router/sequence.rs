@@ -119,14 +119,17 @@ pub async fn create_multi_worker_sequences(
         })
         .collect();
 
-    let multi_worker = ActiveSequencesMultiWorker::new(
-        publisher,
-        block_size,
-        dp_range,
-        replica_sync,
-        router_id,
-        worker_type,
-    );
+    let config_reader = baseten_configmap::current_reader();
+    let multi_worker = baseten_configmap::with_reader(&config_reader, || {
+        ActiveSequencesMultiWorker::new(
+            publisher,
+            block_size,
+            dp_range,
+            replica_sync,
+            router_id,
+            worker_type,
+        )
+    });
 
     let arc = Arc::new(multi_worker);
 

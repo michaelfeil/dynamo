@@ -42,25 +42,6 @@ const ROUTER_QUEUE_BUSY_FRACTIONAL_ENV: &str = "DYN_ROUTER_QUEUE_BUSY_FRACTIONAL
 
 static ROUTER_QUEUE_BUSY_FRACTIONAL: OnceLock<bool> = OnceLock::new();
 
-static ROUTER_QUEUE_THRESHOLD_DECODE_TOKENS: AtomicU64 = AtomicU64::new(0);
-
-/// Set the global decode-tokens-inflight backpressure threshold (median per-worker).
-/// 0 disables the check. Called from the B10 hot-reloadable config loader.
-pub fn set_router_queue_threshold_decode_tokens(tokens: u64) {
-    let prev = ROUTER_QUEUE_THRESHOLD_DECODE_TOKENS.swap(tokens, AtomicOrdering::Relaxed);
-    if prev != tokens {
-        tracing::info!(
-            previous = prev,
-            next = tokens,
-            "router_queue_threshold_decode_tokens changed"
-        );
-    }
-}
-
-pub fn router_queue_threshold_decode_tokens() -> u64 {
-    ROUTER_QUEUE_THRESHOLD_DECODE_TOKENS.load(AtomicOrdering::Relaxed)
-}
-
 fn router_queue_busy_fractional() -> bool {
     *ROUTER_QUEUE_BUSY_FRACTIONAL.get_or_init(|| {
         std::env::var(ROUTER_QUEUE_BUSY_FRACTIONAL_ENV)
@@ -131,10 +112,10 @@ pub struct B10QueueEvalGauges {
     /// `threshold_frac * max_num_batched_tokens` of that worker.
     pub prefill_threshold_tokens: AtomicU64,
     /// Median per-(worker, dp_rank) decode tokens at the last decode-gate
-    /// evaluation. Compared against the global (hot-reloadable)
-    /// `router_queue_threshold_decode_tokens()`, which the metrics sync task
-    /// exports as this gate's threshold gauge.
+    /// evaluation.
     pub decode_evaluated_tokens: AtomicU64,
+    /// Threshold used for the last decode-gate evaluation.
+    pub decode_threshold_tokens: AtomicU64,
     /// Per-worker share of pending-ISL tokens (pending / live workers)
     /// compared at the last cap evaluation of each missing-ISL tier,
     /// index-aligned with the configured tiers. Per-worker so the pair with
@@ -148,6 +129,7 @@ impl B10QueueEvalGauges {
             prefill_evaluated_tokens: AtomicU64::new(0),
             prefill_threshold_tokens: AtomicU64::new(0),
             decode_evaluated_tokens: AtomicU64::new(0),
+            decode_threshold_tokens: AtomicU64::new(0),
             isl_evaluated_tokens_per_tier: (0..tier_count).map(|_| AtomicU64::new(0)).collect(),
         }
     }
@@ -178,6 +160,7 @@ struct SchedulerQueueActor<
     Sel: WorkerSelector<C>,
     RF: OverlapScoresRefresh,
 > {
+    config: baseten_configmap::ConfigReader,
     pending: BinaryHeap<QueueEntry<S::Key>>,
     pending_count: Arc<AtomicUsize>,
     pending_isl_tokens: Arc<AtomicUsize>,
@@ -286,6 +269,8 @@ impl<
         let (admission_tx, admission_rx) = mpsc::channel(ADMISSION_CHANNEL_CAPACITY);
         let handle_queue_depth_tiers = queue_depth_tiers.clone();
         let actor = SchedulerQueueActor {
+            config: baseten_configmap::try_current_reader()
+                .unwrap_or_else(|| baseten_configmap::ConfigReader::in_memory(Default::default())),
             pending: BinaryHeap::new(),
             pending_count: Arc::clone(&pending_count),
             pending_isl_tokens: Arc::clone(&pending_isl_tokens),
@@ -1102,11 +1087,22 @@ impl<
     }
 
     /// Check if the median per-worker decode tokens inflight exceeds the
-    /// globally-configured `router_queue_threshold_decode_tokens`. Returns
+    /// reader's `router_queue_threshold_decode_tokens`. Returns
     /// false when the threshold is 0 (disabled) or no workers are tracked.
     fn decode_tokens_busy(&self) -> bool {
-        let threshold = router_queue_threshold_decode_tokens();
+        let threshold = self
+            .config
+            .snapshot()
+            .routing
+            .router_queue_threshold_decode_tokens
+            .unwrap_or(0);
+        self.eval_gauges
+            .decode_threshold_tokens
+            .store(threshold, AtomicOrdering::Relaxed);
         if threshold == 0 {
+            self.eval_gauges
+                .decode_evaluated_tokens
+                .store(0, AtomicOrdering::Relaxed);
             return false;
         }
         let active_blocks = self.slots.active_blocks();
@@ -1271,10 +1267,6 @@ mod tests {
     use crate::sequences::ActiveSequencesMultiWorker;
     use crate::test_utils::{NoopSequencePublisher, SimpleWorkerConfig};
     use crate::{DefaultWorkerSelector, WorkerSelector};
-
-    // These tests exercise a process-global hot-reload setting and therefore
-    // must not reset it underneath each other.
-    static DECODE_THRESHOLD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn decay_now() -> Instant {
         Instant::now()
@@ -2924,14 +2916,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_decode_tokens_backpressure_queues_request() {
-        let _threshold_guard = DECODE_THRESHOLD_TEST_LOCK.lock().await;
         let block_size = 16;
         let isl = 512;
         // High prefill threshold so prefill-busy never triggers; isolate decode check.
-        let (queue, slots) = make_queue(1, block_size, isl, Some(10000.0));
+        let reader = baseten_configmap::ConfigReader::in_memory(Default::default());
+        let (queue, slots) = baseten_configmap::with_reader(&reader, || {
+            make_queue(1, block_size, isl, Some(10000.0))
+        });
 
         // Set decode threshold to exactly 1 block worth of tokens (16).
-        set_router_queue_threshold_decode_tokens(block_size as u64);
+        let mut config = baseten_configmap::UnifiedConfig::default();
+        config.routing.router_queue_threshold_decode_tokens = Some(block_size as u64);
+        reader.replace(config);
 
         // First request: admitted (no active decode blocks yet).
         let (req1, rx1) = make_request("req-1", isl);
@@ -2963,19 +2959,20 @@ mod tests {
         // Drain any remaining admitted request.
         let _ = slots.mark_prefill_completed(&"req-2".to_string(), decay_now());
         let _ = slots.free(&"req-2".to_string(), decay_now());
-
-        // Reset global threshold.
-        set_router_queue_threshold_decode_tokens(0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_decode_tokens_backpressure_do_not_queue_rejects() {
-        let _threshold_guard = DECODE_THRESHOLD_TEST_LOCK.lock().await;
         let block_size = 16;
         let isl = 512;
-        let (queue, slots) = make_queue(1, block_size, isl, Some(10000.0));
+        let reader = baseten_configmap::ConfigReader::in_memory(Default::default());
+        let (queue, slots) = baseten_configmap::with_reader(&reader, || {
+            make_queue(1, block_size, isl, Some(10000.0))
+        });
 
-        set_router_queue_threshold_decode_tokens(block_size as u64);
+        let mut config = baseten_configmap::UnifiedConfig::default();
+        config.routing.router_queue_threshold_decode_tokens = Some(block_size as u64);
+        reader.replace(config);
 
         let (req1, rx1) = make_request("req-1", isl);
         queue.enqueue(req1).await;
@@ -3008,7 +3005,5 @@ mod tests {
         // Cleanup.
         let _ = slots.mark_prefill_completed(&"req-1".to_string(), decay_now());
         let _ = slots.free(&"req-1".to_string(), decay_now());
-
-        set_router_queue_threshold_decode_tokens(0);
     }
 }

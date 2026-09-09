@@ -57,6 +57,7 @@ harness = false
 required-features = ["agent-trace-bench"]
 
 [dependencies]
+baseten-configmap = { workspace = true }
 # repo
 dynamo-kv-router = { workspace = true, features = ["metrics", "runtime-protocols"] }
 dynamo-memory = { workspace = true }
@@ -93,7 +94,6 @@ prometheus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
-serde_yaml = "0.9"
 sha2 = "0.10"
 strum = { workspace = true }
 tempfile = { workspace = true }

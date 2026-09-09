@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use baseten_configmap::B10RoutingConfig;
 use dynamo_kv_router::protocols::{WorkerConfigLike, WorkerId, WorkerWithDpRank};
 use dynamo_kv_router::scheduling::{IslStats, SchedulingRequest};
-use dynamo_llm::kv_router::b10hotreloadablecm;
 use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
 use parking_lot::RwLock;
 
@@ -85,20 +85,24 @@ pub(crate) struct ScoreBreakdown {
 
 pub(crate) struct B10Scorer {
     observed: ObservedLoadStore,
+    config: baseten_configmap::ConfigReader,
 }
 
 pub(crate) struct PreparedScoring {
     pub(crate) request: SchedulingRequest,
     observed_loads: HashMap<WorkerId, ObservedWorkerLoad>,
     anchors: HashMap<WorkerId, LocalLoadAnchor>,
-    routing: b10hotreloadablecm::B10RoutingConfig,
+    routing: B10RoutingConfig,
     policy: LoadBalancingPolicy,
     block_size: u32,
 }
 
 impl B10Scorer {
     pub(crate) fn new(observed: ObservedLoadStore) -> Self {
-        Self { observed }
+        Self {
+            observed,
+            config: baseten_configmap::current_reader(),
+        }
     }
 
     pub(crate) fn prepare(
@@ -154,16 +158,17 @@ impl B10Scorer {
             update_states: request.update_states,
             resp_tx: None,
         };
-        Self::prepared(request, observed, policy, block_size)
+        self.prepared(request, observed, policy, block_size)
     }
 
     fn prepared(
+        &self,
         request: SchedulingRequest,
         observed: ObservedLoadSnapshot,
         policy: LoadBalancingPolicy,
         block_size: u32,
     ) -> PreparedScoring {
-        let routing = b10hotreloadablecm::get_config().get().routing;
+        let routing = self.config.snapshot().routing.clone();
         PreparedScoring {
             request,
             observed_loads: observed.loads,
@@ -175,7 +180,8 @@ impl B10Scorer {
     }
 
     pub(crate) fn residency_eviction_half_life(&self) -> Option<Duration> {
-        let routing = b10hotreloadablecm::get_config().get().routing;
+        let config = self.config.snapshot();
+        let routing = &config.routing;
         (routing.router_residency_eviction_cost > 0.0)
             .then(|| Duration::from_secs_f64(routing.router_residency_half_life))
     }

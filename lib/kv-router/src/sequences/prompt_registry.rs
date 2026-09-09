@@ -32,6 +32,7 @@ impl WorkerLoadSnapshot {
 }
 
 pub(super) struct PromptRegistry {
+    config: baseten_configmap::ConfigReader,
     // WARNING: prompt membership and worker load are only eventually consistent.
     // Each mutation still starts from one worker-local source of truth: we mutate the chosen
     // `ActiveSequences`, derive an exact `PromptMembershipDelta` plus `WorkerLoadSnapshot`, then
@@ -45,6 +46,12 @@ pub(super) struct PromptRegistry {
 impl Default for PromptRegistry {
     fn default() -> Self {
         Self {
+            config: baseten_configmap::try_current_reader().unwrap_or_else(|| {
+                let mut config = baseten_configmap::UnifiedConfig::default();
+                config.routing.router_prefill_token_discount = 1.0;
+                config.routing.router_decode_token_discount = 1.0;
+                baseten_configmap::ConfigReader::in_memory(config)
+            }),
             membership: PromptMembershipTrie::new(),
             loads: DashMap::with_hasher(FxBuildHasher),
         }
@@ -152,7 +159,11 @@ impl PromptRegistry {
         FxHashMap<WorkerWithDpRank, usize>,
     ) {
         let discounts = if apply_discounts {
-            super::token_load_discounts()
+            let config = self.config.snapshot();
+            (
+                config.routing.router_prefill_token_discount,
+                config.routing.router_decode_token_discount,
+            )
         } else {
             (1.0, 1.0)
         };
@@ -435,7 +446,11 @@ mod tests {
     #[test]
     fn b10_discounts_apply_to_existing_load_only_and_telemetry_path_is_raw() {
         let worker = worker(1, 0);
-        let registry = PromptRegistry::new([worker]);
+        let mut config = baseten_configmap::UnifiedConfig::default();
+        config.routing.router_prefill_token_discount = 0.25;
+        config.routing.router_decode_token_discount = 0.5;
+        let reader = baseten_configmap::ConfigReader::in_memory(config.clone());
+        let registry = baseten_configmap::with_reader(&reader, || PromptRegistry::new([worker]));
         let lookup = lookup();
         let now = Instant::now();
         let anchored_since = now.checked_sub(Duration::from_secs(3)).unwrap_or(now);
@@ -449,12 +464,11 @@ mod tests {
         );
 
         let deltas = PrefillTokenDeltas::uniform(4);
-        let no_overlap = FxHashMap::default();
 
         // Placement projection: only the existing load is discounted; the
         // incoming request's blocks/tokens keep full weight.
         let (blocks, tokens) =
-            registry.project_loads_from_membership(2, &no_overlap, &deltas, now, (0.25, 0.5));
+            registry.potential_blocks_and_tokens(Some(&[7, 8]), &deltas, now, true);
         // blocks: 5 * 0.5 = 2 (as usize) + 2 new
         assert_eq!(blocks.get(&worker).copied(), Some(4));
         // tokens: 9 * 0.25 = 2 (as usize) + 4 added
@@ -465,6 +479,14 @@ mod tests {
         // discounts.
         let (blocks, tokens) =
             registry.potential_blocks_and_tokens(Some(&[7, 8]), &deltas, now, false);
+        assert_eq!(blocks.get(&worker).copied(), Some(5 + 2));
+        assert_eq!(tokens.get(&worker).copied(), Some(9 + 4));
+
+        config.routing.router_prefill_token_discount = 1.0;
+        config.routing.router_decode_token_discount = 1.0;
+        reader.replace(config);
+        let (blocks, tokens) =
+            registry.potential_blocks_and_tokens(Some(&[7, 8]), &deltas, now, true);
         assert_eq!(blocks.get(&worker).copied(), Some(5 + 2));
         assert_eq!(tokens.get(&worker).copied(), Some(9 + 4));
     }

@@ -7,7 +7,6 @@
 //! absolute cache-miss weighting and short-request bypass, sourcing
 //! tuning knobs from the hot-reloadable config manager.
 
-use crate::kv_router::b10hotreloadablecm;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use dynamo_kv_router::protocols::{
     WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
@@ -61,6 +60,7 @@ fn b10_filter_dp_score(
 /// B10 Worker Selector that uses hot-reloadable configuration.
 #[derive(Debug)]
 pub struct B10WorkerSelector {
+    config: baseten_configmap::ConfigReader,
     last_log_time_ms: AtomicU64,
 }
 
@@ -86,6 +86,7 @@ struct B10Score {
 impl B10WorkerSelector {
     pub fn new() -> Self {
         Self {
+            config: baseten_configmap::current_reader(),
             last_log_time_ms: AtomicU64::new(0),
         }
     }
@@ -278,7 +279,7 @@ fn score_worker<C: WorkerConfigLike>(
 
 impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
     fn residency_eviction_half_life(&self) -> Option<Duration> {
-        let config = b10hotreloadablecm::get_config().get();
+        let config = self.config.snapshot();
         let routing = &config.routing;
         (routing.router_residency_eviction_cost > 0.0)
             .then(|| Duration::from_secs_f64(routing.router_residency_half_life))
@@ -314,7 +315,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         }
 
         let request_blocks = request.request_blocks(block_size);
-        let hot_reloadable_config = b10hotreloadablecm::get_config().get();
+        let hot_reloadable_config = self.config.snapshot();
         let verbose = self.should_print_this_loop(workers.len());
 
         let overlap_weight = request
@@ -339,7 +340,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         let active_request_isl_penalty_ramp = hot_reloadable_config
             .routing
             .router_active_request_isl_penalty_ramp;
-        let temperature = b10hotreloadablecm::sanitize_router_temperature(
+        let temperature = baseten_configmap::sanitize_router_temperature(
             request
                 .router_config_override
                 .as_ref()

@@ -163,7 +163,7 @@ const fn default_data_parallel_start_rank() -> u32 {
 
 fn default_data_parallel_size() -> u32 {
     // Baseten: use the hot-reloadable config to get data_parallel_size
-    crate::kv_router::b10hotreloadablecm::get_data_parallel_size()
+    baseten_configmap::current_reader().snapshot().runtime.compute_data_parallel_size()
         .map(|v| v as u32)
         .unwrap_or_else(|| {
             tracing::warn!("B10WorkerSelector: failed to get data_parallel_size from hot-reloadable config, defaulting to 1");
@@ -226,7 +226,9 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
     }
 
     fn total_kv_blocks(&self) -> Option<u64> {
-        crate::kv_router::b10hotreloadablecm::get_engine_metrics_total_kv_blocks_override()
+        baseten_configmap::process_reader()
+            .snapshot()
+            .engine_metrics_total_kv_blocks_override
             .or(self.total_kv_blocks)
     }
 

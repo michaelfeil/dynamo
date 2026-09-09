@@ -36,7 +36,6 @@ use dynamo_llm::entrypoint::{RouterConfig as RsRouterConfig, RouterSelector as R
 use dynamo_llm::kv_router::{
     KvRouter,
     b10_worker_selector::B10WorkerSelector,
-    b10hotreloadablecm::{get_router_active_replicas, set_log_no_changes, validate_config},
     metrics::{RouterRequestMetrics, register_global_metrics_with_component},
     scheduler::DefaultWorkerSelector,
 };
@@ -111,6 +110,7 @@ fn resolve_router_config(
 }
 
 struct Args {
+    config_reader: baseten_configmap::ConfigReader,
     namespace: String,
     component_to_route: String,
     router_component_name: String,
@@ -350,7 +350,7 @@ where
         };
         tokio::time::sleep(std::time::Duration::from_millis(sleep_time)).await;
 
-        let router_active_replicas = get_router_active_replicas();
+        let router_active_replicas = args.config_reader.snapshot().routing.router_active_replicas;
         let active_routers = match get_active_components(&component_router).await {
             Some(count) => count,
             None => router_active_replicas + 1, // force wait
@@ -436,7 +436,8 @@ async fn app(runtime: Runtime, args: Args) -> Result<()> {
             run_with_selector(runtime, component_worker, component_router, selector, args).await
         }
         AlgoSelector::B10 => {
-            let selector = B10WorkerSelector::new();
+            let selector =
+                baseten_configmap::with_reader(&args.config_reader, B10WorkerSelector::new);
             run_with_selector(runtime, component_worker, component_router, selector, args).await
         }
     }
@@ -507,6 +508,7 @@ pub fn start_router(
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
         let args = Args {
+            config_reader: baseten_configmap::current_reader(),
             namespace,
             component_to_route,
             router_component_name,
@@ -518,8 +520,8 @@ pub fn start_router(
             session_affinity_ttl_secs: resolved.session_affinity_ttl_secs,
         };
 
-        set_log_no_changes(true);
-        if !validate_config() {
+        baseten_configmap::set_log_no_changes(true);
+        if !args.config_reader.validate_file() {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "Invalid B10 routing configuration",
             ));

@@ -3,6 +3,7 @@
 
 [workspace]
 members = [
+    "lib/baseten-configmap",
     "lib/llm",
     "lib/runtime",
     "lib/tokenizers",
@@ -46,6 +47,7 @@ keywords = ["llm", "genai", "inference", "nvidia", "distributed"]
 
 [workspace.dependencies]
 # Local crates
+baseten-configmap = { path = "lib/baseten-configmap", version = "1.2.0" }
 dynamo-runtime = { path = "lib/runtime", version = "1.2.0" }
 dynamo-llm = { path = "lib/llm", version = "1.2.0" }
 dynamo-tokenizers = { path = "lib/tokenizers", version = "1.2.0" }

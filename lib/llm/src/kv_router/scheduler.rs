@@ -13,7 +13,6 @@ pub use dynamo_kv_router::scheduling::{
 pub use dynamo_kv_router::selector::DefaultWorkerSelector;
 use dynamo_kv_router::selector::WorkerSelector as WorkerSelectorTrait;
 
-use super::b10hotreloadablecm;
 use super::metrics::ROUTER_QUEUE_METRICS;
 use super::sequence::{
     RuntimeSequencePublisher, SequenceError, SequenceRequest, create_multi_worker_sequences,
@@ -127,6 +126,7 @@ where
         let metrics_scheduler = Arc::clone(&inner);
         let metrics_cancel_token = component.drt().child_token();
         let mut queue_updates = inner.subscribe_queue_updates();
+        let config_reader = baseten_configmap::current_reader();
         tokio::spawn(async move {
             let mut recheck_interval = tokio::time::interval(Duration::from_secs(60));
             let mut hot_reload_interval = tokio::time::interval(Duration::from_secs(10));
@@ -155,7 +155,7 @@ where
                 ROUTER_QUEUE_METRICS.b10_set_gate_evaluation(
                     worker_type,
                     "decode_tokens",
-                    dynamo_kv_router::scheduling::queue::router_queue_threshold_decode_tokens(),
+                    eval.decode_threshold_tokens.load(Relaxed),
                     eval.decode_evaluated_tokens.load(Relaxed),
                 );
                 let tier_evaluated: Vec<u64> = eval
@@ -184,7 +184,7 @@ where
                         sync_queue_metrics();
                     }
                     _ = hot_reload_interval.tick() => {
-                        if let Some(v) = b10hotreloadablecm::get_router_queue_threshold() {
+                        if let Some(v) = config_reader.snapshot().routing.router_queue_threshold {
                             let threshold = if v > 0.0 { Some(v) } else { None };
                             metrics_scheduler.update_router_queue_threshold(threshold).await;
                         }

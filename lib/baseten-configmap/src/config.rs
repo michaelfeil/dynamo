@@ -1,25 +1,10 @@
-// SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-
-//! Hot-reloadable configuration for B10 KV Router
-//!
-//! This module provides automatic reloading of router configuration from a YAML file
-//! specified by the DYN_LLMAPI_CONFIG_PATH environment variable, typically pointing to
-//! /configs/llm_api_config_router.yaml.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::{
-    Arc, OnceLock, RwLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
-use std::time::Duration;
-
 use std::collections::HashMap;
 
-const DEFAULT_CONFIG_PATH: &str = "/configs/llm_api_config_router.yaml";
-const RELOAD_INTERVAL_SECS: u64 = 15; // Reload every 15 seconds
 const DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND: f64 = 2.0 / 3.0;
 const ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN: f64 = 0.0001;
 const ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX: f64 = 0.9999;
@@ -30,27 +15,6 @@ const DEFAULT_ROUTER_ACTIVE_REQUEST_ISL_PENALTY_RAMP: (f64, f64) = (2048.0, 32_7
 /// `worker_id` (u64); clamping to this tiny floor routes ties through
 /// `softmax_sample` (random) instead.
 const MIN_ROUTER_TEMPERATURE: f64 = 1e-12;
-static LOG_NO_CHANGES: AtomicBool = AtomicBool::new(false);
-static ENGINE_METRICS_TOTAL_KV_BLOCKS_OVERRIDE: std::sync::LazyLock<Arc<AtomicU64>> =
-    std::sync::LazyLock::new(|| Arc::new(AtomicU64::new(0)));
-
-pub fn set_log_no_changes(enabled: bool) {
-    LOG_NO_CHANGES.store(enabled, Ordering::Relaxed);
-}
-
-fn log_no_changes() -> bool {
-    LOG_NO_CHANGES.load(Ordering::Relaxed)
-}
-
-fn is_warning_disabled() -> bool {
-    static DISABLE_WARNING: OnceLock<bool> = OnceLock::new();
-    *DISABLE_WARNING.get_or_init(|| {
-        std::env::var("B10_CONFIGMAP_DISABLE_WARNING")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
 /// Partial override structure for B10 routing config, we can't reuse the B10RoutingConfig struct because of the default values
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct B10RoutingConfigOverride {
@@ -234,55 +198,31 @@ impl Default for B10RoutingConfig {
 }
 
 fn default_router_temperature() -> f64 {
-    sanitize_router_temperature(
-        std::env::var("KV_ROUTER_TEMPERATURE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.01),
-    )
+    0.01
 }
 
 fn default_router_overlap_score_weight() -> f64 {
-    std::env::var("KV_ROUTER_OVERLAP_SCORE_WEIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3.5)
+    3.5
 }
 
 fn default_router_decode_block_weight() -> f64 {
-    std::env::var("B10_KV_ROUTER_DECODE_BLOCK_WEIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1.0)
+    1.0
 }
 
 fn default_router_prefill_token_discount() -> f64 {
-    std::env::var("B10_KV_ROUTER_PREFILL_TOKEN_DISCOUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.35)
+    0.35
 }
 
 fn default_router_decode_token_discount() -> f64 {
-    std::env::var("B10_KV_ROUTER_DECODE_TOKEN_DISCOUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.8)
+    0.8
 }
 
 fn default_router_active_request_weight() -> f64 {
-    std::env::var("B10_KV_ROUTER_ACTIVE_REQUEST_WEIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0)
+    0.0
 }
 
 fn default_router_active_request_dp_blend() -> f64 {
-    std::env::var("B10_KV_ROUTER_ACTIVE_REQUEST_DP_BLEND")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(sanitize_router_active_request_dp_blend)
-        .unwrap_or(DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND)
+    DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND
 }
 
 fn sanitize_router_active_request_dp_blend(blend: f64) -> f64 {
@@ -313,42 +253,23 @@ fn sanitize_router_active_request_dp_blend(blend: f64) -> f64 {
 }
 
 fn default_router_cache_miss_weight() -> f64 {
-    std::env::var("B10_KV_ROUTER_CACHE_MISS_WEIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.02)
+    0.02
 }
 
 fn default_router_cache_miss_min_isl() -> usize {
-    std::env::var("B10_KV_ROUTER_CACHE_MISS_MIN_ISL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        // a new worker coming up does not have the system prompt. If a isl is only 512 tokens, its around system prompt.
-        .unwrap_or(4096)
+    4096
 }
 
 fn default_router_session_affinity_score_multiplier() -> f64 {
-    std::env::var("B10_KV_ROUTER_SESSION_AFFINITY_SCORE_MULTIPLIER")
-        .or_else(|_| std::env::var("B10_KV_ROUTER_SESSION_AFFINITY_DISCOUNT"))
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.5)
+    0.5
 }
 
 fn default_router_residency_eviction_cost() -> f64 {
-    std::env::var("B10_KV_ROUTER_RESIDENCY_EVICTION_COST")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(sanitize_router_residency_eviction_cost)
-        .unwrap_or(DEFAULT_ROUTER_RESIDENCY_EVICTION_COST)
+    DEFAULT_ROUTER_RESIDENCY_EVICTION_COST
 }
 
 fn default_router_residency_half_life() -> f64 {
-    std::env::var("B10_KV_ROUTER_RESIDENCY_HALF_LIFE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map(sanitize_router_residency_half_life)
-        .unwrap_or(DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS)
+    DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS
 }
 
 fn default_router_active_request_isl_penalty_ramp() -> (f64, f64) {
@@ -386,7 +307,7 @@ fn sanitize_router_residency_half_life(half_life: f64) -> f64 {
 /// the deterministic `temperature == 0.0` branch that breaks ties by
 /// `worker_id` (u64); instead ties go through `softmax_sample`, which breaks
 /// them uniformly at random.
-pub(crate) fn sanitize_router_temperature(value: f64) -> f64 {
+pub fn sanitize_router_temperature(value: f64) -> f64 {
     if value.is_finite() && value > 0.0 {
         return value;
     }
@@ -411,10 +332,6 @@ fn sanitize_engine_metrics_total_kv_blocks_override(value: Option<u64>) -> Optio
         }
         other => other,
     }
-}
-
-fn set_engine_metrics_total_kv_blocks_override(value: Option<u64>) {
-    ENGINE_METRICS_TOTAL_KV_BLOCKS_OVERRIDE.store(value.unwrap_or(0), Ordering::Relaxed);
 }
 
 /// Override configuration structure
@@ -473,26 +390,13 @@ impl LLMRuntimeConfig {
     }
 }
 
-/// Convenience function to get data parallel size
-/// Returns the computed value based on enable_attention_dp and tensor_parallel_size
-pub fn get_data_parallel_size() -> Option<usize> {
-    let runtime = &get_config().get().runtime;
-    runtime.compute_data_parallel_size()
-}
-
-pub fn get_engine_metrics_total_kv_blocks_override() -> Option<u64> {
-    match ENGINE_METRICS_TOTAL_KV_BLOCKS_OVERRIDE.load(Ordering::Relaxed) {
-        0 => None,
-        value => Some(value),
-    }
-}
-
 /// Unified config containing both routing and runtime configuration
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnifiedConfig {
     pub routing: B10RoutingConfig,
     pub router_active_replicas: usize,
     pub runtime: LLMRuntimeConfig,
+    pub engine_metrics_total_kv_blocks_override: Option<u64>,
 }
 
 impl Default for UnifiedConfig {
@@ -501,6 +405,7 @@ impl Default for UnifiedConfig {
             routing: B10RoutingConfig::default(),
             router_active_replicas: default_router_active_replicas(),
             runtime: LLMRuntimeConfig::default(),
+            engine_metrics_total_kv_blocks_override: None,
         }
     }
 }
@@ -509,119 +414,134 @@ fn default_router_active_replicas() -> usize {
     1
 }
 
-/// Hot-reloadable config manager with unified config
-pub struct HotReloadableConfig {
-    config: Arc<RwLock<UnifiedConfig>>,
-    config_path: PathBuf,
-}
-
-impl Default for HotReloadableConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HotReloadableConfig {
-    /// Create a new hot-reloadable config manager
-    pub fn new() -> Self {
-        let config_path_env = std::env::var("DYN_LLMAPI_CONFIG_PATH");
-
-        let (initial_config, config_path) = if let Ok(path_str) = config_path_env {
-            let config_path = PathBuf::from(path_str);
-            // Only load from file if env var is set
-            let config = Self::load_config(&config_path).unwrap_or_else(|e| {
-                if !is_warning_disabled() {
-                    tracing::warn!(
-                        "Failed to load config from {:?}: {:?}, using defaults",
-                        config_path,
-                        e
-                    );
-                }
-                UnifiedConfig::default()
-            });
-            (config, config_path)
-        } else {
-            // No env var set - use fast defaults and default path
-            if !is_warning_disabled() {
-                tracing::warn!(
-                    "DYN_LLMAPI_CONFIG_PATH not set, using default UnifiedConfig values"
-                );
-            }
-            (UnifiedConfig::default(), PathBuf::from(DEFAULT_CONFIG_PATH))
-        };
-
-        // load_config() publishes these to the scheduler's atomics only on a
-        // successful file load. Publish for the initial config regardless of
-        // source, so a missing/invalid config file doesn't leave the
-        // scheduler running at the atomics' static init (discounts 1.0)
-        // while get_config() reports the serde defaults.
-        dynamo_kv_router::sequences::set_token_load_discounts(
-            initial_config.routing.router_prefill_token_discount,
-            initial_config.routing.router_decode_token_discount,
-        );
-        dynamo_kv_router::scheduling::queue::set_router_queue_threshold_decode_tokens(
-            initial_config
-                .routing
-                .router_queue_threshold_decode_tokens
-                .unwrap_or(0),
-        );
-
+impl B10RoutingConfig {
+    pub(crate) fn from_env() -> Self {
         Self {
-            config: Arc::new(RwLock::new(initial_config)),
-            config_path,
+            router_temperature: {
+                sanitize_router_temperature(
+                    std::env::var("KV_ROUTER_TEMPERATURE")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.01),
+                )
+            },
+            router_overlap_score_weight: {
+                std::env::var("KV_ROUTER_OVERLAP_SCORE_WEIGHT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3.5)
+            },
+            router_decode_block_weight: {
+                std::env::var("B10_KV_ROUTER_DECODE_BLOCK_WEIGHT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1.0)
+            },
+            router_prefill_token_discount: {
+                std::env::var("B10_KV_ROUTER_PREFILL_TOKEN_DISCOUNT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.35)
+            },
+            router_decode_token_discount: {
+                std::env::var("B10_KV_ROUTER_DECODE_TOKEN_DISCOUNT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.8)
+            },
+            router_active_request_weight: {
+                std::env::var("B10_KV_ROUTER_ACTIVE_REQUEST_WEIGHT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0)
+            },
+            router_active_request_dp_blend: {
+                std::env::var("B10_KV_ROUTER_ACTIVE_REQUEST_DP_BLEND")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .map(sanitize_router_active_request_dp_blend)
+                    .unwrap_or(DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND)
+            },
+            router_cache_miss_weight: {
+                std::env::var("B10_KV_ROUTER_CACHE_MISS_WEIGHT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.02)
+            },
+            router_cache_miss_min_isl: {
+                std::env::var("B10_KV_ROUTER_CACHE_MISS_MIN_ISL")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    // a new worker coming up does not have the system prompt. If a isl is only 512 tokens, its around system prompt.
+                    .unwrap_or(4096)
+            },
+            router_session_affinity_score_multiplier: {
+                std::env::var("B10_KV_ROUTER_SESSION_AFFINITY_SCORE_MULTIPLIER")
+                    .or_else(|_| std::env::var("B10_KV_ROUTER_SESSION_AFFINITY_DISCOUNT"))
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.5)
+            },
+            router_residency_eviction_cost: {
+                std::env::var("B10_KV_ROUTER_RESIDENCY_EVICTION_COST")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .map(sanitize_router_residency_eviction_cost)
+                    .unwrap_or(DEFAULT_ROUTER_RESIDENCY_EVICTION_COST)
+            },
+            router_residency_half_life: {
+                std::env::var("B10_KV_ROUTER_RESIDENCY_HALF_LIFE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .map(sanitize_router_residency_half_life)
+                    .unwrap_or(DEFAULT_ROUTER_RESIDENCY_HALF_LIFE_SECS)
+            },
+            ..Self::default()
         }
     }
+}
 
-    fn validate_config(path: &PathBuf) -> Option<LLMConfig> {
-        if !path.exists() || !path.is_file() {
-            if !is_warning_disabled() {
-                tracing::warn!("Config file {:?} does not exist or is not a file", path);
-            }
-            return None;
-        }
-
-        let contents = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                if !is_warning_disabled() {
-                    tracing::warn!("Failed to read config file {:?}: {:?}", path, e);
+impl UnifiedConfig {
+    /// Parse a document using explicit defaults and override selection. No process state is changed.
+    pub fn parse(
+        contents: &str,
+        override_group: Option<&str>,
+        defaults: &B10RoutingConfig,
+    ) -> Result<Self> {
+        let mut document: serde_yaml::Value = serde_yaml::from_str(contents)?;
+        let root = document
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("configuration must be a YAML mapping"))?;
+        let routing_key = serde_yaml::Value::String("b10_routing_config".into());
+        let routing = root
+            .entry(routing_key)
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+        if let Some(routing) = routing.as_mapping_mut() {
+            let serde_yaml::Value::Mapping(mut fallback) = serde_yaml::to_value(defaults)? else {
+                unreachable!()
+            };
+            for (canonical, alias) in [
+                ("router_overlap_score_weight", "router_prefill_block_weight"),
+                (
+                    "router_session_affinity_score_multiplier",
+                    "router_session_affinity_discount",
+                ),
+            ] {
+                if routing.contains_key(serde_yaml::Value::String(alias.into())) {
+                    fallback.remove(serde_yaml::Value::String(canonical.into()));
                 }
-                return None;
             }
-        };
-        match serde_yaml::from_str(&contents) {
-            Ok(config) => Some(config),
-            Err(e) => {
-                if !is_warning_disabled() {
-                    tracing::warn!("Failed to parse YAML config from {:?}: {:?}", path, e);
-                }
-                None
+            for (key, value) in fallback {
+                routing.entry(key).or_insert(value);
             }
         }
-    }
-
-    /// Load config from file
-    fn load_config(path: &PathBuf) -> Result<UnifiedConfig> {
-        let root_config = Self::validate_config(path);
-
-        if root_config.is_none() {
-            return Err(anyhow::anyhow!(
-                "Failed to load or validate config from {:?}",
-                path
-            ));
-        }
-
-        let mut root_config = root_config.unwrap();
-
-        // Apply overrides if present
-        if let Ok(override_group) = std::env::var("ENGINE_ARGS_OVERRIDE_GROUP")
-            && !override_group.is_empty()
-            && let Some(overrides) = &root_config.override_args
-            && let Some(group_config) = overrides.get(&override_group)
+        let mut root_config: LLMConfig = serde_yaml::from_value(document)?;
+        if let Some(group) = override_group
+            && let Some(group_config) = root_config
+                .override_args
+                .as_ref()
+                .and_then(|groups| groups.get(group))
         {
-            if log_no_changes() {
-                tracing::info!("Applying override group '{}'", override_group);
-            }
             if let Some(routing_override) = &group_config.b10_routing_config {
                 root_config
                     .b10_routing_config
@@ -637,7 +557,6 @@ impl HotReloadableConfig {
                 root_config.engine_metrics_total_kv_blocks_override = Some(total_kv_blocks);
             }
         }
-
         let routing = &mut root_config.b10_routing_config;
         routing.router_active_request_dp_blend =
             sanitize_router_active_request_dp_blend(routing.router_active_request_dp_blend);
@@ -651,7 +570,6 @@ impl HotReloadableConfig {
             sanitize_engine_metrics_total_kv_blocks_override(
                 root_config.engine_metrics_total_kv_blocks_override,
             );
-        set_engine_metrics_total_kv_blocks_override(engine_metrics_total_kv_blocks_override);
 
         let runtime_config = LLMRuntimeConfig {
             tensor_parallel_size: root_config.tensor_parallel_size,
@@ -662,211 +580,38 @@ impl HotReloadableConfig {
             router_active_replicas: root_config.b10_routing_config.router_active_replicas,
             routing: root_config.b10_routing_config,
             runtime: runtime_config,
+            engine_metrics_total_kv_blocks_override,
         };
-
-        // Compute data_parallel_size for logging
-        let data_parallel_size = unified_config.runtime.compute_data_parallel_size();
-
-        dynamo_kv_router::sequences::set_token_load_discounts(
-            unified_config.routing.router_prefill_token_discount,
-            unified_config.routing.router_decode_token_discount,
-        );
-
-        let decode_tokens_threshold = unified_config
-            .routing
-            .router_queue_threshold_decode_tokens
-            .unwrap_or(0);
-
-        if decode_tokens_threshold > 0 && decode_tokens_threshold < 1000 {
-            tracing::warn!(
-                router_queue_threshold_decode_tokens = decode_tokens_threshold,
-                "router_queue_threshold_decode_tokens is set below 1000; typical values are 50k-2000k. \
-                 This may cause excessive backpressure."
-            );
-        }
-
-        dynamo_kv_router::scheduling::queue::set_router_queue_threshold_decode_tokens(
-            decode_tokens_threshold,
-        );
-
-        if log_no_changes() {
-            tracing::info!(
-                "Loaded config from {:?}: prefill_discount={}, decode_discount={}, session_affinity_score_multiplier={}, temperature={}, active_request_dp_blend={}, residency_eviction_cost={}, residency_half_life={}, router_active_replicas={}, tensor_parallel_size={:?}, enable_attention_dp={:?}, data_parallel_size={:?}, engine_metrics_total_kv_blocks_override={:?}, router_queue_threshold_decode_tokens={:?}",
-                path,
-                unified_config.routing.router_prefill_token_discount,
-                unified_config.routing.router_decode_token_discount,
-                unified_config
-                    .routing
-                    .router_session_affinity_score_multiplier,
-                unified_config.routing.router_temperature,
-                unified_config.routing.router_active_request_dp_blend,
-                unified_config.routing.router_residency_eviction_cost,
-                unified_config.routing.router_residency_half_life,
-                unified_config.router_active_replicas,
-                unified_config.runtime.tensor_parallel_size,
-                unified_config.runtime.enable_attention_dp,
-                data_parallel_size,
-                engine_metrics_total_kv_blocks_override,
-                unified_config.routing.router_queue_threshold_decode_tokens,
-            );
-        }
 
         Ok(unified_config)
     }
 
-    /// Get a clone of the current config
-    pub fn get(&self) -> UnifiedConfig {
-        self.config.read().unwrap().clone()
-    }
-
-    /// Start background task to reload config periodically
-    pub fn start_reloader(self: Arc<Self>) {
-        std::thread::spawn(move || {
-            tracing::info!(
-                "Starting B10RouterConfig hot-reloader thread, monitoring {:?}",
-                self.config_path
+    pub(crate) fn sanitize(mut self) -> Self {
+        self.router_active_replicas = self.routing.router_active_replicas;
+        self.routing.router_active_request_dp_blend =
+            sanitize_router_active_request_dp_blend(self.routing.router_active_request_dp_blend);
+        self.routing.router_residency_eviction_cost =
+            sanitize_router_residency_eviction_cost(self.routing.router_residency_eviction_cost);
+        self.routing.router_residency_half_life =
+            sanitize_router_residency_half_life(self.routing.router_residency_half_life);
+        self.routing.router_temperature =
+            sanitize_router_temperature(self.routing.router_temperature);
+        self.engine_metrics_total_kv_blocks_override =
+            sanitize_engine_metrics_total_kv_blocks_override(
+                self.engine_metrics_total_kv_blocks_override,
             );
-            loop {
-                match Self::load_config(&self.config_path) {
-                    Ok(new_config) => {
-                        if let Ok(mut config) = self.config.write() {
-                            let config_changed = *config != new_config;
-                            *config = new_config;
-
-                            if config_changed || log_no_changes() {
-                                tracing::info!(
-                                    "B10RouterConfig hot-reload {}: {:?}",
-                                    if config_changed {
-                                        "(HAS CHANGED!)"
-                                    } else {
-                                        "(no change)"
-                                    },
-                                    config
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if !is_warning_disabled() {
-                            tracing::warn!("Failed to hot-reload b10 router config: {:?}", e);
-                        }
-                    }
-                }
-                // Sleep after each reload attempt
-                std::thread::sleep(Duration::from_secs(RELOAD_INTERVAL_SECS));
-            }
-        });
+        self
     }
-}
-
-/// Global config instance
-static CONFIG: std::sync::LazyLock<Arc<HotReloadableConfig>> = std::sync::LazyLock::new(|| {
-    let config = Arc::new(HotReloadableConfig::new());
-    config.clone().start_reloader();
-    config
-});
-
-/// Get the global config instance
-pub fn get_config() -> Arc<HotReloadableConfig> {
-    CONFIG.clone()
-}
-
-/// Convenience function to get prefill token discount
-pub fn get_prefill_token_discount() -> f64 {
-    get_config().get().routing.router_prefill_token_discount
-}
-
-/// Convenience function to get decode token discount
-pub fn get_decode_token_discount() -> f64 {
-    get_config().get().routing.router_decode_token_discount
-}
-
-/// Convenience function to get router temperature
-pub fn get_router_temperature() -> f64 {
-    get_config().get().routing.router_temperature
-}
-
-/// Convenience function to get router overlap score weight
-pub fn get_router_overlap_score_weight() -> f64 {
-    get_config().get().routing.router_overlap_score_weight
-}
-
-/// Convenience function to get router decode block weight
-pub fn get_router_decode_block_weight() -> f64 {
-    get_config().get().routing.router_decode_block_weight
-}
-
-/// Convenience function to get router active request weight
-pub fn get_active_request_weight() -> f64 {
-    get_config().get().routing.router_active_request_weight
-}
-
-/// Convenience function to get router active request DP blend
-pub fn get_active_request_dp_blend() -> f64 {
-    get_config().get().routing.router_active_request_dp_blend
-}
-
-/// Convenience function to get router cache miss weight
-pub fn get_router_cache_miss_weight() -> f64 {
-    get_config().get().routing.router_cache_miss_weight
-}
-
-/// Convenience function to get router cache miss min isl
-pub fn get_router_cache_miss_min_isl() -> usize {
-    get_config().get().routing.router_cache_miss_min_isl
-}
-
-/// Convenience function to get router residency eviction cost weight
-pub fn get_router_residency_eviction_cost() -> f64 {
-    get_config().get().routing.router_residency_eviction_cost
-}
-
-/// Convenience function to get router residency half-life in seconds
-pub fn get_router_residency_half_life() -> f64 {
-    get_config().get().routing.router_residency_half_life
-}
-
-pub fn get_router_queue_threshold() -> Option<f64> {
-    get_config().get().routing.router_queue_threshold
-}
-
-pub fn get_router_queue_threshold_decode_tokens() -> Option<u64> {
-    get_config()
-        .get()
-        .routing
-        .router_queue_threshold_decode_tokens
-}
-
-/// Convenience function to get tensor parallel size
-pub fn get_tensor_parallel_size() -> Option<usize> {
-    get_config().get().runtime.tensor_parallel_size
-}
-
-/// Convenience function to get enable attention dp
-pub fn get_enable_attention_dp() -> Option<bool> {
-    get_config().get().runtime.enable_attention_dp
-}
-
-/// Convenience function to get router active replicas.
-pub fn get_router_active_replicas() -> usize {
-    get_config().get().router_active_replicas
-}
-
-pub fn validate_config() -> bool {
-    // gets result of validation + starts lazy reloader if not already started
-    HotReloadableConfig::validate_config(&CONFIG.config_path).is_some()
 }
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
 
     use super::*;
 
     #[test]
     fn test_default_config() {
-        let config = HotReloadableConfig::default();
-        let unified_config = config.get();
+        let unified_config = UnifiedConfig::default();
 
         assert_eq!(unified_config.routing.router_temperature, 0.01);
         assert_eq!(unified_config.routing.router_overlap_score_weight, 3.5);
@@ -887,17 +632,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_access() {
-        let prefill_discount = get_prefill_token_discount();
-        let decode_discount = get_decode_token_discount();
-        let active_request_dp_blend = get_active_request_dp_blend();
-        assert!(prefill_discount >= 0.0);
-        assert!(decode_discount >= 0.0);
-        assert!(active_request_dp_blend >= 0.0);
-    }
-
-    #[test]
-    #[serial]
     fn test_override_args_applied() {
         use std::io::Write;
 
@@ -930,12 +664,14 @@ override_args:
         let path = temp_file.path().to_path_buf();
 
         // Set env vars
-        unsafe {
-            std::env::set_var("ENGINE_ARGS_OVERRIDE_GROUP", "test_group");
-        }
 
         // Load config
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            Some("test_group"),
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
 
         // Check overrides applied
         assert_eq!(config.routing.router_temperature, 0.99);
@@ -950,17 +686,13 @@ override_args:
         // Check runtime config and computed data_parallel_size
         assert_eq!(config.runtime.tensor_parallel_size, Some(8));
         assert_eq!(config.runtime.enable_attention_dp, Some(true));
-        assert_eq!(get_engine_metrics_total_kv_blocks_override(), Some(250000));
+        assert_eq!(config.engine_metrics_total_kv_blocks_override, Some(250000));
         assert_eq!(config.runtime.compute_data_parallel_size(), Some(8)); // Because enable_attention_dp=true returns tensor_parallel_size
 
         // Cleanup
-        unsafe {
-            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
-        }
     }
 
     #[test]
-    #[serial]
     fn test_prefill_block_weight_alias_populates_overlap_score_weight() {
         use std::io::Write;
 
@@ -972,18 +704,18 @@ b10_routing_config:
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
 
-        unsafe {
-            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
-        }
-
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            None,
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
 
         // The alias populates the same field as router_overlap_score_weight.
         assert_eq!(config.routing.router_overlap_score_weight, 5.5);
     }
 
     #[test]
-    #[serial]
     fn test_decode_block_weight_default_and_override() {
         use std::io::Write;
 
@@ -995,10 +727,13 @@ b10_routing_config:
 "#;
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
-        unsafe {
-            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
-        }
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            None,
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
         assert_eq!(config.routing.router_decode_block_weight, 1.0);
 
         // Override group applies the decode weight.
@@ -1014,18 +749,17 @@ override_args:
 "#;
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
-        unsafe {
-            std::env::set_var("ENGINE_ARGS_OVERRIDE_GROUP", "test_group");
-        }
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            Some("test_group"),
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
         assert_eq!(config.routing.router_decode_block_weight, 2.0);
-        unsafe {
-            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
-        }
     }
 
     #[test]
-    #[serial]
     fn test_override_args_preserve_router_active_replicas_when_missing() {
         use std::io::Write;
 
@@ -1043,22 +777,18 @@ override_args:
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
 
-        unsafe {
-            std::env::set_var("ENGINE_ARGS_OVERRIDE_GROUP", "test_group");
-        }
-
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            Some("test_group"),
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(config.routing.router_temperature, 0.99);
         assert_eq!(config.router_active_replicas, 4);
-
-        unsafe {
-            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
-        }
     }
 
     #[test]
-    #[serial]
     fn test_override_args_not_applied_when_env_missing() {
         use std::io::Write;
 
@@ -1084,12 +814,14 @@ override_args:
         // Ensure env var is NOT set
         // Note: We need a mutex to ensure tests don't trample on each other's env vars
         // but for this specific test file, we can just ensure we clear it.
-        unsafe {
-            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
-        }
 
         // Load config
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            None,
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
 
         // Check overrides NOT applied
         assert_eq!(config.routing.router_temperature, 0.15);
@@ -1111,7 +843,12 @@ b10_routing_config:
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
 
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            None,
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
         assert_eq!(
             config.routing.router_active_request_dp_blend,
             ROUTER_ACTIVE_REQUEST_DP_BLEND_MAX
@@ -1131,7 +868,6 @@ b10_routing_config:
     }
 
     #[test]
-    #[serial]
     fn test_nested_router_active_replicas() {
         use std::io::Write;
 
@@ -1144,18 +880,18 @@ b10_routing_config:
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
 
-        unsafe {
-            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
-        }
-
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            None,
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(config.routing.router_temperature, 0.15);
         assert_eq!(config.router_active_replicas, 2);
     }
 
     #[test]
-    #[serial]
     fn test_override_args_nested_router_active_replicas_applied() {
         use std::io::Write;
 
@@ -1172,21 +908,17 @@ override_args:
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
 
-        unsafe {
-            std::env::set_var("ENGINE_ARGS_OVERRIDE_GROUP", "test_group");
-        }
-
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            Some("test_group"),
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(config.router_active_replicas, 3);
-
-        unsafe {
-            std::env::remove_var("ENGINE_ARGS_OVERRIDE_GROUP");
-        }
     }
 
     #[test]
-    #[serial]
     fn test_engine_metrics_total_kv_blocks_override_sanitization() {
         use std::io::Write;
 
@@ -1197,10 +929,15 @@ engine_metrics_total_kv_blocks_override: 0
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
 
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            None,
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(config.runtime.tensor_parallel_size, None);
-        assert_eq!(get_engine_metrics_total_kv_blocks_override(), None);
+        assert_eq!(config.engine_metrics_total_kv_blocks_override, None);
     }
 
     #[test]
@@ -1275,7 +1012,12 @@ b10_routing_config:
         write!(temp_file, "{}", config_content).unwrap();
         let path = temp_file.path().to_path_buf();
 
-        let config = HotReloadableConfig::load_config(&path).unwrap();
+        let config = UnifiedConfig::parse(
+            &std::fs::read_to_string(&path).unwrap(),
+            None,
+            &B10RoutingConfig::default(),
+        )
+        .unwrap();
         assert_eq!(config.routing.router_temperature, MIN_ROUTER_TEMPERATURE);
     }
 }

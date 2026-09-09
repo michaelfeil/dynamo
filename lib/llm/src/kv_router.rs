@@ -57,7 +57,6 @@ pub use dynamo_kv_router::selector;
 pub mod b10_metrics_helper;
 mod b10_potential_loads_cache;
 pub mod b10_worker_selector;
-pub mod b10hotreloadablecm;
 pub mod indexer;
 pub mod metrics;
 pub mod prefill_router;
