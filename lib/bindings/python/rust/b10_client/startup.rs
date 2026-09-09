@@ -9,7 +9,7 @@ pub(super) enum CoordinatorClient {
 impl CoordinatorClient {
     pub(super) fn parse(
         value: &Bound<'_, PyAny>,
-        runtime: Option<&crate::DistributedRuntime>,
+        runtime: &crate::DistributedRuntime,
     ) -> PyResult<Self> {
         if let Ok(client) = value.extract::<Client>() {
             return Ok(Self::Connected(client.router));
@@ -17,8 +17,6 @@ impl CoordinatorClient {
         let path = value.extract::<String>().map_err(|_| {
             PyTypeError::new_err("coordinator clients must be Client objects or endpoint strings")
         })?;
-        let runtime = runtime
-            .ok_or_else(|| PyValueError::new_err("runtime is required for endpoint strings"))?;
         Ok(Self::Endpoint(runtime.endpoint(path)?.inner))
     }
 
@@ -38,7 +36,7 @@ impl CoordinatorClient {
 }
 
 pub(super) struct CoordinatorStartup {
-    pub runtime: Option<Arc<dynamo_runtime::DistributedRuntime>>,
+    pub runtime: dynamo_runtime::DistributedRuntime,
     pub primary_worker: CoordinatorClient,
     pub primary_router: CoordinatorClient,
     pub next_worker: Option<CoordinatorClient>,

@@ -175,7 +175,7 @@ impl GenerationCoordinator {
         kv_block_size,
         disagg_request_id_machine_id=None,
         prefill_mark_timing=None,
-        runtime=None,
+        runtime,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -188,7 +188,7 @@ impl GenerationCoordinator {
         kv_block_size: u32,
         disagg_request_id_machine_id: Option<u64>,
         prefill_mark_timing: Option<&Bound<'_, PyAny>>,
-        runtime: Option<&crate::DistributedRuntime>,
+        runtime: &crate::DistributedRuntime,
     ) -> PyResult<Self> {
         let _ = model_name;
         let strategy = match enum_value(disaggregation_strategy)?.as_deref() {
@@ -221,13 +221,10 @@ impl GenerationCoordinator {
         if kv_block_size == 0 {
             return Err(PyValueError::new_err("kv_block_size must be positive"));
         }
-        let machine_id = disagg_request_id_machine_id
-            .or_else(|| runtime.map(|runtime| runtime.inner().connection_id()))
-            .ok_or_else(|| {
-                PyValueError::new_err("disagg_request_id_machine_id is required without runtime")
-            })?;
+        let machine_id =
+            disagg_request_id_machine_id.unwrap_or_else(|| runtime.inner().connection_id());
         let startup = Arc::new(CoordinatorStartup {
-            runtime: runtime.map(|runtime| Arc::new(runtime.inner().clone())),
+            runtime: runtime.inner().clone(),
             primary_worker: CoordinatorClient::parse(primary_worker_client, runtime)?,
             primary_router: CoordinatorClient::parse(primary_router_client, runtime)?,
             next_worker: next_worker_client
@@ -317,11 +314,8 @@ impl GenerationCoordinator {
             .map_err(|error| PyValueError::new_err(format!("invalid bind host: {error}")))?;
         let address = SocketAddr::new(host, port);
         let serving = Arc::clone(&self.serving);
-        let startup = self.startup.clone();
-        let runtime = startup
-            .as_ref()
-            .and_then(|startup| startup.runtime.as_ref())
-            .ok_or_else(|| PyValueError::new_err("runtime is required for HTTP serving"))?;
+        let startup = self.startup.clone().expect("local service has startup");
+        let runtime = &startup.runtime;
         let shutdown = runtime.child_token();
         // Stop admission in Phase 1; keep transports alive through HTTP drain.
         let guard = runtime.register_graceful_task();
@@ -329,12 +323,10 @@ impl GenerationCoordinator {
             if shutdown.is_cancelled() {
                 return Err(PyValueError::new_err("runtime is shut down"));
             }
-            if let Some(startup) = startup {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => return Err(PyValueError::new_err("runtime is shut down")),
-                    result = startup.start() => { result.map_err(to_pyerr)?; }
-                }
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return Err(PyValueError::new_err("runtime is shut down")),
+                result = startup.start() => { result.map_err(to_pyerr)?; }
             }
             let mut started = serving.lock().await;
             if *started {

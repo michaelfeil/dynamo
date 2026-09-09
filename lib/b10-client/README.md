@@ -72,8 +72,9 @@ endpoint_url = await local.serve(host="0.0.0.0", port=8080)
 # Runtime shutdown stops the listener; no coordinator context manager needed.
 ```
 
-Direct generation initializes clients lazily; `serve()` initializes them before
-binding HTTP. Neither path requires `start()`. With `runtime`, the listener stays
+The local constructor requires `runtime` as a keyword argument, including when
+passing explicit clients. Direct generation initializes clients lazily; `serve()`
+initializes them before binding HTTP. Neither path requires `start()`. The listener stays
 alive even if the Python coordinator handle is dropped, and runtime shutdown
 initiates graceful HTTP shutdown. `serve()` requires a runtime; there is no
 separate coordinator shutdown method.

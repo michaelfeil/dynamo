@@ -714,7 +714,7 @@ class GenerationCoordinator:
         kv_block_size: int,
         disagg_request_id_machine_id: int | None = None,
         prefill_mark_timing: Any | None = None,
-        runtime: DistributedRuntime | None = None,
+        runtime: DistributedRuntime,
     ) -> None: ...
     async def start(self) -> None:
         """Optional eager initialization; generate() and serve() initialize automatically."""

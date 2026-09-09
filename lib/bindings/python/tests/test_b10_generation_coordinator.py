@@ -54,12 +54,14 @@ async def test_coordinator_accepts_clients_and_endpoint_strings(
         runtime.shutdown()
 
 
-def test_coordinator_endpoint_strings_require_runtime():
-    with pytest.raises(ValueError, match="runtime is required for endpoint strings"):
+@pytest.mark.parametrize("kwargs", [{}, {"runtime": None}])
+def test_coordinator_requires_runtime(kwargs):
+    with pytest.raises(TypeError, match="runtime"):
         GenerationCoordinator(
             primary_worker_client="test.worker.generate",
             primary_router_client="test.router.generate",
             model_name="test",
             kv_block_size=16,
             disagg_request_id_machine_id=1,
+            **kwargs,
         )
