@@ -38,7 +38,7 @@ impl CoordinatorClient {
 }
 
 pub(super) struct CoordinatorStartup {
-    pub _runtime: Option<Arc<dynamo_runtime::DistributedRuntime>>,
+    pub runtime: Option<Arc<dynamo_runtime::DistributedRuntime>>,
     pub primary_worker: CoordinatorClient,
     pub primary_router: CoordinatorClient,
     pub next_worker: Option<CoordinatorClient>,

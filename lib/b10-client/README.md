@@ -61,19 +61,22 @@ not decode protobufs or handle generation requests:
 
 ```python
 local = dynamo.GenerationCoordinator(
-    primary_worker_client=worker_client,
-    primary_router_client=router_client,
+    runtime=runtime,
+    primary_worker_client="namespace.worker.generate",
+    primary_router_client="namespace.router.generate",
     model_name=model_name,
     kv_block_size=32,
-    disagg_request_id_machine_id=0,
 )
 endpoint_url = await local.serve(host="0.0.0.0", port=8080)
 # GET /health and POST /v1/coordinate are now served by Rust/Hyper/Axum.
-await local.shutdown()
+# Runtime shutdown stops the listener; no coordinator context manager needed.
 ```
 
-The Baseten deployment starts this listener by default; `port: null` disables
-HTTP while retaining direct binding calls.
+Direct generation initializes clients lazily; `serve()` initializes them before
+binding HTTP. Neither path requires `start()`. With `runtime`, the listener stays
+alive even if the Python coordinator handle is dropped, and runtime shutdown
+initiates graceful HTTP shutdown. `serve()` requires a runtime; there is no
+separate coordinator shutdown method.
 
 The latency-sensitive path stays entirely native: Hyper receives the body,
 Prost decodes it, the Rust coordinator routes it, and Hyper streams framed

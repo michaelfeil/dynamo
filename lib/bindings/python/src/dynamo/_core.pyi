@@ -717,7 +717,7 @@ class GenerationCoordinator:
         runtime: DistributedRuntime | None = None,
     ) -> None: ...
     async def start(self) -> None:
-        """Resolve endpoint strings; also called by serve() and generate()."""
+        """Optional eager initialization; generate() and serve() initialize automatically."""
         ...
 
     @classmethod
@@ -732,11 +732,11 @@ class GenerationCoordinator:
     def is_server(self) -> bool: ...
 
     async def serve(self, host: str = "0.0.0.0", port: int = 8080) -> str:
-        """Bind the native HTTP entry point and return its URL."""
-        ...
+        """Start HTTP serving in the background and return its URL.
 
-    async def shutdown(self) -> None:
-        """Gracefully stop the HTTP entry point if it is running."""
+        Requires runtime. Serving lasts until runtime shutdown;
+        no context manager or explicit coordinator shutdown is required.
+        """
         ...
 
     async def generate(

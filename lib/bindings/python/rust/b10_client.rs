@@ -29,9 +29,7 @@ use dynamo_b10_client::{
     MinReplicaAvailable, PotentialLoadsCheck, PrefillMarkTiming as CorePrefillMarkTiming,
     RemoteGenerationCoordinator, RequestContext, RouteAndConnectOutcome, RouteOptions,
     RouterRequestGuard, RouterRequestNew, RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
-    RouterWorkerPhase as CoreRouterWorkerPhase,
-    RunningGenerationCoordinatorService as CoreRunningGenerationCoordinatorService,
-    stream_with_optional_prefill_mark,
+    RouterWorkerPhase as CoreRouterWorkerPhase, stream_with_optional_prefill_mark,
 };
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints};
 use dynamo_runtime::pipeline::EngineStream;
@@ -160,7 +158,7 @@ pub(crate) struct GenerationCoordinator {
     startup: Option<Arc<CoordinatorStartup>>,
     inner: Arc<dyn CoreGenerationCoordinatorClient>,
     service: Option<Arc<CoreGenerationCoordinatorService>>,
-    running_service: Arc<tokio::sync::Mutex<Option<CoreRunningGenerationCoordinatorService>>>,
+    serving: Arc<tokio::sync::Mutex<bool>>,
 }
 
 #[pymethods]
@@ -229,7 +227,7 @@ impl GenerationCoordinator {
                 PyValueError::new_err("disagg_request_id_machine_id is required without runtime")
             })?;
         let startup = Arc::new(CoordinatorStartup {
-            _runtime: runtime.map(|runtime| Arc::new(runtime.inner().clone())),
+            runtime: runtime.map(|runtime| Arc::new(runtime.inner().clone())),
             primary_worker: CoordinatorClient::parse(primary_worker_client, runtime)?,
             primary_router: CoordinatorClient::parse(primary_router_client, runtime)?,
             next_worker: next_worker_client
@@ -253,7 +251,7 @@ impl GenerationCoordinator {
             startup: Some(startup),
             inner,
             service: Some(service),
-            running_service: Arc::new(tokio::sync::Mutex::new(None)),
+            serving: Arc::new(tokio::sync::Mutex::new(false)),
         })
     }
 
@@ -280,7 +278,7 @@ impl GenerationCoordinator {
             startup: None,
             inner: Arc::new(inner),
             service: None,
-            running_service: Arc::new(tokio::sync::Mutex::new(None)),
+            serving: Arc::new(tokio::sync::Mutex::new(false)),
         })
     }
 
@@ -294,7 +292,8 @@ impl GenerationCoordinator {
         self.service.is_some()
     }
 
-    /// Resolve endpoint strings once. Also performed by serve() and generate().
+    /// Optional eager initialization for compatibility. serve() and generate()
+    /// initialize clients automatically.
     fn start<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let startup = self.startup.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -306,7 +305,8 @@ impl GenerationCoordinator {
     }
 
     /// Bind the native HTTP entry point in the background. Direct `generate()`
-    /// calls remain available on the same coordinator.
+    /// calls remain available on the same coordinator. With a runtime, the
+    /// listener lives until runtime shutdown, even if this handle is dropped.
     #[pyo3(signature = (host="0.0.0.0", port=8080))]
     fn serve<'p>(&self, py: Python<'p>, host: &str, port: u16) -> PyResult<Bound<'p, PyAny>> {
         let service = self.service.as_ref().cloned().ok_or_else(|| {
@@ -316,33 +316,43 @@ impl GenerationCoordinator {
             .parse::<IpAddr>()
             .map_err(|error| PyValueError::new_err(format!("invalid bind host: {error}")))?;
         let address = SocketAddr::new(host, port);
-        let running = Arc::clone(&self.running_service);
+        let serving = Arc::clone(&self.serving);
         let startup = self.startup.clone();
+        let runtime = startup
+            .as_ref()
+            .and_then(|startup| startup.runtime.as_ref())
+            .ok_or_else(|| PyValueError::new_err("runtime is required for HTTP serving"))?;
+        let shutdown = runtime.child_token();
+        // Stop admission in Phase 1; keep transports alive through HTTP drain.
+        let guard = runtime.register_graceful_task();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Some(startup) = startup {
-                startup.start().await.map_err(to_pyerr)?;
+            if shutdown.is_cancelled() {
+                return Err(PyValueError::new_err("runtime is shut down"));
             }
-            let mut slot = running.lock().await;
-            if slot.is_some() {
+            if let Some(startup) = startup {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Err(PyValueError::new_err("runtime is shut down")),
+                    result = startup.start() => { result.map_err(to_pyerr)?; }
+                }
+            }
+            let mut started = serving.lock().await;
+            if *started {
                 return Err(PyValueError::new_err(
                     "generation coordinator server is already running",
                 ));
             }
             let server = service.start(address).await.map_err(to_pyerr)?;
             let endpoint_url = server.endpoint_url();
-            *slot = Some(server);
+            *started = true;
+            tokio::spawn(async move {
+                let _guard = guard;
+                shutdown.cancelled().await;
+                if let Err(error) = server.shutdown().await {
+                    tracing::error!(%error, "generation coordinator HTTP shutdown failed");
+                }
+            });
             Ok(endpoint_url)
-        })
-    }
-
-    fn shutdown<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
-        let running = Arc::clone(&self.running_service);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let server = running.lock().await.take();
-            if let Some(server) = server {
-                server.shutdown().await.map_err(to_pyerr)?;
-            }
-            Ok(())
         })
     }
 
