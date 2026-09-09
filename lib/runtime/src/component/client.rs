@@ -458,6 +458,15 @@ impl Client {
         self.instances().into_iter().map(|ep| ep.id()).collect()
     }
 
+    /// Check live discovery without cloning its instance table. This deliberately
+    /// does not consult the asynchronously reconciled routing/fault snapshot.
+    pub fn is_instance_live(&self, instance_id: u64) -> bool {
+        self.instance_source
+            .borrow()
+            .iter()
+            .any(|instance| instance.id() == instance_id)
+    }
+
     pub fn instance_ids_avail(&self) -> Vec<u64> {
         self.routing_instances.routable_ids()
     }
@@ -685,6 +694,37 @@ impl Client {
 mod tests {
     use super::*;
     use crate::{DistributedRuntime, Runtime, distributed::DistributedConfig};
+
+    #[tokio::test]
+    async fn live_membership_uses_discovery_not_routing_state() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt, DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("live_membership".to_string())
+            .unwrap()
+            .component("worker".to_string())
+            .unwrap()
+            .endpoint("generate".to_string());
+        let mut client = Client::with_reconcile_interval(endpoint.clone(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        let instances = client.wait_for_instances().await.unwrap();
+        let worker_id = instances[0].id();
+        // Replace the source with a controlled watch channel so assertions do
+        // not depend on the background routing reconciler being scheduled.
+        let (tx, rx) = tokio::sync::watch::channel(instances);
+        client.instance_source = Arc::new(rx);
+        assert!(client.is_instance_live(worker_id));
+        assert!(!client.is_instance_live(worker_id.wrapping_add(1)));
+        client.set_overloaded_instances(&[worker_id]);
+        client.report_instance_down(worker_id);
+        assert!(client.is_instance_live(worker_id));
+        tx.send(Vec::new()).unwrap();
+        assert!(!client.is_instance_live(worker_id));
+    }
 
     /// Test that instances removed via report_instance_down are restored after
     /// the reconciliation interval elapses.

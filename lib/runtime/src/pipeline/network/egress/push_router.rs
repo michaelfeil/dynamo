@@ -594,7 +594,7 @@ where
                 let routing_instances = self.client.routing_instances();
                 routing_instances.routable_ids().contains(&instance_id)
             } else {
-                self.client.instance_ids().contains(&instance_id)
+                self.client.is_instance_live(instance_id)
             }
         };
 

@@ -408,6 +408,12 @@ fault-injection handling. It defaults off so transient transport/backend
 failures do not quarantine remotes unless explicitly enabled; Baseten avoids
 calling `report_instance_down` by default.
 
+Adapted upstream `ai-dynamo/dynamo#14159` (`57aac94525dcf8d3085ef6d7d7b25529c5587ab5`):
+direct dispatch with fault detection disabled checks the borrowed live discovery
+table without cloning instances and collecting IDs. The fault-enabled routing
+snapshot path is unchanged; do not substitute a reconciled snapshot for live
+discovery when replaying this change.
+
 The worker ingress's terminal `complete_final` publish failure is classified
 like the mid-stream data-path failure: when the request context is already
 stopped/killed (client disconnect, or an upstream early break such as the
