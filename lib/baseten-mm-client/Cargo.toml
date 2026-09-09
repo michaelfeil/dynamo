@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "baseten-mm-client"
+description = "Rust HTTP client for Baseten multimodal encoders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = "0.22"
+baseten_performance_client_core = { version = "=0.1.13-post.1", default-features = false, features = ["rustls"] }
+rmpv = { version = "1", features = ["with-serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+rmp-serde = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }

@@ -36,6 +36,24 @@ materialize one Python ``int`` object per token to cross the binding.
 
 B10_DROP_THIS_MESSAGE_KEY: str
 
+class EncoderHttpError(RuntimeError):
+    status_code: int
+
+class MultiModalEncoderClient:
+    def __init__(
+        self,
+        *,
+        url: str,
+        api_key: Optional[str] = None,
+        cache_urls: List[str] = [],
+        proxy: Optional[str] = None,
+        request_timeout_s: float = 300.0,
+        max_retries: int = 1,
+        max_concurrent_requests: int = 64,
+    ) -> None: ...
+    async def call_batch(self, requests: List[Dict[str, Any]]) -> Dict[str, Any]: ...
+
+
 def log_message(level: str, message: str, module: str, file: str, line: int) -> None:
     """
     Log a message from Python with file and line info

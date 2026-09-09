@@ -27,6 +27,7 @@ members = [
     "lib/bench",
     "lib/backend-common",
     "lib/b10-client",
+    "lib/baseten-mm-client",
     "lib/backend-common/examples/mocker",
     "lib/bindings/c",
     "lib/bindings/python/codegen",

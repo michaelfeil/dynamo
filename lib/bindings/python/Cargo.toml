@@ -45,6 +45,7 @@ dynamo-parsers = { path = "../../parsers" }
 dynamo-protocols = { path = "../../protocols" }
 dynamo-backend-common = { path = "../../backend-common" }
 dynamo-b10-client = { path = "../../b10-client" }
+baseten-mm-client = { path = "../../baseten-mm-client" }
 
 anyhow = { version = "1" }
 async-stream = { version = "0.3" }

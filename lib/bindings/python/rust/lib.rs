@@ -73,6 +73,7 @@ impl From<RouterMode> for RsRouterMode {
 }
 
 mod b10_client;
+mod b10_encoder;
 mod b10_health;
 mod b10_rate_limiter;
 mod backend;
@@ -192,6 +193,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<b10_client::RouterWorkerCoordinator>()?;
     m.add_class::<b10_client::GenerationCoordinator>()?;
+    m.add_class::<b10_encoder::MultiModalEncoderClient>()?;
+    m.add(
+        "EncoderHttpError",
+        m.py().get_type::<b10_encoder::EncoderHttpError>(),
+    )?;
     m.add_class::<b10_client::AdmittedRequest>()?;
     m.add_class::<b10_client::GeneratedRequest>()?;
     m.add_class::<b10_client::DeniedGenerationRequest>()?;
