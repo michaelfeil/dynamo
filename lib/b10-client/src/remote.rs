@@ -140,6 +140,22 @@ fn cancelled_outcome() -> GenerationOutcome {
 }
 
 impl GenerationCoordinatorClient for RemoteGenerationCoordinator {
+    fn worker_loads(&self) -> BoxFuture<'_, Result<Vec<crate::WorkerLoad>>> {
+        Box::pin(async {
+            let endpoint = match &self.config {
+                Some(config) => configured_endpoint(config)?,
+                None => self.endpoint.clone(),
+            };
+            let response = self
+                .client
+                .get(endpoint.join("worker_loads")?)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(serde_json::from_slice(&response.bytes().await?)?)
+        })
+    }
     fn generate(
         &self,
         context: RequestContext,

@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 
 pub const COORDINATE_PATH: &str = "/v1/coordinate";
 pub const HEALTH_PATH: &str = "/health";
+pub const WORKER_LOADS_PATH: &str = "/v1/worker_loads";
 
 pub struct GenerationCoordinatorService {
     coordinator: Arc<dyn GenerationCoordinatorClient>,
@@ -64,6 +65,7 @@ impl GenerationCoordinatorService {
         let app = Router::new()
             .route(COORDINATE_PATH, post(coordinate))
             .route(HEALTH_PATH, get(health))
+            .route(WORKER_LOADS_PATH, get(worker_loads))
             .layer(DefaultBodyLimit::max(get_tcp_max_message_size()))
             .with_state(self);
         let task = tokio::spawn(async move {
@@ -140,6 +142,23 @@ impl Drop for RunningGenerationCoordinatorService {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+async fn worker_loads(State(service): State<Arc<GenerationCoordinatorService>>) -> Response<Body> {
+    use axum::response::IntoResponse;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        service.coordinator.worker_loads(),
+    )
+    .await
+    {
+        Ok(Ok(loads)) => axum::Json(loads).into_response(),
+        Ok(Err(error)) => text_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Err(_) => text_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "worker loads query timed out".into(),
+        ),
+    }
 }
 
 async fn coordinate(

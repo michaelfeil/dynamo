@@ -95,6 +95,24 @@ b10_generation_coordinator_config:
   port: 8080
 ```
 
+`GET /v1/worker_loads` returns a flat JSON array of worker loads. Disaggregated
+prefill and decode pools are queried concurrently and concatenated, retaining
+`disaggregation_mode` (`prefill`, `decode`, or `prefill_and_decode`) on each row.
+DP ranks are summed per worker within each pool; identical worker IDs across
+pools remain separate rows. Like Baseten deep health, an idle one-token probe is
+normalized to zero per rank.
+
+```json
+[{"worker_id":42,"disaggregation_mode":"prefill","potential_prefill_tokens":128,"potential_decode_blocks":8,"active_requests":2}]
+```
+
+An unavailable pool fails the request rather than returning partial load data.
+Queries are bounded to five seconds. Remote clients and HTTP relays forward to
+the sibling `worker_loads` endpoint using the same HTTP connection pool and
+reloadable remote URL as generation. Rust callers use `worker_loads()` on the
+coordinator runtime or client. This endpoint shares the listener's trusted-network
+access requirements; no new port or Python handler is introduced.
+
 The latency-sensitive path stays entirely native: Hyper receives the body,
 Prost decodes it, the Rust coordinator routes it, and Hyper streams framed
 responses. There is no Uvicorn/FastAPI server and no per-request PyO3 crossing.

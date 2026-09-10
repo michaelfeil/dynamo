@@ -133,6 +133,28 @@ pub struct GenerationCoordinator {
 }
 
 impl GenerationCoordinator {
+    pub async fn worker_loads(&self) -> Result<Vec<WorkerLoad>> {
+        match self.strategy {
+            DisaggregationStrategy::Aggregated => {
+                self.primary
+                    .worker_loads(WorkerMode::PrefillAndDecode)
+                    .await
+            }
+            DisaggregationStrategy::PrefillFirst => {
+                let next = self
+                    .next
+                    .as_ref()
+                    .expect("validated disaggregated topology");
+                let (mut prefill, decode) = tokio::try_join!(
+                    self.primary.worker_loads(WorkerMode::Prefill),
+                    next.worker_loads(WorkerMode::Decode),
+                )?;
+                prefill.extend(decode);
+                Ok(prefill)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         primary: Arc<RouterWorkerCoordinator>,
@@ -431,6 +453,9 @@ impl GenerationCoordinator {
 /// Requests are owned so bindings can choose the implementation once during
 /// construction and use one object-safe API for every generation.
 pub trait GenerationCoordinatorClient: Send + Sync {
+    fn worker_loads(&self) -> BoxFuture<'_, Result<Vec<WorkerLoad>>> {
+        Box::pin(async { bail!("worker loads are not supported by this coordinator") })
+    }
     fn generate(
         &self,
         context: RequestContext,
@@ -440,6 +465,9 @@ pub trait GenerationCoordinatorClient: Send + Sync {
 }
 
 impl GenerationCoordinatorClient for GenerationCoordinator {
+    fn worker_loads(&self) -> BoxFuture<'_, Result<Vec<WorkerLoad>>> {
+        Box::pin(GenerationCoordinator::worker_loads(self))
+    }
     fn generate(
         &self,
         context: RequestContext,
@@ -450,6 +478,24 @@ impl GenerationCoordinatorClient for GenerationCoordinator {
             self, context, request, options,
         ))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerMode {
+    PrefillAndDecode,
+    Prefill,
+    Decode,
+}
+
+/// DP-rank loads summed per worker, with the one-token idle probe removed per rank.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerLoad {
+    pub worker_id: u64,
+    pub disaggregation_mode: WorkerMode,
+    pub potential_prefill_tokens: usize,
+    pub potential_decode_blocks: usize,
+    pub active_requests: usize,
 }
 
 fn validate_generation_request(

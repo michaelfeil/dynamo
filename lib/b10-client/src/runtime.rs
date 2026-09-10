@@ -81,6 +81,9 @@ impl LocalCoordinator {
 }
 
 impl GenerationCoordinatorClient for LocalCoordinator {
+    fn worker_loads(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::WorkerLoad>>> {
+        Box::pin(async { self.start().await?.worker_loads().await })
+    }
     fn generate(
         &self,
         context: RequestContext,
@@ -121,6 +124,9 @@ struct Listener {
 }
 
 impl GenerationCoordinatorRuntime {
+    pub fn worker_loads(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::WorkerLoad>>> {
+        self.client.worker_loads()
+    }
     pub fn new(
         runtime: DistributedRuntime,
         options: LocalCoordinatorOptions,

@@ -91,6 +91,49 @@ pub struct RouterWorkerCoordinator {
 }
 
 impl RouterWorkerCoordinator {
+    pub async fn worker_loads(&self, mode: crate::WorkerMode) -> Result<Vec<crate::WorkerLoad>> {
+        let instances = available_router_instance_ids(self.router.as_ref());
+        let instance = instances
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("no router instances available for worker loads"))?;
+        let request = to_rmpv_value(&RouterRequest::PotentialLoads {
+            tokens: vec![0].into(),
+            block_mm_infos: None,
+            allow_short_caching: false,
+        })?;
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            let stream = self
+                .router
+                .direct(RsContext::new(request), instance)
+                .await?;
+            first_stream_response(stream).await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("worker loads router query timed out"))??;
+        let RsRouterResponse::PotentialLoads { loads, .. } = response.response else {
+            anyhow::bail!("unexpected router response to worker loads query");
+        };
+        let mut workers = std::collections::BTreeMap::new();
+        for load in loads {
+            let worker = workers.entry(load.worker_id).or_insert(crate::WorkerLoad {
+                worker_id: load.worker_id,
+                disaggregation_mode: mode,
+                potential_prefill_tokens: 0,
+                potential_decode_blocks: 0,
+                active_requests: 0,
+            });
+            worker.potential_prefill_tokens += if load.potential_prefill_tokens == 1 {
+                0
+            } else {
+                load.potential_prefill_tokens
+            };
+            worker.potential_decode_blocks += load.potential_decode_blocks;
+            worker.active_requests += load.active_requests;
+        }
+        Ok(workers.into_values().collect())
+    }
+
     pub(crate) fn router(&self) -> Arc<dyn RouterGuardClient> {
         Arc::clone(&self.router)
     }

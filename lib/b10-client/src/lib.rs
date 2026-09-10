@@ -31,7 +31,7 @@ pub use generation::{
     GenerationCoordinator, GenerationCoordinatorClient, GenerationOptions, GenerationOutcome,
     GenerationRequest, POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
     POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE, POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
-    POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD, PrefillMarkTiming,
+    POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD, PrefillMarkTiming, WorkerLoad, WorkerMode,
 };
 pub use guard::RouterRequestGuard;
 pub use remote::RemoteGenerationCoordinator;

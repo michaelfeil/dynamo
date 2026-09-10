@@ -3101,6 +3101,68 @@ fn generation_coordinator(
     .expect("generation coordinator")
 }
 
+#[tokio::test]
+async fn worker_loads_http_flattens_dp_and_pools_without_partial_results() {
+    let router = |decode| {
+        let response = RsRouterResponse::PotentialLoads {
+            loads: [1, if decode { 1 } else { 12 }]
+                .into_iter()
+                .enumerate()
+                .map(|(rank, tokens)| RsPotentialLoad {
+                    worker_id: 42,
+                    dp_rank: rank as u32,
+                    potential_prefill_tokens: tokens,
+                    potential_decode_blocks: 4,
+                    active_requests: 1,
+                })
+                .collect(),
+            pending_count: 0,
+            pending_isl_tokens: 0,
+        };
+        RouterGuardClientForTesting::new(
+            vec![1],
+            vec![1],
+            vec![
+                Ok(response.clone()),
+                if decode {
+                    Err("decode router unavailable".into())
+                } else {
+                    Ok(response)
+                },
+            ],
+        )
+    };
+    let worker = RouterGuardClientForTesting::new(vec![], vec![], vec![]);
+    let coordinator = generation_coordinator(
+        router(false),
+        worker.clone(),
+        Some(router(true)),
+        Some(worker.clone()),
+        DisaggregationStrategy::PrefillFirst,
+    );
+    let (client, server) = generation_transport(coordinator, true).await;
+    let relay = Arc::new(crate::GenerationCoordinatorService::new(
+        client,
+        DisaggregationStrategy::PrefillFirst,
+    ))
+    .start("127.0.0.1:0".parse().unwrap())
+    .await
+    .unwrap();
+    let client: Arc<dyn crate::GenerationCoordinatorClient> =
+        Arc::new(crate::RemoteGenerationCoordinator::new(relay.endpoint_url()).unwrap());
+    assert_eq!(
+        serde_json::to_value(client.worker_loads().await.unwrap()).unwrap(),
+        serde_json::json!([
+            {"worker_id": 42, "disaggregation_mode": "prefill", "potential_prefill_tokens": 12, "potential_decode_blocks": 8, "active_requests": 2},
+            {"worker_id": 42, "disaggregation_mode": "decode", "potential_prefill_tokens": 0, "potential_decode_blocks": 8, "active_requests": 2}
+        ])
+    );
+    assert!(client.worker_loads().await.is_err());
+    assert!(worker.calls.lock().unwrap().is_empty());
+    relay.shutdown().await.unwrap();
+    server.unwrap().shutdown().await.unwrap();
+}
+
 async fn generation_transport(
     coordinator: GenerationCoordinator,
     remote: bool,
