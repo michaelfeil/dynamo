@@ -147,7 +147,7 @@ impl GenerationCoordinatorRuntime {
         is_client_force: Option<bool>,
     ) -> Result<Self> {
         let default_remote = (is_client_force != Some(false))
-            .then(|| std::env::var("DYNAMO_GENERATION_COORDINATOR_URL").ok())
+            .then(|| std::env::var("DYNAMO_DEFAULT_GENERATION_COORDINATOR_URL").ok())
             .flatten();
         Self::with_default_remote(
             runtime,

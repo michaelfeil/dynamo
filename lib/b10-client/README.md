@@ -88,7 +88,7 @@ Local/remote mode and listener settings are fixed at construction. Only the
 `RemoteGenerationCoordinator::from_config(reader)` for reloadable endpoints;
 the HTTP client retains its connection pool across updates.
 
-The configured constructor captures `DYNAMO_GENERATION_COORDINATOR_URL` as its
+The configured constructor captures `DYNAMO_DEFAULT_GENERATION_COORDINATOR_URL` as its
 default remote (`default`); its presence does not enable remote mode or imply
 that a service is live. Explicit configmap `remotes` take precedence, including
 after reload; removing them restores the captured URL. Explicit `.remote(...)`
