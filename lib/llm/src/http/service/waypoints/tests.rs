@@ -47,6 +47,33 @@ fn typed_chat_chunks_preserve_known_metadata_and_reject_unknown_fields() {
     assert!(serde_json::from_value::<ChatChunk>(input).is_err());
 }
 
+#[test]
+fn captured_chat_chunks_validate_without_retyping_evidence() {
+    let mut input = chunk();
+    input["choices"][0]["stop_reason"] = json!(42);
+    input["choices"][0]["logprobs"] = json!({"content": [{
+        "token": "hello", "logprob": -0.1, "bytes": [104],
+        "top_logprobs": [{"token": "hello", "logprob": -0.1}]
+    }]});
+    input["kv_cache_metrics"] = json!({"num_reused_blocks": 3});
+    let artifact = json!({"stage": "chat_stream", "value": [input.clone()]});
+    let captured: HookArtifact = serde_json::from_value(artifact.clone()).unwrap();
+    assert_eq!(serde_json::to_value(captured).unwrap(), artifact);
+    input["choices"][0]["stop_reason"] = json!("stop sequence");
+    let captured: CapturedChatChunk = serde_json::from_value(input.clone()).unwrap();
+    assert_eq!(serde_json::to_value(captured).unwrap(), input);
+    input["choices"][0]["index"] = json!("not an index");
+    assert!(serde_json::from_value::<CapturedChatChunk>(input).is_err());
+}
+
+#[test]
+fn captured_chat_chunks_reject_the_same_unknown_finish_reasons_as_serving() {
+    let mut input = chunk();
+    input["choices"][0]["finish_reason"] = json!("unknown engine reason");
+    assert!(serde_json::from_value::<NvCreateChatCompletionStreamResponse>(input.clone()).is_err());
+    assert!(serde_json::from_value::<CapturedChatChunk>(input).is_err());
+}
+
 #[tokio::test]
 async fn ingress_and_client_json_are_not_reconstructed() {
     let expected = r#"{ "unknown":1e2, "unknown":2, "nested": { "z":1,"a":2 } }"#;

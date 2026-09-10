@@ -198,6 +198,22 @@ struct ChatChunk {
     kv_cache_metrics: Option<Map<String, Value>>,
 }
 
+/// Validate the production schema without rewriting diagnostic evidence through its Rust types.
+#[derive(Serialize)]
+#[serde(transparent)]
+struct CapturedChatChunk(Box<RawValue>);
+
+impl<'de> Deserialize<'de> for CapturedChatChunk {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // HookArtifact's tagged enum buffers the payload, so deserialize through Value here.
+        let value = Value::deserialize(deserializer)?;
+        serde_json::from_value::<ChatChunk>(value.clone()).map_err(serde::de::Error::custom)?;
+        serde_json::value::to_raw_value(&value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(
     tag = "stage",
@@ -210,7 +226,7 @@ enum HookArtifact {
     Tokenize(Vec<u32>),
     EngineRequest(EngineRequestArtifact),
     EngineOutput(Vec<Map<String, Value>>),
-    ChatStream(Vec<ChatChunk>),
+    ChatStream(Vec<CapturedChatChunk>),
 }
 
 impl HookArtifact {

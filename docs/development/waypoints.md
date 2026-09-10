@@ -71,6 +71,11 @@ so the parsed result is unchanged, but this is a further reason not to read
 Waypoints timings as latency. Everything preserved counts against the same 4 MiB
 capture bound, so a large request may need a nearer `stop_after`.
 
+`chat_stream` preserves the Python chunk JSON after validating the production schema,
+including `stop_reason`, logprob precision, and absent versus null fields. The `client`
+stage still uses the ordinary Rust protocol writers and their normalization. Unsupported
+finish reasons fail typed validation in both normal serving and inspection.
+
 ### Failed runs
 
 ```json

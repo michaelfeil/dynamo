@@ -1378,6 +1378,9 @@ and an OpenAI service pipeline example.
 Waypoints uses typed protocol/stage controls, canonical context and artifact envelopes;
 malformed hook artifacts fail with diagnostic 502 errors instead of unchecked JSON access.
 Original ingress JSON and completed client bodies pass through without schema reconstruction.
+Captured `chat_stream` artifacts validate against the production chunk schema but retain
+the input JSON, including choice extensions and logprob precision. Client rendering still
+uses production types; do not expand accepted finish reasons only for diagnostics.
 
 Waypoints internal inspection (PR #774): `HttpService` starts a separate
 unauthenticated listener on port 9192 (`DYN_WAYPOINTS_PORT`,
