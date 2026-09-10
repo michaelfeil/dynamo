@@ -144,6 +144,28 @@ impl GenerationCoordinatorRuntime {
         options: LocalCoordinatorOptions,
         config: ConfigReader,
         namespace: Option<String>,
+        is_client_force: Option<bool>,
+    ) -> Result<Self> {
+        let default_remote = (is_client_force != Some(false))
+            .then(|| std::env::var("DYNAMO_GENERATION_COORDINATOR_URL").ok())
+            .flatten();
+        Self::with_default_remote(
+            runtime,
+            options,
+            config,
+            namespace,
+            is_client_force,
+            default_remote,
+        )
+    }
+
+    fn with_default_remote(
+        runtime: DistributedRuntime,
+        options: LocalCoordinatorOptions,
+        config: ConfigReader,
+        namespace: Option<String>,
+        is_client_force: Option<bool>,
+        default_remote: Option<String>,
     ) -> Result<Self> {
         ensure!(options.block_size > 0, "kv_block_size must be positive");
         ensure!(
@@ -160,7 +182,11 @@ impl GenerationCoordinatorRuntime {
             started: OnceCell::new(),
         });
         let (client, local): (Arc<dyn GenerationCoordinatorClient>, _) =
-            if settings.remotes.is_some() {
+            if is_client_force.unwrap_or(settings.remotes.is_some() || default_remote.is_some()) {
+                ensure!(
+                    settings.remotes.is_some() || default_remote.is_some(),
+                    "remote coordinator mode requires remotes"
+                );
                 let namespace = runtime
                     .namespace(namespace.context(
                         "namespace is required for configured remote coordinator mode",
@@ -169,6 +195,7 @@ impl GenerationCoordinatorRuntime {
                     Arc::new(RemoteGenerationCoordinator::from_runtime_config(
                         config,
                         Some(&namespace),
+                        default_remote,
                     )?),
                     None,
                 )
@@ -305,9 +332,40 @@ mod tests {
                 machine_id: 1,
             };
             let reader = ConfigReader::in_memory(UnifiedConfig::default());
-            let local =
-                GenerationCoordinatorRuntime::new(runtime.clone(), options(), reader.clone(), None)
-                    .unwrap();
+            let new = |force, namespace, default_remote| {
+                GenerationCoordinatorRuntime::with_default_remote(
+                    runtime.clone(),
+                    options(),
+                    reader.clone(),
+                    namespace,
+                    force,
+                    default_remote,
+                )
+            };
+            let local = new(None, None, None).unwrap();
+            assert!(
+                !new(Some(false), None, Some("invalid".into()))
+                    .unwrap()
+                    .is_client()
+            );
+            let namespace = || Some("coordinator-test".into());
+            assert!(new(None, namespace(), Some("invalid".into())).is_err());
+            assert!(
+                new(
+                    None,
+                    namespace(),
+                    Some("http://default/v1/coordinate".into())
+                )
+                .unwrap()
+                .is_client()
+            );
+            assert_eq!(
+                new(Some(true), namespace(), None)
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "remote coordinator mode requires remotes"
+            );
             let mut config = UnifiedConfig::default();
             config.generation_coordinator.port = Some(0);
             config.generation_coordinator.host = "127.0.0.1".parse().unwrap();
@@ -318,17 +376,17 @@ mod tests {
             config.generation_coordinator.affinity =
                 Some(baseten_configmap::CoordinatorAffinityConfig { ttl_secs: 60 });
             reader.replace(config);
+            assert!(new(None, None, None).is_err());
             assert!(
-                GenerationCoordinatorRuntime::new(runtime.clone(), options(), reader.clone(), None)
-                    .is_err()
+                new(None, namespace(), Some("invalid".into()))
+                    .unwrap()
+                    .is_client()
             );
-            let remote = GenerationCoordinatorRuntime::new(
-                runtime.clone(),
-                options(),
-                reader.clone(),
-                Some("coordinator-test".into()),
-            )
-            .unwrap();
+            let forced_local = new(Some(false), None, None).unwrap();
+            assert!(!forced_local.is_client());
+            assert!(forced_local.start().await.unwrap().is_some());
+            assert!(forced_local.is_server());
+            let remote = new(Some(true), namespace(), None).unwrap();
             assert!(!local.is_client());
             assert_eq!(local.start().await.unwrap(), None);
             assert!(!local.is_server());
@@ -339,6 +397,7 @@ mod tests {
             reader.replace(UnifiedConfig::default());
             assert_eq!(remote.start().await.unwrap().as_deref(), Some(url.as_str()));
             assert!(remote.is_client());
+            assert!(!forced_local.is_client());
             let health = url.replace("/v1/coordinate", "/health");
             assert!(reqwest::get(health).await.unwrap().status().is_success());
             runtime.shutdown();

@@ -200,9 +200,12 @@ async fn remote_pool_keeps_live_affinity_and_rebinds_after_worker_loss() {
         config.generation_coordinator.affinity = Some(CoordinatorAffinityConfig { ttl_secs: 60 });
         let reader = ConfigReader::in_memory(config.clone());
         let namespace = runtime.namespace("coordinator-affinity-test").unwrap();
-        let remote =
-            RemoteGenerationCoordinator::from_runtime_config(reader.clone(), Some(&namespace))
-                .unwrap();
+        let remote = RemoteGenerationCoordinator::from_runtime_config(
+            reader.clone(),
+            Some(&namespace),
+            None,
+        )
+        .unwrap();
         remote.start().await.unwrap();
         let bid_counts = || {
             (
@@ -476,8 +479,14 @@ async fn relay_reloads_remote_endpoints_without_changing_mode_or_active_streams(
         let first_server = start(first.clone()).await;
         let second_server = start(second.clone()).await;
         let reader = ConfigReader::in_memory(UnifiedConfig::default());
-        set_remote(&reader, Some(first_server.endpoint_url()));
-        let remote = Arc::new(RemoteGenerationCoordinator::from_config(reader.clone()).unwrap());
+        let remote = Arc::new(
+            RemoteGenerationCoordinator::from_runtime_config(
+                reader.clone(),
+                None,
+                Some(first_server.endpoint_url()),
+            )
+            .unwrap(),
+        );
         let relay_server = start(remote).await;
         let relay = RemoteGenerationCoordinator::new(relay_server.endpoint_url()).unwrap();
         let explicit = crate::GenerationCoordinatorRuntime::remote(BTreeMap::from([(
@@ -536,6 +545,7 @@ async fn relay_reloads_remote_endpoints_without_changing_mode_or_active_streams(
         second.closed.notified().await;
 
         set_remote(&reader, None);
+        assert_eq!(request(&relay).await.1.admission.prefill_worker_id, 2);
         assert!(RemoteGenerationCoordinator::from_config(reader.clone()).is_err());
         assert_eq!(first.bids.load(Ordering::Relaxed), 0);
         assert_eq!(second.bids.load(Ordering::Relaxed), 0);

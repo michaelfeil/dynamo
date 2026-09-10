@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use baseten_configmap::CoordinatorAffinityConfig;
+use baseten_configmap::{CoordinatorAffinityConfig, GenerationCoordinatorConfig};
 use dynamo_llm::{
     protocols::common::extensions::SessionAffinityId,
     session_affinity::{AffinityAcquire, AffinityCoordinator},
@@ -82,8 +82,25 @@ impl PoolState {
     }
 }
 
+#[derive(Clone)]
+struct RemoteConfig {
+    reader: ConfigReader,
+    default_remote: Option<BTreeMap<String, String>>,
+}
+
+impl RemoteConfig {
+    fn snapshot(&self) -> Result<GenerationCoordinatorConfig> {
+        let mut config = self.reader.snapshot().generation_coordinator.clone();
+        if config.remotes.is_none() {
+            config.remotes = self.default_remote.clone();
+        }
+        config.validate()?;
+        Ok(config)
+    }
+}
+
 pub(super) struct RemotePool {
-    config: ConfigReader,
+    config: RemoteConfig,
     client: Client,
     affinity: Option<(CoordinatorAffinityConfig, Component)>,
     ready: OnceCell<Arc<PoolState>>,
@@ -147,16 +164,18 @@ impl RemotePool {
         config: ConfigReader,
         client: Client,
         namespace: Option<&Namespace>,
+        default_remote: Option<String>,
     ) -> Result<Self> {
-        let snapshot = config.snapshot();
-        snapshot.generation_coordinator.validate()?;
+        let config = RemoteConfig {
+            reader: config,
+            default_remote: default_remote.map(|url| BTreeMap::from([("default".into(), url)])),
+        };
+        let snapshot = config.snapshot()?;
         snapshot
-            .generation_coordinator
             .remotes
             .as_ref()
             .context("remote coordinator requires remotes")?;
         let affinity = snapshot
-            .generation_coordinator
             .affinity
             .as_ref()
             .map(|settings| {
@@ -178,10 +197,8 @@ impl RemotePool {
     }
 
     fn remotes(&self) -> Result<BTreeMap<String, Url>> {
-        let snapshot = self.config.snapshot();
-        snapshot.generation_coordinator.validate()?;
+        let snapshot = self.config.snapshot()?;
         snapshot
-            .generation_coordinator
             .remotes
             .as_ref()
             .context("remote coordinator requires remotes; restart to switch to local mode")?
@@ -348,11 +365,11 @@ impl RemotePool {
     }
 }
 
-async fn refresh(state: &PoolState, config: &ConfigReader, client: &Client) {
-    let snapshot = config.snapshot();
-    let remotes = snapshot.generation_coordinator.remotes.as_ref();
+async fn refresh(state: &PoolState, config: &RemoteConfig, client: &Client) {
     let mut backends = BTreeMap::new();
-    if let Some(remotes) = remotes.filter(|_| snapshot.generation_coordinator.validate().is_ok()) {
+    if let Ok(snapshot) = config.snapshot()
+        && let Some(remotes) = snapshot.remotes.as_ref()
+    {
         let results = futures::future::join_all(remotes.iter().map(|(name, url)| async move {
             let result = async {
                 let endpoint = Url::parse(url)?;

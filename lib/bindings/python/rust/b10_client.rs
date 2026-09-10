@@ -169,6 +169,7 @@ impl GenerationCoordinator {
         prefill_mark_timing=None,
         runtime,
         namespace=None,
+        is_client_force=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -183,6 +184,7 @@ impl GenerationCoordinator {
         prefill_mark_timing: Option<&Bound<'_, PyAny>>,
         runtime: &crate::DistributedRuntime,
         namespace: Option<String>,
+        is_client_force: Option<bool>,
     ) -> PyResult<Self> {
         let _ = model_name;
         let strategy = match enum_value(disaggregation_strategy)?.as_deref() {
@@ -228,6 +230,7 @@ impl GenerationCoordinator {
                     options,
                     baseten_configmap::current_reader(),
                     namespace,
+                    is_client_force,
                 )
                 .map_err(to_pyerr)?,
             ),

@@ -703,6 +703,9 @@ class GenerationCoordinator:
     """Configured coordinator or explicit remote client.
 
     Configured remote mode requires namespace; local mode does not.
+    is_client_force overrides config-based mode selection: False forces local,
+    True requires remotes, and None selects remote when remotes are available.
+    DYNAMO_GENERATION_COORDINATOR_URL supplies a default remote; explicit remotes win.
     """
 
     def __init__(
@@ -719,6 +722,7 @@ class GenerationCoordinator:
         prefill_mark_timing: Any | None = None,
         runtime: DistributedRuntime,
         namespace: str | None = None,
+        is_client_force: bool | None = None,
     ) -> None: ...
     @classmethod
     def remote(cls, backends: Dict[str, str]) -> GenerationCoordinator:

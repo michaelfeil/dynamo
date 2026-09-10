@@ -88,6 +88,19 @@ Local/remote mode and listener settings are fixed at construction. Only the
 `RemoteGenerationCoordinator::from_config(reader)` for reloadable endpoints;
 the HTTP client retains its connection pool across updates.
 
+The configured constructor captures `DYNAMO_GENERATION_COORDINATOR_URL` as its
+default remote (`default`). Explicit configmap `remotes` take precedence, including
+after reload; removing them restores the captured URL. Explicit `.remote(...)`
+clients do not use this environment fallback. Configured affinity still requires
+explicit `remotes` in the configmap.
+
+The constructor's `is_client_force: bool | None = None` overrides mode selection:
+`False` keeps orchestration local and ignores the environment URL; `True` requires
+remotes or an environment URL; `None` selects remote mode when either is available,
+otherwise local.
+In Rust, pass `Option<bool>` to `GenerationCoordinatorRuntime::new`. This does not
+change the config reader or HTTP listener settings.
+
 HTTP is disabled by default. Enable it in the mounted config:
 
 ```yaml

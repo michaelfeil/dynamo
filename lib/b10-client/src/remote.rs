@@ -53,18 +53,20 @@ impl RemoteGenerationCoordinator {
 
     /// Reloadable remotes sharing one HTTP connection pool; distributed affinity requires a runtime.
     pub fn from_config(config: ConfigReader) -> Result<Self> {
-        Self::from_runtime_config(config, None)
+        Self::from_runtime_config(config, None, None)
     }
 
     pub(crate) fn from_runtime_config(
         config: ConfigReader,
         namespace: Option<&dynamo_runtime::component::Namespace>,
+        default_remote: Option<String>,
     ) -> Result<Self> {
         let client = Client::new();
         let endpoints = RemoteEndpoints::Pool(Box::new(RemotePool::new(
             config,
             client.clone(),
             namespace,
+            default_remote,
         )?));
         Ok(Self { endpoints, client })
     }
