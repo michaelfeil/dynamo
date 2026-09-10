@@ -35,6 +35,16 @@ impl HttpService {
         })
     }
 
+    fn set_waypoints_hook(&self, generator: PyObject, event_loop: PyObject) -> PyResult<()> {
+        let mut engine = HttpAsyncEngine::new(generator, event_loop)?;
+        // Diagnostics may replay a live request ID; do not overwrite its routing headers.
+        engine.0.set_publish_worker_metadata(false);
+        engine.0.set_logging_label("Waypoints");
+        self.inner
+            .set_waypoints_hook(Arc::new(engine))
+            .map_err(to_pyerr)
+    }
+
     pub fn add_completions_model(
         &self,
         model: String,

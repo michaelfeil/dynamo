@@ -282,6 +282,8 @@ pub mod kvbm {
 
 /// LLM (Language Model) inference environment variables
 pub mod llm {
+    pub const DYN_WAYPOINTS_PORT: &str = "DYN_WAYPOINTS_PORT";
+    pub const DYN_WAYPOINTS_DISABLE: &str = "DYN_WAYPOINTS_DISABLE";
     /// HTTP body size limit in MB
     pub const DYN_HTTP_BODY_LIMIT_MB: &str = "DYN_HTTP_BODY_LIMIT_MB";
 
@@ -660,6 +662,8 @@ mod tests {
             kvbm::leader::DYN_KVBM_LEADER_ZMQ_ACK_PORT,
             // LLM
             llm::DYN_HTTP_BODY_LIMIT_MB,
+            llm::DYN_WAYPOINTS_PORT,
+            llm::DYN_WAYPOINTS_DISABLE,
             llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS,
             llm::DYN_CLIENT_DISCONNECT_BEHAVIOR,
             llm::DYN_LORA_ENABLED,

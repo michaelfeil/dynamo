@@ -1123,6 +1123,7 @@ fn decode_base64_embedding_to_floats(s: &str) -> Result<Vec<f32>, anyhow::Error>
 
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    inspection: Option<axum::Extension<super::waypoints::Inspection>>,
     headers: HeaderMap,
     Json(mut request): Json<NvCreateChatCompletionRequest>,
 ) -> Result<Response, ErrorResponse> {
@@ -1148,7 +1149,8 @@ async fn handler_chat_completions(
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
     let user = request.inner.user.clone();
-    let request = context_from_headers_with_body_session(request, context_id, &headers, user)?;
+    let mut request = context_from_headers_with_body_session(request, context_id, &headers, user)?;
+    super::waypoints::attach(&mut request, inspection);
     let context = request.context();
 
     // create the connection handles
@@ -1178,7 +1180,7 @@ async fn handler_chat_completions(
 
 /// Checks if an Annotated event represents a backend error and extracts error information.
 /// Returns Some((message, status_code)) if it's an error, None otherwise.
-fn extract_backend_error_if_present<T: serde::Serialize>(
+pub(super) fn extract_backend_error_if_present<T: serde::Serialize>(
     event: &Annotated<T>,
 ) -> Option<(String, StatusCode)> {
     #[derive(serde::Deserialize)]
@@ -1552,18 +1554,36 @@ async fn chat_completions(
     let annotations = request.annotations();
 
     // issue the generate call on the engine
-    let stream = engine.generate(request).await.map_err(|e| {
-        if super::metrics::request_was_rejected(e.as_ref()) {
-            state
-                .metrics_clone()
-                .inc_rejection(&model, super::metrics::Endpoint::ChatCompletions);
-        }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-        err_response
-    })?;
+    if let Some(response) =
+        super::waypoints::canonical(&request, super::waypoints::CanonicalContext::Chat {})
+    {
+        inflight_guard.mark_ok();
+        return Ok(response);
+    }
+    let is_waypoint = super::waypoints::active(&request);
+    let stream = super::waypoints::generate(engine, request)
+        .await
+        .map_err(|e| {
+            if super::metrics::request_was_rejected(e.as_ref()) {
+                state
+                    .metrics_clone()
+                    .inc_rejection(&model, super::metrics::Endpoint::ChatCompletions);
+            }
+            let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
+            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+            err_response
+        })?;
 
-    let worker_info = take_worker_response_metadata(&request_id);
+    let stream = match stream {
+        super::waypoints::Generated::Stopped(response) => {
+            inflight_guard.mark_ok();
+            return Ok(response);
+        }
+        super::waypoints::Generated::Stream(stream) => stream,
+    };
+    let worker_info = (!is_waypoint)
+        .then(|| take_worker_response_metadata(&request_id))
+        .flatten();
     let ctx = stream.context();
 
     // prepare any requested annotations
@@ -1811,6 +1831,7 @@ pub fn validate_completion_fields_generic(
 /// This method will handle the incoming request for the /v1/responses endpoint.
 async fn handler_responses(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    inspection: Option<axum::Extension<super::waypoints::Inspection>>,
     headers: HeaderMap,
     RawJson {
         bytes,
@@ -1870,7 +1891,8 @@ async fn handler_responses(
         endpoint: Endpoint::Responses.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = context_from_headers(ResponsesBody { request, body }, context_id, &headers)?;
+    let mut request = context_from_headers(ResponsesBody { request, body }, context_id, &headers)?;
+    super::waypoints::attach(&mut request, inspection);
     let context = request.context();
 
     // create the connection handles
@@ -2056,6 +2078,8 @@ async fn responses(
     // carries Responses-specific fields (previous_response_id, store, etc.)
     // that the stream converter needs for faithful response reconstruction.
     let responses_ctx = unified_request.responses_context().cloned();
+    let waypoint_losses =
+        super::waypoints::active(&context).then(|| unified_request.losses.clone());
     // b10: what canonicalization dropped/degraded, by kind — the request still
     // succeeds, so this counter is the only place the degradation is visible.
     state.metrics_clone().b10_inc_ingress_losses(
@@ -2078,6 +2102,17 @@ async fn responses(
     if response_params.max_output_tokens.is_none() {
         request.insert(PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, true);
     }
+    if let Some(response) = super::waypoints::canonical(
+        &request,
+        super::waypoints::CanonicalContext::Responses {
+            api_context: &responses_ctx,
+            losses: &waypoint_losses,
+            preserve_omitted_max_tokens: response_params.max_output_tokens.is_none(),
+        },
+    ) {
+        inflight_guard.mark_ok();
+        return Ok(response);
+    }
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
@@ -2097,18 +2132,30 @@ async fn responses(
     tracing::trace!("Issuing generate call for responses");
 
     // issue the generate call on the engine
-    let engine_stream = engine.generate(request).await.map_err(|e| {
-        if super::metrics::request_was_rejected(e.as_ref()) {
-            state
-                .metrics_clone()
-                .inc_rejection(&model, super::metrics::Endpoint::Responses);
-        }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-        err_response
-    })?;
+    let is_waypoint = super::waypoints::active(&request);
+    let engine_stream = super::waypoints::generate(engine, request)
+        .await
+        .map_err(|e| {
+            if super::metrics::request_was_rejected(e.as_ref()) {
+                state
+                    .metrics_clone()
+                    .inc_rejection(&model, super::metrics::Endpoint::Responses);
+            }
+            let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
+            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+            err_response
+        })?;
 
-    let worker_info = take_worker_response_metadata(&request_id);
+    let engine_stream = match engine_stream {
+        super::waypoints::Generated::Stopped(response) => {
+            inflight_guard.mark_ok();
+            return Ok(response);
+        }
+        super::waypoints::Generated::Stream(stream) => stream,
+    };
+    let worker_info = (!is_waypoint)
+        .then(|| take_worker_response_metadata(&request_id))
+        .flatten();
 
     // Capture the context to cancel the stream if the client disconnects
     let ctx = engine_stream.context();

@@ -1375,6 +1375,31 @@ Expose Baseten runtime, router, KV cache, JSON pub/sub, HTTP service controls,
 and decorator behavior through Python bindings and stubs. Adds router examples
 and an OpenAI service pipeline example.
 
+Waypoints uses typed protocol/stage controls, canonical context and artifact envelopes;
+malformed hook artifacts fail with diagnostic 502 errors instead of unchecked JSON access.
+Original ingress JSON and completed client bodies pass through without schema reconstruction.
+
+Waypoints internal inspection (PR #774): `HttpService` starts a separate
+unauthenticated listener on port 9192 (`DYN_WAYPOINTS_PORT`,
+`DYN_WAYPOINTS_DISABLE`). Keep it off public routing. The listener uses the
+configured service host; metrics-only services skip it. Its router calls the real
+Chat, Responses, and Messages handlers in-process with a private request
+extension, preserving their validation, canonicalization, losses, and egress.
+`set_waypoints_hook` connects the monorepo's ordinary Python processor to
+request-local early exits and engine-output replay. There is no global capture
+registry or alternate protocol converter. Preserve the first-item error gate,
+but disable worker-header publication/consumption for diagnostics so replayed
+IDs cannot interfere with live requests. Rebase the checkpoint call sites with
+the production handlers; do not copy their implementations into Waypoints.
+Successful early exits must mark the inflight guard successful. Replay rebuilds
+HTTP framing and must discard captured transport/content headers.
+`preserve_intermediates` returns every completed boundary before `stop_after`
+under `intermediates`, incorporating Brian's request-local collector. Inspected processing failures now return
+HTTP 200 with a terminal `error` artifact, original status/body and completed
+intermediates. Invalid diagnostic controls remain HTTP errors. Full response bounds,
+timeout cancellation, fused-renderer null artifacts, and source cleanup are tested.
+Limits and unsupported boundaries are documented in `docs/development/waypoints.md`.
+
 1.0 -> 1.1 behavior:
 
 The v1.1 upgrade kept B10 router and service pipeline bindings in `9adbfdc64`.

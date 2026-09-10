@@ -68,6 +68,10 @@ pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 pub struct PythonAsyncEngine(PythonServerStreamingEngine);
 
 impl PythonAsyncEngine {
+    pub(crate) fn set_publish_worker_metadata(&mut self, enabled: bool) {
+        self.0.publish_worker_metadata = enabled;
+    }
+
     pub fn set_logging_label(&mut self, label: impl AsRef<str>) {
         self.0.set_logging_label(label);
     }
@@ -123,6 +127,7 @@ pub struct PythonServerStreamingEngine {
     event_loop: Arc<PyObject>,
     has_context: bool,
     block_until_stream_item: bool,
+    publish_worker_metadata: bool,
     logging_label: String,
 }
 
@@ -143,6 +148,7 @@ impl PythonServerStreamingEngine {
             event_loop,
             has_context,
             block_until_stream_item: false,
+            publish_worker_metadata: true,
             logging_label: "Worker".to_string(),
         }
     }
@@ -290,6 +296,7 @@ where
         };
 
         if self.block_until_stream_item
+            && self.publish_worker_metadata
             && let Some(worker_info) = response_context.routed_worker_info()
         {
             dynamo_llm::http::service::baseten::publish_worker_response_metadata(

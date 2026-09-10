@@ -1911,6 +1911,7 @@ class FpmEventSubscriber:
 
 
 class HttpService:
+    def set_waypoints_hook(self, generator: Any, event_loop: Any) -> None: ...
     """
     A HTTP service for dynamo applications.
     It is a OpenAI compatible http ingress into the Dynamo Distributed Runtime.

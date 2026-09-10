@@ -92,7 +92,7 @@ oneshot = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 serde_path_to_error = { workspace = true }
 sha2 = "0.10"
 strum = { workspace = true }
@@ -149,6 +149,7 @@ axum = { workspace = true }
 mime = "0.3"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 rustls = { version = "0.23" }
 utoipa = { version = "5.3", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }

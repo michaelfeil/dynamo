@@ -159,6 +159,7 @@ pub(crate) struct AnthropicMessagesBody {
 /// Top-level HTTP handler for POST /v1/messages.
 async fn handler_anthropic_messages(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    inspection: Option<axum::Extension<super::waypoints::Inspection>>,
     headers: HeaderMap,
     RawJson { bytes, value: body }: RawJson,
 ) -> Result<Response, Response> {
@@ -246,6 +247,7 @@ async fn handler_anthropic_messages(
     if let Some(session_id) = baseten_session_affinity_from_request(&headers, user_id.as_deref()) {
         insert_session_affinity(&mut request, session_id);
     }
+    super::waypoints::attach(&mut request, inspection);
     let context = request.context();
 
     // Create connection handles
@@ -357,6 +359,8 @@ async fn anthropic_messages(
     // carries Anthropic-specific fields (thinking config, cache breakpoints,
     // etc.) that the stream converter needs for faithful response reconstruction.
     let anthropic_ctx = unified_request.anthropic_context().cloned();
+    let waypoint_losses =
+        super::waypoints::active(&context).then(|| unified_request.losses.clone());
     // b10: what canonicalization dropped/degraded, by kind — the request still
     // succeeds, so this counter is the only place the degradation is visible.
     state.metrics_clone().b10_inc_ingress_losses(
@@ -405,39 +409,60 @@ async fn anthropic_messages(
     }
 
     let request = context.map(|_req| chat_request);
-
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
-
-    // Create inflight_guard early to ensure all errors are counted
     let mut inflight_guard = state.metrics_clone().create_inflight_guard(
         &model,
         Endpoint::AnthropicMessages,
         streaming,
         request.id(),
     );
+    if let Some(response) = super::waypoints::canonical(
+        &request,
+        super::waypoints::CanonicalContext::Messages {
+            api_context: &anthropic_ctx,
+            losses: &waypoint_losses,
+            prompt_injected_reasoning,
+        },
+    ) {
+        inflight_guard.mark_ok();
+        return Ok(response);
+    }
+
+    let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     tracing::trace!("Issuing generate call for Anthropic messages");
 
-    let engine_stream = engine.generate(request).await.map_err(|e| {
-        if super::metrics::request_was_rejected(e.as_ref()) {
-            state
-                .metrics_clone()
-                .inc_rejection(&model, super::metrics::Endpoint::AnthropicMessages);
-        }
-        // Check for cancelled request (client disconnected before response was sent)
-        if super::metrics::request_was_cancelled(e.as_ref()) {
-            inflight_guard.mark_error(super::metrics::ErrorType::Cancelled);
-            return anthropic_error(
-                StatusCode::from_u16(499).unwrap(),
-                "request_cancelled",
-                &format!("Request cancelled: {}", e),
-            );
-        }
-        inflight_guard.mark_error(super::metrics::ErrorType::Internal);
-        anthropic_error_from_anyhow(e, "Failed to generate completions")
-    })?;
+    let is_waypoint = super::waypoints::active(&request);
+    let engine_stream = super::waypoints::generate(engine, request)
+        .await
+        .map_err(|e| {
+            if super::metrics::request_was_rejected(e.as_ref()) {
+                state
+                    .metrics_clone()
+                    .inc_rejection(&model, super::metrics::Endpoint::AnthropicMessages);
+            }
+            // Check for cancelled request (client disconnected before response was sent)
+            if super::metrics::request_was_cancelled(e.as_ref()) {
+                inflight_guard.mark_error(super::metrics::ErrorType::Cancelled);
+                return anthropic_error(
+                    StatusCode::from_u16(499).unwrap(),
+                    "request_cancelled",
+                    &format!("Request cancelled: {}", e),
+                );
+            }
+            inflight_guard.mark_error(super::metrics::ErrorType::Internal);
+            anthropic_error_from_anyhow(e, "Failed to generate completions")
+        })?;
 
-    let worker_info = take_worker_response_metadata(&request_id);
+    let engine_stream = match engine_stream {
+        super::waypoints::Generated::Stopped(response) => {
+            inflight_guard.mark_ok();
+            return Ok(response);
+        }
+        super::waypoints::Generated::Stream(stream) => stream,
+    };
+    let worker_info = (!is_waypoint)
+        .then(|| take_worker_response_metadata(&request_id))
+        .flatten();
     let ctx = engine_stream.context();
 
     // NOTE: We intentionally do NOT apply a reasoning parser here.

@@ -206,6 +206,7 @@ impl State {
 
 #[derive(Clone)]
 pub struct HttpService {
+    waypoints_hook: super::waypoints::HookSlot,
     // The state we share with every request handler
     state: Arc<State>,
 
@@ -282,6 +283,12 @@ impl HttpService {
         self.state.clone()
     }
 
+    pub fn set_waypoints_hook(&self, hook: super::waypoints::Hook) -> Result<()> {
+        self.waypoints_hook
+            .set(hook)
+            .map_err(|_| anyhow::anyhow!("Waypoints hook already registered"))
+    }
+
     pub fn state(&self) -> &State {
         Arc::as_ref(&self.state)
     }
@@ -335,6 +342,14 @@ impl HttpService {
         cancel_token: CancellationToken,
         listener: Option<tokio::net::TcpListener>,
     ) -> Result<()> {
+        if self.supports_waypoints() {
+            super::waypoints::spawn(
+                self.router.clone(),
+                self.waypoints_hook.clone(),
+                self.host.clone(),
+                cancel_token.clone(),
+            );
+        }
         let address = format!("{}:{}", self.host, self.port);
         let protocol = if self.enable_tls { "HTTPS" } else { "HTTP" };
         tracing::info!(protocol, address, "Starting HTTP(S) service");
@@ -446,6 +461,17 @@ impl HttpService {
         }
 
         Ok(())
+    }
+
+    fn supports_waypoints(&self) -> bool {
+        // Metrics-only services have no supported handler to inspect.
+        [
+            EndpointType::Chat,
+            EndpointType::Responses,
+            EndpointType::AnthropicMessages,
+        ]
+        .iter()
+        .any(|endpoint| self.state.flags.get(endpoint))
     }
 
     /// Documentation of exposed HTTP endpoints
@@ -639,6 +665,7 @@ impl HttpServiceConfigBuilder {
         let router = router.layer(axum::middleware::from_fn(echo_request_id_header));
 
         Ok(HttpService {
+            waypoints_hook: Default::default(),
             state,
             router,
             port: config.port,
@@ -735,6 +762,28 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn waypoints_listener_requires_a_supported_endpoint() {
+        let service = HttpService::builder()
+            .enable_chat_endpoints(false)
+            .enable_responses_endpoints(false)
+            .enable_anthropic_endpoints(false)
+            .build()
+            .unwrap();
+        assert!(!service.supports_waypoints());
+        for endpoint in [
+            EndpointType::Chat,
+            EndpointType::Responses,
+            EndpointType::AnthropicMessages,
+        ] {
+            service.enable_model_endpoint(endpoint, true);
+            assert!(service.supports_waypoints());
+            service.enable_model_endpoint(endpoint, false);
+            assert!(!service.supports_waypoints());
+        }
+        assert!(HttpService::builder().build().unwrap().supports_waypoints());
+    }
 
     #[tokio::test]
     async fn test_liveness_endpoint_reflects_cancellation() {
