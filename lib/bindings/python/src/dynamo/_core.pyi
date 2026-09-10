@@ -704,8 +704,9 @@ class GenerationCoordinator:
 
     Configured remote mode requires namespace; local mode does not.
     is_client_force overrides config-based mode selection: False forces local,
-    True requires remotes, and None selects remote when remotes are available.
-    DYNAMO_GENERATION_COORDINATOR_URL supplies a default remote; explicit remotes win.
+    True requires remotes or an environment URL; None uses configmap remotes or stays local.
+    DYNAMO_GENERATION_COORDINATOR_URL supplies an address, not a remote-mode enable switch.
+    Explicit remotes take precedence over the environment URL.
     """
 
     def __init__(

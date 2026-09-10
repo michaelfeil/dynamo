@@ -182,7 +182,7 @@ impl GenerationCoordinatorRuntime {
             started: OnceCell::new(),
         });
         let (client, local): (Arc<dyn GenerationCoordinatorClient>, _) =
-            if is_client_force.unwrap_or(settings.remotes.is_some() || default_remote.is_some()) {
+            if is_client_force.unwrap_or(settings.remotes.is_some()) {
                 ensure!(
                     settings.remotes.is_some() || default_remote.is_some(),
                     "remote coordinator mode requires remotes"
@@ -342,17 +342,19 @@ mod tests {
                     default_remote,
                 )
             };
-            let local = new(None, None, None).unwrap();
+            let local = new(None, None, Some("http://default/v1/coordinate".into())).unwrap();
+            assert!(!local.is_client());
+            assert!(!new(None, None, Some("invalid".into())).unwrap().is_client());
             assert!(
                 !new(Some(false), None, Some("invalid".into()))
                     .unwrap()
                     .is_client()
             );
             let namespace = || Some("coordinator-test".into());
-            assert!(new(None, namespace(), Some("invalid".into())).is_err());
+            assert!(new(Some(true), namespace(), Some("invalid".into())).is_err());
             assert!(
                 new(
-                    None,
+                    Some(true),
                     namespace(),
                     Some("http://default/v1/coordinate".into())
                 )
