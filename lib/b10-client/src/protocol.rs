@@ -3,9 +3,10 @@
 
 //! Version-one protobuf messages for remote generation coordination.
 //!
-//! HTTP request bodies contain one encoded [`NewRequestV1`]. Response
+//! `/v1/coordinate` request bodies contain one encoded [`NewRequestV1`]. Response
 //! bodies contain [`GenerationResponseFrameV1`] messages, each prefixed by a
 //! four-byte big-endian payload length. The HTTP path selects protocol version one.
+//! `/v1/bid` uses a single unframed [`BidRequestV1`] and [`BidResponseV1`].
 
 use prost::Message;
 
@@ -26,10 +27,43 @@ pub use wire::{
     TraceContext as TraceContextV1, WeightedTaint as WeightedTaintV1,
     generation_response_frame as generation_response_frame_v1, mm_kwarg as mm_kwarg_v1,
 };
+pub use wire::{BidRequest as BidRequestV1, BidResponse as BidResponseV1};
 
 pub const REQUEST_CONTENT_TYPE: &str = "application/x-protobuf";
 pub const RESPONSE_CONTENT_TYPE: &str = "application/x-protobuf-stream";
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+impl BidRequestV1 {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.tokens.is_empty(), "bid tokens are required");
+        validate_mm_routing_args(self.mm_routing_args.as_ref())
+    }
+}
+
+impl BidResponseV1 {
+    // Exact integer equivalent of (1 - 0.5 * affinity) * (prefill + 0.1 * decode),
+    // scaled by 20. u128 avoids overflow and floating-point tie instability.
+    pub(crate) fn score(&self) -> u128 {
+        (if self.affinity { 1 } else { 2 })
+            * (10 * u128::from(self.prefill_tokens) + u128::from(self.decode_tokens))
+    }
+}
+
+fn validate_mm_routing_args(args: Option<&MmRoutingArgsV1>) -> anyhow::Result<()> {
+    for block in args.into_iter().flat_map(|args| &args.blocks) {
+        anyhow::ensure!(
+            block.present || block.objects.is_empty(),
+            "mm_routing_args absent blocks cannot contain objects"
+        );
+        for range in block.objects.iter().flat_map(|object| &object.offsets) {
+            anyhow::ensure!(
+                range.start <= range.end,
+                "mm_routing_args offsets must be ordered"
+            );
+        }
+    }
+    Ok(())
+}
 
 pub fn validate_request(request: &NewRequestV1) -> anyhow::Result<()> {
     use anyhow::{bail, ensure};
@@ -66,18 +100,7 @@ pub fn validate_request(request: &NewRequestV1) -> anyhow::Result<()> {
     if request.lora.as_deref() == Some("") {
         bail!("new_request.lora cannot be empty");
     }
-    for block in request.mm_routing_args.iter().flat_map(|args| &args.blocks) {
-        ensure!(
-            block.present || block.objects.is_empty(),
-            "new_request.mm_routing_args absent blocks cannot contain objects"
-        );
-        for range in block.objects.iter().flat_map(|object| &object.offsets) {
-            ensure!(
-                range.start <= range.end,
-                "new_request.mm_routing_args offsets must be ordered"
-            );
-        }
-    }
+    validate_mm_routing_args(request.mm_routing_args.as_ref())?;
     if let Some(payloads) = &request.mm_payloads
         && !(payloads.hashes.len() == payloads.positions.len()
             && payloads.hashes.len() == payloads.lengths.len())

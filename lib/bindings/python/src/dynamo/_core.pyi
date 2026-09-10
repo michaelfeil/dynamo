@@ -700,7 +700,10 @@ class RouterWorkerCoordinator:
         ...
 
 class GenerationCoordinator:
-    """Configured coordinator (local or remote backend) or explicit remote client."""
+    """Configured coordinator or explicit remote client.
+
+    Configured remote mode requires namespace; local mode does not.
+    """
 
     def __init__(
         self,
@@ -715,10 +718,11 @@ class GenerationCoordinator:
         disagg_request_id_machine_id: int | None = None,
         prefill_mark_timing: Any | None = None,
         runtime: DistributedRuntime,
+        namespace: str | None = None,
     ) -> None: ...
     @classmethod
     def remote(cls, backends: Dict[str, str]) -> GenerationCoordinator:
-        """Connect to exactly one named remote generation-coordinator backend."""
+        """Connect to named remote generation-coordinator backends."""
         ...
 
     @property

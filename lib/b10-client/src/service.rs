@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 pub const COORDINATE_PATH: &str = "/v1/coordinate";
 pub const HEALTH_PATH: &str = "/health";
 pub const WORKER_LOADS_PATH: &str = "/v1/worker_loads";
+pub const BID_PATH: &str = "/v1/bid";
 
 pub struct GenerationCoordinatorService {
     coordinator: Arc<dyn GenerationCoordinatorClient>,
@@ -66,6 +67,7 @@ impl GenerationCoordinatorService {
             .route(COORDINATE_PATH, post(coordinate))
             .route(HEALTH_PATH, get(health))
             .route(WORKER_LOADS_PATH, get(worker_loads))
+            .route(BID_PATH, post(bid))
             .layer(DefaultBodyLimit::max(get_tcp_max_message_size()))
             .with_state(self);
         let task = tokio::spawn(async move {
@@ -158,6 +160,28 @@ async fn worker_loads(State(service): State<Arc<GenerationCoordinatorService>>) 
             StatusCode::GATEWAY_TIMEOUT,
             "worker loads query timed out".into(),
         ),
+    }
+}
+
+async fn bid(
+    State(service): State<Arc<GenerationCoordinatorService>>,
+    body: Bytes,
+) -> Response<Body> {
+    let request = match protocol::BidRequestV1::decode(body) {
+        Ok(request) => request,
+        Err(error) => return text_response(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    if let Err(error) = request.validate() {
+        return text_response(StatusCode::BAD_REQUEST, error.to_string());
+    }
+    // Each router/remote bid bounds its own query. An equal outer timeout can
+    // discard healthy bids just as a slower option reaches its deadline.
+    match service.coordinator.bid(request).await {
+        Ok(response) => Response::builder()
+            .header(header::CONTENT_TYPE, protocol::REQUEST_CONTENT_TYPE)
+            .body(Body::from(response.encode_to_vec()))
+            .expect("valid protobuf response"),
+        Err(error) => text_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
     }
 }
 

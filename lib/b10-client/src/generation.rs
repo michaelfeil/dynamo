@@ -133,6 +133,55 @@ pub struct GenerationCoordinator {
 }
 
 impl GenerationCoordinator {
+    /// Return the best eligible worker (or prefill/decode pair), without admission.
+    pub async fn bid(
+        &self,
+        request: crate::protocol::BidRequestV1,
+    ) -> Result<crate::protocol::BidResponseV1> {
+        use crate::protocol::BidResponseV1;
+        let affinity_worker_id = request.affinity_worker_id;
+        let (prefill, decode) = match self.strategy {
+            DisaggregationStrategy::Aggregated => {
+                (self.primary.potential_loads(request).await?, None)
+            }
+            DisaggregationStrategy::PrefillFirst => {
+                let next = self
+                    .next
+                    .as_ref()
+                    .expect("validated disaggregated topology");
+                let (prefill, decode) = tokio::try_join!(
+                    self.primary.potential_loads(request.clone()),
+                    next.potential_loads(request),
+                )?;
+                let decode_tokens = decode
+                    .iter()
+                    .map(|load| load.potential_decode_blocks as u64)
+                    .min()
+                    .expect("nonempty eligible decode pool")
+                    .checked_mul(u64::from(next.block_size()))
+                    .context("bid decode token count overflow")?;
+                (prefill, Some(decode_tokens))
+            }
+        };
+        let mut best: Option<BidResponseV1> = None;
+        for load in prefill {
+            let bid = BidResponseV1 {
+                affinity: affinity_worker_id == Some(load.worker_id),
+                prefill_tokens: load.potential_prefill_tokens as u64,
+                decode_tokens: match decode {
+                    Some(tokens) => tokens,
+                    None => (load.potential_decode_blocks as u64)
+                        .checked_mul(u64::from(self.primary.block_size()))
+                        .context("bid decode token count overflow")?,
+                },
+            };
+            if best.as_ref().is_none_or(|best| bid.score() < best.score()) {
+                best = Some(bid);
+            }
+        }
+        best.context("no eligible workers for bid")
+    }
+
     pub async fn worker_loads(&self) -> Result<Vec<WorkerLoad>> {
         match self.strategy {
             DisaggregationStrategy::Aggregated => {
@@ -453,6 +502,15 @@ impl GenerationCoordinator {
 /// Requests are owned so bindings can choose the implementation once during
 /// construction and use one object-safe API for every generation.
 pub trait GenerationCoordinatorClient: Send + Sync {
+    fn bid(
+        &self,
+        _request: crate::protocol::BidRequestV1,
+    ) -> BoxFuture<'_, Result<crate::protocol::BidResponseV1>> {
+        Box::pin(async { bail!("bidding is not supported by this coordinator") })
+    }
+    fn start(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(futures::future::ready(Ok(())))
+    }
     fn worker_loads(&self) -> BoxFuture<'_, Result<Vec<WorkerLoad>>> {
         Box::pin(async { bail!("worker loads are not supported by this coordinator") })
     }
@@ -465,6 +523,12 @@ pub trait GenerationCoordinatorClient: Send + Sync {
 }
 
 impl GenerationCoordinatorClient for GenerationCoordinator {
+    fn bid(
+        &self,
+        request: crate::protocol::BidRequestV1,
+    ) -> BoxFuture<'_, Result<crate::protocol::BidResponseV1>> {
+        Box::pin(GenerationCoordinator::bid(self, request))
+    }
     fn worker_loads(&self) -> BoxFuture<'_, Result<Vec<WorkerLoad>>> {
         Box::pin(GenerationCoordinator::worker_loads(self))
     }

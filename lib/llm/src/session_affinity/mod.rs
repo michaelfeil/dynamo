@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use dynamo_runtime::{component::Client, pipeline::Error};
 
-pub(crate) use coordinator::{AffinityAcquire, AffinityLease};
-pub use coordinator::{AffinityCoordinator, AffinityTarget};
+pub use coordinator::{
+    AffinityAcquire, AffinityCoordinator, AffinityInitialization, AffinityLease, AffinityTarget,
+};
 
 pub const MAX_SESSION_AFFINITY_TTL_SECS: u64 = 31_536_000;
 pub const MAX_SESSION_AFFINITY_ENTRIES: usize = 262_144;

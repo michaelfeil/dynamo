@@ -13,6 +13,13 @@ pub struct GenerationCoordinatorConfig {
     pub host: IpAddr,
     pub port: Option<u16>,
     pub remotes: Option<BTreeMap<String, String>>,
+    pub affinity: Option<CoordinatorAffinityConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorAffinityConfig {
+    pub ttl_secs: u64,
 }
 
 impl Default for GenerationCoordinatorConfig {
@@ -21,31 +28,50 @@ impl Default for GenerationCoordinatorConfig {
             host: Ipv4Addr::UNSPECIFIED.into(),
             port: None,
             remotes: None,
+            affinity: None,
         }
     }
 }
 
 impl GenerationCoordinatorConfig {
     pub fn validate(&self) -> Result<()> {
+        if let Some(affinity) = &self.affinity {
+            anyhow::ensure!(
+                self.remotes.is_some(),
+                "coordinator affinity requires remote mode"
+            );
+            anyhow::ensure!(
+                (1..=31_536_000).contains(&affinity.ttl_secs),
+                "affinity ttl_secs must be between 1 and 31536000"
+            );
+        }
         if let Some(remotes) = &self.remotes {
             anyhow::ensure!(
-                remotes.len() == 1,
-                "coordinator requires exactly one remote backend"
+                !remotes.is_empty(),
+                "coordinator requires at least one remote backend"
             );
-            let (name, endpoint) = remotes.first_key_value().expect("length checked");
-            anyhow::ensure!(
-                !name.trim().is_empty(),
-                "coordinator backend name cannot be empty"
-            );
-            let url = url::Url::parse(endpoint)?;
-            anyhow::ensure!(
-                matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
-                "coordinator backend must be an HTTP(S) URL with a host"
-            );
-            anyhow::ensure!(
-                url.username().is_empty() && url.password().is_none() && url.fragment().is_none(),
-                "coordinator backend URL cannot contain credentials or a fragment"
-            );
+            let mut urls = std::collections::HashSet::new();
+            for (name, endpoint) in remotes {
+                anyhow::ensure!(
+                    !name.trim().is_empty(),
+                    "coordinator backend name cannot be empty"
+                );
+                let url = url::Url::parse(endpoint)?;
+                anyhow::ensure!(
+                    urls.insert(url.clone()),
+                    "coordinator remote URLs must be unique"
+                );
+                anyhow::ensure!(
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+                    "coordinator backend must be an HTTP(S) URL with a host"
+                );
+                anyhow::ensure!(
+                    url.username().is_empty()
+                        && url.password().is_none()
+                        && url.fragment().is_none(),
+                    "coordinator backend URL cannot contain credentials or a fragment"
+                );
+            }
         }
         Ok(())
     }

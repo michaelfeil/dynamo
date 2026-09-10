@@ -3,8 +3,25 @@ syntax = "proto3";
 package dynamo.b10.generation.v1;
 
 // Source of truth for generated Rust messages and cross-language clients.
-// HTTP responses are a sequence of messages prefixed by a
+// Generation HTTP responses are a sequence of messages prefixed by a
 // four-byte big-endian message length.
+
+// POST /v1/bid is unary protobuf in both directions, without stream framing.
+message BidRequest
+{
+  repeated uint32 tokens = 1 [packed = true];
+  optional MmRoutingArgs mm_routing_args = 2;
+  // Preserved by coordinator relays; the current PotentialLoads RPC uses only tokens/MM.
+  optional string cache_salt = 3;
+  optional uint64 affinity_worker_id = 4;
+}
+
+message BidResponse
+{
+  bool affinity = 1;
+  uint64 prefill_tokens = 2;
+  uint64 decode_tokens = 3;
+}
 
 message NewRequest
 {

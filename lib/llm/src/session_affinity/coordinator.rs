@@ -99,6 +99,27 @@ pub struct AffinityCoordinator {
 }
 
 impl AffinityCoordinator {
+    /// Synchronize a caller-owned worker pool on its own event topic.
+    pub async fn enable_replica_sync_for_pool(
+        &self,
+        component: &dynamo_runtime::component::Component,
+        topic: &str,
+        workers: tokio::sync::watch::Receiver<Vec<u64>>,
+    ) -> Result<(), Error> {
+        let replica = ReplicaSyncRuntime::start(
+            component,
+            topic,
+            workers,
+            Arc::downgrade(&self.inner),
+            &self.inner.cancel,
+        )
+        .await?;
+        self.inner
+            .replica
+            .set(replica)
+            .map_err(|_| anyhow::anyhow!("session affinity replica sync already enabled"))
+    }
+
     pub fn new(ttl: Duration) -> Result<Self, Error> {
         Self::new_with_limits(
             ttl,
@@ -189,13 +210,12 @@ impl AffinityCoordinator {
         &self,
         client: dynamo_runtime::component::Client,
     ) -> Result<(), Error> {
-        let replica =
-            ReplicaSyncRuntime::start(client, Arc::downgrade(&self.inner), &self.inner.cancel)
-                .await?;
-        self.inner
-            .replica
-            .set(replica)
-            .map_err(|_| anyhow::anyhow!("session affinity replica sync already enabled"))
+        self.enable_replica_sync_for_pool(
+            client.endpoint.component(),
+            super::replica_sync::SESSION_AFFINITY_SUBJECT,
+            client.instance_avail_watcher(),
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -207,7 +227,7 @@ impl AffinityCoordinator {
         self.acquire_inner(session_id, requested_target, None).await
     }
 
-    pub(crate) async fn acquire_with_context(
+    pub async fn acquire_with_context(
         &self,
         session_id: &SessionAffinityId,
         requested_target: Option<AffinityTarget>,
@@ -655,7 +675,7 @@ impl<'a> VacantEntryExt for dashmap::mapref::entry::VacantEntry<'a, String, Affi
     }
 }
 
-pub(crate) enum AffinityAcquire {
+pub enum AffinityAcquire {
     Initialize(AffinityInitialization),
     Bound {
         target: AffinityTarget,
@@ -664,7 +684,7 @@ pub(crate) enum AffinityAcquire {
 }
 
 impl AffinityAcquire {
-    pub(crate) fn target(&self) -> Option<AffinityTarget> {
+    pub fn target(&self) -> Option<AffinityTarget> {
         match self {
             Self::Initialize(_) => None,
             Self::Bound { target, .. } => Some(*target),
@@ -677,7 +697,7 @@ impl AffinityAcquire {
         }
     }
 
-    pub(crate) fn complete_selection(
+    pub fn complete_selection(
         self,
         selected_target: AffinityTarget,
     ) -> Result<Option<AffinityLease>, Error> {
@@ -707,7 +727,7 @@ impl AffinityAcquire {
     }
 }
 
-pub(crate) struct AffinityInitialization {
+pub struct AffinityInitialization {
     coordinator: Weak<AffinityCoordinatorInner>,
     session_id: String,
     revision: u64,
@@ -773,7 +793,8 @@ impl Drop for AffinityInitialization {
     }
 }
 
-pub(crate) struct AffinityLease {
+/// Keeps a local binding alive until the admitted stream is dropped.
+pub struct AffinityLease {
     coordinator: Weak<AffinityCoordinatorInner>,
     session_id: String,
     revision: u64,

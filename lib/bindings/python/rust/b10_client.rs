@@ -168,6 +168,7 @@ impl GenerationCoordinator {
         disagg_request_id_machine_id=None,
         prefill_mark_timing=None,
         runtime,
+        namespace=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -181,6 +182,7 @@ impl GenerationCoordinator {
         disagg_request_id_machine_id: Option<u64>,
         prefill_mark_timing: Option<&Bound<'_, PyAny>>,
         runtime: &crate::DistributedRuntime,
+        namespace: Option<String>,
     ) -> PyResult<Self> {
         let _ = model_name;
         let strategy = match enum_value(disaggregation_strategy)?.as_deref() {
@@ -225,13 +227,14 @@ impl GenerationCoordinator {
                     runtime.inner().clone(),
                     options,
                     baseten_configmap::current_reader(),
+                    namespace,
                 )
                 .map_err(to_pyerr)?,
             ),
         })
     }
 
-    /// Connect to exactly one named remote generation coordinator backend.
+    /// Connect to named remote generation coordinator backends.
     ///
     /// The returned object exposes the same `generate()` method as the local
     /// constructor. Endpoint discovery and multi-endpoint selection are left

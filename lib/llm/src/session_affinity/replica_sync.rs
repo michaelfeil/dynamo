@@ -5,12 +5,15 @@ use std::sync::Weak;
 
 use anyhow::{Context, Result};
 use dynamo_runtime::{
-    component::Client,
+    component::Component,
     traits::DistributedRuntimeProvider,
     transports::event_plane::{EventPublisher, EventSubscriber},
 };
 use serde::{Deserialize, Serialize};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::coordinator::{AffinityCoordinatorInner, AffinityTarget, AffinityVersion};
@@ -69,20 +72,20 @@ pub(super) struct ReplicaSyncRuntime {
 
 impl ReplicaSyncRuntime {
     pub(super) async fn start(
-        client: Client,
+        component: &Component,
+        subject: &str,
+        local_worker_ids: watch::Receiver<Vec<u64>>,
         coordinator: Weak<AffinityCoordinatorInner>,
         parent_cancel: &CancellationToken,
     ) -> Result<Self> {
-        let component = client.endpoint.component();
         let router_id = component.drt().discovery().instance_id();
-        let publisher = EventPublisher::for_component(component, SESSION_AFFINITY_SUBJECT)
+        let publisher = EventPublisher::for_component(component, subject)
             .await
             .context("create session affinity event publisher")?;
-        let mut subscriber = EventSubscriber::for_component(component, SESSION_AFFINITY_SUBJECT)
+        let mut subscriber = EventSubscriber::for_component(component, subject)
             .await
             .context("create session affinity event subscriber")?
             .typed::<SessionAffinityUpdate>();
-        let local_worker_ids = client.instance_avail_watcher();
 
         let cancel = parent_cancel.child_token();
         let (tx, mut rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);

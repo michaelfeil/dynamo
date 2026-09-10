@@ -321,7 +321,9 @@ pub(crate) fn trace_context_from_wire(trace: protocol::TraceContextV1) -> Distri
     )
 }
 
-fn mm_routing_args_from_wire(args: MmRoutingArgsV1) -> Result<Vec<Option<BlockExtraInfo>>> {
+pub(crate) fn mm_routing_args_from_wire(
+    args: MmRoutingArgsV1,
+) -> Result<Vec<Option<BlockExtraInfo>>> {
     args.blocks
         .into_iter()
         .map(|block| {

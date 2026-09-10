@@ -10,6 +10,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use baseten_configmap::ConfigReader;
+use dynamo_llm::session_affinity::{AffinityLease, AffinityTarget};
 use dynamo_runtime::pipeline::{EngineStream, ResponseStream};
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::future::BoxFuture;
@@ -22,13 +23,20 @@ use std::sync::Arc;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tokio_util::io::StreamReader;
 
+mod pool;
+use pool::RemotePool;
+
+enum RemoteEndpoints {
+    Fixed(Url),
+    Pool(Box<RemotePool>),
+}
+
 type FramedResponse = Pin<Box<dyn Stream<Item = Result<GenerationResponseFrameV1>> + Send>>;
 
-/// Generation coordinator client that POSTs protobuf to one exact HTTP URL.
+/// Native protobuf HTTP client with optional load- and session-aware remote selection.
 pub struct RemoteGenerationCoordinator {
-    endpoint: Url,
+    endpoints: RemoteEndpoints,
     client: Client,
-    config: Option<ConfigReader>,
 }
 
 impl RemoteGenerationCoordinator {
@@ -38,19 +46,27 @@ impl RemoteGenerationCoordinator {
             bail!("generation service URL must use http or https");
         }
         Ok(Self {
-            endpoint,
+            endpoints: RemoteEndpoints::Fixed(endpoint),
             client: Client::new(),
-            config: None,
         })
     }
 
-    /// Remote mode with a reloadable endpoint and one shared HTTP connection pool.
+    /// Reloadable remotes sharing one HTTP connection pool; distributed affinity requires a runtime.
     pub fn from_config(config: ConfigReader) -> Result<Self> {
-        Ok(Self {
-            endpoint: configured_endpoint(&config)?,
-            client: Client::new(),
-            config: Some(config),
-        })
+        Self::from_runtime_config(config, None)
+    }
+
+    pub(crate) fn from_runtime_config(
+        config: ConfigReader,
+        namespace: Option<&dynamo_runtime::component::Namespace>,
+    ) -> Result<Self> {
+        let client = Client::new();
+        let endpoints = RemoteEndpoints::Pool(Box::new(RemotePool::new(
+            config,
+            client.clone(),
+            namespace,
+        )?));
+        Ok(Self { endpoints, client })
     }
 
     async fn generate_remote(
@@ -62,9 +78,36 @@ impl RemoteGenerationCoordinator {
         validate_remote_options(&options)?;
         let wire_request = encode_request(&context, request, &options)?;
         let request_context = context.inner();
-        let endpoint = match &self.config {
-            Some(config) => configured_endpoint(config)?,
-            None => self.endpoint.clone(),
+        let session = wire_request
+            .metadata
+            .get(dynamo_llm::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY)
+            .map(String::as_str)
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                wire_request
+                    .routing
+                    .as_ref()
+                    .and_then(|routing| routing.session_id.as_deref())
+            });
+        let (endpoint, affinity) = match &self.endpoints {
+            RemoteEndpoints::Pool(pool) => {
+                let bid = protocol::BidRequestV1 {
+                    tokens: wire_request.tokens.clone(),
+                    mm_routing_args: wire_request.mm_routing_args.clone(),
+                    cache_salt: wire_request.cache_salt.clone(),
+                    affinity_worker_id: None,
+                };
+                let allowed = wire_request
+                    .routing
+                    .as_ref()
+                    .map_or(&[][..], |routing| routing.allowed_worker_ids.as_slice());
+                tokio::select! {
+                    result = pool.select(session, bid, allowed, &context) => result?,
+                    _ = request_context.stopped() => return Ok(cancelled_outcome()),
+                    _ = request_context.killed() => return Ok(cancelled_outcome()),
+                }
+            }
+            RemoteEndpoints::Fixed(endpoint) => (endpoint.clone(), None),
         };
         let send = self
             .client
@@ -100,10 +143,27 @@ impl RemoteGenerationCoordinator {
         .context("generation service ended before an admission or denial")?;
         match first.frame {
             Some(generation_response_frame_v1::Frame::Admission(admission)) => {
-                connected_outcome(context, admission.into(), reader)
+                let admission: GenerationAdmission = admission.into();
+                let lease = affinity
+                    .map(|selection| {
+                        selection.complete_selection(AffinityTarget {
+                            worker_id: admission.prefill_worker_id,
+                            dp_rank: None,
+                        })
+                    })
+                    .transpose()?
+                    .flatten();
+                connected_outcome(context, admission, reader, lease)
             }
             Some(generation_response_frame_v1::Frame::Denied(denied)) => {
-                Ok(GenerationOutcome::Denied(denied.try_into()?))
+                let denied: DeniedGenerationRequest = denied.try_into()?;
+                if let (Some(selection), Some(admission)) = (affinity, denied.admission) {
+                    selection.complete_selection(AffinityTarget {
+                        worker_id: admission.prefill_worker_id,
+                        dp_rank: None,
+                    })?;
+                }
+                Ok(GenerationOutcome::Denied(denied))
             }
             Some(generation_response_frame_v1::Frame::Error(error)) => {
                 bail!("generation service protocol error: {}", error.message)
@@ -116,21 +176,42 @@ impl RemoteGenerationCoordinator {
     }
 }
 
-fn configured_endpoint(reader: &ConfigReader) -> Result<Url> {
-    let snapshot = reader.snapshot();
-    let config = &snapshot.generation_coordinator;
-    config.validate()?;
-    let remotes = config
-        .remotes
-        .as_ref()
-        .context("remote coordinator requires remotes; restart to switch to local mode")?;
-    Ok(Url::parse(
-        remotes.values().next().expect("validated single backend"),
-    )?)
+async fn fetch_worker_loads(client: &Client, endpoint: &Url) -> Result<Vec<crate::WorkerLoad>> {
+    let response = client
+        .get(endpoint.join("worker_loads")?)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
+async fn fetch_bid(
+    client: &Client,
+    endpoint: &Url,
+    request: protocol::BidRequestV1,
+) -> Result<protocol::BidResponseV1> {
+    request.validate()?;
+    let response = client
+        .post(endpoint.join("bid")?)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            protocol::REQUEST_CONTENT_TYPE,
+        )
+        .header(reqwest::header::ACCEPT, protocol::REQUEST_CONTENT_TYPE)
+        .timeout(std::time::Duration::from_secs(5))
+        .body(request.encode_to_vec())
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(protocol::BidResponseV1::decode(response.bytes().await?)?)
 }
 
 #[cfg(test)]
 mod reload_tests;
+
+#[cfg(test)]
+mod affinity_tests;
 
 fn cancelled_outcome() -> GenerationOutcome {
     GenerationOutcome::Denied(DeniedGenerationRequest {
@@ -140,20 +221,35 @@ fn cancelled_outcome() -> GenerationOutcome {
 }
 
 impl GenerationCoordinatorClient for RemoteGenerationCoordinator {
+    fn bid(
+        &self,
+        request: protocol::BidRequestV1,
+    ) -> BoxFuture<'_, Result<protocol::BidResponseV1>> {
+        Box::pin(async {
+            match &self.endpoints {
+                RemoteEndpoints::Fixed(endpoint) => {
+                    fetch_bid(&self.client, endpoint, request).await
+                }
+                RemoteEndpoints::Pool(pool) => pool.bid(request).await,
+            }
+        })
+    }
+    fn start(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async {
+            if let RemoteEndpoints::Pool(pool) = &self.endpoints {
+                pool.start().await?;
+            }
+            Ok(())
+        })
+    }
     fn worker_loads(&self) -> BoxFuture<'_, Result<Vec<crate::WorkerLoad>>> {
         Box::pin(async {
-            let endpoint = match &self.config {
-                Some(config) => configured_endpoint(config)?,
-                None => self.endpoint.clone(),
-            };
-            let response = self
-                .client
-                .get(endpoint.join("worker_loads")?)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await?
-                .error_for_status()?;
-            Ok(serde_json::from_slice(&response.bytes().await?)?)
+            match &self.endpoints {
+                RemoteEndpoints::Pool(pool) => pool.worker_loads().await,
+                RemoteEndpoints::Fixed(endpoint) => {
+                    fetch_worker_loads(&self.client, endpoint).await
+                }
+            }
         })
     }
     fn generate(
@@ -188,10 +284,12 @@ fn connected_outcome(
     context: RequestContext,
     admission: GenerationAdmission,
     mut reader: FramedResponse,
+    affinity_lease: Option<AffinityLease>,
 ) -> Result<GenerationOutcome> {
     let engine_context = context.inner();
     let cancellation = Arc::clone(&engine_context);
     let output = async_stream::stream! {
+        let _affinity_lease = affinity_lease;
         loop {
             let frame = tokio::select! {
                 frame = reader.next() => frame,

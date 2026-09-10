@@ -3102,7 +3102,78 @@ fn generation_coordinator(
 }
 
 #[tokio::test]
-async fn worker_loads_http_flattens_dp_and_pools_without_partial_results() {
+async fn bids_choose_best_workers_and_require_complete_disaggregated_pairs() {
+    use crate::protocol::BidRequestV1;
+    use DisaggregationStrategy::{Aggregated, PrefillFirst};
+    let router = |rows: &[(u64, usize, usize)]| {
+        RouterGuardClientForTesting::new(
+            vec![1],
+            vec![1],
+            vec![Ok(RsRouterResponse::PotentialLoads {
+                loads: rows
+                    .iter()
+                    .map(|&(worker_id, prefill, decode)| RsPotentialLoad {
+                        worker_id,
+                        dp_rank: 0,
+                        potential_prefill_tokens: prefill,
+                        potential_decode_blocks: decode,
+                        active_requests: 0,
+                    })
+                    .collect(),
+                pending_count: 0,
+                pending_isl_tokens: 0,
+            })],
+        )
+    };
+    for (strategy, affinity_worker_id, empty_prefill, empty_decode, expected) in [
+        (Aggregated, None, false, false, Some((false, 12, 0))),
+        (Aggregated, Some(42), false, false, Some((true, 15, 32))),
+        (PrefillFirst, Some(42), false, false, Some((true, 15, 32))),
+        (PrefillFirst, Some(90), false, false, Some((false, 12, 32))),
+        (PrefillFirst, None, true, false, None),
+        (PrefillFirst, None, false, true, None),
+        (Aggregated, None, true, false, None),
+    ] {
+        let worker = RouterGuardClientForTesting::new(vec![], vec![], vec![]);
+        let coordinator = generation_coordinator(
+            router(if empty_prefill {
+                &[]
+            } else {
+                &[(42, 15, 1), (43, 12, 0)]
+            }),
+            worker.clone(),
+            Some(router(if empty_decode {
+                &[]
+            } else {
+                &[(90, 999, 3), (91, 999, 1)]
+            })),
+            Some(worker.clone()),
+            strategy,
+        );
+        let result = coordinator
+            .bid(BidRequestV1 {
+                tokens: vec![1, 2, 3],
+                affinity_worker_id,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            result
+                .ok()
+                .map(|bid| (bid.affinity, bid.prefill_tokens, bid.decode_tokens)),
+            expected
+        );
+        assert!(worker.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn load_queries_http_choose_bid_without_dispatch() {
+    use crate::protocol::{
+        BidRequestV1, BidResponseV1, MmRoutingArgsV1, MmRoutingBlockV1, MmRoutingObjectV1,
+        TokenRangeV1,
+    };
+    use prost::Message;
     let router = |decode| {
         let response = RsRouterResponse::PotentialLoads {
             loads: [1, if decode { 1 } else { 12 }]
@@ -3116,14 +3187,20 @@ async fn worker_loads_http_flattens_dp_and_pools_without_partial_results() {
                     active_requests: 1,
                 })
                 .collect(),
-            pending_count: 0,
-            pending_isl_tokens: 0,
+            pending_count: 3,
+            pending_isl_tokens: 70,
         };
         RouterGuardClientForTesting::new(
             vec![1],
             vec![1],
             vec![
                 Ok(response.clone()),
+                Ok(response.clone()),
+                if decode {
+                    Err("decode router unavailable".into())
+                } else {
+                    Ok(response.clone())
+                },
                 if decode {
                     Err("decode router unavailable".into())
                 } else {
@@ -3132,15 +3209,28 @@ async fn worker_loads_http_flattens_dp_and_pools_without_partial_results() {
             ],
         )
     };
+    let prefill = router(false);
+    let decode = router(true);
     let worker = RouterGuardClientForTesting::new(vec![], vec![], vec![]);
     let coordinator = generation_coordinator(
-        router(false),
+        prefill.clone(),
         worker.clone(),
-        Some(router(true)),
+        Some(decode.clone()),
         Some(worker.clone()),
         DisaggregationStrategy::PrefillFirst,
     );
-    let (client, server) = generation_transport(coordinator, true).await;
+    let (_, server) = generation_transport(coordinator, true).await;
+    let mut config = baseten_configmap::UnifiedConfig::default();
+    config.generation_coordinator.remotes = Some(BTreeMap::from([(
+        "default".into(),
+        server.as_ref().unwrap().endpoint_url(),
+    )]));
+    let client = Arc::new(
+        crate::RemoteGenerationCoordinator::from_config(
+            baseten_configmap::ConfigReader::in_memory(config),
+        )
+        .unwrap(),
+    );
     let relay = Arc::new(crate::GenerationCoordinatorService::new(
         client,
         DisaggregationStrategy::PrefillFirst,
@@ -3157,6 +3247,75 @@ async fn worker_loads_http_flattens_dp_and_pools_without_partial_results() {
             {"worker_id": 42, "disaggregation_mode": "decode", "potential_prefill_tokens": 0, "potential_decode_blocks": 8, "active_requests": 2}
         ])
     );
+    let request = BidRequestV1 {
+        tokens: vec![10, 20, 30],
+        mm_routing_args: Some(MmRoutingArgsV1 {
+            blocks: vec![
+                MmRoutingBlockV1 {
+                    present: true,
+                    objects: vec![MmRoutingObjectV1 {
+                        mm_hash: 123,
+                        offsets: vec![TokenRangeV1 { start: 0, end: 2 }],
+                    }],
+                },
+                MmRoutingBlockV1::default(),
+            ],
+        }),
+        cache_salt: Some("tenant".into()),
+        affinity_worker_id: Some(42),
+    };
+    let bid = client.bid(request.clone()).await.unwrap();
+    assert_eq!(
+        bid,
+        BidResponseV1 {
+            affinity: true,
+            prefill_tokens: 1,
+            decode_tokens: 4 * u64::from(TEST_BLOCK_SIZE),
+        }
+    );
+    for router in [&prefill, &decode] {
+        let calls = router.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        let observed_request: RouterRequest =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&calls[1].1).unwrap()).unwrap();
+        let RouterRequest::PotentialLoads {
+            tokens: observed,
+            block_mm_infos,
+            allow_short_caching,
+        } = observed_request
+        else {
+            panic!("bid must not admit")
+        };
+        assert_eq!(&observed[..], request.tokens.as_slice());
+        assert_eq!(
+            block_mm_infos,
+            Some(vec![
+                Some(dynamo_kv_router::protocols::BlockExtraInfo {
+                    mm_objects: vec![dynamo_kv_router::protocols::BlockMmObjectInfo {
+                        mm_hash: 123,
+                        offsets: vec![(0, 2)],
+                    }],
+                }),
+                None
+            ])
+        );
+        assert!(!allow_short_caching);
+    }
+    let http = reqwest::Client::new();
+    let mut invalid_mm = request.clone();
+    invalid_mm.mm_routing_args.as_mut().unwrap().blocks[0].present = false;
+    for body in [Vec::new(), vec![0xff], invalid_mm.encode_to_vec()] {
+        assert_eq!(
+            http.post(relay.endpoint_url().replace("coordinate", "bid"))
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+    }
+    assert!(client.bid(request).await.is_err());
     assert!(client.worker_loads().await.is_err());
     assert!(worker.calls.lock().unwrap().is_empty());
     relay.shutdown().await.unwrap();

@@ -14,7 +14,7 @@ pub const HEADER_DYNAMO_SESSION_ID: &str = "x-dynamo-session-id";
 pub struct SessionAffinityId(String);
 
 impl SessionAffinityId {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 

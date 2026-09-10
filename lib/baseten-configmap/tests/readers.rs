@@ -46,7 +46,11 @@ fn coordinator_listener_defaults_disable_and_reload() {
         "{host: invalid}",
         "{ports: 9000}",
         "{remotes: {}}",
-        "{remotes: {a: 'http://a', b: 'http://b'}}",
+        "{remotes: {a: 'http://a', b: 'http://a/'}}",
+        "{remotes: {a: 'http://a', b: 'file:///tmp/server'}}",
+        "{affinity: {ttl_secs: 60}}",
+        "{remotes: {a: 'http://a'}, affinity: {ttl_secs: 0}}",
+        "{remotes: {a: 'http://a'}, affinity: {namespace: routing, component: frontend, ttl_secs: 60}}",
         "{remotes: {'': 'http://a'}}",
         "{remotes: {default: 'file:///tmp/server'}}",
         "{remotes: {default: 'http://user:secret@server'}}",
@@ -88,6 +92,27 @@ fn coordinator_listener_defaults_disable_and_reload() {
             .as_ref()
             .unwrap()["default"],
         "http://coordinator:8080/v1/coordinate"
+    );
+    std::fs::write(&path, "b10_generation_coordinator_config: {remotes: {default: 'http://a', canary: 'http://b'}, affinity: {ttl_secs: 60}}").unwrap();
+    reader.reload().unwrap();
+    let snapshot = reader.snapshot();
+    assert_eq!(
+        snapshot
+            .generation_coordinator
+            .remotes
+            .as_ref()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        snapshot
+            .generation_coordinator
+            .affinity
+            .as_ref()
+            .unwrap()
+            .ttl_secs,
+        60
     );
 }
 

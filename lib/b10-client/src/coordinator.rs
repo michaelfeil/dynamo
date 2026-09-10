@@ -91,15 +91,24 @@ pub struct RouterWorkerCoordinator {
 }
 
 impl RouterWorkerCoordinator {
-    pub async fn worker_loads(&self, mode: crate::WorkerMode) -> Result<Vec<crate::WorkerLoad>> {
+    async fn query_loads(
+        &self,
+        request: crate::protocol::BidRequestV1,
+    ) -> Result<RsRouterResponse> {
+        request.validate()?;
         let instances = available_router_instance_ids(self.router.as_ref());
         let instance = instances
             .first()
             .copied()
-            .ok_or_else(|| anyhow::anyhow!("no router instances available for worker loads"))?;
+            .ok_or_else(|| anyhow::anyhow!("no router instances available for potential loads"))?;
+        // The existing router RPC only models tokens/MM; salt remains
+        // on the bid wire contract for future router support.
         let request = to_rmpv_value(&RouterRequest::PotentialLoads {
-            tokens: vec![0].into(),
-            block_mm_infos: None,
+            tokens: request.tokens.into(),
+            block_mm_infos: request
+                .mm_routing_args
+                .map(crate::protocol::codec::mm_routing_args_from_wire)
+                .transpose()?,
             allow_short_caching: false,
         })?;
         let response = tokio::time::timeout(Duration::from_secs(5), async {
@@ -110,8 +119,30 @@ impl RouterWorkerCoordinator {
             first_stream_response(stream).await
         })
         .await
-        .map_err(|_| anyhow::anyhow!("worker loads router query timed out"))??;
-        let RsRouterResponse::PotentialLoads { loads, .. } = response.response else {
+        .map_err(|_| anyhow::anyhow!("potential loads router query timed out"))??;
+        Ok(response.response)
+    }
+
+    pub(crate) async fn potential_loads(
+        &self,
+        request: crate::protocol::BidRequestV1,
+    ) -> Result<Vec<dynamo_kv_router::scheduling::PotentialLoad>> {
+        let RsRouterResponse::PotentialLoads { loads, .. } = self.query_loads(request).await?
+        else {
+            anyhow::bail!("unexpected router response to bid query");
+        };
+        anyhow::ensure!(!loads.is_empty(), "no eligible workers for bid");
+        Ok(loads)
+    }
+
+    pub async fn worker_loads(&self, mode: crate::WorkerMode) -> Result<Vec<crate::WorkerLoad>> {
+        let RsRouterResponse::PotentialLoads { loads, .. } = self
+            .query_loads(crate::protocol::BidRequestV1 {
+                tokens: vec![0],
+                ..Default::default()
+            })
+            .await?
+        else {
             anyhow::bail!("unexpected router response to worker loads query");
         };
         let mut workers = std::collections::BTreeMap::new();

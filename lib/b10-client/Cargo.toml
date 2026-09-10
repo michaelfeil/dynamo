@@ -37,4 +37,5 @@ tracing = { workspace = true }
 prost-build = "0.13.5"
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

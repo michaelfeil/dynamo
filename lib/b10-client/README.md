@@ -106,21 +106,60 @@ normalized to zero per rank.
 [{"worker_id":42,"disaggregation_mode":"prefill","potential_prefill_tokens":128,"potential_decode_blocks":8,"active_requests":2}]
 ```
 
-An unavailable pool fails the request rather than returning partial load data.
+An unavailable local router pool fails the request. Multi-remote relays return
+the union of current worker snapshots, omitting unavailable/stale remotes (an
+empty array when none are current), without filtering out incomplete disaggregated pools.
 Queries are bounded to five seconds. Remote clients and HTTP relays forward to
 the sibling `worker_loads` endpoint using the same HTTP connection pool and
 reloadable remote URL as generation. Rust callers use `worker_loads()` on the
 coordinator runtime or client. This endpoint shares the listener's trusted-network
 access requirements; no new port or Python handler is introduced.
 
+`POST /v1/bid` queries potential loads for a prompt and its cache identity. Both bodies are
+unary `application/x-protobuf`: `BidRequest { tokens, mm_routing_args, cache_salt, affinity_worker_id }`
+and `BidResponse { affinity, prefill_tokens, decode_tokens }`, without generation stream framing. Rust callers use
+`client.bid(request).await?` or `coordinator.bid(request).await?` with `BidRequestV1`.
+Tokens must be nonempty; malformed/empty requests return 400. Each outgoing remote
+bid and each local router query has its own five-second timeout. Options run
+concurrently; timed-out/failed remote options are excluded and the best successful
+bid is returned. If none succeeds, the response is 503. There is no competing
+five-second timeout around the whole pool; allow response/transport overhead when
+calling a relay. A relay used as another pool's option must still respond within
+that caller's five-second option budget.
+
+The coordinator returns its best aggregate worker or prefill/decode pair using
+`(1 - 0.5 * affinity) * (prefill_tokens + 0.1 * decode_tokens)`. Affinity means the
+prefill-bearing worker matches the request's known `affinity_worker_id`. Each DP rank
+is a candidate; decode blocks are converted using the decode pool's block size.
+Disaggregated routers are queried concurrently and both must have workers. The pair's
+estimate combines prefill-pool prefill tokens with decode-pool decode tokens.
+Bids send only `PotentialLoads`, with short caching disabled: no admission, worker
+execution, capacity reservation, or affinity update. Tokens and MM routing info affect
+the estimate. `cache_salt` is carried through relays but does not yet affect the
+unchanged router RPC/cache. LoRA, worker restrictions, and MM payloads are not bid fields.
+
 The latency-sensitive path stays entirely native: Hyper receives the body,
 Prost decodes it, the Rust coordinator routes it, and Hyper streams framed
 responses. There is no Uvicorn/FastAPI server and no per-request PyO3 crossing.
 
-The remote constructor deliberately accepts a named endpoint map but currently
-requires exactly one entry. This preserves the configuration surface for the
-future multi-endpoint load/session-aware selector without adding a lookup to
-today's single-endpoint request path.
+With one named remote, generation forwards directly without a destination search or
+bid. Session metadata is still forwarded, and configured affinity still records
+admissions and retains stream leases. Without configured affinity, singleton startup
+does not initialize worker-load polling either.
+Multi-backend pools reuse a live session-affinity assignment verified by five-second
+worker-load polls. Both affinity and bidding require a current snapshot for the
+configured URL with aggregate capacity or both prefill and decode workers.
+New/recovered remotes enter selection after a successful poll. Otherwise they bid
+concurrently against these live candidates,
+discard failed bids, and choose the lowest score above. Ties prefer `default`, then
+backend name. Generation worker restrictions prefilter remotes using polled membership.
+Cold selection uses fresh bids, not the background load values. A failed bid does
+not change inventory liveness; inventory probes maintain that independently. The configmap-backed
+native runtime can enable Dynamo's synchronized session affinity store; see the
+[coordinator configuration](../baseten-configmap/README.md#generation-coordinator-listener)
+for the affinity scope, selection policy, and reload behavior. Call `start()` to
+initialize polling before serving requests. The single-endpoint constructor retains
+its direct HTTP path.
 
 The wire schema (compiled by Prost during the build) is
 [`proto/generation_coordinator.proto`](proto/generation_coordinator.proto).
@@ -133,7 +172,7 @@ protobuf fields.
 Worker requests always enable streaming; the prefill worker applies its own
 phase-specific override. `routing.session_id` carries the worker's `user` value
 once, rather than duplicating it in the request body.
-Endpoint probing and selection are not part of the single-endpoint protocol.
+Selection uses the existing load endpoint; the generation wire protocol is unchanged.
 
 `RouterGuardClient` is the transport seam for custom clients and deterministic
 tests. `JsonRouterGuardClient` adapts Dynamo's JSON `PushRouter`.

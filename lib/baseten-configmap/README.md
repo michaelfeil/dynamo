@@ -118,7 +118,8 @@ These are the defaults. `start()` takes no arguments; configuration is Rust-owne
 Direct generation remains available with HTTP disabled. Listener settings
 are fixed at construction; an already-running listener requires a process restart
 to change address. An override group's coordinator section replaces the whole
-section. The native listener serves `/health` and `/v1/coordinate` and drains on
+section. The native listener serves `/health`, `/v1/coordinate`, `/v1/worker_loads`,
+and `/v1/bid` and drains on
 runtime shutdown. It has no HTTP authentication; expose it only on a trusted network.
 
 `remotes` independently selects the backend for both Python and HTTP requests:
@@ -128,15 +129,58 @@ b10_generation_coordinator_config:
   port: null  # client-only frontend; use 8080 to also expose an HTTP relay
   remotes:
     default: http://coordinator-frontend:8080/v1/coordinate
+    canary: http://canary-frontend:8080/v1/coordinate
+  affinity:  # optional; startup-only, shared by cooperating client replicas
+    ttl_secs: 3600
 ```
 
-Exactly one named HTTP(S) backend is supported. Null/omitted remotes use local
+One or more named HTTP(S) backends are supported. Null/omitted remotes use local
 orchestration. Local versus remote mode is fixed when the coordinator is constructed;
 changing modes requires restart. Remote-only startup does not connect local
 router/worker clients. In remote mode, endpoint updates apply to new
-requests after the reader reloads (15-second polling); existing streams keep their
+requests after the reader reloads (15-second polling);
+removed endpoints are excluded immediately. Existing streams keep their
 backend and cancellation behavior. Unchanged backends reuse their HTTP connection
 pool. Local coordinators ignore remote endpoint updates. Removing remotes from a
 remote coordinator rejects new requests rather than switching to local orchestration.
 Invalid reloads retain the previous snapshot. Do not point a relay to itself
 or create cycles between relays.
+
+Remote clients poll `/v1/worker_loads` concurrently every five seconds to establish
+downstream liveness for both affinity and bidding. A live candidate needs an aggregate worker or both prefill
+and decode capacity in a successful snapshot less than fifteen seconds old.
+Otherwise multi-backend pools send concurrent `/v1/bid` requests to the live candidates
+and choose the lowest `(1 - 0.5 * affinity) * (prefill_tokens + 0.1 * decode_tokens)`.
+New/recovered remotes must be observed by a successful poll before selection.
+Bid failures do not evict a remote from inventory. The pooled worker-load endpoint
+returns the union of current snapshots, omitting unavailable/stale remotes.
+Failed bids are excluded; all failed bids reject the request. Ties prefer `default`,
+then backend name. Each bidding option has an independent five-second timeout;
+the relay does not discard successful bids at an equal pool-wide deadline.
+Bids use current prompt-specific loads, not the poll's load values.
+Generation `allowed_worker_ids`, when supplied, prefilters remotes by polled membership;
+it is not a bid API field. Bidding does not reserve capacity or configure a canary
+traffic percentage. A single backend forwards directly without affinity destination
+lookup or bidding, including explicit singleton maps. It still forwards session metadata
+and, when configured, records admissions in the affinity store and retains stream leases.
+Singleton clients without affinity do not initialize worker-load polling at startup.
+Enable affinity from startup, even with one backend, to collect session bindings
+before adding a second remote. Reloading `remotes` retains that same store: existing
+live sessions stay pinned, while new sessions bid across the expanded pool.
+
+When configured, affinity uses Dynamo's existing bounded TTL store and event plane,
+on the separate `generation_coordinator_affinity_events` topic. The namespace is
+required at setup in configured remote mode: Python passes
+`namespace=DYNAMO_MODEL_NAMESPACE` (Rust: `Some(namespace)`). Missing namespaces
+are a setup error; there is no endpoint or environment fallback. Local mode does
+not require this argument.
+The component is fixed to `coordinator_clients`. Neither is a configmap option.
+Client replicas must share this namespace and event discovery.
+A known session chooses the unique live pool containing its admitted prefill worker
+ID in an aggregate/prefill row (also for disaggregation). Decode-only rows do not
+retain affinity or enter its replica membership. Missing, disallowed, or ambiguous
+IDs fall back to bidding. The known worker ID is sent with bids so a fresh candidate
+matching it receives the affinity discount; decode-only matches do not qualify.
+Admission updates the binding; a plain denial does not. Active streams retain their
+affinity lease. Replica synchronization is best-effort; it is not a global lock for
+simultaneous first requests. Only `remotes` reloads; affinity settings require restart.

@@ -7,7 +7,7 @@ use crate::{
     GenerationOutcome, GenerationRequest, JsonPushRouter, PrefillMarkTiming,
     RemoteGenerationCoordinator, RequestContext, RouterWorkerCoordinator,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use baseten_configmap::{ConfigReader, GenerationCoordinatorConfig};
 use dynamo_runtime::pipeline::network::egress::push_router::RouterMode;
 use dynamo_runtime::{DistributedRuntime, component::Endpoint};
@@ -81,6 +81,12 @@ impl LocalCoordinator {
 }
 
 impl GenerationCoordinatorClient for LocalCoordinator {
+    fn bid(
+        &self,
+        request: crate::protocol::BidRequestV1,
+    ) -> futures::future::BoxFuture<'_, Result<crate::protocol::BidResponseV1>> {
+        Box::pin(async { self.start().await?.bid(request).await })
+    }
     fn worker_loads(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::WorkerLoad>>> {
         Box::pin(async { self.start().await?.worker_loads().await })
     }
@@ -124,6 +130,12 @@ struct Listener {
 }
 
 impl GenerationCoordinatorRuntime {
+    pub fn bid(
+        &self,
+        request: crate::protocol::BidRequestV1,
+    ) -> futures::future::BoxFuture<'_, Result<crate::protocol::BidResponseV1>> {
+        self.client.bid(request)
+    }
     pub fn worker_loads(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::WorkerLoad>>> {
         self.client.worker_loads()
     }
@@ -131,6 +143,7 @@ impl GenerationCoordinatorRuntime {
         runtime: DistributedRuntime,
         options: LocalCoordinatorOptions,
         config: ConfigReader,
+        namespace: Option<String>,
     ) -> Result<Self> {
         ensure!(options.block_size > 0, "kv_block_size must be positive");
         ensure!(
@@ -141,15 +154,22 @@ impl GenerationCoordinatorRuntime {
         let snapshot = config.snapshot();
         let settings = &snapshot.generation_coordinator;
         let listener = Some(Listener {
-            runtime,
+            runtime: runtime.clone(),
             address: settings.listen_address(),
             strategy: options.strategy,
             started: OnceCell::new(),
         });
         let (client, local): (Arc<dyn GenerationCoordinatorClient>, _) =
             if settings.remotes.is_some() {
+                let namespace = runtime
+                    .namespace(namespace.context(
+                        "namespace is required for configured remote coordinator mode",
+                    )?)?;
                 (
-                    Arc::new(RemoteGenerationCoordinator::from_config(config)?),
+                    Arc::new(RemoteGenerationCoordinator::from_runtime_config(
+                        config,
+                        Some(&namespace),
+                    )?),
                     None,
                 )
             } else {
@@ -172,15 +192,13 @@ impl GenerationCoordinatorRuntime {
             ..Default::default()
         };
         settings.validate()?;
-        let url = settings
-            .remotes
-            .as_ref()
-            .unwrap()
-            .values()
-            .next()
-            .expect("validated single backend");
         Ok(Self {
-            client: Arc::new(RemoteGenerationCoordinator::new(url)?),
+            client: Arc::new(RemoteGenerationCoordinator::from_config(
+                ConfigReader::in_memory(baseten_configmap::UnifiedConfig {
+                    generation_coordinator: settings,
+                    ..Default::default()
+                }),
+            )?),
             local: None,
             listener: None,
         })
@@ -208,6 +226,7 @@ impl GenerationCoordinatorRuntime {
 
     pub async fn start(&self) -> Result<Option<String>> {
         let Some(listener) = &self.listener else {
+            self.client.start().await?;
             return Ok(None);
         };
         let shutdown = listener.runtime.child_token();
@@ -222,6 +241,12 @@ impl GenerationCoordinatorRuntime {
                         biased;
                         _ = shutdown.cancelled() => anyhow::bail!("runtime is shut down"),
                         result = local.start() => { result?; }
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => anyhow::bail!("runtime is shut down"),
+                        result = self.client.start() => { result?; }
                     }
                 }
                 let Some(address) = listener.address else {
@@ -281,7 +306,7 @@ mod tests {
             };
             let reader = ConfigReader::in_memory(UnifiedConfig::default());
             let local =
-                GenerationCoordinatorRuntime::new(runtime.clone(), options(), reader.clone())
+                GenerationCoordinatorRuntime::new(runtime.clone(), options(), reader.clone(), None)
                     .unwrap();
             let mut config = UnifiedConfig::default();
             config.generation_coordinator.port = Some(0);
@@ -290,10 +315,20 @@ mod tests {
                 "default".into(),
                 "http://127.0.0.1:1/v1/coordinate".into(),
             )]));
+            config.generation_coordinator.affinity =
+                Some(baseten_configmap::CoordinatorAffinityConfig { ttl_secs: 60 });
             reader.replace(config);
-            let remote =
-                GenerationCoordinatorRuntime::new(runtime.clone(), options(), reader.clone())
-                    .unwrap();
+            assert!(
+                GenerationCoordinatorRuntime::new(runtime.clone(), options(), reader.clone(), None)
+                    .is_err()
+            );
+            let remote = GenerationCoordinatorRuntime::new(
+                runtime.clone(),
+                options(),
+                reader.clone(),
+                Some("coordinator-test".into()),
+            )
+            .unwrap();
             assert!(!local.is_client());
             assert_eq!(local.start().await.unwrap(), None);
             assert!(!local.is_server());
