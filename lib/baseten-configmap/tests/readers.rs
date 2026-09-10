@@ -18,6 +18,80 @@ fn config(weight: f64) -> UnifiedConfig {
 }
 
 #[test]
+fn coordinator_listener_defaults_disable_and_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    std::fs::write(&path, "{}").unwrap();
+    let reader = ReaderRegistry::default()
+        .resolve(FileSource::new(&path, None))
+        .unwrap();
+    let initial = reader.snapshot();
+    assert_eq!(initial.generation_coordinator.listen_address(), None);
+
+    std::fs::write(
+        &path,
+        "b10_generation_coordinator_config: {host: '::1', port: 9000}",
+    )
+    .unwrap();
+    reader.reload().unwrap();
+    assert_eq!(
+        reader.snapshot().generation_coordinator.listen_address(),
+        Some("[::1]:9000".parse().unwrap())
+    );
+    assert_eq!(initial.generation_coordinator.port, None);
+
+    for invalid in [
+        "{port: -1}",
+        "{port: 65536}",
+        "{host: invalid}",
+        "{ports: 9000}",
+        "{remotes: {}}",
+        "{remotes: {a: 'http://a', b: 'http://b'}}",
+        "{remotes: {'': 'http://a'}}",
+        "{remotes: {default: 'file:///tmp/server'}}",
+        "{remotes: {default: 'http://user:secret@server'}}",
+    ] {
+        std::fs::write(
+            &path,
+            format!("b10_generation_coordinator_config: {invalid}"),
+        )
+        .unwrap();
+        assert!(reader.reload().is_err());
+        assert_eq!(reader.snapshot().generation_coordinator.port, Some(9000));
+    }
+    std::fs::write(&path, "b10_generation_coordinator_config: {port: null}").unwrap();
+    reader.reload().unwrap();
+    assert_eq!(
+        reader.snapshot().generation_coordinator.listen_address(),
+        None
+    );
+
+    std::fs::write(&path, "b10_generation_coordinator_config: {port: 9000}\noverride_args:\n  frontend:\n    b10_generation_coordinator_config: {host: '127.0.0.1', port: 0}\n").unwrap();
+    let frontend = ReaderRegistry::default()
+        .resolve(FileSource::new(&path, Some("frontend".into())))
+        .unwrap();
+    assert_eq!(
+        frontend.snapshot().generation_coordinator.listen_address(),
+        Some("127.0.0.1:0".parse().unwrap())
+    );
+    std::fs::write(&path, "b10_generation_coordinator_config: {port: null, remotes: {default: 'http://coordinator:8080/v1/coordinate'}}").unwrap();
+    reader.reload().unwrap();
+    assert_eq!(
+        reader.snapshot().generation_coordinator.listen_address(),
+        None
+    );
+    assert_eq!(
+        reader
+            .snapshot()
+            .generation_coordinator
+            .remotes
+            .as_ref()
+            .unwrap()["default"],
+        "http://coordinator:8080/v1/coordinate"
+    );
+}
+
+#[test]
 fn shared_source_reloads_existing_readers_without_mutating_old_snapshots() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.yaml");

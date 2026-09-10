@@ -700,7 +700,7 @@ class RouterWorkerCoordinator:
         ...
 
 class GenerationCoordinator:
-    """Coordinates generation as a local server or remote client."""
+    """Configured coordinator (local or remote backend) or explicit remote client."""
 
     def __init__(
         self,
@@ -716,26 +716,31 @@ class GenerationCoordinator:
         prefill_mark_timing: Any | None = None,
         runtime: DistributedRuntime,
     ) -> None: ...
-    async def start(self) -> None:
-        """Optional eager initialization; generate() and serve() initialize automatically."""
-        ...
-
     @classmethod
     def remote(cls, backends: Dict[str, str]) -> GenerationCoordinator:
         """Connect to exactly one named remote generation-coordinator backend."""
         ...
 
     @property
-    def is_client(self) -> bool: ...
+    def is_client(self) -> bool:
+        """Whether this coordinator was constructed in remote mode."""
+        ...
 
     @property
-    def is_server(self) -> bool: ...
+    def is_server(self) -> bool:
+        """Whether this object has started an HTTP listener and its runtime is active."""
+        ...
 
-    async def serve(self, host: str = "0.0.0.0", port: int = 8080) -> str:
-        """Start HTTP serving in the background and return its URL.
+    async def start(self) -> str | None:
+        """Initialize the backend and optional HTTP listener, returning its URL.
 
         Requires runtime. Serving lasts until runtime shutdown;
         no context manager or explicit coordinator shutdown is required.
+        Rust's b10_generation_coordinator_config controls the listener.
+        No port is configured by default: HTTP is disabled and start returns None.
+        Listener changes require restart.
+        Repeated calls return the existing listener URL. Explicit remote clients
+        return None without opening a listener.
         """
         ...
 

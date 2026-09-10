@@ -3,9 +3,7 @@
 //! Routing, admission, worker connection, cancellation, and guard cleanup live
 //! in `dynamo-b10-client`. This module converts Python inputs, records routed
 //! worker metadata, and exposes the returned stream as an async Python object.
-mod startup;
 mod types;
-use startup::{CoordinatorClient, CoordinatorStartup};
 
 // Re-export the pyclasses registered in `lib.rs::add_class::<...>` so they
 // resolve as `crate::b10_client::Foo` (the crate-root path lib.rs expects).
@@ -20,15 +18,13 @@ pub(crate) use types::{
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
 use crate::{AsyncResponseStream, Client, context, process_stream, to_pyerr};
 use dynamo_b10_client::{
-    CancellationPolicy as CoreCancellationPolicy,
-    DisaggregationStrategy as CoreDisaggregationStrategy,
-    GenerationCoordinator as CoreGenerationCoordinator,
-    GenerationCoordinatorClient as CoreGenerationCoordinatorClient,
-    GenerationCoordinatorService as CoreGenerationCoordinatorService, GenerationOptions,
-    GenerationOutcome as CoreGenerationOutcome, GenerationRequest, JsonRouterGuardClient,
-    MinReplicaAvailable, PotentialLoadsCheck, PrefillMarkTiming as CorePrefillMarkTiming,
-    RemoteGenerationCoordinator, RequestContext, RouteAndConnectOutcome, RouteOptions,
-    RouterRequestGuard, RouterRequestNew, RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
+    CancellationPolicy as CoreCancellationPolicy, CoordinatorClient,
+    DisaggregationStrategy as CoreDisaggregationStrategy, GenerationCoordinatorRuntime,
+    GenerationOptions, GenerationOutcome as CoreGenerationOutcome, GenerationRequest,
+    JsonRouterGuardClient, LocalCoordinatorOptions, MinReplicaAvailable, PotentialLoadsCheck,
+    PrefillMarkTiming as CorePrefillMarkTiming, RequestContext, RouteAndConnectOutcome,
+    RouteOptions, RouterRequestGuard, RouterRequestNew,
+    RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
     RouterWorkerPhase as CoreRouterWorkerPhase, stream_with_optional_prefill_mark,
 };
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints};
@@ -39,7 +35,6 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -155,10 +150,7 @@ fn generation_python_stream(
 /// `PyRouterRequestNew`.
 #[pyclass]
 pub(crate) struct GenerationCoordinator {
-    startup: Option<Arc<CoordinatorStartup>>,
-    inner: Arc<dyn CoreGenerationCoordinatorClient>,
-    service: Option<Arc<CoreGenerationCoordinatorService>>,
-    serving: Arc<tokio::sync::Mutex<bool>>,
+    inner: Arc<GenerationCoordinatorRuntime>,
 }
 
 #[pymethods]
@@ -211,44 +203,31 @@ impl GenerationCoordinator {
                 )));
             }
         };
-        if strategy == CoreDisaggregationStrategy::PrefillFirst
-            && (next_worker_client.is_none() || next_router_client.is_none())
-        {
-            return Err(PyValueError::new_err(
-                "next_worker_client and next_router_client are required for disaggregated generation",
-            ));
-        }
-        if kv_block_size == 0 {
-            return Err(PyValueError::new_err("kv_block_size must be positive"));
-        }
         let machine_id =
             disagg_request_id_machine_id.unwrap_or_else(|| runtime.inner().connection_id());
-        let startup = Arc::new(CoordinatorStartup {
-            runtime: runtime.inner().clone(),
-            primary_worker: CoordinatorClient::parse(primary_worker_client, runtime)?,
-            primary_router: CoordinatorClient::parse(primary_router_client, runtime)?,
+        let options = LocalCoordinatorOptions {
+            primary_worker: coordinator_client(primary_worker_client, runtime)?,
+            primary_router: coordinator_client(primary_router_client, runtime)?,
             next_worker: next_worker_client
-                .map(|client| CoordinatorClient::parse(client, runtime))
+                .map(|client| coordinator_client(client, runtime))
                 .transpose()?,
             next_router: next_router_client
-                .map(|client| CoordinatorClient::parse(client, runtime))
+                .map(|client| coordinator_client(client, runtime))
                 .transpose()?,
             strategy,
             mark_timing,
             block_size: kv_block_size,
             machine_id,
-            ready: tokio::sync::OnceCell::new(),
-        });
-        let inner: Arc<dyn CoreGenerationCoordinatorClient> = startup.clone();
-        let service = Arc::new(CoreGenerationCoordinatorService::new(
-            Arc::clone(&inner),
-            strategy,
-        ));
+        };
         Ok(Self {
-            startup: Some(startup),
-            inner,
-            service: Some(service),
-            serving: Arc::new(tokio::sync::Mutex::new(false)),
+            inner: Arc::new(
+                GenerationCoordinatorRuntime::new(
+                    runtime.inner().clone(),
+                    options,
+                    baseten_configmap::current_reader(),
+                )
+                .map_err(to_pyerr)?,
+            ),
         })
     }
 
@@ -258,93 +237,26 @@ impl GenerationCoordinator {
     /// constructor. Endpoint discovery and multi-endpoint selection are left
     /// to a future client implementation.
     #[classmethod]
-    fn remote(_cls: &Bound<'_, PyType>, mut backends: BTreeMap<String, String>) -> PyResult<Self> {
-        if backends.len() != 1 {
-            return Err(PyValueError::new_err(
-                "remote generation currently requires exactly one named backend",
-            ));
-        }
-        let (name, url) = backends.pop_first().expect("length checked above");
-        if name.is_empty() {
-            return Err(PyValueError::new_err(
-                "remote generation backend name cannot be empty",
-            ));
-        }
-        let inner = RemoteGenerationCoordinator::new(url).map_err(to_pyerr)?;
+    fn remote(_cls: &Bound<'_, PyType>, backends: BTreeMap<String, String>) -> PyResult<Self> {
         Ok(Self {
-            startup: None,
-            inner: Arc::new(inner),
-            service: None,
-            serving: Arc::new(tokio::sync::Mutex::new(false)),
+            inner: Arc::new(GenerationCoordinatorRuntime::remote(backends).map_err(to_pyerr)?),
         })
     }
 
     #[getter]
     fn is_client(&self) -> bool {
-        self.service.is_none()
+        self.inner.is_client()
     }
 
     #[getter]
     fn is_server(&self) -> bool {
-        self.service.is_some()
+        self.inner.is_server()
     }
 
-    /// Optional eager initialization for compatibility. serve() and generate()
-    /// initialize clients automatically.
     fn start<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
-        let startup = self.startup.clone();
+        let coordinator = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if let Some(startup) = startup {
-                startup.start().await.map_err(to_pyerr)?;
-            }
-            Ok(())
-        })
-    }
-
-    /// Bind the native HTTP entry point in the background. Direct `generate()`
-    /// calls remain available on the same coordinator. With a runtime, the
-    /// listener lives until runtime shutdown, even if this handle is dropped.
-    #[pyo3(signature = (host="0.0.0.0", port=8080))]
-    fn serve<'p>(&self, py: Python<'p>, host: &str, port: u16) -> PyResult<Bound<'p, PyAny>> {
-        let service = self.service.as_ref().cloned().ok_or_else(|| {
-            PyValueError::new_err("a remote generation coordinator is client-only")
-        })?;
-        let host = host
-            .parse::<IpAddr>()
-            .map_err(|error| PyValueError::new_err(format!("invalid bind host: {error}")))?;
-        let address = SocketAddr::new(host, port);
-        let serving = Arc::clone(&self.serving);
-        let startup = self.startup.clone().expect("local service has startup");
-        let runtime = &startup.runtime;
-        let shutdown = runtime.child_token();
-        // Stop admission in Phase 1; keep transports alive through HTTP drain.
-        let guard = runtime.register_graceful_task();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if shutdown.is_cancelled() {
-                return Err(PyValueError::new_err("runtime is shut down"));
-            }
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => return Err(PyValueError::new_err("runtime is shut down")),
-                result = startup.start() => { result.map_err(to_pyerr)?; }
-            }
-            let mut started = serving.lock().await;
-            if *started {
-                return Err(PyValueError::new_err(
-                    "generation coordinator server is already running",
-                ));
-            }
-            let server = service.start(address).await.map_err(to_pyerr)?;
-            let endpoint_url = server.endpoint_url();
-            *started = true;
-            tokio::spawn(async move {
-                let _guard = guard;
-                shutdown.cancelled().await;
-                if let Err(error) = server.shutdown().await {
-                    tracing::error!(%error, "generation coordinator HTTP shutdown failed");
-                }
-            });
-            Ok(endpoint_url)
+            coordinator.start().await.map_err(to_pyerr)
         })
     }
 
@@ -813,4 +725,17 @@ impl RouterWorkerCoordinator {
             Python::with_gil(|py| admitted.into_py_any(py))
         })
     }
+}
+
+fn coordinator_client(
+    value: &Bound<'_, PyAny>,
+    runtime: &crate::DistributedRuntime,
+) -> PyResult<CoordinatorClient> {
+    if let Ok(client) = value.extract::<Client>() {
+        return Ok(CoordinatorClient::Connected(client.router));
+    }
+    let path = value.extract::<String>().map_err(|_| {
+        PyTypeError::new_err("coordinator clients must be Client objects or endpoint strings")
+    })?;
+    Ok(CoordinatorClient::Endpoint(runtime.endpoint(path)?.inner))
 }

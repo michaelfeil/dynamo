@@ -101,3 +101,42 @@ The extracted schema retains Rust's defaults, aliases, field-level routing
 overrides, and sanitization. It does not merge arbitrary engine/frontend fields or
 change Python's separate override semantics. Related values are coherent within
 one snapshot; separate routing phases may intentionally take newer snapshots.
+
+## Generation coordinator listener
+
+`GenerationCoordinator` reads the Rust snapshot at construction; `start()` initializes
+the selected backend and optional listener. Python does not parse this section:
+
+```yaml
+b10_generation_coordinator_config:
+  host: 0.0.0.0
+  port: null  # HTTP disabled; set 8080 to listen, or 0 for an ephemeral port
+  remotes: null  # local orchestration
+```
+
+These are the defaults. `start()` takes no arguments; configuration is Rust-owned.
+Direct generation remains available with HTTP disabled. Listener settings
+are fixed at construction; an already-running listener requires a process restart
+to change address. An override group's coordinator section replaces the whole
+section. The native listener serves `/health` and `/v1/coordinate` and drains on
+runtime shutdown. It has no HTTP authentication; expose it only on a trusted network.
+
+`remotes` independently selects the backend for both Python and HTTP requests:
+
+```yaml
+b10_generation_coordinator_config:
+  port: null  # client-only frontend; use 8080 to also expose an HTTP relay
+  remotes:
+    default: http://coordinator-frontend:8080/v1/coordinate
+```
+
+Exactly one named HTTP(S) backend is supported. Null/omitted remotes use local
+orchestration. Local versus remote mode is fixed when the coordinator is constructed;
+changing modes requires restart. Remote-only startup does not connect local
+router/worker clients. In remote mode, endpoint updates apply to new
+requests after the reader reloads (15-second polling); existing streams keep their
+backend and cancellation behavior. Unchanged backends reuse their HTTP connection
+pool. Local coordinators ignore remote endpoint updates. Removing remotes from a
+remote coordinator rejects new requests rather than switching to local orchestration.
+Invalid reloads retain the previous snapshot. Do not point a relay to itself
+or create cycles between relays.

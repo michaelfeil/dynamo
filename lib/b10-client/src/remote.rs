@@ -9,6 +9,7 @@ use crate::{
     GenerationRequest, RequestContext, RouteOptions,
 };
 use anyhow::{Context, Result, bail};
+use baseten_configmap::ConfigReader;
 use dynamo_runtime::pipeline::{EngineStream, ResponseStream};
 use dynamo_runtime::protocols::annotated::Annotated;
 use futures::future::BoxFuture;
@@ -27,6 +28,7 @@ type FramedResponse = Pin<Box<dyn Stream<Item = Result<GenerationResponseFrameV1
 pub struct RemoteGenerationCoordinator {
     endpoint: Url,
     client: Client,
+    config: Option<ConfigReader>,
 }
 
 impl RemoteGenerationCoordinator {
@@ -38,6 +40,16 @@ impl RemoteGenerationCoordinator {
         Ok(Self {
             endpoint,
             client: Client::new(),
+            config: None,
+        })
+    }
+
+    /// Remote mode with a reloadable endpoint and one shared HTTP connection pool.
+    pub fn from_config(config: ConfigReader) -> Result<Self> {
+        Ok(Self {
+            endpoint: configured_endpoint(&config)?,
+            client: Client::new(),
+            config: Some(config),
         })
     }
 
@@ -50,9 +62,13 @@ impl RemoteGenerationCoordinator {
         validate_remote_options(&options)?;
         let wire_request = encode_request(&context, request, &options)?;
         let request_context = context.inner();
+        let endpoint = match &self.config {
+            Some(config) => configured_endpoint(config)?,
+            None => self.endpoint.clone(),
+        };
         let send = self
             .client
-            .post(self.endpoint.clone())
+            .post(endpoint)
             .header(
                 reqwest::header::CONTENT_TYPE,
                 protocol::REQUEST_CONTENT_TYPE,
@@ -99,6 +115,22 @@ impl RemoteGenerationCoordinator {
         }
     }
 }
+
+fn configured_endpoint(reader: &ConfigReader) -> Result<Url> {
+    let snapshot = reader.snapshot();
+    let config = &snapshot.generation_coordinator;
+    config.validate()?;
+    let remotes = config
+        .remotes
+        .as_ref()
+        .context("remote coordinator requires remotes; restart to switch to local mode")?;
+    Ok(Url::parse(
+        remotes.values().next().expect("validated single backend"),
+    )?)
+}
+
+#[cfg(test)]
+mod reload_tests;
 
 fn cancelled_outcome() -> GenerationOutcome {
     GenerationOutcome::Denied(DeniedGenerationRequest {

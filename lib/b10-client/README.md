@@ -67,17 +67,33 @@ local = dynamo.GenerationCoordinator(
     model_name=model_name,
     kv_block_size=32,
 )
-endpoint_url = await local.serve(host="0.0.0.0", port=8080)
-# GET /health and POST /v1/coordinate are now served by Rust/Hyper/Axum.
+endpoint_url = await local.start()
+# With a configured port, GET /health and POST /v1/coordinate are served by Rust.
 # Runtime shutdown stops the listener; no coordinator context manager needed.
 ```
 
 The local constructor requires `runtime` as a keyword argument, including when
-passing explicit clients. Direct generation initializes clients lazily; `serve()`
-initializes them before binding HTTP. Neither path requires `start()`. The listener stays
+passing explicit clients. Direct generation initializes clients lazily; `start()`
+initializes the configured backend and optional HTTP listener. The listener stays
 alive even if the Python coordinator handle is dropped, and runtime shutdown
-initiates graceful HTTP shutdown. `serve()` requires a runtime; there is no
+initiates graceful HTTP shutdown. HTTP listening requires a runtime; there is no
 separate coordinator shutdown method.
+
+`GenerationCoordinatorRuntime` owns client initialization and HTTP lifecycle in
+Rust. Python wraps it without owning startup or shutdown state. Rust callers use
+the same `start()`, `generate()`, `is_client()`, and `is_server()` methods.
+
+Local/remote mode and listener settings are fixed at construction. Only the
+`remotes` endpoint map reloads. Rust callers can use
+`RemoteGenerationCoordinator::from_config(reader)` for reloadable endpoints;
+the HTTP client retains its connection pool across updates.
+
+HTTP is disabled by default. Enable it in the mounted config:
+
+```yaml
+b10_generation_coordinator_config:
+  port: 8080
+```
 
 The latency-sensitive path stays entirely native: Hyper receives the body,
 Prost decodes it, the Rust coordinator routes it, and Hyper streams framed

@@ -1080,6 +1080,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2516,6 +2517,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum 0.8.4",
+ "baseten-configmap",
  "bytes",
  "dynamo-kv-router",
  "dynamo-llm",

@@ -14,6 +14,7 @@ mod guard;
 mod payload_copy;
 pub mod protocol;
 mod remote;
+mod runtime;
 mod service;
 mod types;
 
@@ -34,6 +35,7 @@ pub use generation::{
 };
 pub use guard::RouterRequestGuard;
 pub use remote::RemoteGenerationCoordinator;
+pub use runtime::{CoordinatorClient, GenerationCoordinatorRuntime, LocalCoordinatorOptions};
 pub use service::{GenerationCoordinatorService, RunningGenerationCoordinatorService};
 pub use types::{
     AdmittedRequestTimings, CancellationPolicy, DeniedRequest, MinReplicaAvailable,

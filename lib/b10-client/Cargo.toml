@@ -14,6 +14,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = { workspace = true }
+baseten-configmap = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }

@@ -3,7 +3,57 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+/// Listener settings apply at startup; null port disables HTTP.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GenerationCoordinatorConfig {
+    pub host: IpAddr,
+    pub port: Option<u16>,
+    pub remotes: Option<BTreeMap<String, String>>,
+}
+
+impl Default for GenerationCoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            host: Ipv4Addr::UNSPECIFIED.into(),
+            port: None,
+            remotes: None,
+        }
+    }
+}
+
+impl GenerationCoordinatorConfig {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(remotes) = &self.remotes {
+            anyhow::ensure!(
+                remotes.len() == 1,
+                "coordinator requires exactly one remote backend"
+            );
+            let (name, endpoint) = remotes.first_key_value().expect("length checked");
+            anyhow::ensure!(
+                !name.trim().is_empty(),
+                "coordinator backend name cannot be empty"
+            );
+            let url = url::Url::parse(endpoint)?;
+            anyhow::ensure!(
+                matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+                "coordinator backend must be an HTTP(S) URL with a host"
+            );
+            anyhow::ensure!(
+                url.username().is_empty() && url.password().is_none() && url.fragment().is_none(),
+                "coordinator backend URL cannot contain credentials or a fragment"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn listen_address(&self) -> Option<SocketAddr> {
+        self.port.map(|port| SocketAddr::new(self.host, port))
+    }
+}
 
 const DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND: f64 = 2.0 / 3.0;
 const ROUTER_ACTIVE_REQUEST_DP_BLEND_MIN: f64 = 0.0001;
@@ -338,6 +388,8 @@ fn sanitize_engine_metrics_total_kv_blocks_override(value: Option<u64>) -> Optio
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OverrideConfig {
     #[serde(default)]
+    b10_generation_coordinator_config: Option<GenerationCoordinatorConfig>,
+    #[serde(default)]
     b10_routing_config: Option<B10RoutingConfigOverride>,
 
     #[serde(default)]
@@ -353,6 +405,8 @@ struct OverrideConfig {
 /// Root configuration structure for parsing YAML
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LLMConfig {
+    #[serde(default)]
+    b10_generation_coordinator_config: GenerationCoordinatorConfig,
     #[serde(default)]
     b10_routing_config: B10RoutingConfig,
 
@@ -393,6 +447,7 @@ impl LLMRuntimeConfig {
 /// Unified config containing both routing and runtime configuration
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnifiedConfig {
+    pub generation_coordinator: GenerationCoordinatorConfig,
     pub routing: B10RoutingConfig,
     pub router_active_replicas: usize,
     pub runtime: LLMRuntimeConfig,
@@ -402,6 +457,7 @@ pub struct UnifiedConfig {
 impl Default for UnifiedConfig {
     fn default() -> Self {
         Self {
+            generation_coordinator: GenerationCoordinatorConfig::default(),
             routing: B10RoutingConfig::default(),
             router_active_replicas: default_router_active_replicas(),
             runtime: LLMRuntimeConfig::default(),
@@ -542,6 +598,9 @@ impl UnifiedConfig {
                 .as_ref()
                 .and_then(|groups| groups.get(group))
         {
+            if let Some(coordinator) = &group_config.b10_generation_coordinator_config {
+                root_config.b10_generation_coordinator_config = coordinator.clone();
+            }
             if let Some(routing_override) = &group_config.b10_routing_config {
                 root_config
                     .b10_routing_config
@@ -576,7 +635,9 @@ impl UnifiedConfig {
             enable_attention_dp: root_config.enable_attention_dp,
         };
 
+        root_config.b10_generation_coordinator_config.validate()?;
         let unified_config = UnifiedConfig {
+            generation_coordinator: root_config.b10_generation_coordinator_config,
             router_active_replicas: root_config.b10_routing_config.router_active_replicas,
             routing: root_config.b10_routing_config,
             runtime: runtime_config,
