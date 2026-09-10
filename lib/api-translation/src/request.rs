@@ -2027,7 +2027,7 @@ fn translate_input_items(
                     &call.call_id,
                     &chat_name,
                     &call.arguments,
-                )?);
+                ));
             }
             InputItem::Item(Item::McpCall(call)) => {
                 turn.close_thinking_segment();
@@ -2035,7 +2035,7 @@ fn translate_input_items(
                     &call.id,
                     &call.name,
                     &call.arguments,
-                )?);
+                ));
                 turn.flush_into(cc_messages);
                 let result = if let Some(error) = &call.error {
                     error.clone()
@@ -2328,16 +2328,26 @@ fn function_call_output_text(output: &FunctionCallOutput) -> Result<String, Stri
 /// An echoed `function_call`/`mcp_call` item back into the CC tool call TB originally sent. Unlike
 /// Anthropic's `input: Value`, the Responses arguments are already the model's verbatim JSON
 /// string, so there is no reserialize step to preserve byte-exactness for.
-fn responses_echoed_tool_call(id: &str, name: &str, raw_args: &str) -> Result<ToolCall, String> {
-    let args = serde_json::from_str(raw_args).map_err(|e| {
-        format!("echoed call `{id}` has non-JSON `arguments` (the model never produces those): {e}")
-    })?;
-    Ok(ToolCall {
+///
+/// Non-JSON `arguments` are not refused: a model can emit them (MP-1612), the client stores the
+/// call, and a 400 here wedges every later turn of the thread (MP-1657). Like OpenAI, the string
+/// is opaque history — replayed verbatim, with `args` carrying it as a JSON string so the
+/// downstream chat processor decides how to render it.
+fn responses_echoed_tool_call(id: &str, name: &str, raw_args: &str) -> ToolCall {
+    let args = serde_json::from_str(raw_args).unwrap_or_else(|error| {
+        tracing::warn!(
+            call_id = id,
+            %error,
+            "echoed tool call has non-JSON `arguments`; replaying verbatim"
+        );
+        Value::String(raw_args.to_string())
+    });
+    ToolCall {
         id: id.to_string(),
         name: name.to_string(),
         raw_args: raw_args.to_string(),
         args,
-    })
+    }
 }
 
 /// A caller-executed Responses tool definition -> a CC function tool. Any other declared tool

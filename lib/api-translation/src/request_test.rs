@@ -1130,12 +1130,34 @@ fn adapt_responses_missing_model_is_refused() {
     assert!(err.detail().contains("missing field `model`"), "{err}");
 }
 
+/// MP-1657: a replayed call whose `arguments` never parsed (the model emitted it that way, the
+/// client stored it) is history, not a request defect — it must not 400 the whole turn.
 #[test]
-fn adapt_responses_non_json_echoed_arguments_are_refused() {
-    let err = responses_echoed_tool_call("call_1", "get_weather", "{not json")
-        .err()
-        .unwrap();
-    assert!(err.contains("non-JSON `arguments`"), "{err}");
+fn adapt_responses_non_json_echoed_arguments_pass_through_verbatim() {
+    let call = responses_echoed_tool_call("call_1", "get_weather", "{not json");
+    assert_eq!(call.raw_args, "{not json");
+    assert_eq!(call.args, json!("{not json"));
+}
+
+/// End to end on the Responses input: the malformed replayed call and its output still split the
+/// turn, and the CC assistant message carries the exact bytes the client sent.
+#[test]
+fn adapt_responses_malformed_replayed_call_is_not_refused() {
+    let out = responses_input(json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Render a UI card."}]},
+        {"type": "function_call", "call_id": "c1", "name": "render_ui", "arguments": "{\"a\": "},
+        {"type": "function_call_output", "call_id": "c1", "output": "error: malformed arguments"},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Reply MP1657OK."}]},
+    ]));
+    assert_eq!(out.len(), 4);
+    assert_eq!(out[1]["role"], "assistant");
+    assert_eq!(out[1]["tool_calls"][0]["id"], "c1");
+    assert_eq!(out[1]["tool_calls"][0]["function"]["arguments"], "{\"a\": ");
+    assert_eq!(
+        out[2],
+        json!({"role": "tool", "tool_call_id": "c1", "content": "error: malformed arguments"})
+    );
+    assert_eq!(out[3]["role"], "user");
 }
 
 /// The openai/codex SDKs send `tool_choice: "auto"` unconditionally, even with no tools declared —

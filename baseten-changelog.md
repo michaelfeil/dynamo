@@ -2484,6 +2484,17 @@ the canonical per-stage line `stage.ingress` (elapsed_ms, outcome,
 error_class/status on rejection, model, losses, loss_kinds), replacing
 `predict.ingress_adapted`. Baseten-specific.
 
+Replayed Responses tool calls with non-JSON `arguments` are history, not a
+request defect (MP-1657, #784, paired with monorepo baseten#27877):
+`responses_echoed_tool_call` used to 400 ("the model never produces those"),
+but GLM-5.x does produce them (MP-1612), clients persist the call, and the
+400 then wedged every later turn of the thread. The string is now replayed
+verbatim (`raw_args`, what `history.rs` forwards as `function.arguments`),
+`args` carries it as a JSON string, and a `tracing::warn!` records the call
+id; structural malformation is still refused by the surrounding serde. The
+chat processor on the monorepo side wraps such strings for dict-iterating
+templates. Baseten-specific; not upstreamable.
+
 ## CC pivot: frontends on `b10-dynamo-api-translation` (ingress)
 
 The Messages and Responses handlers in lib/llm canonicalize through the shared
