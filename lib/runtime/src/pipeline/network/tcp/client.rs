@@ -356,6 +356,12 @@ async fn handle_writer(
     alive_rx: tokio::sync::oneshot::Receiver<()>,
     context: Arc<dyn AsyncEngineContext>,
 ) -> Result<FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>> {
+    // Keep one cancellation future per stream. Recreating these futures for every queued
+    // frame repeatedly clones the context's watch receivers and churns Notify state.
+    let killed = context.killed();
+    let stopped = context.stopped();
+    tokio::pin!(killed, stopped);
+
     // Only send sentinel for normal channel closure
     let mut send_sentinel = true;
 
@@ -363,13 +369,13 @@ async fn handle_writer(
         let msg = tokio::select! {
             biased;
 
-            _ = context.killed() => {
+            _ = &mut killed => {
                 tracing::trace!("context kill signal received; shutting down");
                 send_sentinel = false;
                 break;
             }
 
-            _ = context.stopped() => {
+            _ = &mut stopped => {
                 tracing::trace!("context stop signal received; shutting down");
                 send_sentinel = false;
                 break;

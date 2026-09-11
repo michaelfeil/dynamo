@@ -274,6 +274,23 @@ the target container stack.
 
 Status: `keep`
 
+Cancellation-future reuse (basetenlabs/dynamo#787): cherry-pick of upstream
+[ai-dynamo/dynamo#11149](https://github.com/ai-dynamo/dynamo/pull/11149)
+(`1820df91b570f53e8c51d519d9ff5d7d4105267d`), adapted to this fork's stream APIs.
+Upstream request-stream functions absent from this lineage are omitted; the
+HTTP regression test uses this fork's monitor signature and serialized tests.
+TCP response reader/writer, HTTP disconnect monitor, and KV response wrapper
+pin cancellation/closure futures once per stream instead of rebuilding them
+per frame. Preserve kill-before-stop ordering, the `can_stop` gate after a
+completed stop future, and per-frame inactivity timeout resets. Includes the
+upstream HTTP future-reuse regression test adapted to the fork's monitor.
+This is a stream-loop optimization; no booking cleanup or timeout policy changes.
+No fork-specific performance gain or incident resolution is claimed. Drop this
+port when the corresponding upstream implementation is incorporated.
+
+Focused validation: 42 TCP tests and 8 HTTP disconnect tests pass, including
+future reuse, stop/kill handling, and inactivity timeout reset coverage.
+
 Source commits:
 
 - `4a97a52bf` feat: runtime resilience and transport hardening

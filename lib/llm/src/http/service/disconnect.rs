@@ -241,6 +241,10 @@ pub fn monitor_for_disconnects(
 
     async_stream::try_stream! {
         tokio::pin!(stream);
+        // Keep the context's watch-backed cancellation future alive across body frames.
+        // Recreating it for every token repeatedly clones a receiver and churns Notify state.
+        let stopped = context.stopped();
+        tokio::pin!(stopped);
         loop {
             tokio::select! {
                 event = stream.next() => {
@@ -286,7 +290,7 @@ pub fn monitor_for_disconnects(
                         }
                     }
                 }
-                _ = context.stopped() => {
+                _ = &mut stopped => {
                     // Mark as cancelled when context is stopped (client disconnect or timeout)
                     inflight_guard.mark_error(ErrorType::Cancelled);
                     // Token counts (input_tokens, output_tokens) are recorded on
@@ -345,12 +349,14 @@ mod tests {
     #[derive(Debug)]
     struct MockContext {
         stopped: AtomicUsize,
+        stopped_polls: AtomicUsize,
         killed: AtomicUsize,
     }
     impl MockContext {
         fn new() -> Self {
             Self {
                 stopped: AtomicUsize::new(0),
+                stopped_polls: AtomicUsize::new(0),
                 killed: AtomicUsize::new(0),
             }
         }
@@ -376,6 +382,7 @@ mod tests {
             false
         }
         async fn stopped(&self) {
+            self.stopped_polls.fetch_add(1, Ordering::Relaxed);
             std::future::pending::<()>().await;
         }
         async fn killed(&self) {
@@ -430,6 +437,43 @@ mod tests {
     fn cleanup_env() {
         unsafe { std::env::remove_var(BACKEND_STREAM_TIMEOUT_ENV) };
         unsafe { std::env::remove_var(CLIENT_DISCONNECT_BEHAVIOR_ENV) };
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_monitor_reuses_stopped_future_across_events() {
+        cleanup_env();
+        let model = "reuse-stopped-future";
+        let metrics = Arc::new(Metrics::new());
+        let guard = metrics.clone().create_inflight_guard(
+            model,
+            Endpoint::ChatCompletions,
+            true,
+            "req-reuse",
+        );
+        let context = Arc::new(MockContext::new());
+        let engine_context: Arc<dyn AsyncEngineContext> = context.clone();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let handle = ConnectionHandle::create_disabled(tx);
+        let stream = futures::stream::unfold(0, |index| async move {
+            tokio::task::yield_now().await;
+            (index < 4).then(|| {
+                (
+                    Ok(Event::default().data(format!("token-{index}"))),
+                    index + 1,
+                )
+            })
+        });
+
+        let monitored = monitor_for_disconnects(stream, engine_context, guard, handle, false);
+        tokio::pin!(monitored);
+        while monitored.next().await.is_some() {}
+
+        assert_eq!(
+            context.stopped_polls.load(Ordering::Relaxed),
+            1,
+            "the same stopped future should remain pending across all response events"
+        );
     }
 
     #[test]

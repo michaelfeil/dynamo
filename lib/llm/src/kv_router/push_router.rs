@@ -858,12 +858,16 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             // Move guard into the stream closure. Drop fires here if the stream
             // is polled to completion, or via the outer Drop if never polled.
             let mut guard = guard;
+            // Keep one cancellation future alive for the whole response stream. Calling
+            // `stopped()` for every item repeatedly clones and polls a watch receiver.
+            let stopped = context_for_monitoring.stopped();
+            tokio::pin!(stopped);
 
             loop {
                 tokio::select! {
                     biased;
 
-                    _ = context_for_monitoring.stopped() => {
+                    _ = &mut stopped => {
                         tracing::debug!("Request {context_id} cancelled, ending stream");
                         break;
                     }
