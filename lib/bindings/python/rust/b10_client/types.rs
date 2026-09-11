@@ -4,9 +4,9 @@
 //! Python-facing request, option, denial, and admission wrappers for the
 //! language-neutral types in `dynamo-b10-client`.
 
+use crate::AsyncResponseStream;
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
 use crate::tokens::extract_list_or_numpy_u32;
-use crate::{AsyncResponseStream, Client};
 use dynamo_b10_client::{
     AdmittedRequestTimings, CancellationPolicy as CoreCancellationPolicy,
     DeniedRequest as CoreDeniedRequest, GenerationAdmission, RouterRequestGuard,
@@ -270,9 +270,7 @@ impl PyRouterRequestNew {
 
 /// Why a [`super::RouterWorkerCoordinator::route_and_worker`] call was denied. One of
 /// these is returned (never raised) instead of a `AdmittedRequest` when the
-/// router is backpressured, a `require_available` component is down, the
-/// optional `potential_loads_next_check` preflight found the next request
-/// would overfill the router, that preflight could not reach the router,
+/// router is backpressured, a `require_available` component is down,
 /// policy-allowed cancellation wins at a phase boundary, or
 /// `wait_for_first_response` could not read a first worker event.
 ///
@@ -296,30 +294,12 @@ pub(crate) enum DeniedRequest {
         /// The name of the down component (its endpoint id).
         name: String,
     },
-    /// The `potential_loads_next_check` preflight found the selected router
-    /// load percentile would exceed the configured thresholds.
-    NextRouterBackpressure {
-        /// Router-level pending queue depth (`pending_count`).
-        queue_depth: usize,
-        /// ISL tokens the router reports as currently queued.
-        pending_isl_tokens: usize,
-        /// Selected percentile of `potential_prefill_tokens` across workers.
-        /// Kept as a legacy field name for Python compatibility.
-        total_prefill_tokens: usize,
-        /// Selected percentile of `potential_decode_blocks` across workers.
-        /// Kept as a legacy field name for Python compatibility.
-        total_decode_blocks: usize,
-    },
-    /// The `potential_loads_next_check` preflight could not reach the router.
+    /// The selected worker could not be reached, including exhausted stale reroutes.
     NextRouterUnreachable {
-        /// The error encountered while querying the router.
+        /// The routing or worker connection error.
         error: String,
     },
-    /// The `potential_loads_next_check` preflight received an unexpected
-    /// router response (not `RouterResponse::PotentialLoads`): a
-    /// wrong-protocol shape such as `Backpressure` or `New`, or an
-    /// older/unknown variant. The preflight fails closed -- the request is
-    /// denied rather than passing the overload check unvalidated.
+    /// The router returned an unexpected response variant.
     ProtocolError {
         /// Debug representation of the unexpected `RouterResponse` variant
         /// received from the downstream router, for diagnostics.
@@ -355,17 +335,6 @@ impl From<CoreDeniedRequest> for DeniedRequest {
             CoreDeniedRequest::RequiredComponentsDown { name } => {
                 Self::RequiredComponentsDown { name }
             }
-            CoreDeniedRequest::NextRouterBackpressure {
-                queue_depth,
-                pending_isl_tokens,
-                total_prefill_tokens,
-                total_decode_blocks,
-            } => Self::NextRouterBackpressure {
-                queue_depth,
-                pending_isl_tokens,
-                total_prefill_tokens,
-                total_decode_blocks,
-            },
             CoreDeniedRequest::NextRouterUnreachable { error } => {
                 Self::NextRouterUnreachable { error }
             }
@@ -428,70 +397,6 @@ impl DeniedGenerationRequest {
 
     fn prefill_dp_rank(&self) -> Option<u32> {
         self.admission.map(|admission| admission.prefill_dp_rank)
-    }
-}
-
-/// Required preflight passed to [`super::RouterWorkerCoordinator::route_and_worker`]:
-/// before routing, the coordinator queries the *downstream* `client` (another
-/// router further along the pipeline, e.g. the next router in a
-/// disagg-prefill topology) for the *potential loads* of all its workers (the
-/// `potential_loads` method) and denies the request when the configured load
-/// percentile exceeds the thresholds -- so a request is not routed onward to an
-/// already-overloaded downstream router. A threshold of `0` disables that
-/// dimension (no limit). Prefill and decode thresholds are measured in tokens;
-/// decode is converted to blocks with the coordinator's `block_size` before
-/// comparing with router-reported `potential_decode_blocks`. Both load
-/// dimensions use `load_percentile` as a `0.0` to `1.0` fraction across workers,
-/// and `queue_depth` is the router-level `pending_count`.
-///
-/// The `client` is REQUIRED: it is the downstream router whose loads are checked
-/// (this is distinct from the routing router the coordinator routes through).
-/// The overlap-aware `block_mm_infos` conditioning the reported loads is passed
-/// on `PyRouterRequestNew` (and is shared by the route and the preflight), not on
-/// this check. Defaults:
-/// `queue_depth_threshold=0` (disabled), `prefill_tokens_threshold=1_000_000`,
-/// `decode_tokens_threshold=16_000_000`, `load_percentile=0.5` (p50).
-#[pyclass]
-pub(crate) struct RouterCoordinatorPotentialLoadsCheck {
-    /// Downstream router `Client` whose potential loads are checked ahead of
-    /// routing, to ensure it is not already overloaded.
-    #[pyo3(get, set)]
-    pub(super) client: Client,
-    #[pyo3(get, set)]
-    pub(super) queue_depth_threshold: usize,
-    #[pyo3(get, set)]
-    pub(super) prefill_tokens_threshold: usize,
-    #[pyo3(get, set)]
-    pub(super) decode_tokens_threshold: usize,
-    #[pyo3(get, set)]
-    pub(super) load_percentile: f64,
-}
-
-#[pymethods]
-impl RouterCoordinatorPotentialLoadsCheck {
-    #[new]
-    #[pyo3(signature = (
-        client,
-        queue_depth_threshold = 0,
-        prefill_tokens_threshold = 1_000_000,
-        decode_tokens_threshold = 16_000_000,
-        load_percentile = 0.5,
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        client: Client,
-        queue_depth_threshold: usize,
-        prefill_tokens_threshold: usize,
-        decode_tokens_threshold: usize,
-        load_percentile: f64,
-    ) -> Self {
-        Self {
-            client,
-            queue_depth_threshold,
-            prefill_tokens_threshold,
-            decode_tokens_threshold,
-            load_percentile,
-        }
     }
 }
 
@@ -610,7 +515,7 @@ impl AdmittedRequest {
     }
 
     /// Seconds from entering route/connect setup to the successful KV-router
-    /// `new` response used for this admitted worker. Includes preflight and any
+    /// `new` response used for this admitted worker. Includes availability checks and
     /// stale-route reroute work before the final accepted route.
     fn routing_new_duration_seconds(&self) -> f64 {
         self.timings.routing_new_duration.as_secs_f64()

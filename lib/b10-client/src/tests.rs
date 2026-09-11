@@ -3,10 +3,7 @@ use super::coordinator::{
     shield_route_and_connect, stream_with_optional_prefill_mark,
 };
 use super::guard::{ROUTER_GUARD_CLEANUP_GRACE_PERIOD, RouterRequestGuard};
-use super::types::{
-    AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable,
-    PotentialLoadsCheck as PotentialLoadsCheckData, PreflightInputs, RouterRequestNew,
-};
+use super::types::{AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, RouterRequestNew};
 use crate::{
     CancellationPolicy, DisaggregationStrategy, GenerationCoordinator, GenerationOptions,
     GenerationOutcome, GenerationRequest, PrefillMarkTiming, RequestContext, RouteOptions,
@@ -770,50 +767,6 @@ fn backpressure_response(
     })
 }
 
-/// Single-worker PotentialLoads scripted response used by the preflight tests.
-fn potential_loads_response(
-    potential_prefill_tokens: usize,
-    potential_decode_blocks: usize,
-    pending_count: usize,
-    pending_isl_tokens: usize,
-) -> Result<RsRouterResponse, String> {
-    Ok(RsRouterResponse::PotentialLoads {
-        loads: vec![RsPotentialLoad {
-            worker_id: 1,
-            dp_rank: 0,
-            potential_prefill_tokens,
-            potential_decode_blocks,
-            active_requests: 0,
-        }],
-        pending_count,
-        pending_isl_tokens,
-    })
-}
-
-fn potential_loads_response_for_workers(
-    loads: Vec<(usize, usize)>,
-    pending_count: usize,
-    pending_isl_tokens: usize,
-) -> Result<RsRouterResponse, String> {
-    Ok(RsRouterResponse::PotentialLoads {
-        loads: loads
-            .into_iter()
-            .enumerate()
-            .map(
-                |(idx, (potential_prefill_tokens, potential_decode_blocks))| RsPotentialLoad {
-                    worker_id: idx as u64 + 1,
-                    dp_rank: idx as u32,
-                    potential_prefill_tokens,
-                    potential_decode_blocks,
-                    active_requests: 0,
-                },
-            )
-            .collect(),
-        pending_count,
-        pending_isl_tokens,
-    })
-}
-
 /// Test driver: cast both role fakes to `Arc<dyn RouterGuardClient>` and
 /// forward to the real `route_and_connect` so a test exercises the
 /// production routing -> connect lifecycle end-to-end.
@@ -825,7 +778,6 @@ async fn connect(
     request_id: &str,
     context: RequestContext,
     require: Vec<MinReplicaAvailable>,
-    preflight_inputs: Option<PreflightInputs>,
     worker_request: rmpv::Value,
     max_reroutes: u64,
     allow_cancel_routing: bool,
@@ -839,7 +791,6 @@ async fn connect(
         request_id.to_string(),
         context,
         require,
-        preflight_inputs,
         worker_request,
         TEST_BLOCK_SIZE,
         max_reroutes,
@@ -1025,7 +976,6 @@ async fn route_and_connect_happy_router_response_inject_and_mark_free_on_drop() 
         "req-happy",
         context.clone(),
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -1078,7 +1028,6 @@ async fn route_and_connect_wait_for_first_response_omits_sentinel() {
         "req-swallow-first-event".to_string(),
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         TEST_BLOCK_SIZE,
         0,
@@ -1148,7 +1097,6 @@ async fn route_and_connect_wait_for_first_response_replays_non_sentinel_item() {
         "req-swallow-first-event-non-health".to_string(),
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         TEST_BLOCK_SIZE,
         0,
@@ -1225,7 +1173,6 @@ async fn stream_prefill_mark_skips_internal_event_and_marks_first_real_item() {
         "req-prefill-mark-first-real-item",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -1278,7 +1225,6 @@ async fn route_and_connect_wait_for_first_response_uses_sentinel_behavior() {
         "req-wait-and-return-first-event-sentinel".to_string(),
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         TEST_BLOCK_SIZE,
         0,
@@ -1341,7 +1287,6 @@ async fn route_and_connect_wait_for_first_response_failure_returns_denied() {
         "req-swallow-first-event-denied".to_string(),
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         TEST_BLOCK_SIZE,
         0,
@@ -1392,7 +1337,6 @@ async fn route_and_connect_proactive_stale_reroutes_then_connects() {
         "req-proactive-stale",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         1,
         true,
@@ -1465,7 +1409,6 @@ async fn route_and_connect_stale_loop_exhausted_returns_next_router_unreachable(
         "req-stale-exhausted",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         1,
         true,
@@ -1521,7 +1464,6 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
         "req-reactive-stale",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         1,
         true,
@@ -1591,7 +1533,6 @@ async fn route_and_connect_non_stale_open_error_raises_and_frees_guard() {
         "req-non-stale",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -1634,7 +1575,6 @@ async fn route_and_connect_router_backpressure_returns_denied() {
         "req-bp",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -1683,7 +1623,6 @@ async fn route_and_connect_router_queue_backpressure_reason_is_preserved() {
         "req-router-queue-bp",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -1728,7 +1667,6 @@ async fn route_and_connect_cancellable_routing_frees_late_new_after_parent_stop(
             "req-route-late-new-cancelled",
             context_for_task,
             Vec::new(),
-            None,
             make_worker_request(),
             0,
             true,
@@ -1772,7 +1710,6 @@ async fn route_and_connect_cancellable_setup_frees_late_stream_after_parent_stop
             "req-setup-late-stream-cancelled",
             context_for_task,
             Vec::new(),
-            None,
             make_worker_request(),
             0,
             true,
@@ -1814,7 +1751,6 @@ async fn route_and_connect_detached_setup_ignores_already_stopped_parent() {
         "req-detached-setup-stopped-parent",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         false,
@@ -1939,7 +1875,6 @@ async fn route_and_connect_first_response_timeout_kills_route_context_and_backpr
         "req-first-response-timeout",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -2003,7 +1938,6 @@ async fn route_and_connect_require_available_goes_down_post_route_returns_denied
             name: "prefillworker".to_string(),
             router: required,
         }],
-        None,
         make_worker_request(),
         0,
         true,
@@ -2029,423 +1963,6 @@ async fn route_and_connect_require_available_goes_down_post_route_returns_denied
     assert_eq!(router.method_call_count("mark_free"), 1);
 }
 
-#[tokio::test]
-async fn route_and_connect_preflight_overflow_returns_next_router_backpressure() {
-    // Single-worker p50 prefill tokens (10_000) exceed the threshold (1_000)
-    // -> evaluate_potential_loads returns Some(NextRouterBackpressureInfo).
-    // The potential-loads preflight runs before the route, so the route request
-    // is never sent and there is no routed guard to free.
-    // The other thresholds are set high so only prefill trips.
-    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
-    let next = RouterGuardClientForTesting::new(
-        vec![9],
-        vec![9],
-        vec![potential_loads_response(10_000, 1_000, 50, 5_000)],
-    );
-    let context = build_test_context("test-preflight-overflow");
-
-    let preflight_inputs = PreflightInputs {
-        check: PotentialLoadsCheckData {
-            router: next.clone(),
-            queue_depth_threshold: 100,
-            prefill_tokens_threshold: 1_000,
-            decode_tokens_threshold: 100_000,
-            load_percentile: 0.5,
-        },
-        tokens: vec![1],
-        block_mm_infos: None,
-    };
-
-    let outcome = connect(
-        router.clone(),
-        worker.clone(),
-        make_routing_request(),
-        "req-pf-overflow",
-        context,
-        Vec::new(),
-        Some(preflight_inputs),
-        make_worker_request(),
-        0,
-        true,
-        true,
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("denied, not raised");
-
-    match outcome {
-        RouteAndConnectOutcome::Denied(DeniedRequest::NextRouterBackpressure {
-            queue_depth,
-            pending_isl_tokens,
-            total_prefill_tokens,
-            total_decode_blocks,
-        }) => {
-            assert_eq!(queue_depth, 50);
-            assert_eq!(pending_isl_tokens, 5_000);
-            assert_eq!(total_prefill_tokens, 10_000);
-            assert_eq!(total_decode_blocks, 1_000);
-        }
-        other => panic!("expected Denied(NextRouterBackpressure), got {:?}", other),
-    }
-
-    // Preflight ran on next; route and worker were never reached, so no routed
-    // guard exists and no mark_free is sent.
-    assert_eq!(next.method_call_count("potential_loads"), 1);
-    assert_eq!(router.method_call_count("new"), 0);
-    assert_eq!(router.method_call_count("mark_free"), 0);
-    assert_eq!(worker.method_call_count("generate"), 0);
-}
-
-#[tokio::test]
-async fn route_and_connect_preflight_uses_configured_load_percentile_not_sum() {
-    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
-    let next = RouterGuardClientForTesting::new(
-        vec![9],
-        vec![9],
-        vec![potential_loads_response_for_workers(
-            vec![(10, 1), (20, 2), (1_000, 100)],
-            0,
-            0,
-        )],
-    );
-    let context = build_test_context("test-preflight-percentile");
-
-    let preflight_inputs = PreflightInputs {
-        check: PotentialLoadsCheckData {
-            router: next.clone(),
-            queue_depth_threshold: 0,
-            prefill_tokens_threshold: 500,
-            decode_tokens_threshold: 500,
-            load_percentile: 0.5,
-        },
-        tokens: vec![1],
-        block_mm_infos: None,
-    };
-
-    let outcome = connect(
-        router.clone(),
-        worker.clone(),
-        make_routing_request(),
-        "req-pf-percentile",
-        context,
-        Vec::new(),
-        Some(preflight_inputs),
-        make_worker_request(),
-        0,
-        true,
-        true,
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("ok");
-
-    match outcome {
-        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(worker_id, 1),
-        other => panic!(
-            "expected Connected because p50 load passes, got {:?}",
-            other
-        ),
-    }
-
-    assert_eq!(next.method_call_count("potential_loads"), 1);
-    assert_eq!(worker.method_call_count("generate"), 1);
-    drop(outcome);
-    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
-}
-
-#[tokio::test]
-async fn route_and_connect_preflight_decode_threshold_accepts_tokens() {
-    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
-    let next = RouterGuardClientForTesting::new(
-        vec![9],
-        vec![9],
-        vec![potential_loads_response(1, 2, 0, 0)],
-    );
-    let context = build_test_context("test-preflight-decode-token-threshold");
-
-    let preflight_inputs = PreflightInputs {
-        check: PotentialLoadsCheckData {
-            router: next.clone(),
-            queue_depth_threshold: 0,
-            prefill_tokens_threshold: 100,
-            // 33 tokens at block size 32 ceil-converts to 2 blocks, so a
-            // reported load of 2 decode blocks is within threshold.
-            decode_tokens_threshold: TEST_BLOCK_SIZE as usize + 1,
-            load_percentile: 0.5,
-        },
-        tokens: vec![1],
-        block_mm_infos: None,
-    };
-
-    let outcome = connect(
-        router.clone(),
-        worker.clone(),
-        make_routing_request(),
-        "req-pf-decode-token-threshold",
-        context,
-        Vec::new(),
-        Some(preflight_inputs),
-        make_worker_request(),
-        0,
-        true,
-        true,
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("ok");
-
-    match outcome {
-        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(worker_id, 1),
-        other => panic!("expected Connected, got {:?}", other),
-    }
-
-    assert_eq!(next.method_call_count("potential_loads"), 1);
-    assert_eq!(worker.method_call_count("generate"), 1);
-    drop(outcome);
-    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
-}
-
-#[tokio::test]
-async fn route_and_connect_preflight_thresholds_zero_disables_preflight() {
-    // All thresholds zero disables every dimension -- even though the
-    // preflight reports heavy load. The preflight returns Ok(None), the
-    // route succeeds, and the worker connect happens -> Connected{1}.
-    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
-    let next = RouterGuardClientForTesting::new(
-        vec![9],
-        vec![9],
-        vec![potential_loads_response(
-            usize::MAX / 4,
-            1_000,
-            usize::MAX / 4,
-            5_000,
-        )],
-    );
-    let context = build_test_context("test-preflight-zero");
-
-    let preflight_inputs = PreflightInputs {
-        check: PotentialLoadsCheckData {
-            router: next.clone(),
-            queue_depth_threshold: 0,
-            prefill_tokens_threshold: 0,
-            decode_tokens_threshold: 0,
-            load_percentile: 0.5,
-        },
-        tokens: vec![1],
-        block_mm_infos: None,
-    };
-
-    let outcome = connect(
-        router.clone(),
-        worker.clone(),
-        make_routing_request(),
-        "req-pf-zero",
-        context,
-        Vec::new(),
-        Some(preflight_inputs),
-        make_worker_request(),
-        0,
-        true,
-        true,
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("ok");
-
-    match outcome {
-        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(worker_id, 1),
-        other => panic!("expected Connected, got {:?}", other),
-    }
-
-    // Preflight DID run (so the disabled-threshold path is covered);
-    // the route succeeded; the worker's direct opened.
-    assert_eq!(next.method_call_count("potential_loads"), 1);
-    assert_eq!(worker.method_call_count("generate"), 1);
-    drop(outcome);
-    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn route_and_connect_preflight_follows_cancellable_routing_policy() {
-    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
-    let next = RouterGuardClientForTesting::new(
-        vec![9],
-        vec![9],
-        vec![potential_loads_response(1, 1, 0, 0)],
-    );
-    next.set_respect_cancel(CancelRespect::Yes);
-    let context = build_test_context("test-preflight-cancellable-routing");
-    context.inner().stop_generating();
-
-    let preflight_inputs = PreflightInputs {
-        check: PotentialLoadsCheckData {
-            router: next.clone(),
-            queue_depth_threshold: 100,
-            prefill_tokens_threshold: 100,
-            decode_tokens_threshold: 100,
-            load_percentile: 0.5,
-        },
-        tokens: vec![1],
-        block_mm_infos: None,
-    };
-
-    let outcome = connect(
-        router.clone(),
-        worker.clone(),
-        make_routing_request(),
-        "req-pf-cancellable-routing",
-        context,
-        Vec::new(),
-        Some(preflight_inputs),
-        make_worker_request(),
-        0,
-        true,
-        true,
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("denied, not raised");
-
-    assert!(matches!(
-        outcome,
-        RouteAndConnectOutcome::Denied(DeniedRequest::Cancelled())
-    ));
-
-    assert_eq!(next.calls().len(), 0);
-    assert_eq!(next.method_call_count("potential_loads"), 0);
-    assert_eq!(router.method_call_count("new"), 0);
-    assert_eq!(worker.method_call_count("generate"), 0);
-    let preflight_contexts = next.route_contexts();
-    assert!(preflight_contexts.is_empty());
-}
-
-#[tokio::test]
-async fn route_and_connect_preflight_detaches_when_routing_cancellation_disabled() {
-    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    router.set_respect_cancel(CancelRespect::Yes);
-    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
-    let next = RouterGuardClientForTesting::new(
-        vec![9],
-        vec![9],
-        vec![potential_loads_response(1, 1, 0, 0)],
-    );
-    next.set_respect_cancel(CancelRespect::Yes);
-    let context = build_test_context("test-preflight-detached-routing");
-    context.inner().stop_generating();
-
-    let preflight_inputs = PreflightInputs {
-        check: PotentialLoadsCheckData {
-            router: next.clone(),
-            queue_depth_threshold: 100,
-            prefill_tokens_threshold: 100,
-            decode_tokens_threshold: 100,
-            load_percentile: 0.5,
-        },
-        tokens: vec![1],
-        block_mm_infos: None,
-    };
-
-    let outcome = connect(
-        router.clone(),
-        worker.clone(),
-        make_routing_request(),
-        "req-pf-detached-routing",
-        context,
-        Vec::new(),
-        Some(preflight_inputs),
-        make_worker_request(),
-        0,
-        false,
-        false,
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("ok");
-
-    match &outcome {
-        RouteAndConnectOutcome::Connected { worker_id, .. } => assert_eq!(*worker_id, 1),
-        other => panic!("expected Connected, got {:?}", other),
-    }
-
-    assert_eq!(next.method_call_count("potential_loads"), 1);
-    assert_eq!(router.method_call_count("new"), 1);
-    assert_eq!(worker.method_call_count("generate"), 1);
-    let preflight_contexts = next.route_contexts();
-    assert_eq!(preflight_contexts.len(), 1);
-    assert!(!preflight_contexts[0].is_stopped());
-    assert!(!preflight_contexts[0].is_killed());
-    let route_contexts = router.route_contexts();
-    assert_eq!(route_contexts.len(), 1);
-    assert!(!route_contexts[0].is_stopped());
-    assert!(!route_contexts[0].is_killed());
-
-    drop(outcome);
-    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
-}
-
-#[tokio::test]
-async fn route_and_connect_preflight_unreachable_returns_next_router_unreachable() {
-    // Preflight router fake has NO available instances -> query_potential_loads
-    // bails with "no router instances available...". Because preflight is
-    // sequential, the route request is never sent.
-    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
-    let next = RouterGuardClientForTesting::new(vec![], vec![], vec![]);
-    let context = build_test_context("test-pf-unreachable");
-
-    let preflight_inputs = PreflightInputs {
-        check: PotentialLoadsCheckData {
-            router: next.clone(),
-            queue_depth_threshold: 0,
-            prefill_tokens_threshold: 1_000_000,
-            decode_tokens_threshold: 16_000_000,
-            load_percentile: 0.5,
-        },
-        tokens: vec![1],
-        block_mm_infos: None,
-    };
-
-    let outcome = connect(
-        router.clone(),
-        worker.clone(),
-        make_routing_request(),
-        "req-pf-unreachable",
-        context,
-        Vec::new(),
-        Some(preflight_inputs),
-        make_worker_request(),
-        0,
-        true,
-        true,
-        Duration::from_secs(60),
-    )
-    .await
-    .expect("denied, not raised");
-
-    match outcome {
-        RouteAndConnectOutcome::Denied(DeniedRequest::NextRouterUnreachable { error }) => {
-            assert!(
-                error.contains("no router instances available"),
-                "error: {}",
-                error
-            );
-        }
-        other => panic!("expected Denied(NextRouterUnreachable), got {:?}", other),
-    }
-
-    // Preflight was attempted but never made a direct() call (empty
-    // instance set bails before the loop); route and worker were never called.
-    assert_eq!(next.method_call_count("potential_loads"), 0);
-    assert_eq!(router.method_call_count("new"), 0);
-    assert_eq!(router.method_call_count("mark_free"), 0);
-    assert_eq!(worker.method_call_count("generate"), 0);
-}
-
 #[tokio::test(start_paused = true)]
 async fn route_and_connect_cancellable_routing_checks_stopped_context_before_direct() {
     // Stop the parent context BEFORE awaiting route_and_connect. Cancellable
@@ -2465,7 +1982,6 @@ async fn route_and_connect_cancellable_routing_checks_stopped_context_before_dir
         "req-routing-cancel",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -2498,7 +2014,7 @@ async fn route_and_connect_post_admit_stream_eof_fires_mark_free_then_denies_unr
     // guard requests `mark_free`, kills the detached route context, and waits
     // for cleanup before the retry can reuse the same request id. Both
     // ROUTER_GUARD_ATTEMPTS=2 attempts hit this path; the loop exhausts and
-    // `route_request` returns Err, which `route_once` (no preflight, no
+    // `route_request` returns Err, which `route_once` (no
     // require_during) maps to `Denied::NextRouterUnreachable`.
     //
     // Asserts `mark_free == 2` -- one per attempt's cleanup task. This is
@@ -2521,7 +2037,6 @@ async fn route_and_connect_post_admit_stream_eof_fires_mark_free_then_denies_unr
         "req-post-admit-eof",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -2580,9 +2095,7 @@ async fn route_and_connect_unexpected_response_variant_fires_mark_free_then_deni
     // mark_free, drops the provisional guard, returns an unarmed placeholder
     // guard with
     // `RouteSource::ProtocolError { received }`. `route_once` maps that to
-    // `Denied::ProtocolError { received }`. Mirrors the stricter
-    // `potential_loads` handling (`PotentialLoadsError::ProtocolError`
-    // -> `DeniedRequest::ProtocolError`).
+    // `Denied::ProtocolError { received }`.
     //
     // Only the FIRST attempt's instance hits this path: route_request
     // `return`s immediately on the unexpected variant, so only one
@@ -2598,7 +2111,6 @@ async fn route_and_connect_unexpected_response_variant_fires_mark_free_then_deni
         "req-unexpected-variant",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -2652,7 +2164,6 @@ async fn route_and_connect_stream_cancelled_in_band_truncates_stream() {
         "req-stream-cancel",
         context.clone(),
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -2715,7 +2226,6 @@ async fn route_and_connect_lifecycle_mark_prefill_then_mark_free_order() {
         "req-lifecycle",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -2782,7 +2292,6 @@ async fn route_and_connect_slow_mark_free_callback_still_completes_once() {
         "req-slow-mark-free",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -2833,7 +2342,6 @@ async fn route_and_connect_mark_free_preempts_in_flight_mark_prefill() {
         "req-prefill-preempted-by-free",
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         0,
         true,
@@ -2906,7 +2414,6 @@ async fn route_and_connect_detached_setup_completes_after_outer_abort() {
             "req-detached-setup",
             context_for_task,
             Vec::new(),
-            None,
             worker_request,
             0,
             true,
@@ -2965,7 +2472,6 @@ async fn shield_route_and_connect_no_taker_drains_connected_worker_stream() {
         "req-shield-route-no-taker".to_string(),
         context,
         Vec::new(),
-        None,
         make_worker_request(),
         TEST_BLOCK_SIZE,
         0,
@@ -3018,7 +2524,6 @@ async fn route_and_connect_cancellable_setup_drops_on_outer_abort() {
             "req-cancellable-setup",
             context_for_task,
             Vec::new(),
-            None,
             worker_request,
             0,
             true,
@@ -3552,11 +3057,8 @@ async fn generation_coordinator_prefill_first_moves_handoff_and_drops_bootstrap(
                 "required_taints": ["rack=a"]
             }
         })]]);
-        let decode_router = RouterGuardClientForTesting::new(
-            vec![8],
-            vec![8],
-            vec![potential_loads_response(1, 1, 0, 0), route_response_new(2)],
-        );
+        let decode_router =
+            RouterGuardClientForTesting::new(vec![8], vec![8], vec![route_response_new(2)]);
         let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
         decode_worker
             .set_stream_chunks(vec![vec![jv!({"bootstrap": true}), jv!({"decode": true})]]);
@@ -3590,10 +3092,7 @@ async fn generation_coordinator_prefill_first_moves_handoff_and_drops_bootstrap(
                     }),
                     decode_worker_request: Some(jv!({"method": "generate", "prompt": "hello"})),
                 },
-                GenerationOptions {
-                    enable_potential_loads_next_check: true,
-                    ..Default::default()
-                },
+                GenerationOptions::default(),
             )
             .await
             .expect("generation starts");
@@ -3641,7 +3140,7 @@ async fn generation_coordinator_prefill_first_moves_handoff_and_drops_bootstrap(
             decode_call["disaggregated_params"]["disagg_request_id"].as_u64(),
             Some(1234)
         );
-        assert_eq!(decode_router.method_call_count("potential_loads"), 1);
+        assert_eq!(decode_router.method_call_count("potential_loads"), 0);
         let decode_route = decode_router
             .calls()
             .into_iter()

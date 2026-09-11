@@ -26,7 +26,7 @@ message BidResponse
 
 message NewRequest
 {
-  reserved 7, 8, 12;
+  reserved 7, 8, 12, 13;
   reserved "sampling", "streaming", "user";
   string model = 1;
   repeated uint32 tokens = 2 [packed = true];
@@ -37,7 +37,6 @@ message NewRequest
   optional string cache_salt = 9;
   optional sint32 engine_priority = 10;
   optional string service_tier = 11;
-  bool enable_potential_loads_next_check = 13;
   // Named MessagePack map: required sampling_params, optional
   // dynamic_temperature_rules and prompt_logprobs. Values are backend-defined.
   bytes sampling_msgpack = 14;
@@ -150,11 +149,12 @@ message DeniedGeneration
 
 message DeniedRequest
 {
+  reserved 8 to 11;
   enum Kind {
     KIND_UNSPECIFIED = 0;
     ROUTER_BACKPRESSURE = 1;
     REQUIRED_COMPONENTS_DOWN = 2;
-    NEXT_ROUTER_BACKPRESSURE = 3;
+    reserved 3;
     NEXT_ROUTER_UNREACHABLE = 4;
     PROTOCOL_ERROR = 5;
     CANCELLED = 6;
@@ -167,10 +167,6 @@ message DeniedRequest
   optional string received = 5;
   uint64 queued_isl_tokens = 6;
   optional uint64 max_queued_isl_tokens = 7;
-  uint64 queue_depth = 8;
-  uint64 pending_isl_tokens = 9;
-  uint64 total_prefill_tokens = 10;
-  uint64 total_decode_blocks = 11;
 }
 
 message ProtocolError

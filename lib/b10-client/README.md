@@ -197,5 +197,5 @@ tests. `JsonRouterGuardClient` adapts Dynamo's JSON `PushRouter`.
 
 The Python extension in `lib/bindings/python` only converts Python values,
 adapts the response stream, and exposes the Rust admission result as PyO3
-classes. Changes to routing, preflight, reroute, cancellation, and guard cleanup
+classes. Changes to routing, reroute, cancellation, and guard cleanup
 belong in this crate.

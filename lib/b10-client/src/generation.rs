@@ -10,9 +10,8 @@
 //! stay at the language binding and are passed here as opaque MessagePack maps.
 
 use crate::{
-    CancellationPolicy, PotentialLoadsCheck, RequestContext, RouteAndConnectOutcome, RouteOptions,
-    RouterRequestNew, RouterWorkerCoordinator, RouterWorkerPhase,
-    stream_with_optional_prefill_mark,
+    CancellationPolicy, RequestContext, RouteAndConnectOutcome, RouteOptions, RouterRequestNew,
+    RouterWorkerCoordinator, RouterWorkerPhase, stream_with_optional_prefill_mark,
 };
 use anyhow::{Context, Result, bail};
 use dynamo_kv_router::protocols::RoutingConstraints;
@@ -30,11 +29,6 @@ const MIN_GLOBAL_DISAGG_REQUEST_ID: u64 = 1 << 42;
 const MACHINE_ID_BITS: u32 = 10;
 const COUNTER_BITS: u32 = 12;
 static DISAGG_REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-pub const POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD: usize = 10;
-pub const POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD: usize = 512_000;
-pub const POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD: usize = 32_000_000;
-pub const POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE: f64 = 0.5;
 
 /// Generation topology implemented by [`GenerationCoordinator`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,8 +67,6 @@ pub struct GenerationRequest {
 pub struct GenerationOptions {
     pub primary: RouteOptions,
     pub decode: RouteOptions,
-    /// Probe the downstream router before admitting prefill.
-    pub enable_potential_loads_next_check: bool,
 }
 
 /// Admission metadata from the prefill-bearing route.
@@ -228,25 +220,9 @@ impl GenerationCoordinator {
         &self,
         context: RequestContext,
         request: GenerationRequest,
-        mut options: GenerationOptions,
+        options: GenerationOptions,
     ) -> Result<GenerationOutcome> {
         validate_generation_request(&request, self.strategy)?;
-        if options.enable_potential_loads_next_check {
-            let next = self
-                .next
-                .as_ref()
-                .context("potential-load checking requires a downstream router")?;
-            options
-                .primary
-                .potential_loads_check
-                .get_or_insert_with(|| PotentialLoadsCheck {
-                    router: next.router(),
-                    queue_depth_threshold: POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD,
-                    prefill_tokens_threshold: POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
-                    decode_tokens_threshold: POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
-                    load_percentile: POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE,
-                });
-        }
         match self.strategy {
             DisaggregationStrategy::Aggregated => {
                 self.generate_aggregated(context, request, options.primary)
@@ -264,9 +240,6 @@ impl GenerationCoordinator {
         mut request: GenerationRequest,
         mut options: RouteOptions,
     ) -> Result<GenerationOutcome> {
-        if options.potential_loads_check.is_some() {
-            bail!("potential loads next check cannot be used for aggregated generation");
-        }
         set_map_field(
             &mut request.primary_worker_request,
             "disaggregation_mode",
@@ -412,9 +385,6 @@ impl GenerationCoordinator {
         // decode stream back to the parent so normal client cancellation is
         // restored after the critical handoff window.
         options.decode.cancellation = CancellationPolicy::DetachToWorkerStreamConnected;
-        if options.decode.potential_loads_check.is_some() {
-            bail!("potential loads next check cannot be used on the terminal decode leg");
-        }
         // GenerationCoordinatorV2 intentionally applies request priority only
         // to the first routed component. Allowed workers and do_not_queue are
         // request-wide and remain on the cloned request.

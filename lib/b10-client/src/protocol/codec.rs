@@ -8,7 +8,7 @@ use super::*;
 use crate::protocol;
 use crate::{
     DeniedGenerationRequest, DeniedRequest, DisaggregationStrategy, GenerationAdmission,
-    GenerationOptions, GenerationRequest, RequestContext, RouterRequestNew,
+    GenerationRequest, RequestContext, RouterRequestNew,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use dynamo_kv_router::protocols::{BlockExtraInfo, BlockMmObjectInfo, RoutingConstraints};
@@ -19,7 +19,6 @@ use std::collections::{HashMap, HashSet};
 pub(crate) fn encode_request(
     context: &RequestContext,
     request: GenerationRequest,
-    options: &GenerationOptions,
 ) -> Result<NewRequestV1> {
     let GenerationRequest {
         routing_request,
@@ -98,7 +97,6 @@ pub(crate) fn encode_request(
         cache_salt: worker.cache_salt,
         engine_priority: worker.priority,
         service_tier: worker.service_tier,
-        enable_potential_loads_next_check: options.enable_potential_loads_next_check,
     };
     protocol::validate_request(&request)?;
     Ok(request)
@@ -238,7 +236,7 @@ pub(crate) fn decode_new_request(
     request_id: String,
     request: NewRequestV1,
     strategy: DisaggregationStrategy,
-) -> Result<(GenerationRequest, bool)> {
+) -> Result<GenerationRequest> {
     let routing = request.routing.context("new_request.routing is required")?;
     let sampling_payload: SamplingPayload<Value> =
         rmp_serde::from_slice(&request.sampling_msgpack).context("invalid sampling_msgpack")?;
@@ -279,35 +277,32 @@ pub(crate) fn decode_new_request(
         .mm_routing_args
         .map(mm_routing_args_from_wire)
         .transpose()?;
-    Ok((
-        GenerationRequest {
-            routing_request: RouterRequestNew {
-                tokens: request.tokens,
-                block_mm_infos,
-                routing_constraints: RoutingConstraints {
-                    required_taints: routing_constraints.required_taints.into_iter().collect(),
-                    preferred_taints: routing_constraints
-                        .preferred_taints
-                        .into_iter()
-                        .map(|taint| (taint.taint, taint.weight))
-                        .collect::<HashMap<_, _>>(),
-                },
-                allowed_worker_ids: (!routing.allowed_worker_ids.is_empty()).then(|| {
-                    routing
-                        .allowed_worker_ids
-                        .into_iter()
-                        .collect::<HashSet<_>>()
-                }),
-                priority_jump: routing.priority_jump,
-                priority_load_shed_percent: u8::try_from(routing.priority_load_shed_percent)
-                    .context("routing.priority_load_shed_percent exceeds uint8")?,
-                do_not_queue: routing.do_not_queue,
+    Ok(GenerationRequest {
+        routing_request: RouterRequestNew {
+            tokens: request.tokens,
+            block_mm_infos,
+            routing_constraints: RoutingConstraints {
+                required_taints: routing_constraints.required_taints.into_iter().collect(),
+                preferred_taints: routing_constraints
+                    .preferred_taints
+                    .into_iter()
+                    .map(|taint| (taint.taint, taint.weight))
+                    .collect::<HashMap<_, _>>(),
             },
-            primary_worker_request,
-            decode_worker_request,
+            allowed_worker_ids: (!routing.allowed_worker_ids.is_empty()).then(|| {
+                routing
+                    .allowed_worker_ids
+                    .into_iter()
+                    .collect::<HashSet<_>>()
+            }),
+            priority_jump: routing.priority_jump,
+            priority_load_shed_percent: u8::try_from(routing.priority_load_shed_percent)
+                .context("routing.priority_load_shed_percent exceeds uint8")?,
+            do_not_queue: routing.do_not_queue,
         },
-        request.enable_potential_loads_next_check,
-    ))
+        primary_worker_request,
+        decode_worker_request,
+    })
 }
 
 pub(crate) fn trace_context_from_wire(trace: protocol::TraceContextV1) -> DistributedTraceContext {
@@ -456,18 +451,6 @@ fn denied_request_to_wire(value: DeniedRequest) -> DeniedRequestV1 {
             output.kind = DeniedKindV1::RequiredComponentsDown.into();
             output.name = Some(name);
         }
-        DeniedRequest::NextRouterBackpressure {
-            queue_depth,
-            pending_isl_tokens,
-            total_prefill_tokens,
-            total_decode_blocks,
-        } => {
-            output.kind = DeniedKindV1::NextRouterBackpressure.into();
-            output.queue_depth = queue_depth as u64;
-            output.pending_isl_tokens = pending_isl_tokens as u64;
-            output.total_prefill_tokens = total_prefill_tokens as u64;
-            output.total_decode_blocks = total_decode_blocks as u64;
-        }
         DeniedRequest::NextRouterUnreachable { error } => {
             output.kind = DeniedKindV1::NextRouterUnreachable.into();
             output.error = Some(error);
@@ -534,12 +517,6 @@ impl TryFrom<DeniedRequestV1> for DeniedRequest {
             DeniedKindV1::RequiredComponentsDown => Self::RequiredComponentsDown {
                 name: value.name.context("component denial is missing name")?,
             },
-            DeniedKindV1::NextRouterBackpressure => Self::NextRouterBackpressure {
-                queue_depth: number(value.queue_depth, "queue_depth")?,
-                pending_isl_tokens: number(value.pending_isl_tokens, "pending_isl_tokens")?,
-                total_prefill_tokens: number(value.total_prefill_tokens, "total_prefill_tokens")?,
-                total_decode_blocks: number(value.total_decode_blocks, "total_decode_blocks")?,
-            },
             DeniedKindV1::NextRouterUnreachable => Self::NextRouterUnreachable {
                 error: value.error.context("unreachable denial is missing error")?,
             },
@@ -595,7 +572,6 @@ mod tests {
                     primary_worker_request: worker,
                     decode_worker_request: None,
                 },
-                &GenerationOptions::default(),
             )
             .unwrap();
             let mm = wire.mm_payloads.as_ref().unwrap();
@@ -609,7 +585,7 @@ mod tests {
             };
             assert_eq!(encoded.as_ptr(), allocation, "encoder copied {field}");
 
-            let (decoded, _) = decode_new_request(
+            let decoded = decode_new_request(
                 "large-mm".to_string(),
                 wire,
                 DisaggregationStrategy::PrefillFirst,

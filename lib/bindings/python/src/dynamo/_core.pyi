@@ -574,7 +574,6 @@ class RouterWorkerCoordinator:
             routing_kwargs: PyRouterRequestNew,
             worker_args: JsonLike | None = None,
             require_available: List[Client] | None = None,
-            potential_loads_next_check: RouterCoordinatorPotentialLoadsCheck | None = None,
             annotated: bool | None = False,
             cancellation: CancellationPolicy = CancellationPolicy.Cancellable,
             max_reroutes: int = 1,
@@ -609,30 +608,14 @@ class RouterWorkerCoordinator:
         the other phases populate their corresponding attribution. Unknown
         values are rejected before routing begins.
 
-        When ``potential_loads_next_check`` is given, a *potential loads*
-        preflight queries the *downstream* ``client`` it carries (another router,
-        e.g. the next router in a disagg-prefill topology -- distinct from the
-        routing router) for worker potential loads before sending the route
-        request (on the first attempt only -- a stale-route reroute does not
-        change the downstream router's loads) and denies the request when the
-        configured load percentile exceeds the thresholds. This is deliberately
-        sequential so a preflight denial does not leave a newly routed request to
-        free. The preflight is part of the ``routing`` phase, so it is shielded
-        when the policy detaches routing (e.g.
-        ``CancellationPolicy.FullyDetached``).
-
-        The ``require_available`` check runs before routing, the first-attempt
-        ``potential_loads_next_check`` preflight runs next, then the route is sent
-        only if both pass. A short post-route re-check repeats the
+        The ``require_available`` check runs before routing. A short post-route re-check repeats the
         ``require_available`` lookup. A
         routed worker that turns out to be stale (its etcd entry was removed
         after the router chose it) is re-routed, bounded by ``max_reroutes``
         (the initial attempt plus up to ``max_reroutes`` reroutes); exhausting
         the bound returns ``DeniedRequest::NextRouterUnreachable``.
 
-        ``tracing_enabled`` emits route/preflight step breadcrumbs with whether a
-        trace context is available. Slow potential-load checks still warn
-        regardless of this flag.
+        ``tracing_enabled`` emits route step breadcrumbs with trace availability.
 
         When ``wait_for_first_response`` is true, worker setup waits for the
         first non-error item from the returned worker stream and drops it only
@@ -674,8 +657,7 @@ class RouterWorkerCoordinator:
 
         Returns :class:`AdmittedRequest` on a successful route or
         :class:`DeniedRequest` when the router is backpressured, a
-        ``require_available`` component is down, the preflight overflows, the
-        preflight cannot reach the router, the stale-route reroute loop is
+        ``require_available`` component is down, the stale-route reroute loop is
         exhausted, policy-allowed cancellation wins, or
         ``wait_for_first_response`` cannot read the first worker stream item --
         never raising in those cases. A non-stale worker-open failure (or
@@ -759,7 +741,6 @@ class GenerationCoordinator:
         routing_kwargs: PyRouterRequestNew,
         worker_args: Any,
         decode_worker_args: Any | None = None,
-        enable_potential_loads_next_check: bool = False,
         annotated: bool = False,
     ) -> GeneratedRequest | DeniedGenerationRequest: ...
 class DeniedGenerationRequest:
@@ -908,34 +889,15 @@ class DeniedRequest:
         """The name of the down component (its endpoint id)."""
         ...
 
-    class NextRouterBackpressure:
-        """
-        The ``potential_loads_next_check`` preflight found the selected router
-        load percentile would exceed the configured thresholds.
-        """
-        queue_depth: int
-        """Router-level pending queue depth (``pending_count``)."""
-        pending_isl_tokens: int
-        """ISL tokens the router reports as currently queued."""
-        total_prefill_tokens: int
-        """Selected percentile of ``potential_prefill_tokens`` across workers."""
-        total_decode_blocks: int
-        """Selected percentile of ``potential_decode_blocks`` across workers."""
-        ...
-
     class NextRouterUnreachable:
-        """The ``potential_loads_next_check`` preflight could not reach the router."""
+        """The selected worker is unreachable, including exhausted stale reroutes."""
         error: str
         """The error encountered while querying the router."""
         ...
 
     class ProtocolError:
         """
-        The ``potential_loads_next_check`` preflight received an unexpected
-        router response (not ``RouterResponse::PotentialLoads``): a
-        wrong-protocol shape such as ``Backpressure`` or ``New``, or an
-        older/unknown variant. The preflight fails closed -- the request is
-        denied rather than passing the overload check unvalidated.
+        The router returned an unexpected response variant.
         """
         received: str
         """Debug representation of the unexpected ``RouterResponse`` variant."""
@@ -959,71 +921,6 @@ class DeniedRequest:
         ...
 
     ...
-
-
-class RouterCoordinatorPotentialLoadsCheck:
-    """
-    Required preflight passed to
-    :meth:`RouterWorkerCoordinator.route_and_worker`: before routing, the
-    coordinator queries the *downstream* ``client`` (another router further
-    along the pipeline, e.g. the next router in a disagg-prefill topology --
-    distinct from the routing router) for the *potential loads* of all its
-    workers (the ``potential_loads`` method) and denies the request when the
-    configured load percentile exceeds the thresholds -- so a request is not
-    routed onward to an already-overloaded downstream router. A threshold of
-    ``0`` disables that dimension (no limit). Prefill and decode thresholds are
-    measured in tokens. Decode is converted to blocks with the coordinator's
-    ``block_size`` before comparing with router-reported
-    ``potential_decode_blocks``. Both load dimensions use ``load_percentile`` as
-    a ``0.0`` to ``1.0`` fraction across workers, and ``queue_depth`` is the
-    router-level ``pending_count``.
-
-    The ``client`` is required: it is the downstream router whose loads are
-    checked. The overlap-aware ``block_mm_infos`` conditioning the reported loads
-    lives on ``PyRouterRequestNew`` (shared by the route and the preflight), not
-    on this check. Defaults:
-    ``queue_depth_threshold=0`` (disabled), ``prefill_tokens_threshold=1_000_000``,
-    ``decode_tokens_threshold=16_000_000``, ``load_percentile=0.5`` (p50).
-    """
-
-    def __init__(
-        self,
-        client: Client,
-        queue_depth_threshold: int = 0,
-        prefill_tokens_threshold: int = 1_000_000,
-        decode_tokens_threshold: int = 16_000_000,
-        load_percentile: float = 0.5,
-    ) -> None: ...
-
-    @property
-    def client(self) -> Client: ...
-
-    @client.setter
-    def client(self, value: Client) -> None: ...
-
-    @property
-    def queue_depth_threshold(self) -> int: ...
-
-    @queue_depth_threshold.setter
-    def queue_depth_threshold(self, value: int) -> None: ...
-
-    @property
-    def prefill_tokens_threshold(self) -> int: ...
-
-    @prefill_tokens_threshold.setter
-    def prefill_tokens_threshold(self, value: int) -> None: ...
-
-    @property
-    def decode_tokens_threshold(self) -> int: ...
-
-    @decode_tokens_threshold.setter
-    def decode_tokens_threshold(self, value: int) -> None: ...
-
-    @property
-    def load_percentile(self) -> float: ...
-
-    @load_percentile.setter
-    def load_percentile(self, value: float) -> None: ...
 
 
 class ModelCardInstanceId:

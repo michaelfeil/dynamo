@@ -12,7 +12,7 @@ mod types;
 use types::RouterWorkerPhaseArg;
 pub(crate) use types::{
     AdmittedRequest, CancellationPolicy, DeniedGenerationRequest, DeniedRequest, GeneratedRequest,
-    PyRouterRequestNew, PyRouterWorkerPhase, RouterCoordinatorPotentialLoadsCheck,
+    PyRouterRequestNew, PyRouterWorkerPhase,
 };
 
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
@@ -21,7 +21,7 @@ use dynamo_b10_client::{
     CancellationPolicy as CoreCancellationPolicy, CoordinatorClient,
     DisaggregationStrategy as CoreDisaggregationStrategy, GenerationCoordinatorRuntime,
     GenerationOptions, GenerationOutcome as CoreGenerationOutcome, GenerationRequest,
-    JsonRouterGuardClient, LocalCoordinatorOptions, MinReplicaAvailable, PotentialLoadsCheck,
+    JsonRouterGuardClient, LocalCoordinatorOptions, MinReplicaAvailable,
     PrefillMarkTiming as CorePrefillMarkTiming, RequestContext, RouteAndConnectOutcome,
     RouteOptions, RouterRequestGuard, RouterRequestNew,
     RouterWorkerCoordinator as CoreRouterWorkerCoordinator,
@@ -277,7 +277,6 @@ impl GenerationCoordinator {
         routing_kwargs,
         worker_args,
         decode_worker_args=None,
-        enable_potential_loads_next_check=false,
         annotated=false,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -288,7 +287,6 @@ impl GenerationCoordinator {
         routing_kwargs: Py<PyRouterRequestNew>,
         worker_args: PyObject,
         decode_worker_args: Option<PyObject>,
-        enable_potential_loads_next_check: bool,
         annotated: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
         let routing_request = extract_router_request(py, &routing_kwargs)?;
@@ -312,10 +310,7 @@ impl GenerationCoordinator {
                         primary_worker_request,
                         decode_worker_request,
                     },
-                    GenerationOptions {
-                        enable_potential_loads_next_check,
-                        ..Default::default()
-                    },
+                    GenerationOptions::default(),
                 )
                 .await
                 .map_err(to_pyerr)?;
@@ -420,19 +415,8 @@ impl RouterWorkerCoordinator {
     /// before returning `DeniedRequest.Cancelled`. Routing and setup are
     /// INDEPENDENT axes; see [`CancellationPolicy`] for the full matrix.
     ///
-    /// When `potential_loads_next_check` is given, a *potential loads* preflight
-    /// queries the *downstream* `client` it carries (another router, e.g. the
-    /// next router in a disagg-prefill topology -- distinct from the routing
-    /// router) for worker potential loads before the route request is sent (on
-    /// the first attempt only -- a stale-route reroute does not change the
-    /// downstream router's loads) and denies the request when the configured
-    /// load percentile exceeds the thresholds. This is deliberately sequential
-    /// so a preflight denial does not leave a newly routed request to free. The
-    /// preflight is part of the `routing` phase, so it is shielded when
-    /// `cancellation.allow_cancel_routing()` is false.
-    /// `tracing_enabled=true` emits route/preflight step breadcrumbs with whether
-    /// a trace context is available; slow potential-load checks still warn
-    /// regardless of this flag. When `wait_for_first_response=true`, worker
+    /// `tracing_enabled=true` emits route step breadcrumbs with trace availability.
+    /// When `wait_for_first_response=true`, worker
     /// setup waits for the first non-error item from the returned
     /// worker stream and drops it only when it carries the drop-message
     /// sentinel key `dynamo._core.B10_DROP_THIS_MESSAGE_KEY`. Otherwise,
@@ -455,8 +439,7 @@ impl RouterWorkerCoordinator {
     /// generation stream, lifecycle guard, setup timing/reroute accessors, and
     /// chosen `worker_id`) or a
     /// [`DeniedRequest`] when the router is backpressured, a `require_available`
-    /// component is down, the preflight overflows, the preflight cannot reach
-    /// the router, policy-allowed cancellation wins, the stale-route reroute
+    /// component is down, policy-allowed cancellation wins, the stale-route reroute
     /// loop is exhausted, or `wait_for_first_response` cannot read the first
     /// worker stream item — never raising in those cases. Discriminate in Python with
     /// `isinstance(result, AdmittedRequest)` / `isinstance(result, DeniedRequest)`
@@ -469,7 +452,7 @@ impl RouterWorkerCoordinator {
     /// KV-lifecycle callbacks to the router. A non-stale worker-open failure (or a
     /// non-object `worker_args`) IS raised, not returned as a `DeniedRequest`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, potential_loads_next_check=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, wait_for_first_response=false, mark_prefill_on_response=false, phase=None))]
+    #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, wait_for_first_response=false, mark_prefill_on_response=false, phase=None))]
     fn route_and_worker<'p>(
         &self,
         py: Python<'p>,
@@ -477,7 +460,6 @@ impl RouterWorkerCoordinator {
         routing_kwargs: Py<PyRouterRequestNew>,
         worker_args: Option<PyObject>,
         require_available: Option<Vec<Client>>,
-        potential_loads_next_check: Option<PyObject>,
         annotated: Option<bool>,
         cancellation: CancellationPolicy,
         max_reroutes: u64,
@@ -507,8 +489,7 @@ impl RouterWorkerCoordinator {
 
         // `block_mm_infos` is held loosely as an `Optional[Any]` on the pyclass;
         // pythonize to a serde_json::Value and deserialize to the typed wire
-        // form (same path as before), so the route (`New`) and the preflight
-        // (`PotentialLoads`) share the same overlap-aware metadata.
+        // form for the router's overlap-aware metadata.
         let block_mm_infos_typed: Option<Vec<Option<BlockExtraInfo>>> = match block_mm_infos_py {
             Some(mm) => {
                 let value = pythonize::depythonize(&mm.into_bound(py))?;
@@ -528,33 +509,6 @@ impl RouterWorkerCoordinator {
                 RoutingConstraints::from(rc_cloned)
             }
             None => RoutingConstraints::default(),
-        };
-
-        // Extract the preflight check into a plain `Send` struct while we hold
-        // the GIL. `router` is the downstream `client`'s router (the router the
-        // preflight queries, distinct from the routing router). The
-        // `block_mm_infos` conditioning the preflight comes from the pyclass
-        // field (see above), not the check itself.
-        let next_check: Option<PotentialLoadsCheck> = match potential_loads_next_check {
-            Some(obj) => {
-                let bound = obj.into_bound(py);
-                let check = bound
-                    .downcast::<RouterCoordinatorPotentialLoadsCheck>()
-                    .map_err(|_| {
-                        PyTypeError::new_err(
-                            "potential_loads_next_check must be a RouterCoordinatorPotentialLoadsCheck",
-                        )
-                    })?;
-                let borrowed = check.borrow();
-                Some(PotentialLoadsCheck {
-                    router: Arc::new(JsonRouterGuardClient::new(borrowed.client.router.clone())),
-                    queue_depth_threshold: borrowed.queue_depth_threshold,
-                    prefill_tokens_threshold: borrowed.prefill_tokens_threshold,
-                    decode_tokens_threshold: borrowed.decode_tokens_threshold,
-                    load_percentile: borrowed.load_percentile,
-                })
-            }
-            None => None,
         };
 
         let routing_request = RouterRequestNew {
@@ -609,7 +563,6 @@ impl RouterWorkerCoordinator {
                     worker_request,
                     RouteOptions {
                         require_available: require,
-                        potential_loads_check: next_check,
                         cancellation: core_cancellation,
                         max_reroutes,
                         tracing_enabled,

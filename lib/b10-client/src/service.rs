@@ -90,18 +90,14 @@ impl GenerationCoordinatorService {
         let request_id = request.request_id.clone();
         let trace_context = request.trace_context.take();
         let metadata = std::mem::take(&mut request.metadata);
-        let (generation_request, enable_potential_loads_next_check) =
-            decode_new_request(request_id.clone(), request, self.strategy)?;
+        let generation_request = decode_new_request(request_id.clone(), request, self.strategy)?;
         let inner: Arc<dyn AsyncEngineContext> = Arc::new(Controller::new(request_id));
         let trace_context = trace_context.map(trace_context_from_wire);
         self.coordinator
             .generate(
                 RequestContext::new(inner, trace_context, metadata),
                 generation_request,
-                GenerationOptions {
-                    enable_potential_loads_next_check,
-                    ..Default::default()
-                },
+                GenerationOptions::default(),
             )
             .await
     }

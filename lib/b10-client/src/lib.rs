@@ -29,17 +29,15 @@ pub use coordinator::{
 pub use generation::{
     DeniedGenerationRequest, DisaggregationStrategy, GeneratedRequest, GenerationAdmission,
     GenerationCoordinator, GenerationCoordinatorClient, GenerationOptions, GenerationOutcome,
-    GenerationRequest, POTENTIAL_LOADS_NEXT_DECODE_TOKENS_THRESHOLD,
-    POTENTIAL_LOADS_NEXT_LOAD_PERCENTILE, POTENTIAL_LOADS_NEXT_PREFILL_TOKENS_THRESHOLD,
-    POTENTIAL_LOADS_NEXT_QUEUE_DEPTH_THRESHOLD, PrefillMarkTiming, WorkerLoad, WorkerMode,
+    GenerationRequest, PrefillMarkTiming, WorkerLoad, WorkerMode,
 };
 pub use guard::RouterRequestGuard;
 pub use remote::RemoteGenerationCoordinator;
 pub use runtime::{CoordinatorClient, GenerationCoordinatorRuntime, LocalCoordinatorOptions};
 pub use service::{GenerationCoordinatorService, RunningGenerationCoordinatorService};
 pub use types::{
-    AdmittedRequestTimings, CancellationPolicy, DeniedRequest, MinReplicaAvailable,
-    PotentialLoadsCheck, RouteOptions, RouterRequestNew, RouterWorkerPhase,
+    AdmittedRequestTimings, CancellationPolicy, DeniedRequest, MinReplicaAvailable, RouteOptions,
+    RouterRequestNew, RouterWorkerPhase,
 };
 
 /// Worker-stream item key used for an internal readiness event that should not

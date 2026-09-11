@@ -78,7 +78,7 @@ impl RemoteGenerationCoordinator {
         options: GenerationOptions,
     ) -> Result<GenerationOutcome> {
         validate_remote_options(&options)?;
-        let wire_request = encode_request(&context, request, &options)?;
+        let wire_request = encode_request(&context, request)?;
         let request_context = context.inner();
         let session = wire_request
             .metadata
@@ -267,7 +267,6 @@ impl GenerationCoordinatorClient for RemoteGenerationCoordinator {
 fn validate_remote_options(options: &GenerationOptions) -> Result<()> {
     for (name, route) in [("primary", &options.primary), ("decode", &options.decode)] {
         if !route.require_available.is_empty()
-            || route.potential_loads_check.is_some()
             || route.cancellation != CancellationPolicy::Cancellable
             || route.max_reroutes != RouteOptions::default().max_reroutes
             || route.tracing_enabled
@@ -526,10 +525,7 @@ mod tests {
                     primary_worker_request: worker_request,
                     decode_worker_request: None,
                 },
-                GenerationOptions {
-                    enable_potential_loads_next_check: true,
-                    ..Default::default()
-                },
+                GenerationOptions::default(),
             )
             .await
             .unwrap();
@@ -568,7 +564,6 @@ mod tests {
         assert_eq!(request.model, "test-model");
         assert_eq!(request.tokens, vec![1, 2, 3, 4]);
         assert_eq!(request.lora.as_deref(), Some("adapter-a"));
-        assert!(request.enable_potential_loads_next_check);
         let routing = request.routing.unwrap();
         assert_eq!(routing.session_id.as_deref(), Some("session-a"));
         assert!(routing.do_not_queue);

@@ -7,9 +7,7 @@
 //! Holds the [`RouterGuardClient`] trait (+ the production
 //! [`JsonRouterGuardClient`] impl), the `route_request` /
 //! `route_once` / `connect_worker` / `route_and_connect` core, the
-//! `shield_to_completion` / `shield_stream_to_completion` detach helpers, and
-//! the next-router `potential_loads` preflight
-//! (`query_potential_loads` / `evaluate_potential_loads`). Internal routing
+//! `shield_to_completion` / `shield_stream_to_completion` detach helpers. Internal routing
 //! enums (`RouteSource` / `RouteOnceOutcome` / `OpenResult` /
 //! `RouteAndConnectOutcome`) live here too.
 //!
@@ -20,7 +18,7 @@
 use crate::context::RequestContext;
 use anyhow::Result;
 use dynamo_kv_router::protocols::{
-    BlockExtraInfo, RouterBackpressureReason, RouterRequest, RouterResponse as RsRouterResponse,
+    RouterBackpressureReason, RouterRequest, RouterResponse as RsRouterResponse,
 };
 use dynamo_llm::discovery::{RuntimeConfigWatch, runtime_config_watch};
 use dynamo_runtime::component::Endpoint;
@@ -62,12 +60,11 @@ fn from_rmpv_value<T: DeserializeOwned>(value: &rmpv::Value) -> Result<T> {
 use super::DROP_THIS_MESSAGE_KEY;
 use super::guard::{
     ROUTER_GUARD_ATTEMPTS, ROUTER_GUARD_CALLBACK_TIMEOUT, ROUTER_GUARD_CLEANUP_GRACE_PERIOD,
-    ROUTER_GUARD_NOTIFY_TIMEOUT, ROUTER_GUARD_RETRY_DELAY, RouterRequestGuard,
+    ROUTER_GUARD_NOTIFY_TIMEOUT, RouterRequestGuard,
 };
 use super::payload_copy::PayloadCopy;
 use super::types::{
-    AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, NextRouterBackpressureInfo,
-    PotentialLoadsCheck, PreflightInputs, RouteOptions, RouterRequestNew,
+    AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, RouteOptions, RouterRequestNew,
 };
 
 /// JSON-typed push router used to talk to KV router instances.
@@ -77,7 +74,6 @@ use super::types::{
 /// alias names that router type used throughout the b10_client coordinator.
 pub type JsonPushRouter = PushRouter<rmpv::Value, RsAnnotated<rmpv::Value>>;
 
-const POTENTIAL_LOADS_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(590);
@@ -170,10 +166,6 @@ impl RouterWorkerCoordinator {
         Ok(workers.into_values().collect())
     }
 
-    pub(crate) fn router(&self) -> Arc<dyn RouterGuardClient> {
-        Arc::clone(&self.router)
-    }
-
     pub fn new(
         router: Arc<dyn RouterGuardClient>,
         worker: Arc<dyn RouterGuardClient>,
@@ -222,11 +214,6 @@ impl RouterWorkerCoordinator {
             );
         }
 
-        let preflight_inputs = options.potential_loads_check.map(|check| PreflightInputs {
-            tokens: routing_request.tokens.clone(),
-            block_mm_infos: routing_request.block_mm_infos.clone(),
-            check,
-        });
         let routing_request = Arc::new(routing_request.into_routing_request_value()?);
         let request_id = context.id().to_string();
         let phase = options.phase.map(|phase| phase.as_str().to_string());
@@ -241,7 +228,6 @@ impl RouterWorkerCoordinator {
             request_id,
             context,
             options.require_available,
-            preflight_inputs,
             worker_request,
             self.block_size,
             options.max_reroutes,
@@ -280,7 +266,6 @@ fn denied_request_kind(denied: &DeniedRequest) -> String {
             format!("router_backpressure.{reason}")
         }
         DeniedRequest::RequiredComponentsDown { .. } => "required_components_down".to_string(),
-        DeniedRequest::NextRouterBackpressure { .. } => "next_router_backpressure".to_string(),
         DeniedRequest::NextRouterUnreachable { .. } => "next_router_unreachable".to_string(),
         DeniedRequest::ProtocolError { .. } => "protocol_error".to_string(),
         DeniedRequest::Cancelled() => "cancelled".to_string(),
@@ -1101,305 +1086,6 @@ async fn drain_worker_stream_to_completion(
     }
 }
 
-/// Error from the `potential_loads` preflight: either the downstream router
-/// could not be reached ([`PotentialLoadsError::Unreachable`]) or it replied
-/// with an unexpected `RouterResponse` variant that is not `PotentialLoads`
-/// ([`PotentialLoadsError::ProtocolError`]). The coordinator maps both to a
-/// [`DeniedRequest`] -- `NextRouterUnreachable` and `ProtocolError`
-/// respectively -- so the preflight never silently passes an unexpected
-/// condition.
-enum PotentialLoadsError {
-    Unreachable { error: String },
-    ProtocolError { received: String },
-}
-
-fn potential_loads_outcome(
-    result: &Result<Option<NextRouterBackpressureInfo>, PotentialLoadsError>,
-) -> &'static str {
-    match result {
-        Ok(Some(_)) => "backpressure",
-        Ok(None) => "pass",
-        Err(PotentialLoadsError::Unreachable { .. }) => "unreachable",
-        Err(PotentialLoadsError::ProtocolError { .. }) => "protocol_error",
-    }
-}
-
-/// Query the downstream `client`'s router (carried on `check.router`) for
-/// potential loads (the `potential_loads` method) and evaluate the response
-/// against `check`. Returns `Ok(None)` when the preflight passes; `Ok(Some(info))`
-/// when the selected load percentile exceeds the configured thresholds (next-router
-/// backpressure); `Err(PotentialLoadsError::Unreachable)` when the query
-/// itself could not be performed (the coordinator maps this to a
-/// `DeniedRequest::NextRouterUnreachable`); `Err(PotentialLoadsError::ProtocolError)`
-/// when the decoded response is not `RouterResponse::PotentialLoads` (the
-/// coordinator maps this to a `DeniedRequest::ProtocolError`) -- the preflight
-/// fails closed rather than treating an unexpected/wrong-protocol shape as a
-/// silent pass.
-///
-/// A threshold of `0` disables that dimension (no limit). Prefill and decode
-/// thresholds are measured in tokens; decode is converted to blocks with the
-/// coordinator block size before comparing with router-reported
-/// `potential_decode_blocks`. `queue_depth` is the router-level `pending_count`.
-#[allow(clippy::too_many_arguments)]
-async fn query_potential_loads(
-    tokens: Vec<u32>,
-    block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
-    context: Option<RequestContext>,
-    request_id: &str,
-    check: &PotentialLoadsCheck,
-    block_size: u32,
-    tracing_enabled: bool,
-    allow_cancel_routing: bool,
-) -> Result<Option<NextRouterBackpressureInfo>, PotentialLoadsError> {
-    let started = Instant::now();
-    if tracing_enabled {
-        tracing::info!(
-            request_id = %request_id,
-            endpoint = %check.router.endpoint_id(),
-            trace_context_available = trace_context_available(&context),
-            "query_potential_loads started"
-        );
-    }
-
-    let result = 'query: {
-        let instance_ids = available_router_instance_ids(check.router.as_ref());
-        if instance_ids.is_empty() {
-            break 'query Err(PotentialLoadsError::Unreachable {
-                error: "no router instances available for potential loads query".to_string(),
-            });
-        }
-        let request = RouterRequest::PotentialLoads {
-            tokens: tokens.into(),
-            block_mm_infos,
-            // no caching for this query.
-            allow_short_caching: false,
-        };
-        let request_value =
-            match to_rmpv_value(&request).map_err(|e| PotentialLoadsError::Unreachable {
-                error: format!("failed to encode potential loads request: {e}"),
-            }) {
-                Ok(value) => value,
-                Err(err) => break 'query Err(err),
-            };
-
-        let mut last_error: Option<String> = None;
-        for attempt in 0..ROUTER_GUARD_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(ROUTER_GUARD_RETRY_DELAY).await;
-            }
-
-            for &instance_id in &instance_ids {
-                let (request_ctx, mut cancellation_forwarder) =
-                    create_detached_router_request_context(
-                        request_value.clone(),
-                        &context,
-                        request_id,
-                        allow_cancel_routing,
-                    );
-                let span = context
-                    .as_ref()
-                    .map(|ctx| ctx.direct_span("query_potential_loads", instance_id))
-                    .unwrap_or_else(tracing::Span::none);
-
-                let result = async {
-                    let stream = check.router.direct(request_ctx, instance_id).await?;
-                    if tracing_enabled {
-                        tracing::debug!(
-                            request_id = %request_id,
-                            router_instance_id = instance_id,
-                            attempt = attempt + 1,
-                            attempts = ROUTER_GUARD_ATTEMPTS,
-                            "query_potential_loads router stream opened"
-                        );
-                    }
-                    first_stream_response(stream).await
-                }
-                .instrument(span);
-                tokio::pin!(result);
-                let result = tokio::select! {
-                    result = &mut result => result,
-                    _ = tokio::time::sleep(POTENTIAL_LOADS_SLOW_LOG_THRESHOLD) => {
-                        tracing::warn!(
-                            request_id = %request_id,
-                            router_instance_id = instance_id,
-                            attempt = attempt + 1,
-                            attempts = ROUTER_GUARD_ATTEMPTS,
-                            threshold_ms = POTENTIAL_LOADS_SLOW_LOG_THRESHOLD.as_millis(),
-                            "query_potential_loads attempt still pending after expected latency"
-                        );
-                        result.await
-                    }
-                };
-                abort_cancellation_forwarder(&mut cancellation_forwarder);
-
-                match result {
-                    Ok(router_stream_response) => {
-                        break 'query evaluate_potential_loads(
-                            &router_stream_response.response,
-                            check,
-                            block_size,
-                        );
-                    }
-                    Err(err) => {
-                        last_error = Some(err.to_string());
-                        tracing::warn!(
-                            request_id = %request_id,
-                            router_instance_id = instance_id,
-                            attempt = attempt + 1,
-                            attempts = ROUTER_GUARD_ATTEMPTS,
-                            error = %err,
-                            "query_potential_loads attempt failed",
-                        );
-                    }
-                }
-            }
-        }
-
-        Err(PotentialLoadsError::Unreachable {
-            error: format!(
-                "failed to query potential loads through any KV router{}",
-                last_error.map(|err| format!(": {err}")).unwrap_or_default()
-            ),
-        })
-    };
-
-    let elapsed = started.elapsed();
-    let outcome = potential_loads_outcome(&result);
-    if elapsed >= POTENTIAL_LOADS_SLOW_LOG_THRESHOLD {
-        tracing::warn!(
-            request_id = %request_id,
-            endpoint = %check.router.endpoint_id(),
-            elapsed_ms = elapsed.as_millis(),
-            threshold_ms = POTENTIAL_LOADS_SLOW_LOG_THRESHOLD.as_millis(),
-            outcome,
-            "query_potential_loads exceeded expected latency"
-        );
-    } else if tracing_enabled {
-        tracing::debug!(
-            request_id = %request_id,
-            endpoint = %check.router.endpoint_id(),
-            elapsed_ms = elapsed.as_millis(),
-            outcome,
-            "query_potential_loads completed"
-        );
-    }
-    result
-}
-
-/// Evaluate a decoded `RouterResponse::PotentialLoads` against the check's
-/// thresholds. Returns `Ok(Some(info))` when any enabled threshold is exceeded
-/// (next-router backpressure) and `Ok(None)` when the response is
-/// `PotentialLoads` but no threshold is exceeded. Returns
-/// `Err(PotentialLoadsError::ProtocolError)` when the response is NOT
-/// `PotentialLoads` -- the preflight fails closed: a `Backpressure`, `New`, or
-/// older/wrong-protocol shape is surfaced as a denial rather than silently
-/// passing the overload check.
-fn evaluate_potential_loads(
-    response: &RsRouterResponse,
-    check: &PotentialLoadsCheck,
-    block_size: u32,
-) -> Result<Option<NextRouterBackpressureInfo>, PotentialLoadsError> {
-    let RsRouterResponse::PotentialLoads {
-        loads,
-        pending_count,
-        pending_isl_tokens,
-    } = response
-    else {
-        return Err(PotentialLoadsError::ProtocolError {
-            received: format!("{response:?}"),
-        });
-    };
-    let prefill_tokens = percentile_load(
-        loads.iter().map(|l| l.potential_prefill_tokens),
-        check.load_percentile,
-    );
-    let decode_blocks = percentile_load(
-        loads.iter().map(|l| l.potential_decode_blocks),
-        check.load_percentile,
-    );
-    let queue_depth = *pending_count;
-    let pending_isl = *pending_isl_tokens;
-    let decode_blocks_threshold =
-        decode_tokens_threshold_to_blocks(check.decode_tokens_threshold, block_size);
-
-    let prefill_exceeded =
-        check.prefill_tokens_threshold != 0 && prefill_tokens > check.prefill_tokens_threshold;
-    let decode_exceeded = decode_blocks_threshold != 0 && decode_blocks > decode_blocks_threshold;
-    let queue_exceeded =
-        check.queue_depth_threshold != 0 && queue_depth > check.queue_depth_threshold;
-
-    if prefill_exceeded || decode_exceeded || queue_exceeded {
-        Ok(Some(NextRouterBackpressureInfo {
-            queue_depth,
-            pending_isl_tokens: pending_isl,
-            prefill_tokens,
-            decode_blocks,
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
-fn decode_tokens_threshold_to_blocks(decode_tokens_threshold: usize, block_size: u32) -> usize {
-    if decode_tokens_threshold == 0 {
-        return 0;
-    }
-
-    let block_size = block_size as usize;
-    debug_assert_ne!(block_size, 0, "block_size must be positive");
-    if block_size == 0 {
-        return decode_tokens_threshold;
-    }
-
-    ((decode_tokens_threshold - 1) / block_size) + 1
-}
-
-fn percentile_load(values: impl Iterator<Item = usize>, percentile: f64) -> usize {
-    let mut values = values.collect::<Vec<_>>();
-    let percentile = normalize_load_percentile(percentile);
-    if values.is_empty() {
-        return 0;
-    }
-    values.sort_unstable();
-    if values.len() == 1 {
-        return values[0];
-    }
-
-    let rank = percentile * (values.len() - 1) as f64;
-    let lower = rank.floor() as usize;
-    let upper = rank.ceil() as usize;
-    if lower == upper {
-        return values[lower];
-    }
-
-    let weight = rank - lower as f64;
-    let interpolated = values[lower] as f64 * (1.0 - weight) + values[upper] as f64 * weight;
-    interpolated.ceil() as usize
-}
-
-fn normalize_load_percentile(percentile: f64) -> f64 {
-    if !percentile.is_finite() {
-        tracing::warn!(
-            load_percentile = ?percentile,
-            normalized_load_percentile = 0.5,
-            "potential_loads load_percentile must be finite and between 0.0 and 1.0; using p50"
-        );
-        return 0.5;
-    }
-
-    if !(0.0..=1.0).contains(&percentile) {
-        let normalized = percentile.clamp(0.0, 1.0);
-        tracing::warn!(
-            load_percentile = percentile,
-            normalized_load_percentile = normalized,
-            "potential_loads load_percentile must be between 0.0 and 1.0; clamping"
-        );
-        return normalized;
-    }
-
-    percentile
-}
-
 /// Render a [`RouterBackpressureReason`] as its snake_case reason name.
 fn reason_to_string(reason: &RouterBackpressureReason) -> &'static str {
     match reason {
@@ -1421,14 +1107,7 @@ enum RouteOnceOutcome {
     Denied(DeniedRequest),
 }
 
-/// One attempt of the route phase: check `require_available`, run the optional
-/// next-router potential-loads preflight, then issue the KV-router `new` request
-/// only if those pre-route checks pass. The potential-loads check is deliberately
-/// sequential: a downstream overload denial must not leave a fresh routed request
-/// sitting in the routing router's scheduler while this coordinator races to free
-/// it. A short post-route `require_available` re-check still runs because a
-/// component can go down while the route is in flight. Every armed-but-denied
-/// path frees the guard first.
+/// Check required components, route, then re-check availability and free denied admissions.
 #[allow(clippy::too_many_arguments)]
 async fn route_once(
     router_guard_client: Arc<dyn RouterGuardClient>,
@@ -1436,8 +1115,6 @@ async fn route_once(
     request_id: String,
     context: Option<RequestContext>,
     require: Vec<MinReplicaAvailable>,
-    preflight: Option<PreflightInputs>,
-    block_size: u32,
     notify_timeout: Duration,
     tracing_enabled: bool,
     allow_cancel_routing: bool,
@@ -1461,84 +1138,6 @@ async fn route_once(
             "route_once denied before routing because a required component is down"
         );
         return RouteOnceOutcome::Denied(DeniedRequest::RequiredComponentsDown { name });
-    }
-
-    if let Some(pf) = preflight {
-        let PreflightInputs {
-            check,
-            tokens,
-            block_mm_infos,
-        } = pf;
-        log_route_step(
-            tracing_enabled,
-            &context,
-            &request_id,
-            "potential_loads_preflight_start",
-        );
-        let preflight_result = query_potential_loads(
-            tokens,
-            block_mm_infos,
-            context.clone(),
-            &request_id,
-            &check,
-            block_size,
-            tracing_enabled,
-            allow_cancel_routing,
-        )
-        .await;
-
-        if let Some(denied) =
-            cancellation_denial_for_optional_context(&context, allow_cancel_routing)
-        {
-            tracing::info!(
-                request_id = %request_id,
-                "route_once denied after potential_loads because context was cancelled"
-            );
-            return RouteOnceOutcome::Denied(denied);
-        }
-
-        match preflight_result {
-            Ok(Some(info)) => {
-                tracing::info!(
-                    request_id = %request_id,
-                    queue_depth = info.queue_depth,
-                    pending_isl_tokens = info.pending_isl_tokens,
-                    total_prefill_tokens = info.prefill_tokens,
-                    total_decode_blocks = info.decode_blocks,
-                    "route_once denied before routing by potential_loads preflight"
-                );
-                return RouteOnceOutcome::Denied(DeniedRequest::NextRouterBackpressure {
-                    queue_depth: info.queue_depth,
-                    pending_isl_tokens: info.pending_isl_tokens,
-                    total_prefill_tokens: info.prefill_tokens,
-                    total_decode_blocks: info.decode_blocks,
-                });
-            }
-            Ok(None) => {
-                log_route_step(
-                    tracing_enabled,
-                    &context,
-                    &request_id,
-                    "potential_loads_preflight_passed",
-                );
-            }
-            Err(PotentialLoadsError::ProtocolError { received }) => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    received = %received,
-                    "route_once denied before routing by malformed potential_loads response"
-                );
-                return RouteOnceOutcome::Denied(DeniedRequest::ProtocolError { received });
-            }
-            Err(PotentialLoadsError::Unreachable { error }) => {
-                tracing::warn!(
-                    request_id = %request_id,
-                    error = %error,
-                    "route_once denied before routing because potential_loads was unreachable"
-                );
-                return RouteOnceOutcome::Denied(DeniedRequest::NextRouterUnreachable { error });
-            }
-        }
     }
 
     log_route_step(
@@ -1997,8 +1596,7 @@ where
 /// bounded by `max_reroutes` (the initial attempt plus up to `max_reroutes`
 /// reroutes); exhausting the bound returns
 /// `DeniedRequest::NextRouterUnreachable { "stale route loop exhausted" }`.
-/// The preflight runs only on the first attempt (a stale reroute does not change
-/// the downstream router's reported loads). Each attempt sends a copy of
+/// Each attempt sends a copy of
 /// `worker_request` with the per-route `RouterResponse::New` injected under
 /// the `router_response` field so the worker sees `worker_id` / `dp_rank` /
 /// `overlap_blocks` / `dp_strict_rank`; see `payload_copy.rs` for when that
@@ -2014,7 +1612,6 @@ pub async fn route_and_connect(
     request_id: String,
     context: RequestContext,
     require: Vec<MinReplicaAvailable>,
-    mut preflight_inputs: Option<PreflightInputs>,
     worker_request: rmpv::Value,
     block_size: u32,
     max_reroutes: u64,
@@ -2032,11 +1629,6 @@ pub async fn route_and_connect(
     let worker_request = Arc::new(worker_request);
     let mut spare: Option<PayloadCopy> = None;
     loop {
-        let preflight = if attempt == 0 {
-            preflight_inputs.take()
-        } else {
-            None
-        };
         // Stage the payload copy, then route; it resolves inside
         // `connect_worker`'s setup once the route is usable, and a denial
         // abandons it without waiting (policy in payload_copy.rs).
@@ -2049,8 +1641,6 @@ pub async fn route_and_connect(
             request_id.clone(),
             Some(context.clone()),
             require.clone(),
-            preflight,
-            block_size,
             notify_timeout,
             tracing_enabled,
             allow_cancel_routing,

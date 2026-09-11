@@ -114,24 +114,9 @@ pub struct MinReplicaAvailable {
     pub router: Arc<dyn RouterGuardClient>,
 }
 
-pub struct PotentialLoadsCheck {
-    pub router: Arc<dyn RouterGuardClient>,
-    pub queue_depth_threshold: usize,
-    pub prefill_tokens_threshold: usize,
-    pub decode_tokens_threshold: usize,
-    pub load_percentile: f64,
-}
-
-pub struct PreflightInputs {
-    pub check: PotentialLoadsCheck,
-    pub tokens: Vec<u32>,
-    pub block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
-}
-
 /// Per-call behavior for [`crate::RouterWorkerCoordinator::route_and_worker`].
 pub struct RouteOptions {
     pub require_available: Vec<MinReplicaAvailable>,
-    pub potential_loads_check: Option<PotentialLoadsCheck>,
     pub cancellation: CancellationPolicy,
     pub max_reroutes: u64,
     pub tracing_enabled: bool,
@@ -143,7 +128,6 @@ impl Default for RouteOptions {
     fn default() -> Self {
         Self {
             require_available: Vec::new(),
-            potential_loads_check: None,
             cancellation: CancellationPolicy::default(),
             max_reroutes: 1,
             tracing_enabled: false,
@@ -174,12 +158,6 @@ pub enum DeniedRequest {
     RequiredComponentsDown {
         name: String,
     },
-    NextRouterBackpressure {
-        queue_depth: usize,
-        pending_isl_tokens: usize,
-        total_prefill_tokens: usize,
-        total_decode_blocks: usize,
-    },
     NextRouterUnreachable {
         error: String,
     },
@@ -190,11 +168,4 @@ pub enum DeniedRequest {
     FirstWorkerEventFailed {
         error: String,
     },
-}
-
-pub(crate) struct NextRouterBackpressureInfo {
-    pub queue_depth: usize,
-    pub pending_isl_tokens: usize,
-    pub prefill_tokens: usize,
-    pub decode_blocks: usize,
 }
