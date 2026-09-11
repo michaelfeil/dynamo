@@ -274,6 +274,16 @@ the target container stack.
 
 Status: `keep`
 
+TCP request-size preflight: port of upstream
+[ai-dynamo/dynamo#14110](https://github.com/ai-dynamo/dynamo/pull/14110)
+(`8e9a96f53bc3d8caae7559f578706525205fa4ae`). Validate the full encoded frame
+against the sender's `DYN_TCP_MAX_MESSAGE_SIZE` before connection lookup or
+queue admission, using the decoder's inclusive size limit. Oversized or
+unencodable requests return `InvalidArgument` without sending bytes; framing
+still happens after admission and preserves the payload's `Bytes` allocation.
+This does not change b10-client's routing-error mapping: that path still
+surfaces a 500. Remove this port once the upstream implementation is included.
+
 TCP registry mutex (upstream
 [ai-dynamo/dynamo#11065](https://github.com/ai-dynamo/dynamo/pull/11065)):
 cherry-pick `97b8acfb817df24f1ae9cdaa8b697ee280e54e30`, adapted to this
