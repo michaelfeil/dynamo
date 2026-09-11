@@ -14,12 +14,12 @@ use dynamo_kv_router::protocols::{
     BlockExtraInfo, PotentialLoad as RsPotentialLoad, RouterBackpressureReason, RouterRequest,
     RouterResponse as RsRouterResponse, RoutingConstraints,
 };
-use dynamo_runtime::pipeline::context::Controller;
 use dynamo_runtime::pipeline::{
     AsyncEngineContext, AsyncEngineContextProvider, EngineStream, ResponseStream, async_trait,
     context::Context as RsContext,
 };
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
+use dynamo_runtime::{CancellationToken, pipeline::context::Controller};
 use futures::StreamExt;
 use futures::stream;
 use std::collections::BTreeMap;
@@ -102,6 +102,7 @@ struct RouterGuardClientForTesting {
     calls: Mutex<Vec<(u64, rmpv::Value)>>,
     load_query_sessions: Mutex<Vec<Option<String>>>,
     detailed_calls: Mutex<Vec<DetailedCall>>,
+    shutdown_token: CancellationToken,
 }
 
 impl RouterGuardClientForTesting {
@@ -131,6 +132,7 @@ impl RouterGuardClientForTesting {
             calls: Mutex::new(Vec::new()),
             load_query_sessions: Mutex::new(Vec::new()),
             detailed_calls: Mutex::new(Vec::new()),
+            shutdown_token: CancellationToken::new(),
         })
     }
 
@@ -215,12 +217,20 @@ impl RouterGuardClientForTesting {
     fn route_contexts(&self) -> Vec<Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>> {
         self.route_contexts.lock().unwrap().clone()
     }
+
+    fn shutdown(&self) {
+        self.shutdown_token.cancel();
+    }
 }
 
 #[async_trait]
 impl RouterGuardClient for RouterGuardClientForTesting {
     fn endpoint_id(&self) -> String {
         self.endpoint_id.clone()
+    }
+
+    fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown_token.clone()
     }
 
     fn available_instance_ids(&self) -> Vec<u64> {
@@ -543,6 +553,46 @@ async fn notify_timeout_sends_mark_free_and_exits() {
     drop(guard);
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(router.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn runtime_shutdown_frees_all_live_guards() {
+    let router =
+        RouterGuardClientForTesting::new(vec![7], vec![7], vec![new_response(), new_response()]);
+    router.set_prefill_callback_delay(Duration::from_secs(60));
+
+    let (first_guard, first_source) = route(
+        router.clone(),
+        jv!({"method": "new", "tokens": [1]}),
+        "req-shutdown-1",
+        vec![],
+        Duration::from_secs(60),
+    )
+    .await;
+    let (second_guard, second_source) = route(
+        router.clone(),
+        jv!({"method": "new", "tokens": [2]}),
+        "req-shutdown-2",
+        vec![],
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert!(matches!(first_source, RouteSource::Routed { worker_id: 1 }));
+    assert!(matches!(
+        second_source,
+        RouteSource::Routed { worker_id: 1 }
+    ));
+    first_guard.mark_prefill();
+    wait_for_call_count(&router, 3).await;
+    assert_eq!(
+        router.calls().last().unwrap().1["method"].as_str(),
+        Some("mark_prefill")
+    );
+    router.shutdown();
+    wait_for_method_call_count(&router, "mark_free", 2, Duration::from_secs(2)).await;
+    assert!(first_guard.routed());
+    assert!(second_guard.routed());
 }
 
 /// Decode the way the request plane does: msgpack, not JSON. A JSON hop would

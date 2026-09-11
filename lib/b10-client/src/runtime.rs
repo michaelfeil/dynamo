@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use baseten_configmap::{ConfigReader, GenerationCoordinatorConfig};
 use dynamo_runtime::pipeline::network::egress::push_router::RouterMode;
-use dynamo_runtime::{DistributedRuntime, component::Endpoint};
+use dynamo_runtime::{CancellationToken, DistributedRuntime, component::Endpoint};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 use tokio::sync::OnceCell;
 
@@ -47,6 +47,7 @@ pub struct LocalCoordinatorOptions {
 struct LocalCoordinator {
     options: LocalCoordinatorOptions,
     ready: OnceCell<GenerationCoordinator>,
+    shutdown_token: CancellationToken,
 }
 
 impl LocalCoordinator {
@@ -57,6 +58,7 @@ impl LocalCoordinator {
                     self.options.primary_router.connect().await?,
                     self.options.primary_worker.connect().await?,
                     self.options.block_size,
+                    self.shutdown_token.clone(),
                 )?);
                 let next = match (&self.options.next_router, &self.options.next_worker) {
                     (Some(router), Some(worker)) => {
@@ -64,6 +66,7 @@ impl LocalCoordinator {
                             router.connect().await?,
                             worker.connect().await?,
                             self.options.block_size,
+                            self.shutdown_token.clone(),
                         )?))
                     }
                     _ => None,
@@ -175,6 +178,7 @@ impl GenerationCoordinatorRuntime {
         );
         let snapshot = config.snapshot();
         let settings = &snapshot.generation_coordinator;
+        let shutdown_token = runtime.child_token();
         let listener = Some(Listener {
             runtime: runtime.clone(),
             address: settings.listen_address(),
@@ -203,6 +207,7 @@ impl GenerationCoordinatorRuntime {
                 let local = Arc::new(LocalCoordinator {
                     options,
                     ready: OnceCell::new(),
+                    shutdown_token,
                 });
                 (local.clone(), Some(local))
             };

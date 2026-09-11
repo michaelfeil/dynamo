@@ -68,6 +68,9 @@ impl GuardMark {
 }
 
 fn guard_free_requested(state: &RouterRequestGuardState) -> bool {
+    if state.shutdown_token.is_cancelled() {
+        state.free_requested.store(true, Ordering::Release);
+    }
     state.free_requested.load(Ordering::Acquire) || state.dropped.load(Ordering::Acquire)
 }
 
@@ -80,12 +83,18 @@ fn request_once(flag: &AtomicBool, notify: &Notify) {
     }
 }
 
-async fn wait_for_free_request(state: &RouterRequestGuardState) {
-    loop {
-        if guard_free_requested(state) {
-            return;
+async fn wait_for_guard_signal(state: &RouterRequestGuardState) {
+    tokio::select! {
+        _ = state.notify.notified() => {}
+        _ = state.shutdown_token.cancelled() => {
+            state.free_requested.store(true, Ordering::Release);
         }
-        state.notify.notified().await;
+    }
+}
+
+async fn wait_for_free_request(state: &RouterRequestGuardState) {
+    while !guard_free_requested(state) {
+        wait_for_guard_signal(state).await;
     }
 }
 
@@ -111,6 +120,7 @@ pub(super) struct RouterRequestGuardState {
     dropped: AtomicBool,
     cleanup_done: AtomicBool,
     notify_timeout: Duration,
+    shutdown_token: dynamo_runtime::CancellationToken,
     notify: Notify,
     /// Receiver for the cleanup task's completion signal. Taken (once) by
     /// [`RouterRequestGuard::wait_for_cleanup`]; `None` after the first waiter.
@@ -213,6 +223,7 @@ impl RouterRequestGuard {
         notify_timeout: Duration,
     ) -> Self {
         let (cleanup_done_tx, cleanup_done_rx) = oneshot::channel();
+        let shutdown_token = router.shutdown_token();
         let state = Arc::new(RouterRequestGuardState {
             router,
             request_id,
@@ -222,6 +233,7 @@ impl RouterRequestGuard {
             dropped: AtomicBool::new(false),
             cleanup_done: AtomicBool::new(!armed),
             notify_timeout,
+            shutdown_token,
             notify: Notify::new(),
             cleanup_done_rx: Mutex::new(Some(cleanup_done_rx)),
         });
@@ -635,7 +647,7 @@ async fn router_request_guard_cleanup(
             continue;
         }
 
-        if tokio::time::timeout(state.notify_timeout, state.notify.notified())
+        if tokio::time::timeout(state.notify_timeout, wait_for_guard_signal(&state))
             .await
             .is_err()
         {

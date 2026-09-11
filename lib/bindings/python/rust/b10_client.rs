@@ -29,6 +29,7 @@ use dynamo_b10_client::{
 };
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints};
 use dynamo_runtime::pipeline::EngineStream;
+use dynamo_runtime::prelude::DistributedRuntimeProvider;
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -354,6 +355,7 @@ impl GenerationCoordinator {
 #[pyclass]
 pub(crate) struct RouterWorkerCoordinator {
     inner: Arc<CoreRouterWorkerCoordinator>,
+    shutdown_token: dynamo_runtime::CancellationToken,
 }
 
 #[pymethods]
@@ -369,14 +371,17 @@ impl RouterWorkerCoordinator {
             return Err(PyValueError::new_err("block_size must be positive"));
         }
 
+        let shutdown_token = router_client.endpoint.drt().runtime().child_token();
         let inner = CoreRouterWorkerCoordinator::from_push_routers(
             router_client.router,
             worker_client.router,
             block_size,
+            shutdown_token.clone(),
         )
         .map_err(to_pyerr)?;
         Ok(Self {
             inner: Arc::new(inner),
+            shutdown_token,
         })
     }
 
@@ -530,7 +535,10 @@ impl RouterWorkerCoordinator {
             .into_iter()
             .map(|client| MinReplicaAvailable {
                 name: client.endpoint.id().to_string(),
-                router: Arc::new(JsonRouterGuardClient::new(client.router)),
+                router: Arc::new(JsonRouterGuardClient::new(
+                    client.router,
+                    self.shutdown_token.clone(),
+                )),
             })
             .collect();
 

@@ -211,14 +211,14 @@ impl RouterWorkerCoordinator {
         router: JsonPushRouter,
         worker: JsonPushRouter,
         block_size: u32,
+        shutdown_token: dynamo_runtime::CancellationToken,
     ) -> Result<Self> {
         let runtime_configs = spawn_runtime_config_watch(&worker.client.endpoint);
+        let mut worker = JsonRouterGuardClient::new(worker, shutdown_token.clone());
+        worker.runtime_configs = Some(runtime_configs);
         Self::new(
-            Arc::new(JsonRouterGuardClient::new(router)),
-            Arc::new(JsonRouterGuardClient {
-                router: worker,
-                runtime_configs: Some(runtime_configs),
-            }),
+            Arc::new(JsonRouterGuardClient::new(router, shutdown_token)),
+            Arc::new(worker),
             block_size,
         )
     }
@@ -514,6 +514,9 @@ pub(super) struct RouterStreamResponse {
 pub trait RouterGuardClient: Send + Sync {
     fn endpoint_id(&self) -> String;
 
+    /// Fires while router transports are still available during runtime shutdown.
+    fn shutdown_token(&self) -> dynamo_runtime::CancellationToken;
+
     fn available_instance_ids(&self) -> Vec<u64>;
 
     fn instance_ids(&self) -> Vec<u64>;
@@ -531,13 +534,15 @@ pub trait RouterGuardClient: Send + Sync {
 pub struct JsonRouterGuardClient {
     router: JsonPushRouter,
     runtime_configs: Option<Arc<OnceLock<RuntimeConfigWatch>>>,
+    shutdown_token: dynamo_runtime::CancellationToken,
 }
 
 impl JsonRouterGuardClient {
-    pub fn new(router: JsonPushRouter) -> Self {
+    pub fn new(router: JsonPushRouter, shutdown_token: dynamo_runtime::CancellationToken) -> Self {
         Self {
             router,
             runtime_configs: None,
+            shutdown_token,
         }
     }
 }
@@ -566,6 +571,10 @@ fn spawn_runtime_config_watch(endpoint: &Endpoint) -> Arc<OnceLock<RuntimeConfig
 impl RouterGuardClient for JsonRouterGuardClient {
     fn endpoint_id(&self) -> String {
         self.router.client.endpoint.id().to_string()
+    }
+
+    fn shutdown_token(&self) -> dynamo_runtime::CancellationToken {
+        self.shutdown_token.clone()
     }
 
     fn available_instance_ids(&self) -> Vec<u64> {

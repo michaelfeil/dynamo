@@ -14,6 +14,7 @@ let client = RouterWorkerCoordinator::from_push_routers(
     router_push_router,
     worker_push_router,
     32,
+    shutdown_token,
 )?;
 
 let outcome = client
