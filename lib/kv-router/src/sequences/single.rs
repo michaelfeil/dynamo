@@ -33,11 +33,21 @@ use super::prefill_tracker::{PrefillLoadState, PrefillLoadTracker};
 use super::prompt_registry::WorkerLoadSnapshot;
 use crate::protocols::PrefillLoadHint;
 
-/// Duration after which stale requests may be expired (10 minutes).
-const EXPIRY_DURATION: Duration = Duration::from_secs(600);
+/// Duration after which stale requests may be expired (10 minutes by default).
+fn active_request_expiry_duration() -> Duration {
+    static EXPIRY_DURATION: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+    *EXPIRY_DURATION.get_or_init(|| {
+        std::env::var("DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(600))
+    })
+}
 
 /// How often we *check* for stale requests (30 seconds). This is not
-/// the expiration time, that is EXPIRY_DURATION.
+/// the expiration time, which is configured separately.
 const CHECK_EXPIRY_FREQUENCY: Duration = Duration::from_secs(30);
 
 // TODO: use the common request_id if it exists in the repo
@@ -350,7 +360,7 @@ impl ActiveSequences {
         }
 
         self.last_expiry_check_time = now;
-        let expired_requests_time = now - EXPIRY_DURATION;
+        let expired_requests_time = now - active_request_expiry_duration();
         let expired_request_ids: HashSet<RequestId> = self
             .requests
             .iter()
