@@ -130,48 +130,21 @@ impl GenerationCoordinator {
         &self,
         request: crate::protocol::BidRequestV1,
     ) -> Result<crate::protocol::BidResponseV1> {
-        use crate::protocol::BidResponseV1;
-        let (prefill, decode) = match self.strategy {
-            DisaggregationStrategy::Aggregated => {
-                (self.primary.potential_loads(request).await?, None)
-            }
+        match self.strategy {
+            DisaggregationStrategy::Aggregated => self.primary.bid(request).await,
             DisaggregationStrategy::PrefillFirst => {
                 let next = self
                     .next
                     .as_ref()
                     .expect("validated disaggregated topology");
-                let (prefill, decode) = tokio::try_join!(
-                    self.primary.potential_loads(request.clone()),
-                    next.potential_loads(request),
-                )?;
-                let decode_tokens = decode
-                    .iter()
-                    .map(|load| load.potential_decode_blocks as u64)
-                    .min()
-                    .expect("nonempty eligible decode pool")
-                    .checked_mul(u64::from(next.block_size()))
-                    .context("bid decode token count overflow")?;
-                (prefill, Some(decode_tokens))
-            }
-        };
-        let mut best: Option<BidResponseV1> = None;
-        for load in prefill {
-            let bid = BidResponseV1 {
-                // The downstream will resolve session affinity in a future change.
-                affinity: false,
-                prefill_tokens: load.potential_prefill_tokens as u64,
-                decode_tokens: match decode {
-                    Some(tokens) => tokens,
-                    None => (load.potential_decode_blocks as u64)
-                        .checked_mul(u64::from(self.primary.block_size()))
-                        .context("bid decode token count overflow")?,
-                },
-            };
-            if best.as_ref().is_none_or(|best| bid.score() < best.score()) {
-                best = Some(bid);
+                let (prefill, decode) =
+                    tokio::try_join!(self.primary.bid(request.clone()), next.bid(request))?;
+                Ok(crate::protocol::BidResponseV1 {
+                    decode_tokens: decode.decode_tokens,
+                    ..prefill
+                })
             }
         }
-        best.context("no eligible workers for bid")
     }
 
     pub async fn worker_loads(&self) -> Result<Vec<WorkerLoad>> {

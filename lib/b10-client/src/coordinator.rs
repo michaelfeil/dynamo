@@ -87,28 +87,17 @@ pub struct RouterWorkerCoordinator {
 }
 
 impl RouterWorkerCoordinator {
-    async fn query_loads(
+    async fn query_router(
         &self,
-        request: crate::protocol::BidRequestV1,
+        request: RouterRequest,
+        session_id: Option<String>,
     ) -> Result<RsRouterResponse> {
-        request.validate()?;
-        let session_id = request.session_id;
         let instances = available_router_instance_ids(self.router.as_ref());
         let instance = instances
             .first()
             .copied()
-            .ok_or_else(|| anyhow::anyhow!("no router instances available for potential loads"))?;
-        // The existing router RPC only models tokens/MM; salt remains
-        // on the bid wire contract for future router support.
-        let request = to_rmpv_value(&RouterRequest::PotentialLoads {
-            tokens: request.tokens.into(),
-            block_mm_infos: request
-                .mm_routing_args
-                .map(crate::protocol::codec::mm_routing_args_from_wire)
-                .transpose()?,
-            allow_short_caching: false,
-        })?;
-        let mut request = RsContext::new(request);
+            .ok_or_else(|| anyhow::anyhow!("no router instances available for query"))?;
+        let mut request = RsContext::new(to_rmpv_value(&request)?);
         if let Some(session_id) = session_id {
             request.insert_metadata(
                 dynamo_llm::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY,
@@ -120,28 +109,65 @@ impl RouterWorkerCoordinator {
             first_stream_response(stream).await
         })
         .await
-        .map_err(|_| anyhow::anyhow!("potential loads router query timed out"))??;
+        .map_err(|_| anyhow::anyhow!("router query timed out"))??;
         Ok(response.response)
     }
 
-    pub(crate) async fn potential_loads(
+    pub(crate) async fn bid(
         &self,
         request: crate::protocol::BidRequestV1,
-    ) -> Result<Vec<dynamo_kv_router::scheduling::PotentialLoad>> {
-        let RsRouterResponse::PotentialLoads { loads, .. } = self.query_loads(request).await?
+    ) -> Result<crate::protocol::BidResponseV1> {
+        use anyhow::Context;
+        request.validate()?;
+        // The router RPC only models tokens/MM; salt remains
+        // on the bid wire contract for future router support.
+        let response = self
+            .query_router(
+                RouterRequest::Bid {
+                    tokens: request.tokens.into(),
+                    block_mm_infos: request
+                        .mm_routing_args
+                        .map(crate::protocol::codec::mm_routing_args_from_wire)
+                        .transpose()?,
+                    routing_constraints: Default::default(),
+                    allowed_worker_ids: None,
+                },
+                request.session_id,
+            )
+            .await?;
+        let RsRouterResponse::Bid {
+            prefill_blocks,
+            decode_blocks,
+            ..
+        } = response
         else {
-            anyhow::bail!("unexpected router response to bid query");
+            anyhow::bail!("expected bid router response with prefill/decode block costs");
         };
-        anyhow::ensure!(!loads.is_empty(), "no eligible workers for bid");
-        Ok(loads)
+        let prefill_tokens = prefill_blocks * f64::from(self.block_size);
+        anyhow::ensure!(
+            prefill_tokens.is_finite() && prefill_tokens >= 0.0 && prefill_tokens < u64::MAX as f64,
+            "invalid or overflowing bid prefill token count"
+        );
+        Ok(crate::protocol::BidResponseV1 {
+            // Session metadata is forwarded; bids do not resolve affinity yet.
+            affinity: false,
+            prefill_tokens: prefill_tokens.round() as u64,
+            decode_tokens: decode_blocks
+                .checked_mul(u64::from(self.block_size))
+                .context("bid decode token count overflow")?,
+        })
     }
 
     pub async fn worker_loads(&self, mode: crate::WorkerMode) -> Result<Vec<crate::WorkerLoad>> {
         let RsRouterResponse::PotentialLoads { loads, .. } = self
-            .query_loads(crate::protocol::BidRequestV1 {
-                tokens: vec![0],
-                ..Default::default()
-            })
+            .query_router(
+                RouterRequest::PotentialLoads {
+                    tokens: vec![0].into(),
+                    block_mm_infos: None,
+                    allow_short_caching: false,
+                },
+                None,
+            )
             .await?
         else {
             anyhow::bail!("unexpected router response to worker loads query");

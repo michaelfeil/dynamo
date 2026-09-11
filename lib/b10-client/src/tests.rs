@@ -243,7 +243,7 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         let data = request.content().clone();
         let context = request.context();
         let method = data["method"].as_str().unwrap_or("").to_string();
-        if method == "potential_loads" {
+        if matches!(method.as_str(), "potential_loads" | "bid") {
             self.load_query_sessions.lock().unwrap().push(
                 request
                     .metadata()
@@ -2616,66 +2616,65 @@ fn generation_coordinator(
     .expect("generation coordinator")
 }
 
+fn bid_response(
+    worker_id: u64,
+    prefill_blocks: f64,
+    decode_blocks: u64,
+) -> Result<RsRouterResponse, String> {
+    Ok(RsRouterResponse::Bid {
+        worker_id,
+        dp_rank: 0,
+        prefill_blocks,
+        decode_blocks,
+    })
+}
+
 #[tokio::test]
-async fn bids_choose_best_workers_and_require_complete_disaggregated_pairs() {
+async fn bids_use_selected_costs_and_require_complete_disaggregated_pairs() {
     use crate::protocol::BidRequestV1;
     use DisaggregationStrategy::{Aggregated, PrefillFirst};
-    let router = |rows: &[(u64, usize, usize)]| {
-        RouterGuardClientForTesting::new(
-            vec![1],
-            vec![1],
-            vec![Ok(RsRouterResponse::PotentialLoads {
-                loads: rows
-                    .iter()
-                    .map(|&(worker_id, prefill, decode)| RsPotentialLoad {
-                        worker_id,
-                        dp_rank: 0,
-                        potential_prefill_tokens: prefill,
-                        potential_decode_blocks: decode,
-                        active_requests: 0,
-                    })
-                    .collect(),
-                pending_count: 0,
-                pending_isl_tokens: 0,
-            })],
-        )
-    };
+    let router = |response| RouterGuardClientForTesting::new(vec![1], vec![1], vec![response]);
     for (strategy, session_id, empty_prefill, empty_decode, expected) in [
-        (Aggregated, None, false, false, Some((false, 12, 0))),
+        (Aggregated, None, false, false, Some((false, 15, 160))),
         (
             Aggregated,
             Some("session"),
             false,
             false,
-            Some((false, 12, 0)),
+            Some((false, 15, 160)),
         ),
         (
             PrefillFirst,
             Some("session"),
             false,
             false,
-            Some((false, 12, 32)),
+            Some((false, 15, 448)),
         ),
         (PrefillFirst, None, true, false, None),
         (PrefillFirst, None, false, true, None),
         (Aggregated, None, true, false, None),
     ] {
         let worker = RouterGuardClientForTesting::new(vec![], vec![], vec![]);
-        let coordinator = generation_coordinator(
-            router(if empty_prefill {
-                &[]
-            } else {
-                &[(42, 15, 1), (43, 12, 0)]
-            }),
-            worker.clone(),
-            Some(router(if empty_decode {
-                &[]
-            } else {
-                &[(90, 999, 3), (91, 999, 1)]
-            })),
-            Some(worker.clone()),
+        let prefill = router(if empty_prefill {
+            Err("no eligible workers".into())
+        } else {
+            bid_response(42, 15.0 / 32.0, 5)
+        });
+        let decode = router(if empty_decode {
+            Err("no eligible workers".into())
+        } else {
+            bid_response(90, 999.0 / 64.0, 7)
+        });
+        let coordinator = GenerationCoordinator::new(
+            Arc::new(RouterWorkerCoordinator::new(prefill, worker.clone(), 32).unwrap()),
+            Some(Arc::new(
+                RouterWorkerCoordinator::new(decode, worker.clone(), 64).unwrap(),
+            )),
             strategy,
-        );
+            PrefillMarkTiming::AfterPrefillCompute,
+            7,
+        )
+        .unwrap();
         let result = coordinator
             .bid(BidRequestV1 {
                 tokens: vec![1, 2, 3],
@@ -2688,6 +2687,46 @@ async fn bids_choose_best_workers_and_require_complete_disaggregated_pairs() {
                 .ok()
                 .map(|bid| (bid.affinity, bid.prefill_tokens, bid.decode_tokens)),
             expected
+        );
+        assert!(worker.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn bid_validates_selected_costs_without_fallback() {
+    for (response, expected_error) in [
+        (route_response_new(42), Some("expected bid")),
+        (bid_response(42, 1.0, u64::MAX), Some("overflow")),
+        (bid_response(42, f64::MAX, 0), Some("overflow")),
+        (bid_response(42, -1.0, 0), Some("invalid")),
+        (bid_response(42, f64::NAN, 0), Some("invalid")),
+        (bid_response(42, 65.0 / 64.0, 0), None),
+    ] {
+        let router = RouterGuardClientForTesting::new(vec![1], vec![1], vec![response]);
+        let worker = RouterGuardClientForTesting::new(vec![], vec![], vec![]);
+        let coordinator = RouterWorkerCoordinator::new(router.clone(), worker.clone(), 64).unwrap();
+        let result = coordinator
+            .bid(crate::protocol::BidRequestV1 {
+                tokens: vec![1],
+                ..Default::default()
+            })
+            .await;
+        if let Some(message) = expected_error {
+            assert!(result.unwrap_err().to_string().contains(message));
+        } else {
+            let bid = result.unwrap();
+            assert_eq!((bid.prefill_tokens, bid.decode_tokens), (65, 0));
+        }
+        let calls = router.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["method"].as_str(), Some("bid"));
+        assert!(
+            calls[0]
+                .1
+                .as_map()
+                .unwrap()
+                .iter()
+                .all(|(key, _)| key.as_str() != Some("affinity_worker_id"))
         );
         assert!(worker.calls.lock().unwrap().is_empty());
     }
@@ -2721,11 +2760,11 @@ async fn load_queries_http_choose_bid_without_dispatch() {
             vec![1],
             vec![
                 Ok(response.clone()),
-                Ok(response.clone()),
+                bid_response(42, 3.0 / f64::from(TEST_BLOCK_SIZE), 4),
                 if decode {
                     Err("decode router unavailable".into())
                 } else {
-                    Ok(response.clone())
+                    bid_response(42, 3.0 / f64::from(TEST_BLOCK_SIZE), 4)
                 },
                 if decode {
                     Err("decode router unavailable".into())
@@ -2795,7 +2834,7 @@ async fn load_queries_http_choose_bid_without_dispatch() {
         bid,
         BidResponseV1 {
             affinity: false,
-            prefill_tokens: 1,
+            prefill_tokens: 3,
             decode_tokens: 4 * u64::from(TEST_BLOCK_SIZE),
         }
     );
@@ -2806,12 +2845,21 @@ async fn load_queries_http_choose_bid_without_dispatch() {
         );
         let calls = router.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
+        let inventory_request: RouterRequest =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&calls[0].1).unwrap()).unwrap();
+        assert!(matches!(
+            inventory_request,
+            RouterRequest::PotentialLoads {
+                allow_short_caching: false,
+                ..
+            }
+        ));
         let observed_request: RouterRequest =
             rmp_serde::from_slice(&rmp_serde::to_vec_named(&calls[1].1).unwrap()).unwrap();
-        let RouterRequest::PotentialLoads {
+        let RouterRequest::Bid {
             tokens: observed,
             block_mm_infos,
-            allow_short_caching,
+            ..
         } = observed_request
         else {
             panic!("bid must not admit")
@@ -2829,7 +2877,6 @@ async fn load_queries_http_choose_bid_without_dispatch() {
                 None
             ])
         );
-        assert!(!allow_short_caching);
     }
     let http = reqwest::Client::new();
     let mut invalid_mm = request.clone();

@@ -1655,6 +1655,18 @@ now, preserving the API shape for future parallel potential-load probes and
 session-aware multi-endpoint selection. Block size and disaggregated request-ID
 machine identity remain service-local configuration rather than wire fields.
 
+v1.2 read-only coordinator bids (#803):
+
+Coordinator bids use dedicated `RouterRequest::Bid` / `RouterResponse::Bid`
+variants so unsupported routers reject bids instead of admitting them. Replies
+contain the selected worker/rank and prefill/decode block costs; fractional
+prefill blocks preserve token-level costs. Probes use the existing worker
+selector and configured temperature with read-only state, without queue admission,
+worker booking, or affinity/load mutation.
+Replay the request/response fields, scheduler probe, B10 selector changes, and
+coordinator caller together; retain tests for aggregate and disaggregated bids
+and side-effect-free probes.
+
 Replay the protobuf schema, native client/service, PyO3 lifecycle bindings, and
 the broad client/server streaming tests together. Before claiming the intended
 sub-2 ms proxy overhead, run an optimized p50/p99 benchmark in the integration

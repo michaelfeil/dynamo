@@ -548,6 +548,16 @@ pub enum RouterRequest {
         #[serde(default, skip_serializing_if = "is_false")]
         do_not_queue: bool,
     },
+    /// Read-only candidate selection; unsupported routers reject this method.
+    Bid {
+        tokens: TokenBlob,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_mm_infos: Option<Vec<Option<BlockExtraInfo>>>,
+        #[serde(default, skip_serializing_if = "RoutingConstraints::is_empty")]
+        routing_constraints: RoutingConstraints,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allowed_worker_ids: Option<HashSet<WorkerId>>,
+    },
     MarkPrefill {
         // Once request is cancelled, the frontend might not be allowed to send a
         // request with linking the id. In this case, the request_id is provided in the payload.
@@ -605,6 +615,13 @@ pub enum RouterResponse {
         best_overlap_blocks: u32,
         #[serde(default)]
         dp_strict_rank: bool,
+    },
+    Bid {
+        worker_id: WorkerId,
+        dp_rank: DpRank,
+        /// Fractional blocks preserve token-level prefill costs.
+        prefill_blocks: f64,
+        decode_blocks: u64,
     },
     Backpressure {
         reason: RouterBackpressureReason,

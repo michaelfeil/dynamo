@@ -11,7 +11,7 @@ message BidRequest
 {
   repeated uint32 tokens = 1 [packed = true];
   optional MmRoutingArgs mm_routing_args = 2;
-  // Preserved by coordinator relays; the current PotentialLoads RPC uses only tokens/MM.
+  // Preserved by coordinator relays; router bids do not yet use cache_salt.
   optional string cache_salt = 3;
   // Same key as Routing.session_id; the downstream owns affinity decisions.
   optional string session_id = 4;

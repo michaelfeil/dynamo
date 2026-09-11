@@ -61,6 +61,14 @@ where
     Sel: WorkerSelectorTrait<ModelRuntimeConfig> + Send + Sync + 'static,
     RF: OverlapScoresRefresh + Send + Sync + 'static,
 {
+    /// Read-only placement evaluation through the queue actor, without admission.
+    pub async fn probe(
+        &self,
+        request: SchedulingRequest,
+    ) -> Result<dynamo_kv_router::scheduling::ProbeResponse, KvSchedulerError> {
+        self.inner.probe(request).await
+    }
+
     /// Start the scheduler, optionally wiring an [`OverlapScoresRefresh`] into the queue so
     /// long-waiting requests can be re-scored at dequeue time.
     #[expect(clippy::too_many_arguments)]

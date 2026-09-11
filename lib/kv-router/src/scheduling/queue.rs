@@ -21,19 +21,19 @@ use super::policy::{FcfsPolicy, SchedulingPolicy};
 use super::prefill_load::PrefillLoadEstimator;
 use super::selector::{DefaultWorkerSelector, WorkerSelector};
 use super::types::{
-    KvSchedulerError, OverloadedWorkerProvider, SchedulingContext, SchedulingRequest,
-    SchedulingResponse,
+    KvSchedulerError, OverloadedWorkerProvider, ProbeResponse, SchedulingContext,
+    SchedulingRequest, SchedulingResponse,
 };
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, RouterBackpressureReason, WorkerConfigLike, WorkerId,
-    WorkerWithDpRank,
+    WorkerSelectionResult, WorkerWithDpRank,
 };
 use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRequest};
 
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)
 pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 
-const ADMISSION_CHANNEL_CAPACITY: usize = 65_536;
+const COMMAND_CHANNEL_CAPACITY: usize = 8_192;
 
 /// Bounds the tier-cap rejection path's cancelled-entry prune (a full pending-heap
 /// scan) under sustained overload.
@@ -151,6 +151,10 @@ enum AdmissionCommand {
         threshold_frac: Option<f64>,
         ack_tx: oneshot::Sender<()>,
     },
+    Probe {
+        request: SchedulingRequest,
+        response_tx: oneshot::Sender<Result<ProbeResponse, KvSchedulerError>>,
+    },
 }
 
 struct SchedulerQueueActor<
@@ -266,7 +270,7 @@ impl<
         let pending_isl_tokens = Arc::new(AtomicUsize::new(0));
         let cancelled_requests = Arc::new(AtomicUsize::new(0));
         let eval_gauges = Arc::new(B10QueueEvalGauges::new(queue_depth_tiers.b10_tier_count()));
-        let (admission_tx, admission_rx) = mpsc::channel(ADMISSION_CHANNEL_CAPACITY);
+        let (admission_tx, admission_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let handle_queue_depth_tiers = queue_depth_tiers.clone();
         let actor = SchedulerQueueActor {
             config: baseten_configmap::try_current_reader()
@@ -445,6 +449,30 @@ impl<
         }
     }
 
+    /// Evaluate without admission or booking through the shared command queue.
+    /// Waits for queue capacity like admission. Dropping this future never
+    /// requires cleanup.
+    pub async fn probe(
+        &self,
+        mut request: SchedulingRequest,
+    ) -> Result<ProbeResponse, KvSchedulerError> {
+        request.eligibility().validate_pinned_worker_allowed()?;
+        request.update_states = false;
+        request.preferred_worker = None;
+        request.resp_tx = None;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.admission_tx
+            .send(AdmissionCommand::Probe {
+                request,
+                response_tx,
+            })
+            .await
+            .map_err(|_| KvSchedulerError::SubscriberShutdown)?;
+        response_rx
+            .await
+            .map_err(|_| KvSchedulerError::SubscriberShutdown)?
+    }
+
     /// Called on prefill_complete/free. Drains pending requests while workers have capacity.
     /// Each scheduled request updates active_tokens via add_request, so the prefill-busy check
     /// sees fresh state on the next iteration.
@@ -537,6 +565,15 @@ impl<
     async fn run(mut self, mut rx: mpsc::Receiver<AdmissionCommand>) {
         while let Some(command) = rx.recv().await {
             match command {
+                AdmissionCommand::Probe {
+                    mut request,
+                    response_tx,
+                } => {
+                    if !response_tx.is_closed() {
+                        let result = self.evaluate_probe(&mut request, Instant::now());
+                        let _ = response_tx.send(result);
+                    }
+                }
                 AdmissionCommand::Enqueue {
                     request,
                     block_hashes,
@@ -862,9 +899,25 @@ impl<
         }
     }
 
-    /// Run the full scheduling pipeline for a single request:
-    /// compute potential load -> select worker -> book tracked state -> respond.
-    fn admit_one(&self, mut request: SchedulingRequest, decay_now: Instant) {
+    fn evaluate_probe(
+        &self,
+        request: &mut SchedulingRequest,
+        decay_now: Instant,
+    ) -> Result<ProbeResponse, KvSchedulerError> {
+        let selection = self.select_candidate(request, decay_now)?;
+        Ok(ProbeResponse {
+            worker: selection.worker,
+            prefill_blocks: request.prefill_tokens_for(selection.worker) as f64
+                / f64::from(self.block_size),
+            decode_blocks: request.decode_blocks_for(selection.worker, self.block_size) as u64,
+        })
+    }
+
+    fn select_candidate(
+        &self,
+        request: &mut SchedulingRequest,
+        decay_now: Instant,
+    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
         let (decode_blocks, prefill_tokens) = self.slots.potential_blocks_and_tokens_at(
             request.token_seq.as_deref(),
             &request.prefill_token_deltas(),
@@ -880,21 +933,23 @@ impl<
         if self.slots.tracks_residency()
             && let Some(half_life) = self.selector.residency_eviction_half_life()
         {
-            request.eviction_costs = self.residency_eviction_costs(&request, half_life, decay_now);
+            request.eviction_costs = self.residency_eviction_costs(request, half_life, decay_now);
         }
 
-        let selection = {
-            let workers = self.workers_with_configs.borrow();
-            let overloaded_worker_ids = self
-                .overloaded_worker_provider
-                .as_ref()
-                .and_then(|provider| provider());
-            let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
-            self.selector
-                .select_worker(&workers, &request, eligibility, self.block_size)
-        };
+        let workers = self.workers_with_configs.borrow();
+        let overloaded_worker_ids = self
+            .overloaded_worker_provider
+            .as_ref()
+            .and_then(|provider| provider());
+        let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+        self.selector
+            .select_worker(&workers, request, eligibility, self.block_size)
+    }
 
-        let selection = match selection {
+    /// Run the full scheduling pipeline for a single request:
+    /// compute potential load -> select worker -> book tracked state -> respond.
+    fn admit_one(&self, mut request: SchedulingRequest, decay_now: Instant) {
+        let selection = match self.select_candidate(&mut request, decay_now) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("scheduling failed: {e}");
@@ -1778,6 +1833,37 @@ mod tests {
             resp_tx: Some(tx),
         };
         (req, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_leaves_live_and_cancelled_pending_requests_unchanged() {
+        let (queue, slots) = make_queue_with_custom_selector(
+            1,
+            16,
+            64,
+            Some(0.5),
+            MinDecodeSelector { rendezvous: None },
+        );
+        let (live, live_rx) = make_request("live", 64);
+        queue.enqueue(live).await;
+        live_rx.await.unwrap().unwrap();
+        let (pending, pending_rx) = make_request("pending", 64);
+        queue.enqueue(pending).await;
+        assert_eq!(queue.pending_count(), 1);
+        drop(pending_rx);
+
+        // A probe must neither book another request nor prune cancelled admissions.
+        let (request, _) = make_request("live", 17);
+        let bid = queue.probe(request).await.unwrap();
+        assert_eq!(bid.prefill_blocks, 81.0 / 16.0);
+
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.pending_isl_tokens(), 64);
+        assert_eq!(queue.b10_cancelled_requests_count(), 0);
+        assert_eq!(slots.active_request_counts().values().sum::<usize>(), 1);
+        slots.free(&"live".to_string(), Instant::now()).unwrap();
+        queue.update().await;
+        slots.assert_completely_drained(Instant::now());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -339,6 +339,14 @@ where
             .map_err(|_| KvSchedulerError::SubscriberShutdown)?
     }
 
+    /// Read-only placement evaluation; never queued for admission or booked.
+    pub async fn probe(
+        &self,
+        request: SchedulingRequest,
+    ) -> Result<super::types::ProbeResponse, KvSchedulerError> {
+        self.queue.probe(request).await
+    }
+
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
         self.queue.register_workers(worker_ids);
     }

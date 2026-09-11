@@ -90,6 +90,14 @@ pub struct SchedulingResponse {
     pub dp_strict_rank: bool,
 }
 
+/// A hypothetical placement, computed without admission or booking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeResponse {
+    pub worker: WorkerWithDpRank,
+    pub prefill_blocks: f64,
+    pub decode_blocks: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IslStats {
     pub count: usize,
@@ -103,6 +111,7 @@ pub struct ActiveRequestIslStats {
     pub by_worker_id: HashMap<WorkerId, IslStats>,
 }
 
+#[derive(Default)]
 pub struct SchedulingRequest {
     // Request identity and payload.
     pub maybe_request_id: Option<String>,
@@ -267,6 +276,14 @@ impl SchedulingRequest {
             .get(&worker)
             .copied()
             .unwrap_or(default_prefill_tokens)
+    }
+
+    /// Projected decode load, including the prompt when no worker load is tracked yet.
+    pub fn decode_blocks_for(&self, worker: WorkerWithDpRank, block_size: u32) -> usize {
+        self.decode_blocks
+            .get(&worker)
+            .copied()
+            .unwrap_or_else(|| self.prefill_tokens_for(worker) / block_size as usize)
     }
 
     /// Prompt-side load before applying this request's cache-hit credits.

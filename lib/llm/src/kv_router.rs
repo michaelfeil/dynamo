@@ -54,6 +54,7 @@ pub use dynamo_kv_router::protocols;
 pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
+mod b10_bid;
 pub mod b10_metrics_helper;
 mod b10_potential_loads_cache;
 pub mod b10_worker_selector;
@@ -1134,6 +1135,25 @@ where
         let context_id = ctx.context().id().to_string();
         // Handle different request types
         let response = match request {
+            RouterRequest::Bid {
+                tokens,
+                block_mm_infos,
+                routing_constraints,
+                allowed_worker_ids,
+            } => {
+                let request_context = ctx.context();
+                tokio::select! {
+                    biased;
+                    _ = request_context.stopped() => return Err(cancelled_error(&context_id)),
+                    _ = request_context.killed() => return Err(cancelled_error(&context_id)),
+                    bid = self.bid(
+                        &tokens,
+                        block_mm_infos.as_deref(),
+                        allowed_worker_ids,
+                        routing_constraints,
+                    ) => bid?,
+                }
+            }
             RouterRequest::New {
                 tokens,
                 block_mm_infos,
@@ -1342,6 +1362,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod b10_bid;
+
     use super::*;
     use std::collections::HashMap;
 

@@ -227,12 +227,7 @@ fn score_worker<C: WorkerConfigLike>(
 ) -> B10Score {
     let prefill_token = request.prefill_tokens_for(worker);
     let potential_prefill_block = (prefill_token as f64) / (block_size as f64);
-    let decode_block_fallback = potential_prefill_block.floor() as usize;
-    let decode_block = request
-        .decode_blocks
-        .get(&worker)
-        .copied()
-        .unwrap_or(decode_block_fallback) as f64;
+    let decode_block = request.decode_blocks_for(worker, block_size) as f64;
 
     // Absolute cache-miss tokens: ISL minus device-resident cache hit tokens.
     // For short requests below `cache_miss_min_isl`, treat the request as a
@@ -316,7 +311,7 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
 
         let request_blocks = request.request_blocks(block_size);
         let hot_reloadable_config = self.config.snapshot();
-        let verbose = self.should_print_this_loop(workers.len());
+        let verbose = request.update_states && self.should_print_this_loop(workers.len());
 
         let overlap_weight = request
             .router_config_override
@@ -405,13 +400,15 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
                 );
             }
 
-            tracing::info!(
-                "B10WorkerSelector selected pinned worker: worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
-                worker.worker_id,
-                worker.dp_rank,
-                score.logit,
-                effective_overlap_blocks,
-            );
+            if request.update_states {
+                tracing::info!(
+                    "B10WorkerSelector selected pinned worker: worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
+                    worker.worker_id,
+                    worker.dp_rank,
+                    score.logit,
+                    effective_overlap_blocks,
+                );
+            }
 
             return Ok(WorkerSelectionResult {
                 worker,
@@ -469,13 +466,15 @@ impl WorkerSelector<ModelRuntimeConfig> for B10WorkerSelector {
         let effective_overlap_blocks = request.effective_overlap_blocks_for(best_worker);
         let cached_tokens = request.effective_cached_tokens_for(best_worker);
 
-        tracing::info!(
-            "B10WorkerSelector selected worker: worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
-            best_worker.worker_id,
-            best_worker.dp_rank,
-            best_logit,
-            effective_overlap_blocks,
-        );
+        if request.update_states {
+            tracing::info!(
+                "B10WorkerSelector selected worker: worker_id={} dp_rank={:?}, logit: {:.3}, effective cached blocks: {:.2}",
+                best_worker.worker_id,
+                best_worker.dp_rank,
+                best_logit,
+                effective_overlap_blocks,
+            );
+        }
 
         Ok(WorkerSelectionResult {
             worker: best_worker,
@@ -538,6 +537,66 @@ mod tests {
             shared_cache_hits: None,
             resp_tx: None,
         }
+    }
+
+    #[test]
+    fn read_only_selection_reports_costs_without_selection_telemetry() {
+        let selector = B10WorkerSelector::new();
+        let workers = HashMap::from([(2, test_worker_config(4, 2)), (1, test_worker_config(2, 2))]);
+        let mut request = base_request(65);
+        request.router_config_override = Some(RouterConfigOverride {
+            router_temperature: Some(0.0),
+            prefill_load_scale: Some(1.0),
+            ..Default::default()
+        });
+        request
+            .prefill_tokens
+            .insert(WorkerWithDpRank::new(2, 5), 0);
+        for _ in 0..50 {
+            let selected = selector
+                .select_worker(&workers, &request, request.eligibility(), 64)
+                .unwrap();
+            assert_eq!(selected.worker, WorkerWithDpRank::new(2, 5));
+        }
+        request.prefill_tokens.clear();
+        assert_eq!(selector.last_log_time_ms.load(Ordering::Relaxed), 0);
+        // Reported block costs use the same inputs as the B10 logit.
+        let worker = WorkerWithDpRank::new(1, 2);
+        let score = score_worker(
+            &workers,
+            &request,
+            worker,
+            64,
+            1.0,
+            1.0,
+            0.0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            (2048.0, 32_768.0),
+        );
+        assert_eq!(
+            score.decode_block,
+            request.decode_blocks_for(worker, 64) as f64
+        );
+        assert_eq!(
+            score.potential_prefill_block,
+            request.prefill_tokens_for(worker) as f64 / 64.0
+        );
+        let probe = selector
+            .select_worker(&workers, &request, request.eligibility(), 64)
+            .unwrap();
+        assert_eq!(request.prefill_tokens_for(probe.worker), 65);
+        assert_eq!(request.decode_blocks_for(probe.worker, 64), 1);
+        request.pinned_worker = Some(worker);
+        request.decode_blocks.insert(worker, 7);
+        let probe = selector
+            .select_worker(&workers, &request, request.eligibility(), 64)
+            .unwrap();
+        assert_eq!(request.prefill_tokens_for(probe.worker), 65);
+        assert_eq!(request.decode_blocks_for(probe.worker, 64), 7);
     }
 
     #[test]
@@ -752,8 +811,10 @@ mod tests {
         assert_eq!(result.worker, worker_rank_0);
     }
 
-    #[test]
-    fn zero_temperature_is_floored_and_does_not_tiebreak_by_worker_id() {
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn zero_temperature_is_floored_and_does_not_tiebreak_by_worker_id(#[case] update_states: bool) {
         let selector = B10WorkerSelector::new();
         // All workers identical -> all logits tie. A temperature of 0 is now
         // floored to 1e-12, so ties go through softmax_sample (uniform random)
@@ -764,6 +825,7 @@ mod tests {
             (20, test_worker_config(0, 1)),
         ]);
         let mut request = base_request(128);
+        request.update_states = update_states;
         request.router_config_override = Some(RouterConfigOverride {
             router_temperature: Some(0.0),
             ..Default::default()
@@ -783,6 +845,9 @@ mod tests {
             seen.len() > 1,
             "temperature=0 should not deterministically pick the lowest worker_id; saw {seen:?}"
         );
+        if !update_states {
+            assert_eq!(selector.last_log_time_ms.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]

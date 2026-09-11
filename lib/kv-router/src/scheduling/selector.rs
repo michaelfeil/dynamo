@@ -16,6 +16,7 @@ use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, Worker
 ///
 /// Generic over `C` so that the scheduling layer does not depend on a concrete config type.
 pub trait WorkerSelector<C: WorkerConfigLike> {
+    /// Read-only requests use the same selection policy without updating selection state.
     fn select_worker(
         &self,
         workers: &HashMap<WorkerId, C>,
@@ -323,7 +324,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
                 if score == best_logit {
                     tie_count += 1;
-                    // Reservoir sampling keeps tied minima uniform without collecting workers.
                     if rng.random_range(0..tie_count) == 0 {
                         best_worker = Some(worker);
                     }
@@ -597,52 +597,16 @@ mod tests {
             (20, SimpleWorkerConfig::default()),
             (30, SimpleWorkerConfig::default()),
         ]);
-        let request = SchedulingRequest {
-            maybe_request_id: Some("test".into()),
-            token_seq: None,
-            isl_tokens: 16,
-            tier_overlap_blocks: Default::default(),
-            effective_overlap_blocks: HashMap::default(),
-            effective_cached_tokens: HashMap::default(),
-            decode_blocks: FxHashMap::default(),
-            prefill_tokens: FxHashMap::default(),
-            active_requests: HashMap::new(),
-            active_request_isl_stats: None,
-            eviction_costs: HashMap::new(),
-            track_prefill_tokens: true,
-            router_config_override: None,
-            update_states: false,
-            lora_name: None,
-            priority_jump: 0.0,
-            priority_load_shed_percent: 0,
-            do_not_queue: false,
-            expected_output_tokens: None,
-            pinned_worker: None,
-            preferred_worker: None,
-            allowed_worker_ids: None,
-            routing_constraints: crate::protocols::RoutingConstraints::default(),
-            shared_cache_hits: None,
-            resp_tx: None,
-        };
-        let mut selected = [false; 3];
-
+        let request = base_request(16);
+        let mut selected = HashSet::new();
         for _ in 0..120 {
             let result = selector
                 .select_worker(&workers, &request, request.eligibility(), 16)
                 .unwrap();
-            match result.worker.worker_id {
-                10 => selected[0] = true,
-                20 => selected[1] = true,
-                30 => selected[2] = true,
-                worker_id => panic!("unexpected worker id: {worker_id}"),
-            }
+            assert!(workers.contains_key(&result.worker.worker_id));
+            selected.insert(result.worker.worker_id);
         }
-
-        let selected_count = selected.into_iter().filter(|seen| *seen).count();
-        assert!(
-            selected_count > 1,
-            "zero-temperature tie-breaking should not always select the same worker"
-        );
+        assert!(selected.len() > 1, "selection should randomize tied minima");
     }
 
     #[test]
