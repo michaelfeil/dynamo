@@ -1141,6 +1141,18 @@ where
                 routing_constraints,
                 allowed_worker_ids,
             } => {
+                let session_id = session_affinity_from_context(&ctx).map_err(anyhow::Error::msg)?;
+                let preferred_worker = match (self.affinity.as_ref(), session_id.as_ref()) {
+                    (Some(affinity), Some(session_id)) => {
+                        affinity.query_target(session_id, None)?.and_then(|target| {
+                            target
+                                .dp_rank
+                                .or_else(|| self.unique_dp_rank_for_worker(target.worker_id))
+                                .map(|rank| WorkerWithDpRank::new(target.worker_id, rank))
+                        })
+                    }
+                    _ => None,
+                };
                 let request_context = ctx.context();
                 tokio::select! {
                     biased;
@@ -1151,6 +1163,7 @@ where
                         block_mm_infos.as_deref(),
                         allowed_worker_ids,
                         routing_constraints,
+                        preferred_worker,
                     ) => bid?,
                 }
             }
@@ -1260,6 +1273,7 @@ where
                         }
                         RouterResponse::New {
                             worker_id: worker.worker_id,
+                            affinity: Some(preferred_worker == Some(worker)),
                             dp_rank: worker.dp_rank,
                             overlap_blocks,
                             best_overlap_blocks,
@@ -1568,6 +1582,8 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_router_uses_context_session_affinity_as_soft_preference() {
+        use futures::StreamExt;
+
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let selected_worker = WorkerWithDpRank::from_worker_id(0);
         let router = make_test_router(
@@ -1589,7 +1605,12 @@ mod tests {
                 Default::default(),
             );
             request.insert_metadata(SESSION_AFFINITY_CONTEXT_KEY, "shared-session");
-            router.generate(request).await.unwrap();
+            let mut response = router.generate(request).await.unwrap();
+            assert!(matches!(
+                response.next().await.unwrap().data.unwrap(),
+                RouterResponse::New { affinity: Some(hit), .. }
+                    if hit == (request_id == "second")
+            ));
             assert!(router.affinity_leases.contains_key(request_id));
             router.free(request_id).await.unwrap();
             assert!(!router.affinity_leases.contains_key(request_id));

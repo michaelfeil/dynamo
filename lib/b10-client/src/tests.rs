@@ -398,6 +398,7 @@ impl RouterGuardClient for RouterGuardClientForTesting {
 
 fn new_response() -> Result<RsRouterResponse, String> {
     Ok(RsRouterResponse::New {
+        affinity: None,
         worker_id: 1,
         dp_rank: 0,
         overlap_blocks: 0,
@@ -747,6 +748,7 @@ fn make_worker_request() -> rmpv::Value {
 
 fn route_response_new(worker_id: u64) -> Result<RsRouterResponse, String> {
     Ok(RsRouterResponse::New {
+        affinity: None,
         worker_id,
         dp_rank: 0,
         overlap_blocks: 0,
@@ -2624,6 +2626,7 @@ fn bid_response(
     Ok(RsRouterResponse::Bid {
         worker_id,
         dp_rank: 0,
+        affinity: false,
         prefill_blocks,
         decode_blocks,
     })
@@ -2689,6 +2692,25 @@ async fn bids_use_selected_costs_and_require_complete_disaggregated_pairs() {
             expected
         );
         assert!(worker.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn bid_response_serializes_affinity_explicitly() {
+    for affinity in [false, true] {
+        let response = RsRouterResponse::Bid {
+            worker_id: 42,
+            dp_rank: 0,
+            affinity,
+            prefill_blocks: 1.0,
+            decode_blocks: 2,
+        };
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["affinity"], affinity);
+        assert!(matches!(
+            serde_json::from_value::<RsRouterResponse>(wire).unwrap(),
+            RsRouterResponse::Bid { affinity: actual, .. } if actual == affinity
+        ));
     }
 }
 
@@ -2838,10 +2860,10 @@ async fn load_queries_http_choose_bid_without_dispatch() {
             decode_tokens: 4 * u64::from(TEST_BLOCK_SIZE),
         }
     );
-    for router in [&prefill, &decode] {
+    for (router, session_id) in [(&prefill, request.session_id.clone()), (&decode, None)] {
         assert_eq!(
             *router.load_query_sessions.lock().unwrap(),
-            vec![None, request.session_id.clone()]
+            vec![None, session_id]
         );
         let calls = router.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -3215,6 +3237,7 @@ async fn generation_coordinator_decode_denial_retains_prefill_admission() {
             vec![7],
             vec![7],
             vec![Ok(RsRouterResponse::New {
+                affinity: None,
                 worker_id: 1,
                 dp_rank: 3,
                 overlap_blocks: 2,

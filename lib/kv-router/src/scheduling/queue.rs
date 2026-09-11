@@ -458,7 +458,6 @@ impl<
     ) -> Result<ProbeResponse, KvSchedulerError> {
         request.eligibility().validate_pinned_worker_allowed()?;
         request.update_states = false;
-        request.preferred_worker = None;
         request.resp_tx = None;
         let (response_tx, response_rx) = oneshot::channel();
         self.admission_tx

@@ -607,6 +607,9 @@ pub enum RouterBackpressureReason {
 pub enum RouterResponse {
     New {
         worker_id: WorkerId,
+        /// Whether selection matched an existing session preference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        affinity: Option<bool>,
         #[serde(default)]
         dp_rank: DpRank,
         overlap_blocks: u32,
@@ -619,6 +622,7 @@ pub enum RouterResponse {
     Bid {
         worker_id: WorkerId,
         dp_rank: DpRank,
+        affinity: bool,
         /// Fractional blocks preserve token-level prefill costs.
         prefill_blocks: f64,
         decode_blocks: u64,

@@ -136,6 +136,7 @@ impl RouterWorkerCoordinator {
             )
             .await?;
         let RsRouterResponse::Bid {
+            affinity,
             prefill_blocks,
             decode_blocks,
             ..
@@ -149,8 +150,7 @@ impl RouterWorkerCoordinator {
             "invalid or overflowing bid prefill token count"
         );
         Ok(crate::protocol::BidResponseV1 {
-            // Session metadata is forwarded; bids do not resolve affinity yet.
-            affinity: false,
+            affinity,
             prefill_tokens: prefill_tokens.round() as u64,
             decode_tokens: decode_blocks
                 .checked_mul(u64::from(self.block_size))

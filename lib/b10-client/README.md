@@ -142,16 +142,18 @@ calling a relay. A relay used as another pool's option must still respond within
 that caller's five-second option budget.
 
 The coordinator returns its best aggregate worker or prefill/decode pair using
-`(1 - 0.5 * affinity) * (prefill_tokens + 0.1 * decode_tokens)`. For now, local bids
-always return `affinity=false`. Callers supply only `session_id`, the same key used
+`(1 - 0.5 * affinity) * (prefill_tokens + 0.1 * decode_tokens)`.
+Callers supply only `session_id`, the same key used
 by `/v1/coordinate`; affinity decisions belong to the downstream coordinator, not
-the caller or relay. The key is forwarded through relays and router request metadata
-for future affinity resolution, without any affinity lookup or update during bidding.
+the caller or relay. The key is forwarded to the prefill-bearing router, which
+queries the existing binding without acquiring a lease or refreshing its TTL.
+The bound worker/rank is a soft preference; `affinity=true` only when it wins
+selection. Decode-leg bids receive no session hint.
 Each DP rank
 is a candidate; decode blocks are converted using the decode pool's block size.
 Disaggregated routers are queried concurrently and both must have workers. The pair's
 estimate combines prefill-pool prefill tokens with decode-pool decode tokens.
-Bids send only `PotentialLoads`, with short caching disabled: no admission, worker
+Bids send only `Bid`: no admission, worker
 execution, capacity reservation, or affinity update. Tokens and MM routing info affect
 the estimate. `cache_salt` is carried through relays but does not yet affect the
 unchanged router RPC/cache. LoRA, worker restrictions, and MM payloads are not bid fields.

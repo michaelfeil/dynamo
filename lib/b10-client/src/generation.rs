@@ -137,8 +137,10 @@ impl GenerationCoordinator {
                     .next
                     .as_ref()
                     .expect("validated disaggregated topology");
+                let mut decode_request = request.clone();
+                decode_request.session_id = None;
                 let (prefill, decode) =
-                    tokio::try_join!(self.primary.bid(request.clone()), next.bid(request))?;
+                    tokio::try_join!(self.primary.bid(request), next.bid(decode_request))?;
                 Ok(crate::protocol::BidResponseV1 {
                     decode_tokens: decode.decode_tokens,
                     ..prefill

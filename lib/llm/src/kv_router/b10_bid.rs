@@ -7,7 +7,7 @@ use anyhow::Result;
 use dynamo_kv_router::{
     protocols::{
         BlockExtraInfo, BlockHashOptions, RouterResponse, RoutingConstraints, WorkerId,
-        compute_block_hash_for_seq,
+        WorkerWithDpRank, compute_block_hash_for_seq,
     },
     scheduling::SchedulingRequest,
     selector::WorkerSelector,
@@ -30,6 +30,7 @@ where
         block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
+        preferred_worker: Option<WorkerWithDpRank>,
     ) -> Result<RouterResponse> {
         anyhow::ensure!(!tokens.is_empty(), "cannot bid on an empty token sequence");
         let hash_options = BlockHashOptions {
@@ -62,6 +63,7 @@ where
                 isl_tokens: tokens.len(),
                 allowed_worker_ids,
                 routing_constraints,
+                preferred_worker,
                 track_prefill_tokens: self.kv_router_config.track_prefill_tokens(None),
                 tier_overlap_blocks: tier_overlap_blocks_from_tiered_matches(
                     &lookup.tiered_matches,
@@ -76,6 +78,7 @@ where
         Ok(RouterResponse::Bid {
             worker_id: bid.worker.worker_id,
             dp_rank: bid.worker.dp_rank,
+            affinity: preferred_worker == Some(bid.worker),
             prefill_blocks: bid.prefill_blocks,
             decode_blocks: bid.decode_blocks,
         })

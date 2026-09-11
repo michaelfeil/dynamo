@@ -1662,7 +1662,9 @@ variants so unsupported routers reject bids instead of admitting them. Replies
 contain the selected worker/rank and prefill/decode block costs; fractional
 prefill blocks preserve token-level costs. Probes use the existing worker
 selector and configured temperature with read-only state, without queue admission,
-worker booking, or affinity/load mutation.
+worker booking, or affinity/load mutation. Session bindings are queried read-only
+on the prefill-bearing router; bids report affinity only if the bound worker/rank
+is selected, without refreshing TTL. Decode-leg bids receive no session hint.
 Replay the request/response fields, scheduler probe, B10 selector changes, and
 coordinator caller together; retain tests for aggregate and disaggregated bids
 and side-effect-free probes.
