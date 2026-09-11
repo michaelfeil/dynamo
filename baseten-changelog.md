@@ -274,6 +274,21 @@ the target container stack.
 
 Status: `keep`
 
+TCP registry mutex (upstream
+[ai-dynamo/dynamo#11065](https://github.com/ai-dynamo/dynamo/pull/11065)):
+cherry-pick `97b8acfb817df24f1ae9cdaa8b697ee280e54e30`, adapted to this
+fork's response-stream registry. Replace the Tokio mutex with `parking_lot`
+and keep registration/call-home map operations in synchronous helpers; prepare
+stream metadata outside the lock and release the startup lock before awaiting
+the listener. Retain the single state, cancellation/tombstone bookkeeping, and
+asynchronous drop cleanup. Includes upstream's 128-stream concurrent
+registration/call-home payload test. Upstream measured lower registry latency
+without a demonstrated throughput gain. Fork-local dummy TCP measurements are
+recorded in [#816](https://github.com/basetenlabs/dynamo/pull/816#issuecomment-5627836748):
+registration latency and CPU/request improved under contention, while average
+round-trip p99 worsened. These are transport measurements, not model-serving results.
+Drop this port when the corresponding upstream implementation is incorporated.
+
 Cancellation-future reuse (basetenlabs/dynamo#787): cherry-pick of upstream
 [ai-dynamo/dynamo#11149](https://github.com/ai-dynamo/dynamo/pull/11149)
 (`1820df91b570f53e8c51d519d9ff5d7d4105267d`), adapted to this fork's stream APIs.
