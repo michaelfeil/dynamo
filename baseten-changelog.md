@@ -1606,6 +1606,12 @@ both router guards alive through the returned stream. The Python extension
 only converts serialized worker maps, exposes admission metadata, and adapts
 the response stream.
 
+SGLang empty-token handoffs retain the prefill stream until decode connects,
+then emit the final prefill completion with cache metrics before decode tokens.
+Token-bearing TRT handoffs still emit immediately. Preserve late-prefill error
+and cancellation cleanup, DP-rank handoff metadata, and the local/remote
+regression tests when replaying.
+
 Preserve error annotations before filtering metadata-only messages (#768):
 prefill failures retain their original error, bootstrap failures are forwarded
 without treating them as successful transfer, and decode errors terminate the

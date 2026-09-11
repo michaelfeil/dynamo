@@ -399,12 +399,23 @@ impl GenerationCoordinator {
         admission.decode_worker_id = Some(decode_worker_id);
         admission.decode_dp_rank = Some(decode_dp_rank);
 
-        // Yield the prefill handoff immediately. Bootstrap consumption occurs
-        // on the next poll, preserving time-to-first-token behavior.
+        let empty_prefill_handoff =
+            map_get(first_output_mut(&mut prefill_response)?, "token_ids_diff")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty);
+        let prefill_stream = empty_prefill_handoff.then_some(stream);
+        let machine_id = self.disagg_request_id_machine_id;
+        let request_context = context.inner();
         let output = async_stream::stream! {
             let prefill_guard = prefill_guard;
             let _decode_guard = decode_guard;
-            yield Annotated::from_data(prefill_response);
+            let mut prefill_response = if empty_prefill_handoff {
+                prefill_response
+            } else {
+                // Token-bearing handoffs retain the immediate TRT first-token path.
+                yield Annotated::from_data(prefill_response);
+                Value::Nil
+            };
 
             match next_visible_annotated(&mut decode_stream).await {
                 Some(error) if error.is_error() => {
@@ -423,6 +434,44 @@ impl GenerationCoordinator {
                     );
                     return;
                 }
+            }
+
+            if let Some(mut stream) = prefill_stream {
+                // SGLang cannot complete prefill until decode connects for KV transfer.
+                loop {
+                    let item = tokio::select! {
+                        biased;
+                        _ = request_context.stopped() => return,
+                        _ = request_context.killed() => return,
+                        item = next_visible_annotated(&mut stream) => item,
+                    };
+                    let Some(item) = item else {
+                        if prefill_response["finished"].as_bool() == Some(false) {
+                            yield Annotated::from_error(
+                                "prefill stream ended before a completion response was produced",
+                            );
+                            return;
+                        }
+                        break;
+                    };
+                    if item.is_error() {
+                        yield item;
+                        return;
+                    }
+                    prefill_response = item.data.expect("next_visible_annotated returned data");
+                    match prepare_handoff_response(&mut prefill_response, machine_id) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            yield Annotated::from_data(prefill_response);
+                            return;
+                        }
+                        Err(error) => {
+                            yield Annotated::from_error(error.to_string());
+                            return;
+                        }
+                    }
+                }
+                yield Annotated::from_data(prefill_response);
             }
 
             while let Some(item) = decode_stream.next().await {

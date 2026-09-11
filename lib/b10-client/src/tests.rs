@@ -91,6 +91,7 @@ struct RouterGuardClientForTesting {
     instance_ids: Mutex<Vec<u64>>,
     responses: Mutex<VecDeque<Result<RsRouterResponse, String>>>,
     stream_chunks_queue: Mutex<Option<VecDeque<Vec<RsAnnotated<rmpv::Value>>>>>,
+    stream_override: Mutex<Option<stream::BoxStream<'static, RsAnnotated<rmpv::Value>>>>,
     respect_cancel: Mutex<CancelRespect>,
     auto_remove_on_error: AtomicBool,
     stream_items_polled: Arc<AtomicUsize>,
@@ -121,6 +122,7 @@ impl RouterGuardClientForTesting {
             instance_ids: Mutex::new(instance_ids),
             responses: Mutex::new(responses.into()),
             stream_chunks_queue: Mutex::new(None),
+            stream_override: Mutex::new(None),
             respect_cancel: Mutex::new(CancelRespect::No),
             auto_remove_on_error: AtomicBool::new(false),
             stream_items_polled: Arc::new(AtomicUsize::new(0)),
@@ -327,6 +329,10 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         let open_delay = *self.open_delay.lock().unwrap();
         if open_delay > Duration::ZERO {
             tokio::time::sleep(open_delay).await;
+        }
+
+        if let Some(stream) = self.stream_override.lock().unwrap().take() {
+            return Ok(ResponseStream::new(stream, context));
         }
 
         // Multi-chunk stream mode: each direct() consumes one inner
@@ -3276,6 +3282,240 @@ async fn generation_coordinator_prefill_first_moves_handoff_and_drops_bootstrap(
         wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2)).await;
         if let Some(server) = server {
             server.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn generation_coordinator_empty_prefill_handoff_preserves_completion() {
+    for remote in [false, true] {
+        for late_metrics in [false, true] {
+            for cached_tokens in [0, 2] {
+                let prefill_router =
+                    RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+                let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+                let decode_router =
+                    RouterGuardClientForTesting::new(vec![8], vec![8], vec![route_response_new(2)]);
+                let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+                let ready = Arc::new(tokio::sync::Notify::new());
+                let transfer_done = ready.clone();
+                let handoff = jv!({
+                    "request_id": "sglang",
+                    "finished": false,
+                    "outputs": [{
+                        "token_ids_diff": [],
+                        "length": 0,
+                        "finish_reason": "length",
+                        "disaggregated_params": {
+                            "request_type": "context_only",
+                            "kv_transfer_params": {"disagg_prefill_dp_rank": 3}
+                        }
+                    }]
+                });
+                let mut completion = handoff.clone();
+                let expected_metrics = jv!({
+                    "kv_cache_hit_rate": cached_tokens as f64 / 3.0,
+                    "num_reused_blocks": cached_tokens,
+                    "num_missed_blocks": 3 - cached_tokens
+                });
+                let rmpv::Value::Map(ref mut completion_fields) = completion else {
+                    unreachable!()
+                };
+                completion_fields.retain(|(key, _)| key.as_str() != Some("finished"));
+                completion_fields.extend([
+                    ("finished".into(), jv!(true)),
+                    ("cached_tokens".into(), jv!(cached_tokens)),
+                    ("kv_cache_metrics".into(), expected_metrics.clone()),
+                ]);
+                *prefill_worker.stream_override.lock().unwrap() =
+                    Some(Box::pin(async_stream::stream! {
+                        if late_metrics {
+                            yield RsAnnotated::from_data(handoff);
+                            transfer_done.notified().await;
+                            yield RsAnnotated::from_annotation("metrics", &"ignored").unwrap();
+                        }
+                        yield RsAnnotated::from_data(completion);
+                    }));
+                *decode_worker.stream_override.lock().unwrap() = Some(Box::pin(
+                    async_stream::stream! {
+                        ready.notify_one();
+                        yield RsAnnotated::from_data(jv!({"outputs": [{"token_ids_diff": []}]}));
+                        yield RsAnnotated::from_data(jv!({"outputs": [{"token_ids_diff": [10, 11]}]}));
+                    },
+                ));
+                let coordinator = generation_coordinator(
+                    prefill_router.clone(),
+                    prefill_worker,
+                    Some(decode_router.clone()),
+                    Some(decode_worker.clone()),
+                    DisaggregationStrategy::PrefillFirst,
+                );
+                let (coordinator, server) = generation_transport(coordinator, remote).await;
+                let responses = tokio::time::timeout(Duration::from_secs(5), async {
+                    let outcome = coordinator
+                        .generate(
+                            build_test_context("sglang"),
+                            GenerationRequest {
+                                routing_request: RouterRequestNew {
+                                    tokens: vec![1, 2, 3],
+                                    ..Default::default()
+                                },
+                                primary_worker_request: make_worker_request(),
+                                decode_worker_request: Some(make_worker_request()),
+                            },
+                            GenerationOptions::default(),
+                        )
+                        .await
+                        .unwrap();
+                    let GenerationOutcome::Connected(generated) = outcome else {
+                        panic!("expected connected")
+                    };
+                    generated.stream.collect::<Vec<_>>().await
+                })
+                .await
+                .expect("prefill must not wait for transfer before polling decode");
+                assert_eq!(responses.len(), 2);
+                let prefill = responses[0].data.as_ref().unwrap();
+                assert_eq!(prefill["cached_tokens"].as_i64(), Some(cached_tokens));
+                assert_eq!(prefill["kv_cache_metrics"], expected_metrics);
+                assert!(prefill["outputs"][0]["finish_reason"].is_nil());
+                assert_eq!(
+                    responses[1].data.as_ref().unwrap()["outputs"][0]["token_ids_diff"],
+                    jv!([10, 11])
+                );
+                assert_eq!(decode_worker.calls()[0].1["disaggregated_params"]["kv_transfer_params"]["disagg_prefill_dp_rank"].as_i64(), Some(3));
+                wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2))
+                    .await;
+                wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2))
+                    .await;
+                assert_eq!(prefill_router.method_call_count("mark_free"), 1);
+                assert_eq!(decode_router.method_call_count("mark_free"), 1);
+                if let Some(server) = server {
+                    server.shutdown().await.unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn generation_coordinator_empty_prefill_failure_cleans_up_both_workers() {
+    use dynamo_runtime::error::{DynamoError, ErrorType};
+    use dynamo_runtime::protocols::maybe_error::MaybeError;
+
+    for remote in [false, true] {
+        for failure in ["annotated", "terminal", "malformed", "cancel", "eof"] {
+            let prefill_router =
+                RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+            let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+            let decode_router =
+                RouterGuardClientForTesting::new(vec![8], vec![8], vec![route_response_new(2)]);
+            let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+            let context = build_test_context("sglang-failure");
+            let stop_context = context.inner();
+            let error = RsAnnotated::from_err(
+                DynamoError::builder()
+                    .error_type(ErrorType::ResponseTimeout)
+                    .message("prefill transfer failed")
+                    .build(),
+            );
+            let expected_error = error.clone();
+            *prefill_worker.stream_override.lock().unwrap() =
+                Some(Box::pin(async_stream::stream! {
+                    yield RsAnnotated::from_data(jv!({"finished": false, "outputs": [{
+                        "token_ids_diff": [], "finish_reason": "length",
+                        "disaggregated_params": {"request_type": "context_only"}
+                    }]}));
+                    match failure {
+                        "annotated" => yield error,
+                        "terminal" => yield RsAnnotated::from_data(jv!({"outputs": [{
+                            "token_ids_diff": [], "finish_reason": "error",
+                            "disaggregated_params": {"request_type": "context_only"}
+                        }]})),
+                        "malformed" => yield RsAnnotated::from_data(jv!({"outputs": []})),
+                        "cancel" => {
+                            stop_context.stop_generating();
+                            std::future::pending::<()>().await;
+                        }
+                        "eof" => {}
+                        _ => unreachable!(),
+                    }
+                }));
+            decode_worker.set_stream_chunks(vec![vec![
+                jv!({"bootstrap": true}),
+                jv!({"must_not_be_seen": true}),
+            ]]);
+            let coordinator = generation_coordinator(
+                prefill_router.clone(),
+                prefill_worker,
+                Some(decode_router.clone()),
+                Some(decode_worker),
+                DisaggregationStrategy::PrefillFirst,
+            );
+            let (coordinator, server) = generation_transport(coordinator, remote).await;
+            let responses = tokio::time::timeout(Duration::from_secs(5), async {
+                let outcome = coordinator
+                    .generate(
+                        context,
+                        GenerationRequest {
+                            routing_request: RouterRequestNew {
+                                tokens: vec![1, 2, 3],
+                                ..Default::default()
+                            },
+                            primary_worker_request: make_worker_request(),
+                            decode_worker_request: Some(make_worker_request()),
+                        },
+                        GenerationOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                match outcome {
+                    GenerationOutcome::Connected(generated) => {
+                        generated.stream.collect::<Vec<_>>().await
+                    }
+                    GenerationOutcome::Denied(denied) => {
+                        assert!(remote && failure == "cancel");
+                        assert!(matches!(denied.denied, DeniedRequest::Cancelled()));
+                        Vec::new()
+                    }
+                }
+            })
+            .await
+            .expect("late prefill failure must not hang");
+            if failure == "cancel" {
+                assert!(responses.is_empty());
+            } else {
+                assert_eq!(responses.len(), 1);
+                match failure {
+                    "annotated" => assert_eq!(
+                        serde_json::to_value(&responses[0]).unwrap(),
+                        serde_json::to_value(&expected_error).unwrap()
+                    ),
+                    "terminal" => {
+                        let response = responses[0].data.as_ref().unwrap();
+                        assert_eq!(
+                            response["outputs"][0]["finish_reason"].as_str(),
+                            Some("error")
+                        );
+                        assert!(response["outputs"][0]["disaggregated_params"].is_nil());
+                    }
+                    "malformed" => assert!(responses[0].is_error()),
+                    "eof" => {
+                        assert!(responses[0].is_error());
+                        assert!(responses[0].data.is_none());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2))
+                .await;
+            wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2))
+                .await;
+            assert_eq!(prefill_router.method_call_count("mark_free"), 1);
+            assert_eq!(decode_router.method_call_count("mark_free"), 1);
+            if let Some(server) = server {
+                server.shutdown().await.unwrap();
+            }
         }
     }
 }
