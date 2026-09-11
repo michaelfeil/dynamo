@@ -1643,6 +1643,10 @@ did not catch this.
 
 v1.2 remote generation coordinator:
 
+`DYNAMO_DEFAULT_GENERATION_COORDINATOR_URL` selects remote mode by default and
+supplies the `default` endpoint. Explicit configmap remotes override it;
+`is_client_force=False` keeps orchestration local regardless of the environment.
+
 The generation coordinator now has a common Rust client trait with local and
 remote implementations. The remote path uses a versioned, typed protobuf over
 HTTP; tokens and multimodal payloads are separate from an opaque MessagePack
