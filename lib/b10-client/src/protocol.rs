@@ -36,6 +36,12 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 impl BidRequestV1 {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.tokens.is_empty(), "bid tokens are required");
+        if let Some(session) = &self.session_id {
+            anyhow::ensure!(
+                session.len() <= dynamo_llm::session_affinity::MAX_SESSION_AFFINITY_ID_BYTES,
+                "bid session ID is too long"
+            );
+        }
         validate_mm_routing_args(self.mm_routing_args.as_ref())
     }
 }

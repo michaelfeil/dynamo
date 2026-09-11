@@ -274,7 +274,7 @@ impl RemotePool {
     pub(super) async fn select(
         &self,
         session: Option<&str>,
-        mut request: protocol::BidRequestV1,
+        request: protocol::BidRequestV1,
         allowed: &[u64],
         context: &RequestContext,
     ) -> Result<(Url, Option<AffinityAcquire>)> {
@@ -310,7 +310,7 @@ impl RemotePool {
             // updates affinity and the stream retains its lease.
             return Ok((remotes.into_values().next().expect("singleton"), affinity));
         }
-        request.affinity_worker_id = affinity
+        let affinity_worker_id = affinity
             .as_ref()
             .and_then(AffinityAcquire::target)
             .map(|target| target.worker_id)
@@ -320,7 +320,7 @@ impl RemotePool {
         state.retain_live(&mut remotes, allowed);
         {
             let backends = state.backends.read().unwrap();
-            if let Some(target) = request.affinity_worker_id {
+            if let Some(target) = affinity_worker_id {
                 let mut matches = backends.iter().filter(|(name, backend)| {
                     remotes
                         .get(*name)

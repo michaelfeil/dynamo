@@ -27,6 +27,7 @@ struct Backend {
     bids: AtomicUsize,
     decode_tokens: AtomicUsize,
     session: std::sync::Mutex<Option<String>>,
+    bid_session: std::sync::Mutex<Option<String>>,
     stall_bid: bool,
 }
 
@@ -48,9 +49,10 @@ impl GenerationCoordinatorClient for Backend {
                 self.release.notified().await;
             }
             request.validate()?;
+            *self.bid_session.lock().unwrap() = request.session_id;
             anyhow::ensure!(!self.unavailable.load(Ordering::Relaxed), "unavailable");
             Ok(protocol::BidResponseV1 {
-                affinity: request.affinity_worker_id == Some(self.id),
+                affinity: false,
                 prefill_tokens: self.load.load(Ordering::Relaxed) as u64,
                 decode_tokens: self.decode_tokens.load(Ordering::Relaxed) as u64,
             })
@@ -246,15 +248,21 @@ async fn remote_pool_keeps_live_affinity_and_rebinds_after_worker_loss() {
         );
         assert_eq!(bid_counts(), (1, 1));
 
-        // Same scorer for direct bids and generation fallback: affinity halves
-        // the cost, and decode tokens contribute one tenth of their count.
+        // Bids forward the session key without asserting affinity on behalf of
+        // either backend, even when this relay already has a sticky binding.
         let mut bid = protocol::BidRequestV1 {
             tokens: vec![1, 2, 3],
-            affinity_worker_id: Some(2),
+            session_id: Some("sticky".into()),
             ..Default::default()
         };
-        assert!(remote.bid(bid.clone()).await.unwrap().affinity);
-        bid.affinity_worker_id = None;
+        assert!(!remote.bid(bid.clone()).await.unwrap().affinity);
+        for backend in [&first, &second] {
+            assert_eq!(
+                backend.bid_session.lock().unwrap().as_deref(),
+                Some("sticky")
+            );
+        }
+        bid.session_id = Some("unknown-bid-session".into());
         assert_eq!(remote.bid(bid.clone()).await.unwrap().prefill_tokens, 10);
         second.decode_tokens.store(100, Ordering::Relaxed);
         assert_eq!(remote.bid(bid).await.unwrap().prefill_tokens, 15);

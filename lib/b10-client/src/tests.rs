@@ -103,6 +103,7 @@ struct RouterGuardClientForTesting {
     mark_free_callback_delay: Mutex<Duration>,
     route_contexts: Mutex<Vec<Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>>>,
     calls: Mutex<Vec<(u64, rmpv::Value)>>,
+    load_query_sessions: Mutex<Vec<Option<String>>>,
     detailed_calls: Mutex<Vec<DetailedCall>>,
 }
 
@@ -131,6 +132,7 @@ impl RouterGuardClientForTesting {
             mark_free_callback_delay: Mutex::new(Duration::ZERO),
             route_contexts: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
+            load_query_sessions: Mutex::new(Vec::new()),
             detailed_calls: Mutex::new(Vec::new()),
         })
     }
@@ -244,6 +246,14 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         let data = request.content().clone();
         let context = request.context();
         let method = data["method"].as_str().unwrap_or("").to_string();
+        if method == "potential_loads" {
+            self.load_query_sessions.lock().unwrap().push(
+                request
+                    .metadata()
+                    .get(dynamo_llm::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY)
+                    .cloned(),
+            );
+        }
         let ctx_stopped_or_killed = context.is_stopped() || context.is_killed();
 
         // Legacy log: every direct() attempt is recorded so tests can
@@ -3125,11 +3135,22 @@ async fn bids_choose_best_workers_and_require_complete_disaggregated_pairs() {
             })],
         )
     };
-    for (strategy, affinity_worker_id, empty_prefill, empty_decode, expected) in [
+    for (strategy, session_id, empty_prefill, empty_decode, expected) in [
         (Aggregated, None, false, false, Some((false, 12, 0))),
-        (Aggregated, Some(42), false, false, Some((true, 15, 32))),
-        (PrefillFirst, Some(42), false, false, Some((true, 15, 32))),
-        (PrefillFirst, Some(90), false, false, Some((false, 12, 32))),
+        (
+            Aggregated,
+            Some("session"),
+            false,
+            false,
+            Some((false, 12, 0)),
+        ),
+        (
+            PrefillFirst,
+            Some("session"),
+            false,
+            false,
+            Some((false, 12, 32)),
+        ),
         (PrefillFirst, None, true, false, None),
         (PrefillFirst, None, false, true, None),
         (Aggregated, None, true, false, None),
@@ -3153,7 +3174,7 @@ async fn bids_choose_best_workers_and_require_complete_disaggregated_pairs() {
         let result = coordinator
             .bid(BidRequestV1 {
                 tokens: vec![1, 2, 3],
-                affinity_worker_id,
+                session_id: session_id.map(str::to_owned),
                 ..Default::default()
             })
             .await;
@@ -3262,18 +3283,22 @@ async fn load_queries_http_choose_bid_without_dispatch() {
             ],
         }),
         cache_salt: Some("tenant".into()),
-        affinity_worker_id: Some(42),
+        session_id: Some("shared-session".into()),
     };
     let bid = client.bid(request.clone()).await.unwrap();
     assert_eq!(
         bid,
         BidResponseV1 {
-            affinity: true,
+            affinity: false,
             prefill_tokens: 1,
             decode_tokens: 4 * u64::from(TEST_BLOCK_SIZE),
         }
     );
     for router in [&prefill, &decode] {
+        assert_eq!(
+            *router.load_query_sessions.lock().unwrap(),
+            vec![None, request.session_id.clone()]
+        );
         let calls = router.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         let observed_request: RouterRequest =
@@ -3304,7 +3329,14 @@ async fn load_queries_http_choose_bid_without_dispatch() {
     let http = reqwest::Client::new();
     let mut invalid_mm = request.clone();
     invalid_mm.mm_routing_args.as_mut().unwrap().blocks[0].present = false;
-    for body in [Vec::new(), vec![0xff], invalid_mm.encode_to_vec()] {
+    let mut invalid_session = request.clone();
+    invalid_session.session_id = Some("x".repeat(257));
+    for body in [
+        Vec::new(),
+        vec![0xff],
+        invalid_mm.encode_to_vec(),
+        invalid_session.encode_to_vec(),
+    ] {
         assert_eq!(
             http.post(relay.endpoint_url().replace("coordinate", "bid"))
                 .body(body)

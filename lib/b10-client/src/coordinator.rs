@@ -96,6 +96,7 @@ impl RouterWorkerCoordinator {
         request: crate::protocol::BidRequestV1,
     ) -> Result<RsRouterResponse> {
         request.validate()?;
+        let session_id = request.session_id;
         let instances = available_router_instance_ids(self.router.as_ref());
         let instance = instances
             .first()
@@ -111,11 +112,15 @@ impl RouterWorkerCoordinator {
                 .transpose()?,
             allow_short_caching: false,
         })?;
+        let mut request = RsContext::new(request);
+        if let Some(session_id) = session_id {
+            request.insert_metadata(
+                dynamo_llm::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY,
+                session_id,
+            );
+        }
         let response = tokio::time::timeout(Duration::from_secs(5), async {
-            let stream = self
-                .router
-                .direct(RsContext::new(request), instance)
-                .await?;
+            let stream = self.router.direct(request, instance).await?;
             first_stream_response(stream).await
         })
         .await

@@ -97,7 +97,7 @@ impl RemoteGenerationCoordinator {
                     tokens: wire_request.tokens.clone(),
                     mm_routing_args: wire_request.mm_routing_args.clone(),
                     cache_salt: wire_request.cache_salt.clone(),
-                    affinity_worker_id: None,
+                    session_id: session.map(str::to_owned),
                 };
                 let allowed = wire_request
                     .routing

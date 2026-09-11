@@ -13,7 +13,8 @@ message BidRequest
   optional MmRoutingArgs mm_routing_args = 2;
   // Preserved by coordinator relays; the current PotentialLoads RPC uses only tokens/MM.
   optional string cache_salt = 3;
-  optional uint64 affinity_worker_id = 4;
+  // Same key as Routing.session_id; the downstream owns affinity decisions.
+  optional string session_id = 4;
 }
 
 message BidResponse

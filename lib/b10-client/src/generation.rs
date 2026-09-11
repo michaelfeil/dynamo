@@ -139,7 +139,6 @@ impl GenerationCoordinator {
         request: crate::protocol::BidRequestV1,
     ) -> Result<crate::protocol::BidResponseV1> {
         use crate::protocol::BidResponseV1;
-        let affinity_worker_id = request.affinity_worker_id;
         let (prefill, decode) = match self.strategy {
             DisaggregationStrategy::Aggregated => {
                 (self.primary.potential_loads(request).await?, None)
@@ -166,7 +165,8 @@ impl GenerationCoordinator {
         let mut best: Option<BidResponseV1> = None;
         for load in prefill {
             let bid = BidResponseV1 {
-                affinity: affinity_worker_id == Some(load.worker_id),
+                // The downstream will resolve session affinity in a future change.
+                affinity: false,
                 prefill_tokens: load.potential_prefill_tokens as u64,
                 decode_tokens: match decode {
                     Some(tokens) => tokens,
