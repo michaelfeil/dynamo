@@ -331,6 +331,7 @@ mod tests {
         );
         let worker_request = serde_json::from_value(serde_json::json!({
             "model": "fast-model",
+            "streaming": false,
             "sampling_params": {"temperature": 0.2},
             "lora": "adapter-a",
             "user": "session-a"
@@ -385,7 +386,7 @@ mod tests {
         assert_eq!(
             map_value(&capture.request.primary_worker_request, "streaming")
                 .and_then(Value::as_bool),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             map_value(&capture.request.primary_worker_request, "user").and_then(Value::as_str),

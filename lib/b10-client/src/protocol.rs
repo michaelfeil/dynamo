@@ -88,7 +88,6 @@ pub fn validate_request(request: &NewRequestV1) -> anyhow::Result<()> {
             "trace_context.span_id is required"
         );
     }
-    ensure!(!request.model.is_empty(), "new_request.model is required");
     ensure!(!request.tokens.is_empty(), "new_request.tokens is required");
     ensure!(request.routing.is_some(), "new_request.routing is required");
     let routing = request.routing.as_ref().expect("checked above");
@@ -100,12 +99,10 @@ pub fn validate_request(request: &NewRequestV1) -> anyhow::Result<()> {
         bail!("new_request.routing.session_id cannot be empty");
     }
     ensure!(
-        !request.sampling_msgpack.is_empty(),
-        "new_request.sampling_msgpack is required"
+        !request.worker_msgpack.is_empty(),
+        "new_request.worker_msgpack is required"
     );
-    if request.lora.as_deref() == Some("") {
-        bail!("new_request.lora cannot be empty");
-    }
+
     validate_mm_routing_args(request.mm_routing_args.as_ref())?;
     if let Some(payloads) = &request.mm_payloads
         && !(payloads.hashes.len() == payloads.positions.len()

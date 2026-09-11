@@ -181,16 +181,18 @@ its direct HTTP path.
 
 The wire schema (compiled by Prost during the build) is
 [`proto/generation_coordinator.proto`](proto/generation_coordinator.proto).
-Request IDs, models, tokens, routing, and sampling are semantically
-required and are checked at the protocol boundary. LoRA, multimodal data,
-session/cache affinity, and trace extensions remain optional. Sampling is one
-required MessagePack map because its backend-specific shape evolves
-independently; routing, LoRA, multimodal, trace, and admission data are typed
-protobuf fields.
-Worker requests always enable streaming; the prefill worker applies its own
-phase-specific override. `routing.session_id` carries the worker's `user` value
-once, rather than duplicating it in the request body.
-Selection uses the existing load endpoint; the generation wire protocol is unchanged.
+Tokens and multimodal payloads travel separately from `worker_msgpack`, an
+opaque MessagePack map containing all remaining worker kwargs. The codec
+preserves unknown keys and binary values; the worker owns validation of model,
+sampling, and backend options. The general map must exclude `tokens` and
+`mm_args`. The coordinator reconstructs `tokens: {tokens: [...]}`, sets the
+request ID, and attaches multimodal payloads only to the primary worker request.
+Generation coordination supplies the routing response and disaggregation state.
+
+Session identity and cache salt are projected into routing metadata for bids
+while their original worker fields remain in the general map. Request IDs,
+tokens, routing, and the worker blob are required at the protocol boundary.
+This schema is breaking: clients and coordinators must be upgraded together.
 
 `RouterGuardClient` is the transport seam for custom clients and deterministic
 tests. `JsonRouterGuardClient` adapts Dynamo's JSON `PushRouter`.

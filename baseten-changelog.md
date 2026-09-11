@@ -1629,7 +1629,14 @@ v1.2 remote generation coordinator:
 
 The generation coordinator now has a common Rust client trait with local and
 remote implementations. The remote path uses a versioned, typed protobuf over
-HTTP; sampling is the only extensible MessagePack request section. A native
+HTTP; tokens and multimodal payloads are separate from an opaque MessagePack
+worker map, preserving backend kwargs and binary values without an allowlist.
+The worker map excludes tokens and mm_args; decode omits multimodal payloads.
+Tokens are reconstructed in the worker's nested Tokens shape. Session identity
+and cache salt are also projected into routing metadata for bids. This replaces
+the sampling-only envelope and typed worker fields with a breaking protobuf
+change; frontend clients and coordinator services must be upgraded together.
+A native
 Hyper/Axum service wraps the local coordinator and exposes `/health` plus the
 streaming `/v1/coordinate` endpoint. Python controls service startup and
 shutdown through PyO3 but is not present on the request path. The Python remote

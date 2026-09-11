@@ -96,7 +96,10 @@ impl RemoteGenerationCoordinator {
                 let bid = protocol::BidRequestV1 {
                     tokens: wire_request.tokens.clone(),
                     mm_routing_args: wire_request.mm_routing_args.clone(),
-                    cache_salt: wire_request.cache_salt.clone(),
+                    cache_salt: wire_request
+                        .routing
+                        .as_ref()
+                        .and_then(|routing| routing.cache_salt.clone()),
                     session_id: session.map(str::to_owned),
                 };
                 let allowed = wire_request
@@ -561,16 +564,17 @@ mod tests {
             Some("acme")
         );
         let request = captured;
-        assert_eq!(request.model, "test-model");
+        let worker: Value = rmp_serde::from_slice(&request.worker_msgpack).unwrap();
+        assert_eq!(worker["model"].as_str(), Some("test-model"));
         assert_eq!(request.tokens, vec![1, 2, 3, 4]);
-        assert_eq!(request.lora.as_deref(), Some("adapter-a"));
+        assert_eq!(worker["lora"].as_str(), Some("adapter-a"));
         let routing = request.routing.unwrap();
         assert_eq!(routing.session_id.as_deref(), Some("session-a"));
         assert!(routing.do_not_queue);
         assert_eq!(routing.allowed_worker_ids, vec![5, 7]);
         assert_eq!(request.mm_routing_args.unwrap().blocks.len(), 2);
         assert_eq!(request.mm_payloads.unwrap().hashes, vec!["image-hash"]);
-        let sampling: Value = rmp_serde::from_slice(&request.sampling_msgpack).unwrap();
+        let sampling: Value = rmp_serde::from_slice(&request.worker_msgpack).unwrap();
         assert_eq!(
             map_value(&sampling, "sampling_params")
                 .and_then(|params| map_value(params, "max_tokens"))

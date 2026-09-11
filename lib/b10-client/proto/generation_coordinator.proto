@@ -26,23 +26,17 @@ message BidResponse
 
 message NewRequest
 {
-  reserved 7, 8, 12, 13;
-  reserved "sampling", "streaming", "user";
-  string model = 1;
-  repeated uint32 tokens = 2 [packed = true];
-  optional string lora = 3;
-  optional MmRoutingArgs mm_routing_args = 4;
-  optional Routing routing = 5;
-  optional MmPayloads mm_payloads = 6;
-  optional string cache_salt = 9;
-  optional sint32 engine_priority = 10;
-  optional string service_tier = 11;
-  // Named MessagePack map: required sampling_params, optional
-  // dynamic_temperature_rules and prompt_logprobs. Values are backend-defined.
-  bytes sampling_msgpack = 14;
-  string request_id = 15;
-  optional TraceContext trace_context = 16;
-  map<string, string> metadata = 17;
+  repeated uint32 tokens = 1 [packed = true];
+  optional MmRoutingArgs mm_routing_args = 2;
+  optional Routing routing = 3;
+  optional MmPayloads mm_payloads = 4;
+  // Opaque worker map excluding tokens and mm_args. Preserve backend fields,
+  // including unknown fields and MessagePack binary values, without projection.
+  // Breaking change: clients and coordinators must be upgraded together.
+  bytes worker_msgpack = 6;
+  string request_id = 7;
+  optional TraceContext trace_context = 8;
+  map<string, string> metadata = 9;
 }
 
 message Routing
@@ -53,6 +47,7 @@ message Routing
   uint32 priority_load_shed_percent = 4;
   repeated uint64 allowed_worker_ids = 5 [packed = true];
   optional RoutingConstraints constraints = 6;
+  optional string cache_salt = 7;
 }
 
 message RoutingConstraints

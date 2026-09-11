@@ -25,19 +25,23 @@ pub(crate) fn encode_request(
         primary_worker_request,
         decode_worker_request: _,
     } = request;
-    let worker: WorkerArgs =
-        rmpv::ext::from_value(primary_worker_request).context("invalid worker_args")?;
-    if worker.sampling_params.is_nil() {
-        bail!("worker_args.sampling_params is required");
-    }
-    let sampling_payload = SamplingPayload {
-        sampling_params: worker.sampling_params,
-        dynamic_temperature_rules: worker
-            .dynamic_temperature_rules
-            .filter(|value| !value.is_nil()),
-        prompt_logprobs: worker.prompt_logprobs.filter(|value| !value.is_nil()),
+    let Value::Map(mut worker) = primary_worker_request else {
+        bail!("worker_args must be a map");
     };
-    let mm_payloads = worker.mm_args.map(mm_payloads_from_args).transpose()?;
+    let session_id = optional_worker_string(&worker, "user")?;
+    let cache_salt = optional_worker_string(&worker, "cache_salt")?;
+    let mm_args = worker
+        .iter()
+        .position(|(key, _)| key.as_str() == Some("mm_args"))
+        .map(|index| worker.remove(index).1)
+        .filter(|value| !value.is_nil());
+    let mm_payloads = mm_args
+        .map(|value| {
+            let args = rmpv::ext::from_value(value).context("invalid mm_args")?;
+            mm_payloads_from_args(args)
+        })
+        .transpose()?;
+    worker.retain(|(key, _)| key.as_str() != Some("tokens"));
     let mm_routing_args = routing_request
         .block_mm_infos
         .as_ref()
@@ -77,12 +81,11 @@ pub(crate) fn encode_request(
         request_id: context.id().to_string(),
         trace_context,
         metadata: context.metadata_snapshot(),
-        model: worker.model,
         tokens: routing_request.tokens,
-        lora: worker.lora,
         mm_routing_args,
         routing: Some(RoutingV1 {
-            session_id: worker.user,
+            session_id,
+            cache_salt,
             do_not_queue: routing_request.do_not_queue,
             priority_jump: routing_request.priority_jump,
             priority_load_shed_percent: u32::from(routing_request.priority_load_shed_percent),
@@ -93,10 +96,7 @@ pub(crate) fn encode_request(
             }),
         }),
         mm_payloads,
-        sampling_msgpack: rmp_serde::to_vec_named(&sampling_payload)?,
-        cache_salt: worker.cache_salt,
-        engine_priority: worker.priority,
-        service_tier: worker.service_tier,
+        worker_msgpack: rmp_serde::to_vec_named(&Value::Map(worker))?,
     };
     protocol::validate_request(&request)?;
     Ok(request)
@@ -112,18 +112,20 @@ pub(crate) fn map_value<'a>(map: &'a Value, key: &str) -> Option<&'a Value> {
         .find_map(|(candidate, value)| (candidate.as_str() == Some(key)).then_some(value))
 }
 
-#[derive(serde::Deserialize)]
-struct WorkerArgs {
-    model: String,
-    sampling_params: Value,
-    dynamic_temperature_rules: Option<Value>,
-    prompt_logprobs: Option<Value>,
-    lora: Option<String>,
-    user: Option<String>,
-    cache_salt: Option<String>,
-    priority: Option<i32>,
-    service_tier: Option<String>,
-    mm_args: Option<MmArgs>,
+fn optional_worker_string(worker: &[(Value, Value)], key: &str) -> Result<Option<String>> {
+    match worker
+        .iter()
+        .find(|(candidate, _)| candidate.as_str() == Some(key))
+        .map(|(_, value)| value)
+    {
+        None | Some(Value::Nil) => Ok(None),
+        Some(value) => Ok(Some(
+            value
+                .as_str()
+                .with_context(|| format!("worker_args.{key} must be a string"))?
+                .to_owned(),
+        )),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -142,15 +144,6 @@ struct NativeMmInput {
     #[serde(rename = "type")]
     kind: String,
     url: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SamplingPayload<T> {
-    sampling_params: T,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dynamic_temperature_rules: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_logprobs: Option<T>,
 }
 
 fn mm_routing_args_from_blocks(
@@ -238,32 +231,24 @@ pub(crate) fn decode_new_request(
     strategy: DisaggregationStrategy,
 ) -> Result<GenerationRequest> {
     let routing = request.routing.context("new_request.routing is required")?;
-    let sampling_payload: SamplingPayload<Value> =
-        rmp_serde::from_slice(&request.sampling_msgpack).context("invalid sampling_msgpack")?;
-    let mut worker = Vec::new();
-    insert(&mut worker, "method", Value::from("generate"));
+    let payload: Value =
+        rmp_serde::from_slice(&request.worker_msgpack).context("invalid worker_msgpack")?;
+    let Value::Map(mut worker) = payload else {
+        bail!("worker_msgpack must contain a map");
+    };
+    if worker
+        .iter()
+        .any(|(key, _)| matches!(key.as_str(), Some("tokens" | "mm_args")))
+    {
+        bail!("worker_msgpack must exclude tokens and mm_args");
+    }
+    worker.retain(|(key, _)| key.as_str() != Some("id"));
     insert(&mut worker, "id", Value::from(request_id));
-    insert(&mut worker, "model", Value::from(request.model));
-    insert(&mut worker, "tokens", uint_array(&request.tokens));
     insert(
         &mut worker,
-        "sampling_params",
-        sampling_payload.sampling_params,
+        "tokens",
+        Value::Map(vec![(Value::from("tokens"), uint_array(&request.tokens))]),
     );
-    insert(&mut worker, "streaming", Value::from(true));
-    insert_optional_string(&mut worker, "lora", request.lora);
-    insert_optional_string(&mut worker, "cache_salt", request.cache_salt);
-    insert_optional_string(&mut worker, "service_tier", request.service_tier);
-    insert_optional_string(&mut worker, "user", routing.session_id);
-    if let Some(priority) = request.engine_priority {
-        insert(&mut worker, "priority", Value::from(priority));
-    }
-    if let Some(value) = sampling_payload.dynamic_temperature_rules {
-        insert(&mut worker, "dynamic_temperature_rules", value);
-    }
-    if let Some(value) = sampling_payload.prompt_logprobs {
-        insert(&mut worker, "prompt_logprobs", value);
-    }
     // Decode needs the same generation parameters, but not the potentially
     // large multimodal input blobs consumed during prefill.
     let decode_worker_request =
@@ -404,12 +389,6 @@ fn insert(map: &mut Vec<(Value, Value)>, key: &'static str, value: Value) {
     map.push((Value::from(key), value));
 }
 
-fn insert_optional_string(map: &mut Vec<(Value, Value)>, key: &'static str, value: Option<String>) {
-    if let Some(value) = value {
-        insert(map, key, Value::from(value));
-    }
-}
-
 impl From<crate::GenerationAdmission> for AdmissionV1 {
     fn from(value: crate::GenerationAdmission) -> Self {
         Self {
@@ -541,6 +520,95 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn request_round_trip_preserves_worker_field_shapes() {
+        let context = RequestContext::new(
+            Arc::new(Controller::new("token-shape".to_string())),
+            None,
+            Default::default(),
+        );
+        let worker = Value::Map(vec![
+            ("model".into(), "test-model".into()),
+            ("sampling_params".into(), Value::Map(vec![])),
+            ("streaming".into(), false.into()),
+            ("user".into(), "session-a".into()),
+            ("cache_salt".into(), "tenant-a".into()),
+            ("prompt_logprobs".into(), Value::Array(vec![(-0.5).into()])),
+            (
+                "future_worker_option".into(),
+                Value::Binary(vec![0, 255, 3]),
+            ),
+            (
+                "tokens".into(),
+                Value::Map(vec![(
+                    "tokens".into(),
+                    Value::Binary(
+                        [1_u32, 2, 151_643]
+                            .into_iter()
+                            .flat_map(u32::to_le_bytes)
+                            .collect(),
+                    ),
+                )]),
+            ),
+            (
+                "mocker_config".into(),
+                Value::Map(vec![("speedup_ratio".into(), 2.0.into())]),
+            ),
+            (
+                "chat_template_kwargs".into(),
+                Value::Map(vec![("thinking".into(), true.into())]),
+            ),
+            (
+                "b10_request_performance".into(),
+                Value::Map(vec![("priority_engine".into(), 7.into())]),
+            ),
+        ]);
+        let original = worker.clone();
+        let wire = encode_request(
+            &context,
+            GenerationRequest {
+                routing_request: RouterRequestNew {
+                    tokens: vec![1, 2, 151_643],
+                    ..Default::default()
+                },
+                primary_worker_request: worker,
+                decode_worker_request: None,
+            },
+        )
+        .unwrap();
+        let payload: Value = rmp_serde::from_slice(&wire.worker_msgpack).unwrap();
+        assert!(map_value(&payload, "tokens").is_none());
+        assert!(map_value(&payload, "mm_args").is_none());
+        assert_eq!(
+            wire.routing.as_ref().unwrap().session_id.as_deref(),
+            Some("session-a")
+        );
+        assert_eq!(
+            wire.routing.as_ref().unwrap().cache_salt.as_deref(),
+            Some("tenant-a")
+        );
+        use prost::Message;
+        let wire = NewRequestV1::decode(wire.encode_to_vec().as_slice()).unwrap();
+
+        let decoded = decode_new_request(
+            "token-shape".to_string(),
+            wire,
+            DisaggregationStrategy::PrefillFirst,
+        )
+        .unwrap();
+        let expected = uint_array(&[1_u32, 2, 151_643]);
+        assert_eq!(decoded.primary_worker_request["tokens"]["tokens"], expected);
+        let decode = decoded.decode_worker_request.unwrap();
+        assert_eq!(decode["tokens"]["tokens"], expected);
+        for payload in [&decoded.primary_worker_request, &decode] {
+            for (key, value) in original.as_map().unwrap() {
+                if key.as_str() != Some("tokens") {
+                    assert_eq!(&payload[key.as_str().unwrap()], value, "field {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn multimodal_conversion_moves_large_buffers_in_both_directions() {
         // Embeddings and kwargs are alternative worker input formats.
         for field in ["mm_embeds_encoded", "mm_kwargs"] {
@@ -574,6 +642,9 @@ mod tests {
                 },
             )
             .unwrap();
+            let general: Value = rmp_serde::from_slice(&wire.worker_msgpack).unwrap();
+            assert!(map_value(&general, "tokens").is_none());
+            assert!(map_value(&general, "mm_args").is_none());
             let mm = wire.mm_payloads.as_ref().unwrap();
             let encoded = if field == "mm_embeds_encoded" {
                 &mm.embeddings[0]
