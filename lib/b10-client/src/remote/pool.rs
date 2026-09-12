@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::scoring::{BidScorer, WeightedBidScorer};
 use super::*;
 use baseten_configmap::{CoordinatorAffinityConfig, GenerationCoordinatorConfig};
 use dynamo_llm::{
@@ -103,6 +104,7 @@ pub(super) struct RemotePool {
     config: RemoteConfig,
     client: Client,
     affinity: Option<(CoordinatorAffinityConfig, Component)>,
+    scorer: WeightedBidScorer,
     ready: OnceCell<Arc<PoolState>>,
     cancel: CancellationToken,
 }
@@ -148,9 +150,9 @@ impl RemotePool {
             .into_iter()
             .flatten()
             .min_by(|left, right| {
-                left.2
-                    .score()
-                    .cmp(&right.2.score())
+                self.scorer
+                    .score(&left.2)
+                    .cmp(&self.scorer.score(&right.2))
                     .then_with(|| {
                         (left.0.as_str() != "default").cmp(&(right.0.as_str() != "default"))
                     })
@@ -189,6 +191,10 @@ impl RemotePool {
             config,
             client,
             affinity,
+            scorer: WeightedBidScorer::new(
+                snapshot.bid_decode_token_weight,
+                snapshot.bid_affinity_multiplier,
+            )?,
             ready: OnceCell::new(),
             cancel: namespace.map_or_else(CancellationToken::new, |namespace| {
                 namespace.drt().child_token()

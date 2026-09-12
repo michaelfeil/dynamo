@@ -1665,6 +1665,14 @@ now, preserving the API shape for future parallel potential-load probes and
 session-aware multi-endpoint selection. Block size and disaggregated request-ID
 machine identity remain service-local configuration rather than wire fields.
 
+Coordinator bid scoring weights:
+
+`b10_generation_coordinator_config.bid_decode_token_weight` (default `0.1`) and
+`bid_affinity_multiplier` (default `0.5`) tune remote coordinator selection.
+Clients capture both at construction; changing them requires a restart, while
+remote endpoint changes remain reloadable. Replay config fields, pool capture,
+and scoring together, retaining exact integer score and overflow regression tests.
+
 v1.2 read-only coordinator bids (#803):
 
 Coordinator bids use dedicated `RouterRequest::Bid` / `RouterResponse::Bid`

@@ -24,6 +24,7 @@ use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tokio_util::io::StreamReader;
 
 mod pool;
+mod scoring;
 use pool::RemotePool;
 
 enum RemoteEndpoints {

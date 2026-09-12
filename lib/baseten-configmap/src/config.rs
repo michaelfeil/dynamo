@@ -14,6 +14,8 @@ pub struct GenerationCoordinatorConfig {
     pub port: Option<u16>,
     pub remotes: Option<BTreeMap<String, String>>,
     pub affinity: Option<CoordinatorAffinityConfig>,
+    pub bid_decode_token_weight: f64,
+    pub bid_affinity_multiplier: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,12 +31,23 @@ impl Default for GenerationCoordinatorConfig {
             port: None,
             remotes: None,
             affinity: None,
+            bid_decode_token_weight: 0.1,
+            bid_affinity_multiplier: 0.5,
         }
     }
 }
 
 impl GenerationCoordinatorConfig {
     pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("bid_decode_token_weight", self.bid_decode_token_weight),
+            ("bid_affinity_multiplier", self.bid_affinity_multiplier),
+        ] {
+            anyhow::ensure!(
+                value.is_finite() && value >= 0.0,
+                "{name} must be finite and nonnegative"
+            );
+        }
         if let Some(affinity) = &self.affinity {
             anyhow::ensure!(
                 self.remotes.is_some(),
@@ -695,6 +708,29 @@ impl UnifiedConfig {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn coordinator_bid_weights_parse_and_validate() {
+        let parse = |yaml: &str| UnifiedConfig::parse(yaml, None, &B10RoutingConfig::default());
+        let defaults = parse("{}").unwrap().generation_coordinator;
+        assert_eq!(defaults.bid_decode_token_weight, 0.1);
+        assert_eq!(defaults.bid_affinity_multiplier, 0.5);
+        let custom = parse("b10_generation_coordinator_config:\n  bid_decode_token_weight: 0.2\n  bid_affinity_multiplier: 0.8\n").unwrap().generation_coordinator;
+        assert_eq!(custom.bid_decode_token_weight, 0.2);
+        assert_eq!(custom.bid_affinity_multiplier, 0.8);
+        for key in ["bid_decode_token_weight", "bid_affinity_multiplier"] {
+            assert!(parse(&format!("b10_generation_coordinator_config:\n  {key}: 0\n")).is_ok());
+            for value in ["-1", ".nan", ".inf", "-.inf"] {
+                assert!(
+                    parse(&format!(
+                        "b10_generation_coordinator_config:\n  {key}: {value}\n"
+                    ))
+                    .is_err(),
+                    "{key}={value}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_default_config() {

@@ -143,7 +143,24 @@ calling a relay. A relay used as another pool's option must still respond within
 that caller's five-second option budget.
 
 The coordinator returns its best aggregate worker or prefill/decode pair using
-`(1 - 0.5 * affinity) * (prefill_tokens + 0.1 * decode_tokens)`.
+`(prefill_tokens + bid_decode_token_weight * decode_tokens) *
+(bid_affinity_multiplier if affinity else 1)`. Configure the weights under:
+
+```yaml
+b10_generation_coordinator_config:
+  bid_decode_token_weight: 0.1
+  bid_affinity_multiplier: 0.5
+```
+
+Weights are converted to reduced integer ratios at client construction. Defaults
+reproduce the original `u128` score exactly: `(10 * prefill_tokens + decode_tokens)
+* (1 if affinity else 2)`. Comparisons and ties use integer arithmetic.
+
+Both values must be finite, between 0 and 429496.7295, and have at most four decimal
+places. Construction rejects combinations that could overflow `u128` for `u64`
+token counts. Restart the client/frontend to apply changes; endpoint reloads do
+not change the scorer.
+
 Callers supply only `session_id`, the same key used
 by `/v1/coordinate`; affinity decisions belong to the downstream coordinator, not
 the caller or relay. The key is forwarded to the prefill-bearing router, which

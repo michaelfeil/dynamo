@@ -46,15 +46,6 @@ impl BidRequestV1 {
     }
 }
 
-impl BidResponseV1 {
-    // Exact integer equivalent of (1 - 0.5 * affinity) * (prefill + 0.1 * decode),
-    // scaled by 20. u128 avoids overflow and floating-point tie instability.
-    pub(crate) fn score(&self) -> u128 {
-        (if self.affinity { 1 } else { 2 })
-            * (10 * u128::from(self.prefill_tokens) + u128::from(self.decode_tokens))
-    }
-}
-
 fn validate_mm_routing_args(args: Option<&MmRoutingArgsV1>) -> anyhow::Result<()> {
     for block in args.into_iter().flat_map(|args| &args.blocks) {
         anyhow::ensure!(
