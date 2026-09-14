@@ -1184,6 +1184,14 @@ port only failing cases.
 
 v1.2 implementation note:
 
+Anthropic streaming text arriving after a tool header must not reuse a closed
+text block. Buffer text fragments while a tool block is open, then open a fresh
+text block after its arguments complete (or stream end closes the tool). Keep
+both text fragments and tool arguments intact. The captured Nemotron ordering
+is newline, tool header, newline, arguments; regression tests enforce distinct
+text blocks on either side of the tool. Tagged tests share production event
+generation rather than maintaining a duplicate converter state machine.
+
 Followed v1.1 for the B10 health and rate-limit subset. The branch now carries
 the standalone B10 health heartbeat/poison state, the `/health_file` route, the
 header-driven B10 rate limiter, and Python functions `set_health`,
