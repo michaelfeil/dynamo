@@ -84,9 +84,9 @@ separate coordinator shutdown method.
 Rust. Python wraps it without owning startup or shutdown state. Rust callers use
 the same `start()`, `generate()`, `is_client()`, and `is_server()` methods.
 
-Local/remote mode and listener settings are fixed at construction. Only the
-`remotes` endpoint map reloads. Rust callers can use
-`RemoteGenerationCoordinator::from_config(reader)` for reloadable endpoints;
+Local/remote mode and listener settings are fixed at construction. The `remotes`
+endpoint map and bid scoring weights reload. Rust callers can use
+`RemoteGenerationCoordinator::from_config(reader)` for reloadable configuration;
 the HTTP client retains its connection pool across updates.
 
 The configured constructor captures `DYNAMO_DEFAULT_GENERATION_COORDINATOR_URL` as its
@@ -152,14 +152,15 @@ b10_generation_coordinator_config:
   bid_affinity_multiplier: 0.5
 ```
 
-Weights are converted to reduced integer ratios at client construction. Defaults
+Each bid round converts one config snapshot to reduced integer ratios. Defaults
 reproduce the original `u128` score exactly: `(10 * prefill_tokens + decode_tokens)
 * (1 if affinity else 2)`. Comparisons and ties use integer arithmetic.
 
 Both values must be finite, between 0 and 429496.7295, and have at most four decimal
-places. Construction rejects combinations that could overflow `u128` for `u64`
-token counts. Restart the client/frontend to apply changes; endpoint reloads do
-not change the scorer.
+places. Config validation rejects combinations that could overflow `u128` for
+`u64` token counts. Weight changes apply to new bid rounds after config reload,
+without restarting the client/frontend. In-flight rounds retain their weights;
+invalid reloads retain the previous configuration.
 
 Callers supply only `session_id`, the same key used
 by `/v1/coordinate`; affinity decisions belong to the downstream coordinator, not

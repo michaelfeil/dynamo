@@ -130,6 +130,8 @@ b10_generation_coordinator_config:
   remotes:
     default: http://coordinator-frontend:8080/v1/coordinate
     canary: http://canary-frontend:8080/v1/coordinate
+  bid_decode_token_weight: 0.1
+  bid_affinity_multiplier: 0.5
   affinity:  # optional; startup-only, shared by cooperating client replicas
     ttl_secs: 3600
 ```
@@ -137,7 +139,7 @@ b10_generation_coordinator_config:
 One or more named HTTP(S) backends are supported. Null/omitted remotes use local
 orchestration. Local versus remote mode is fixed when the coordinator is constructed;
 changing modes requires restart. Remote-only startup does not connect local
-router/worker clients. In remote mode, endpoint updates apply to new
+router/worker clients. In remote mode, endpoint and bid-weight updates apply to new
 requests after the reader reloads (15-second polling);
 removed endpoints are excluded immediately. Existing streams keep their
 backend and cancellation behavior. Unchanged backends reuse their HTTP connection
@@ -150,7 +152,8 @@ Remote clients poll `/v1/worker_loads` concurrently every five seconds to establ
 downstream liveness for both affinity and bidding. A live candidate needs an aggregate worker or both prefill
 and decode capacity in a successful snapshot less than fifteen seconds old.
 Otherwise multi-backend pools send concurrent `/v1/bid` requests to the live candidates
-and choose the lowest `(1 - 0.5 * affinity) * (prefill_tokens + 0.1 * decode_tokens)`.
+and minimize `(prefill_tokens + bid_decode_token_weight * decode_tokens) *
+(bid_affinity_multiplier if affinity else 1)`.
 New/recovered remotes must be observed by a successful poll before selection.
 Bid failures do not evict a remote from inventory. The pooled worker-load endpoint
 returns the union of current snapshots, omitting unavailable/stale remotes.

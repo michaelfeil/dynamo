@@ -11,7 +11,7 @@ mod registry;
 
 pub use config::{
     B10RoutingConfig, CoordinatorAffinityConfig, GenerationCoordinatorConfig, LLMRuntimeConfig,
-    UnifiedConfig, sanitize_router_temperature,
+    UnifiedConfig, bid_weight_ratio, sanitize_router_temperature,
 };
 pub use logging::set_log_no_changes;
 pub use reader::ConfigReader;

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -39,15 +39,7 @@ impl Default for GenerationCoordinatorConfig {
 
 impl GenerationCoordinatorConfig {
     pub fn validate(&self) -> Result<()> {
-        for (name, value) in [
-            ("bid_decode_token_weight", self.bid_decode_token_weight),
-            ("bid_affinity_multiplier", self.bid_affinity_multiplier),
-        ] {
-            anyhow::ensure!(
-                value.is_finite() && value >= 0.0,
-                "{name} must be finite and nonnegative"
-            );
-        }
+        validate_bid_weights(self.bid_decode_token_weight, self.bid_affinity_multiplier)?;
         if let Some(affinity) = &self.affinity {
             anyhow::ensure!(
                 self.remotes.is_some(),
@@ -92,6 +84,45 @@ impl GenerationCoordinatorConfig {
     pub fn listen_address(&self) -> Option<SocketAddr> {
         self.port.map(|port| SocketAddr::new(self.host, port))
     }
+}
+
+const BID_WEIGHT_SCALE: u128 = 10_000;
+
+fn validate_bid_weights(decode_token_weight: f64, affinity_multiplier: f64) -> Result<()> {
+    let (decode_weight, prefill_weight) =
+        ratio(decode_token_weight).context("invalid bid_decode_token_weight")?;
+    let (affinity_weight, unmatched_weight) =
+        ratio(affinity_multiplier).context("invalid bid_affinity_multiplier")?;
+    ensure!(
+        (prefill_weight + decode_weight)
+            .checked_mul(u128::from(u64::MAX))
+            .and_then(|score| score.checked_mul(affinity_weight.max(unmatched_weight)))
+            .is_some(),
+        "bid weights would overflow u128 scores"
+    );
+    Ok(())
+}
+
+fn ratio(value: f64) -> Result<(u128, u128)> {
+    let scaled = (value * BID_WEIGHT_SCALE as f64).round();
+    ensure!(
+        value.is_finite()
+            && value >= 0.0
+            && scaled <= f64::from(u32::MAX)
+            && scaled / BID_WEIGHT_SCALE as f64 == value,
+        "bid weights must be between 0 and 429496.7295 with at most four decimal places"
+    );
+    Ok(bid_weight_ratio(value))
+}
+
+/// Reduced ratio for a bid weight that has passed config validation.
+pub fn bid_weight_ratio(value: f64) -> (u128, u128) {
+    let numerator = (value * BID_WEIGHT_SCALE as f64).round() as u128;
+    let (mut a, mut b) = (numerator, BID_WEIGHT_SCALE);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    (numerator / a, BID_WEIGHT_SCALE / a)
 }
 
 const DEFAULT_ROUTER_ACTIVE_REQUEST_DP_BLEND: f64 = 2.0 / 3.0;
@@ -766,7 +797,7 @@ override_args:
         assert_eq!(custom.bid_affinity_multiplier, 0.8);
         for key in ["bid_decode_token_weight", "bid_affinity_multiplier"] {
             assert!(parse(&format!("b10_generation_coordinator_config:\n  {key}: 0\n")).is_ok());
-            for value in ["-1", ".nan", ".inf", "-.inf"] {
+            for value in ["-1", ".nan", ".inf", "-.inf", "0.12345", "429496.7296"] {
                 assert!(
                     parse(&format!(
                         "b10_generation_coordinator_config:\n  {key}: {value}\n"
@@ -776,6 +807,12 @@ override_args:
                 );
             }
         }
+        assert!(
+            parse("b10_generation_coordinator_config:\n  bid_decode_token_weight: 429496.7293\n  bid_affinity_multiplier: 429496.7293\n").is_err()
+        );
+        assert!(
+            parse("b10_generation_coordinator_config:\n  bid_decode_token_weight: 429496.7295\n  bid_affinity_multiplier: 429496.7295\n").is_ok()
+        );
     }
 
     #[test]

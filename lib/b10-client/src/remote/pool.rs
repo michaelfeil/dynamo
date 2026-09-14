@@ -104,7 +104,6 @@ pub(super) struct RemotePool {
     config: RemoteConfig,
     client: Client,
     affinity: Option<(CoordinatorAffinityConfig, Component)>,
-    scorer: WeightedBidScorer,
     ready: OnceCell<Arc<PoolState>>,
     cancel: CancellationToken,
 }
@@ -133,6 +132,11 @@ impl RemotePool {
         request: protocol::BidRequestV1,
     ) -> Result<(Url, protocol::BidResponseV1)> {
         request.validate()?;
+        let config = self.config.snapshot()?;
+        let scorer = WeightedBidScorer::new(
+            config.bid_decode_token_weight,
+            config.bid_affinity_multiplier,
+        );
         let bids = futures::future::join_all(remotes.iter().map(|(name, endpoint)| {
             let request = request.clone();
             async move {
@@ -150,9 +154,9 @@ impl RemotePool {
             .into_iter()
             .flatten()
             .min_by(|left, right| {
-                self.scorer
+                scorer
                     .score(&left.2)
-                    .cmp(&self.scorer.score(&right.2))
+                    .cmp(&scorer.score(&right.2))
                     .then_with(|| {
                         (left.0.as_str() != "default").cmp(&(right.0.as_str() != "default"))
                     })
@@ -191,10 +195,6 @@ impl RemotePool {
             config,
             client,
             affinity,
-            scorer: WeightedBidScorer::new(
-                snapshot.bid_decode_token_weight,
-                snapshot.bid_affinity_multiplier,
-            )?,
             ready: OnceCell::new(),
             cancel: namespace.map_or_else(CancellationToken::new, |namespace| {
                 namespace.drt().child_token()

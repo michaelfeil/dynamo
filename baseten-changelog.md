@@ -1677,9 +1677,10 @@ Coordinator bid scoring weights:
 
 `b10_generation_coordinator_config.bid_decode_token_weight` (default `0.1`) and
 `bid_affinity_multiplier` (default `0.5`) tune remote coordinator selection.
-Clients capture both at construction; changing them requires a restart, while
-remote endpoint changes remain reloadable. Replay config fields, pool capture,
-and scoring together, retaining exact integer score and overflow regression tests.
+Each bid round captures both from one current config snapshot; weights and remote
+endpoints reload without restarting the client. Replay config validation and
+request-local scoring together, retaining exact integer score, overflow, and
+config validation regression tests.
 
 v1.2 read-only coordinator bids (#803):
 
