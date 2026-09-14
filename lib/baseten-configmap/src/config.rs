@@ -107,6 +107,7 @@ const MIN_ROUTER_TEMPERATURE: f64 = 1e-12;
 /// Partial override structure for B10 routing config, we can't reuse the B10RoutingConfig struct because of the default values
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct B10RoutingConfigOverride {
+    enable_eagle: Option<bool>,
     router_temperature: Option<f64>,
     #[serde(alias = "router_prefill_block_weight")]
     router_overlap_score_weight: Option<f64>,
@@ -132,6 +133,10 @@ struct B10RoutingConfigOverride {
 /// subset of Pytorch B10 routing config. Keep in sync with `B10RoutingConfig` pydantic model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct B10RoutingConfig {
+    /// EAGLE bigram cache hashes; read at router startup, not hot-reloaded.
+    #[serde(default)]
+    pub enable_eagle: bool,
+
     #[serde(default = "default_router_temperature")]
     pub router_temperature: f64,
 
@@ -206,6 +211,9 @@ pub struct B10RoutingConfig {
 
 impl B10RoutingConfig {
     fn apply_override(&mut self, overrides: &B10RoutingConfigOverride) {
+        if let Some(value) = overrides.enable_eagle {
+            self.enable_eagle = value;
+        }
         if let Some(value) = overrides.router_temperature {
             self.router_temperature = value;
         }
@@ -263,6 +271,7 @@ impl B10RoutingConfig {
 impl Default for B10RoutingConfig {
     fn default() -> Self {
         Self {
+            enable_eagle: false,
             router_temperature: default_router_temperature(),
             router_overlap_score_weight: default_router_overlap_score_weight(),
             router_decode_block_weight: default_router_decode_block_weight(),
@@ -708,6 +717,43 @@ impl UnifiedConfig {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn eagle_hash_mode_defaults_and_role_overrides() {
+        let defaults = B10RoutingConfig::default();
+        assert!(
+            !UnifiedConfig::parse("{}", None, &defaults)
+                .unwrap()
+                .routing
+                .enable_eagle
+        );
+        for root in [false, true] {
+            let yaml = format!(
+                r#"
+b10_routing_config:
+  enable_eagle: {root}
+override_args:
+  prefill:
+    b10_routing_config:
+      enable_eagle: true
+  decode:
+    b10_routing_config:
+      enable_eagle: false
+"#
+            );
+            for (group, expected) in [
+                (None, root),
+                (Some("prefill"), true),
+                (Some("decode"), false),
+            ] {
+                let config = UnifiedConfig::parse(&yaml, group, &defaults).unwrap();
+                assert_eq!(
+                    config.routing.enable_eagle, expected,
+                    "root={root}, group={group:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn coordinator_bid_weights_parse_and_validate() {

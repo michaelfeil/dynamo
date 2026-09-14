@@ -296,7 +296,7 @@ where
             None,
             worker_type,
             None,
-            false,
+            args.config_reader.snapshot().routing.enable_eagle,
             None,
             Some(&component_router),
         )

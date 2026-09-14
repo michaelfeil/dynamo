@@ -691,6 +691,14 @@ The v1.0 `router_disable_snapshots_in_primary` knob was also restored: the
 Python/Rust config accepts the flag, and the active B10 router disables its
 JetStream snapshot loop after winning the active-router gate.
 
+The standalone router reads `b10_routing_config.enable_eagle` at startup,
+including role overrides selected by `ENGINE_ARGS_OVERRIDE_GROUP` (#843).
+This replaces hardcoded non-Eagle hashing so request hashes match SGLang's
+Eagle bigram KV-event hashes; mismatched hashes reported zero cache overlap.
+The field defaults to `false` and requires a router restart when changed.
+Preserve both config parsing/override handling and the `KvRouter::new` wiring
+when rebasing; worker-side advertisement alone does not configure this path.
+
 The v1.2 local-indexer worker-query recovery path now honors
 `skip_initial_worker_wait`: by default, the B10 router waits for the initial
 worker-query KV recovery to complete before registering the serving `generate`
