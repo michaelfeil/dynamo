@@ -25,7 +25,7 @@ use dynamo_runtime::{
     distributed::{DiscoveryBackend, DistributedConfig, RequestPlaneMode},
     error::{BackendError, ErrorType, match_error_chain},
     pipeline::{
-        AsyncEngineContext, Context, ManyIn, Operator, PushRouter, RouterMode,
+        AddressedRequest, AsyncEngineContext, Context, ManyIn, Operator, PushRouter, RouterMode,
         ServerStreamingEngine, StreamingDispatch, context::Controller,
     },
     storage::kv::Selector,
@@ -306,11 +306,10 @@ impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>
 {
     async fn generate(
         &self,
-        _request: &PreprocessedRequest,
-        context: SingleIn<()>,
-        _address: String,
-        instance: Option<Instance>,
+        request: SingleIn<AddressedRequest<&PreprocessedRequest>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        let (addressed, context) = request.transfer(());
+        let (_, _, instance) = addressed.into_parts();
         self.worker_ids
             .lock()
             .unwrap()
@@ -1610,12 +1609,11 @@ impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>
 {
     async fn generate(
         &self,
-        _request: &PreprocessedRequest,
-        context: SingleIn<()>,
-        _address: String,
-        instance: Option<Instance>,
+        request: SingleIn<AddressedRequest<&PreprocessedRequest>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         tokio::task::yield_now().await;
+        let (addressed, context) = request.transfer(());
+        let (_, _, instance) = addressed.into_parts();
         self.worker_ids
             .lock()
             .unwrap()
@@ -3132,11 +3130,10 @@ struct RejectFirstDispatch {
 impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>> for RejectFirstDispatch {
     async fn generate(
         &self,
-        request: &PreprocessedRequest,
-        context: SingleIn<()>,
-        _address: String,
-        instance: Option<Instance>,
+        request: SingleIn<AddressedRequest<&PreprocessedRequest>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        let (addressed, context) = request.transfer(());
+        let (request, _, instance) = addressed.into_parts();
         let worker_id = instance.expect("selected worker instance").id();
         let excluded_worker_ids = request
             .migration_state
@@ -3711,11 +3708,10 @@ impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>
 {
     async fn generate(
         &self,
-        request: &PreprocessedRequest,
-        context: SingleIn<()>,
-        _address: String,
-        instance: Option<Instance>,
+        request: SingleIn<AddressedRequest<&PreprocessedRequest>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
+        let (addressed, context) = request.transfer(());
+        let (request, _, instance) = addressed.into_parts();
         let worker_id = instance.expect("selected worker instance").id();
         let excluded_worker_ids = request
             .migration_state
