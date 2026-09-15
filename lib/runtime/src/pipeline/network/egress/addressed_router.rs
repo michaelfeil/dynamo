@@ -11,7 +11,7 @@ use super::*;
 use crate::component::Instance;
 use crate::discovery::EndpointInstanceId;
 use crate::dynamo_nvtx_range;
-use crate::engine::{AsyncEngine, AsyncEngineContextProvider, Data, EngineContextGuard};
+use crate::engine::{AsyncEngineContextProvider, Data, EngineContextGuard};
 use crate::error::{DynamoError, ErrorType, match_error_chain};
 use crate::logging::inject_trace_headers_into_map;
 use crate::metrics::frontend_perf::STAGE_DURATION_SECONDS;
@@ -1002,72 +1002,6 @@ mod rejection_detection_tests {
     }
 }
 
-#[async_trait::async_trait]
-impl<T, U> AsyncEngine<SingleIn<AddressedRequest<T>>, ManyOut<U>, Error> for AddressedPushRouter
-where
-    T: Data + Serialize,
-    U: Data + for<'de> Deserialize<'de> + MaybeError,
-{
-    async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error> {
-        let (addressed_request, context) = request.transfer(());
-        let (request, address, instance_info) = addressed_request.into_parts();
-
-        self.dispatch_borrowed::<T, U>(&request, context, address, instance_info)
-            .await
-    }
-}
-
-impl AddressedPushRouter {
-    async fn dispatch_borrowed<T, U>(
-        &self,
-        request: &T,
-        context: SingleIn<()>,
-        address: String,
-        instance_info: Option<Instance>,
-    ) -> Result<ManyOut<U>, Error>
-    where
-        T: Data + Serialize,
-        U: Data + for<'de> Deserialize<'de> + MaybeError,
-    {
-        let first_response_guard = context
-            .get_optional::<FirstResponseGuard>(FIRST_RESPONSE_GUARD_CONTEXT_KEY)
-            .map_err(Error::msg)?;
-
-        // Retained dispatch can outlive the caller. Only encoded bytes may cross
-        // that boundary; the payload itself is borrowed for this call.
-        let queue_start = Instant::now();
-        let payload = payload_codec_for_worker(instance_info.as_ref()).encode(request)?;
-        if let Some(guard) = first_response_guard.and_then(|guard| guard.take()) {
-            let permit =
-                try_acquire_retained_dispatch_permit(&RETAINED_FIRST_RESPONSE_DISPATCH_PERMITS)?;
-            let router = self.clone();
-            let dispatch = async move {
-                router
-                    .dispatch_and_finalize::<T, U>(
-                        &context,
-                        address,
-                        instance_info.as_ref(),
-                        Some(payload),
-                        None,
-                        queue_start,
-                    )
-                    .await
-            };
-            return dispatch_with_first_response_guard(dispatch, guard, permit).await;
-        }
-
-        self.dispatch_and_finalize::<T, U>(
-            &context,
-            address,
-            instance_info.as_ref(),
-            Some(payload),
-            None,
-            queue_start,
-        )
-        .await
-    }
-}
-
 /// Transport seam beneath `PushRouter`: given an already-selected worker (typed
 /// request + resolved address), dispatch the final hop and return a typed stream.
 /// Selection, occupancy, fault detection, and migration stay in `PushRouter`
@@ -1119,9 +1053,43 @@ where
 {
     async fn generate(&self, request: SingleIn<AddressedRequest<&T>>) -> Result<ManyOut<U>, Error> {
         let (addressed, context) = request.into_parts();
-        let (request, address, instance) = addressed.into_parts();
-        self.dispatch_borrowed::<T, U>(request, context, address, instance)
-            .await
+        let (request, address, instance_info) = addressed.into_parts();
+        let first_response_guard = context
+            .get_optional::<FirstResponseGuard>(FIRST_RESPONSE_GUARD_CONTEXT_KEY)
+            .map_err(Error::msg)?;
+
+        // Retained dispatch can outlive the caller. Only encoded bytes may cross
+        // that boundary; the payload itself is borrowed for this call.
+        let queue_start = Instant::now();
+        let payload = payload_codec_for_worker(instance_info.as_ref()).encode(request)?;
+        if let Some(guard) = first_response_guard.and_then(|guard| guard.take()) {
+            let permit =
+                try_acquire_retained_dispatch_permit(&RETAINED_FIRST_RESPONSE_DISPATCH_PERMITS)?;
+            let router = self.clone();
+            let dispatch = async move {
+                router
+                    .dispatch_and_finalize::<T, U>(
+                        &context,
+                        address,
+                        instance_info.as_ref(),
+                        Some(payload),
+                        None,
+                        queue_start,
+                    )
+                    .await
+            };
+            return dispatch_with_first_response_guard(dispatch, guard, permit).await;
+        }
+
+        self.dispatch_and_finalize::<T, U>(
+            &context,
+            address,
+            instance_info.as_ref(),
+            Some(payload),
+            None,
+            queue_start,
+        )
+        .await
     }
 
     async fn generate_bidirectional(

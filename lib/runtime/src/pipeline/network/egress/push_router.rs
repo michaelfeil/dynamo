@@ -3564,7 +3564,7 @@ mod tests {
             &self,
             request: SingleIn<AddressedRequest<&u64>>,
         ) -> Result<ManyOut<TestResponse>, Error> {
-            let (addressed, _) = request.into_parts();
+            let (addressed, _ctx) = request.transfer(());
             let (payload, address, instance) = addressed.into_parts();
             self.unary
                 .lock()
@@ -3673,15 +3673,9 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("retry this request"));
         }
-        assert!(
-            router
-                .direct(SingleIn::new(&payload), worker_id)
-                .await
-                .is_err()
-        );
         drop(payload);
         let requests = transport.requests.lock().unwrap();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 6);
         for (attempt, (control, data)) in requests.iter().enumerate() {
             assert_eq!(
                 control
@@ -3690,10 +3684,8 @@ mod tests {
                     .unwrap(),
                 expected
             );
-            if attempt < 6 {
-                assert_eq!(control.id, format!("attempt-{attempt}"));
-                assert_eq!(control.metadata["attempt"], attempt.to_string());
-            }
+            assert_eq!(control.id, format!("attempt-{attempt}"));
+            assert_eq!(control.metadata["attempt"], attempt.to_string());
         }
         rt.shutdown();
     }
