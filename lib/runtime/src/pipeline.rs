@@ -23,8 +23,7 @@ pub use network::egress::addressed_router::{
     propagate_first_response_guard,
 };
 pub use network::egress::push_router::{
-    DirectRequest, MultimodalCacheIndex, MultimodalCacheKeyExtractor, PushRouter, RouterMode,
-    WorkerLoadMonitor,
+    MultimodalCacheIndex, MultimodalCacheKeyExtractor, PushRouter, RouterMode, WorkerLoadMonitor,
 };
 pub mod registry;
 

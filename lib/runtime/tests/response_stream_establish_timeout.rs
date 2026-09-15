@@ -26,8 +26,8 @@ use dynamo_runtime::{
     engine::{AsyncEngine, AsyncEngineContextProvider},
     error::{DynamoError, ErrorType, match_error_chain},
     pipeline::{
-        AddressedPushRouter, AddressedRequest, ManyIn, ManyOut, PipelineError, ResponseStream,
-        SingleIn, StreamingDispatch,
+        AddressedPushRouter, ManyIn, ManyOut, PipelineError, ResponseStream, SingleIn,
+        StreamingDispatch,
         network::{Ingress, PushWorkHandler, ResponsePlaneMode},
     },
     protocols::maybe_error::MaybeError,
@@ -195,20 +195,20 @@ struct ProxiedDispatch {
 impl StreamingDispatch<u64, TestResponse> for ProxiedDispatch {
     async fn generate(
         &self,
-        request: SingleIn<AddressedRequest<u64>>,
+        request: &u64,
+        context: SingleIn<()>,
+        address: String,
+        instance: Option<Instance>,
     ) -> Result<ManyOut<TestResponse>, Error> {
-        let (addressed, context) = request.transfer(());
-        let establish_timeout = addressed.establish_timeout();
-        let (payload, address, instance) = addressed.into_parts();
         let (_, endpoint_path) = address.split_once('/').unwrap();
-        let proxied = AddressedRequest::with_instance(
-            payload,
+        StreamingDispatch::<u64, TestResponse>::generate(
+            self.inner.as_ref(),
+            request,
+            context,
             format!("{}/{endpoint_path}", self.proxy),
-            instance.unwrap(),
+            instance,
         )
-        .with_establish_timeout(establish_timeout);
-        let (_, request) = context.transfer(proxied);
-        StreamingDispatch::<u64, TestResponse>::generate(self.inner.as_ref(), request).await
+        .await
     }
 
     async fn generate_bidirectional(
