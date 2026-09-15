@@ -1379,7 +1379,17 @@ keep the parser aligned with a prompt it never renders. Anthropic dialect-shape
 checks are unchanged (budget < `max_tokens`, budget only with
 `type: enabled`, unknown `type` refused).
 
-The request-side assistant message accepts `reasoning` as a serde alias for `reasoning_content`, so prior-turn reasoning sent under either wire name (OpenRouter/newer-vLLM `reasoning` or DeepSeek/vLLM-legacy `reasoning_content`) deserializes into the canonical field and re-renders into the chat template.
+The request-side assistant message reads `reasoning` and `reasoning_content` separately so replaying both keys does not cause a serde alias collision (MP-1661). A non-null canonical value wins; otherwise the alias fills in. Reasoning may also be an object with string `text`, or an array of such objects, normalized to one flat string (MP-1671). Existing string arrays retain their tool-call-aligned segment representation. No message-wide duplicate-key normalization, summary fallback, mixed arrays, or silent dropping of text-less blocks is added. Serialization still emits only `reasoning_content`. These are fork protocol extensions; keep until the upstream wire types support the same replay contract.
+
+Messages egress preserves the caller's `stop_sequences` in request context and
+reports a confirmed `nvext.matched_stop` as `stop_reason: stop_sequence` with
+the matched string (MP-1550). Internal stops, token limits and tool-use finishes
+keep their existing reason. Streaming retains match metadata independently of
+the finish chunk. Messages requests ask for continuous usage, and the converter
+emits `message_start` once after recording the first chunk's prompt/cache counts
+(MP-1654); both cache fields are explicit, including zero. Final-only-usage
+backends remain streaming and reconcile at end. Preserve the shared event
+generation and pending-text/tool-block ordering from #846 when replaying.
 
 `BasetenExt.mocker_config` per-request passthrough field: a free-form
 `Option<HashMap<String, Value>>` for per-request overrides consumed only by

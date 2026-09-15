@@ -490,11 +490,12 @@ async fn anthropic_messages(
 
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut converter = match anthropic_ctx {
+        // `message_start` is emitted by the converter on the first engine chunk
+        // (or at stream end) so its usage carries real prompt/cached counts.
+        let converter = match anthropic_ctx {
             Some(ctx) => AnthropicStreamConverter::with_context(model_for_resp, ctx),
             None => AnthropicStreamConverter::new(model_for_resp),
         };
-        let start_events = converter.emit_start_events();
 
         let converter = std::sync::Arc::new(std::sync::Mutex::new(converter));
         let converter_end = converter.clone();
@@ -530,8 +531,6 @@ async fn anthropic_messages(
             })
             .flatten();
 
-        let start_stream = stream::iter(start_events);
-
         let done_stream = stream::once(async move {
             let mut conv = converter_end.lock().expect("converter lock poisoned");
             let end_events = if saw_error_end.load(Ordering::Acquire) {
@@ -543,7 +542,7 @@ async fn anthropic_messages(
         })
         .flatten();
 
-        let full_stream = start_stream.chain(event_stream).chain(done_stream);
+        let full_stream = event_stream.chain(done_stream);
         let full_stream = full_stream.map(|result| result.map_err(axum::Error::new));
 
         let stream =

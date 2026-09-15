@@ -581,14 +581,16 @@ pub enum StopReason {
 
 /// Reasoning content from a previous assistant turn.
 ///
-/// Deserializes from either:
+/// Deserializes from:
 /// - A plain string: `"reasoning_content": "thinking..."` -> `Text("thinking...")`
 /// - An array of strings: `"reasoning_content": ["seg1", "seg2"]` -> `Segments(["seg1", "seg2"])`
+/// - An object with string `text`, or an array of such objects -> flat `Text`.
+///   Object blocks are not aligned with tool calls, so they never become `Segments`.
 ///
 /// The `Segments` variant preserves interleaved reasoning order needed for KV cache-correct
 /// context reconstruction. `segments[i]` is the reasoning that preceded `tool_calls[i]`;
 /// `segments[tool_calls.len()]` is any trailing reasoning after the last tool call.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum ReasoningContent {
     /// Flat string -- single reasoning block or legacy backward-compat form.
@@ -596,6 +598,44 @@ pub enum ReasoningContent {
     /// Interleaved segments. segments[i] precedes tool_calls[i];
     /// segments[N] is trailing reasoning after the last tool call.
     Segments(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for ReasoningContent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct TextBlock {
+            text: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Text(String),
+            Segments(Vec<String>),
+            Block(TextBlock),
+            Blocks(Vec<TextBlock>),
+        }
+
+        let input = Input::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(
+                "reasoning_content/reasoning must be a string, an array of strings, \
+                 an object with string text, or an array of objects with string text",
+            )
+        })?;
+        Ok(match input {
+            Input::Text(text) => Self::Text(text),
+            Input::Segments(segments) => Self::Segments(segments),
+            Input::Block(block) => Self::Text(block.text),
+            Input::Blocks(blocks) => Self::Text(
+                blocks
+                    .into_iter()
+                    .map(|block| block.text)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        })
+    }
 }
 
 impl ReasoningContent {
@@ -804,7 +844,7 @@ pub enum ChatCompletionRequestUserMessageContentPart {
 /// Extends upstream `ChatCompletionRequestAssistantMessage` with:
 /// - `reasoning_content`: interleaved reasoning segments for KV cache correctness
 ///   (DeepSeek-R1, QwQ models)
-#[derive(Debug, Serialize, Deserialize, Default, Clone, Builder, PartialEq)]
+#[derive(Debug, Serialize, Default, Clone, Builder, PartialEq)]
 #[builder(name = "ChatCompletionRequestAssistantMessageArgs")]
 #[builder(pattern = "mutable")]
 #[builder(setter(into, strip_option), default)]
@@ -814,8 +854,8 @@ pub struct ChatCompletionRequestAssistantMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ChatCompletionRequestAssistantMessageContent>,
     /// Reasoning content from a previous assistant turn.
-    // b10: a customer still wants to send either "reasoning" or "reasoning_content"; accept both.
-    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
+    // Read both wire keys separately below: serde(alias) rejects replaying both (MP-1661).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<ReasoningContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
@@ -833,6 +873,38 @@ pub struct ChatCompletionRequestAssistantMessage {
     #[deprecated]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<FunctionCall>,
+}
+
+impl<'de> Deserialize<'de> for ChatCompletionRequestAssistantMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Input {
+            content: Option<ChatCompletionRequestAssistantMessageContent>,
+            reasoning_content: Option<ReasoningContent>,
+            reasoning: Option<ReasoningContent>,
+            refusal: Option<String>,
+            name: Option<String>,
+            audio: Option<ChatCompletionRequestAssistantMessageAudio>,
+            tool_calls: Option<Vec<ChatCompletionMessageToolCall>>,
+            partial: Option<bool>,
+            function_call: Option<FunctionCall>,
+        }
+
+        let input = Input::deserialize(deserializer)?;
+        #[allow(deprecated)]
+        Ok(Self {
+            content: input.content,
+            // A missing/null canonical value falls back; an empty string still wins.
+            // Both fields are validated, even when the alias is not selected.
+            reasoning_content: input.reasoning_content.or(input.reasoning),
+            refusal: input.refusal,
+            name: input.name,
+            audio: input.audio,
+            tool_calls: input.tool_calls,
+            partial: input.partial,
+            function_call: input.function_call,
+        })
+    }
 }
 
 /// Chat completion request message enum.
@@ -1083,6 +1155,157 @@ pub struct CreateChatCompletionStreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_replay_accepts_both_reasoning_keys_with_canonical_precedence() {
+        for (raw, expected) in [
+            (r#"{"reasoning":"alias"}"#, Some("alias")),
+            (r#"{"reasoning_content":"canonical"}"#, Some("canonical")),
+            (
+                r#"{"reasoning":"alias","reasoning_content":"canonical"}"#,
+                Some("canonical"),
+            ),
+            (
+                r#"{"reasoning_content":"canonical","reasoning":"alias"}"#,
+                Some("canonical"),
+            ),
+            (
+                r#"{"reasoning_content":null,"reasoning":"alias"}"#,
+                Some("alias"),
+            ),
+            (r#"{"reasoning_content":"","reasoning":"alias"}"#, Some("")),
+            (r#"{"reasoning_content":null,"reasoning":null}"#, None),
+            (r#"{}"#, None),
+        ] {
+            let assistant: ChatCompletionRequestAssistantMessage =
+                serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                assistant.reasoning_content,
+                expected.map(|text| ReasoningContent::Text(text.into())),
+                "{raw}"
+            );
+            let serialized = serde_json::to_value(assistant).unwrap();
+            assert!(serialized.get("reasoning").is_none());
+            assert_eq!(
+                serialized.get("reasoning_content"),
+                expected.map(serde_json::Value::from).as_ref()
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_replay_normalizes_text_blocks_but_preserves_interleaved_segments() {
+        use serde_json::json;
+
+        for (wire, expected) in [
+            (json!("thought"), ReasoningContent::Text("thought".into())),
+            (json!([]), ReasoningContent::Segments(vec![])),
+            (
+                json!(["before tool", "", "after tool"]),
+                ReasoningContent::Segments(vec![
+                    "before tool".into(),
+                    "".into(),
+                    "after tool".into(),
+                ]),
+            ),
+            (
+                json!({"text":"thought"}),
+                ReasoningContent::Text("thought".into()),
+            ),
+            (
+                json!([{"type":"reasoning.text","text":"first"}, {"text":""}, {"text":"last"}]),
+                ReasoningContent::Text("first\nlast".into()),
+            ),
+        ] {
+            for field in ["reasoning", "reasoning_content"] {
+                let request: CreateChatCompletionRequest = serde_json::from_value(json!({
+                    "model":"m",
+                    "messages":[
+                        {"role":"user","content":"Say hello."},
+                        {"role":"assistant","content":"Hello!",(field):wire.clone()},
+                        {"role":"user","content":"Now say goodbye."}
+                    ]
+                }))
+                .unwrap();
+                let ChatCompletionRequestMessage::Assistant(assistant) = &request.messages[1]
+                else {
+                    panic!("expected assistant");
+                };
+                assert_eq!(assistant.reasoning_content.as_ref(), Some(&expected));
+                let normalized = serde_json::to_value(&request).unwrap();
+                assert_eq!(
+                    normalized["messages"][1]["reasoning_content"],
+                    serde_json::to_value(&expected).unwrap()
+                );
+                assert!(normalized["messages"][1].get("reasoning").is_none());
+                let round_trip: CreateChatCompletionRequest =
+                    serde_json::from_value(normalized).unwrap();
+                assert_eq!(round_trip.messages, request.messages);
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_replay_rejects_unsupported_shapes_in_either_key() {
+        use serde_json::json;
+
+        for invalid in [
+            json!(42),
+            json!(false),
+            json!([1]),
+            json!([null]),
+            json!({"text":null}),
+            json!({"text":42}),
+            json!({"summary":"summary"}),
+            json!({"type":"reasoning.encrypted","data":"opaque"}),
+            json!({"type":"anything"}),
+            json!({"foo":"bar"}),
+            json!([{"text":"ok"}, {"type":"reasoning.encrypted","data":"opaque"}]),
+            json!(["mixed", {"text":"object"}]),
+        ] {
+            // An otherwise valid canonical value must not hide an invalid alias, or vice versa.
+            for field in ["reasoning", "reasoning_content"] {
+                let mut assistant = json!({"role":"assistant","content":"ok","reasoning":"valid","reasoning_content":"valid"});
+                assistant[field] = invalid.clone();
+                let err = serde_json::from_value::<CreateChatCompletionRequest>(json!({
+                    "model":"m","messages":[assistant]
+                }))
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains("reasoning_content/reasoning"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_replay_preserves_other_fields() {
+        let mut wire = serde_json::json!({
+            "role":"assistant", "content":[{"type":"text","text":"ok"}],
+            "reasoning":"thought", "refusal":"refusal", "name":"bot", "partial":true,
+            "audio":{"id":"audio-id"},
+            "tool_calls":[{"id":"call-id","type":"function","function":{"name":"f","arguments":"{}"}}],
+            "function_call":{"name":"legacy","arguments":"{}"}
+        });
+        let message: ChatCompletionRequestMessage = serde_json::from_value(wire.clone()).unwrap();
+        let reasoning = wire.as_object_mut().unwrap().remove("reasoning").unwrap();
+        wire["reasoning_content"] = reasoning;
+        assert_eq!(serde_json::to_value(message).unwrap(), wire);
+    }
+
+    #[test]
+    fn assistant_replay_does_not_add_last_wins_duplicate_key_handling() {
+        for fields in [
+            r#""reasoning_content":"first","reasoning_content":"second""#,
+            r#""reasoning":"first","reasoning":"second""#,
+            r#""content":"first","content":"second""#,
+        ] {
+            let raw = format!(r#"{{"model":"m","messages":[{{"role":"assistant",{fields}}}]}}"#);
+            let err = serde_json::from_str::<CreateChatCompletionRequest>(&raw).unwrap_err();
+            assert!(err.to_string().contains("duplicate field"), "{err}");
+        }
+    }
 
     #[test]
     fn response_message_omits_absent_reasoning_content() {

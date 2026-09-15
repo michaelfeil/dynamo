@@ -57,6 +57,8 @@ use super::openai::responses::NvCreateResponse;
 /// fields specific to that API that cannot be represented in the
 /// OpenAI Chat Completions format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// The Anthropic variant is deliberately larger; contexts are built once per request.
+#[allow(clippy::large_enum_variant)]
 pub enum ApiContext {
     /// Request came from the OpenAI Chat Completions API.
     /// All fields are natively represented in `NvCreateChatCompletionRequest`.
@@ -105,6 +107,11 @@ pub struct AnthropicContext {
     /// Output configuration (effort level, JSON schema format).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_config: Option<serde_json::Value>,
+
+    /// The request's `stop_sequences`, kept so the response can report which
+    /// one the engine matched (`stop_reason: stop_sequence` + `stop_sequence`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop_sequences: Vec<String>,
 }
 
 /// Responses API-specific fields preserved from `NvCreateResponse`.
@@ -238,6 +245,7 @@ impl UnifiedRequest {
             service_tier: req.service_tier.clone(),
             container: req.container.clone(),
             output_config: req.output_config.clone(),
+            stop_sequences: req.stop_sequences.clone().unwrap_or_default(),
         };
         let canonical = super::anthropic::types::canonicalize_anthropic_body(body)?;
         Ok(Self {

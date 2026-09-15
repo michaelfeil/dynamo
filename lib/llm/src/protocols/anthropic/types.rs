@@ -72,7 +72,9 @@ fn canonicalize_anthropic_body_inner(
     nv.inner.stream = Some(true);
     nv.inner.stream_options = Some(dynamo_protocols::types::ChatCompletionStreamOptions {
         include_usage: true,
-        continuous_usage_stats: false,
+        // Per-chunk usage lets `message_start` carry the engine's
+        // prompt/cached counts instead of zeros (stream_converter.rs).
+        continuous_usage_stats: true,
     });
     Ok(crate::protocols::unified::Canonicalized {
         request: nv,
@@ -101,7 +103,8 @@ pub(crate) fn new_tool_use_id() -> String {
 ///
 /// Dynamo backends report `prompt_tokens` as the complete prompt and
 /// `cached_tokens` as a subset of it. Anthropic reports the cached subset
-/// separately, so `input_tokens` must exclude it.
+/// separately, so `input_tokens` must exclude it. Both cache fields are always
+/// present (0 when nothing was cached), matching the Anthropic wire.
 pub(super) fn completion_usage_to_anthropic(usage: &CompletionUsage) -> AnthropicUsage {
     let cache_read_input_tokens = usage
         .prompt_tokens_details
@@ -110,19 +113,35 @@ pub(super) fn completion_usage_to_anthropic(usage: &CompletionUsage) -> Anthropi
         // A backend must not be able to produce an Anthropic usage breakdown
         // whose cached subset exceeds the complete prompt.
         .map(|tokens| tokens.min(usage.prompt_tokens))
-        .filter(|&tokens| tokens > 0);
+        .unwrap_or(0);
 
     AnthropicUsage {
-        input_tokens: usage
-            .prompt_tokens
-            .saturating_sub(cache_read_input_tokens.unwrap_or(0)),
+        input_tokens: usage.prompt_tokens.saturating_sub(cache_read_input_tokens),
         output_tokens: usage.completion_tokens,
         // OpenAI-compatible backends do not report cache-write counts. Emit an
         // explicit 0 (not absent) so downstream metering never interprets a
         // missing field as "the whole prompt was written to cache".
         cache_creation_input_tokens: Some(0),
-        cache_read_input_tokens,
+        // Explicit 0 (not absent) for the same reason: SEG meters
+        // input_tokens + cache_read_input_tokens and must not guess.
+        cache_read_input_tokens: Some(cache_read_input_tokens),
     }
+}
+
+/// The user `stop_sequences` entry the engine stopped on, if any. The chat
+/// processor reports it as `nvext.matched_stop` on the terminal chunk (the
+/// aggregator merges it into the unary response); only a value that is one of
+/// the request's own sequences counts, so control-token stops stay `end_turn`.
+pub(crate) fn matched_stop_sequence(
+    nvext: Option<&serde_json::Value>,
+    api_context: Option<&crate::protocols::unified::AnthropicContext>,
+) -> Option<String> {
+    let matched = nvext?.get("matched_stop")?.as_str()?;
+    api_context?
+        .stop_sequences
+        .iter()
+        .any(|s| s == matched)
+        .then(|| matched.to_string())
 }
 
 /// Convert a completed chat completion response into an Anthropic Messages response.
@@ -131,8 +150,12 @@ pub fn chat_completion_to_anthropic_response(
     model: &str,
     api_context: Option<&crate::protocols::unified::AnthropicContext>,
 ) -> AnthropicMessageResponse {
-    let _ = api_context; // Available for future enrichment (service_tier, etc.)
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
+    // A user stop sequence match turns `end_turn` into `stop_sequence`. Tool
+    // use takes precedence: a turn that already emitted tool calls reports
+    // `tool_use` and does not expose the matched string, matching Anthropic,
+    // where `stop_sequence` is only set alongside `stop_reason: stop_sequence`.
+    let matched = matched_stop_sequence(chat_resp.nvext.as_ref(), api_context);
 
     let choice = chat_resp.inner.choices.into_iter().next();
     let mut content = Vec::new();
@@ -141,6 +164,9 @@ pub fn chat_completion_to_anthropic_response(
     if let Some(choice) = choice {
         // Map finish_reason
         stop_reason = choice.finish_reason.map(|fr| match fr {
+            dynamo_protocols::types::FinishReason::Stop if matched.is_some() => {
+                AnthropicStopReason::StopSequence
+            }
             dynamo_protocols::types::FinishReason::Stop => AnthropicStopReason::EndTurn,
             dynamo_protocols::types::FinishReason::Length => AnthropicStopReason::MaxTokens,
             dynamo_protocols::types::FinishReason::ToolCalls => AnthropicStopReason::ToolUse,
@@ -211,6 +237,7 @@ pub fn chat_completion_to_anthropic_response(
         .map(completion_usage_to_anthropic)
         .unwrap_or_else(|| AnthropicUsage {
             cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
             ..Default::default()
         });
 
@@ -220,8 +247,12 @@ pub fn chat_completion_to_anthropic_response(
         role: "assistant".to_string(),
         content,
         model: model.to_string(),
+        stop_sequence: if stop_reason == Some(AnthropicStopReason::StopSequence) {
+            matched
+        } else {
+            None
+        },
         stop_reason,
-        stop_sequence: None,
         usage,
     }
 }
@@ -250,6 +281,25 @@ mod tests {
         let body = serde_json::to_value(&chat).unwrap();
         assert!(body.get("context_management").is_none());
     }
+    #[test]
+    fn messages_requests_preserve_stops_and_request_continuous_usage() {
+        let body = serde_json::json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop_sequences": ["END"]
+        });
+        let req = serde_json::from_value(body.clone()).unwrap();
+        let unified =
+            crate::protocols::unified::UnifiedRequest::from_anthropic_body(&req, body).unwrap();
+        let crate::protocols::unified::ApiContext::Anthropic(ctx) = unified.api_context else {
+            panic!("expected Anthropic context");
+        };
+        assert_eq!(ctx.stop_sequences, vec!["END"]);
+        let options = unified.inner.inner.stream_options.unwrap();
+        assert!(options.include_usage);
+        assert!(options.continuous_usage_stats);
+    }
+
     use dynamo_protocols::types::{
         ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageContent,
@@ -716,6 +766,92 @@ mod tests {
     }
 
     #[allow(deprecated)]
+    fn stopped_chat_response(nvext: Option<serde_json::Value>) -> NvCreateChatCompletionResponse {
+        NvCreateChatCompletionResponse {
+            inner: dynamo_protocols::types::CreateChatCompletionResponse {
+                id: "chatcmpl-stop".into(),
+                choices: vec![dynamo_protocols::types::ChatChoice {
+                    index: 0,
+                    message: dynamo_protocols::types::ChatCompletionResponseMessage {
+                        content: Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                            "The quick brown fox jumps over the ".to_string(),
+                        )),
+                        refusal: None,
+                        tool_calls: None,
+                        role: dynamo_protocols::types::Role::Assistant,
+                        function_call: None,
+                        audio: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: Some(dynamo_protocols::types::FinishReason::Stop),
+                    logprobs: None,
+                }],
+                created: 1726000000,
+                model: "test-model".into(),
+                service_tier: None,
+                system_fingerprint: None,
+                object: "chat.completion".to_string(),
+                usage: None,
+            },
+            nvext,
+        }
+    }
+
+    /// MP-1550: a user `stop_sequences` match (reported by the processor as
+    /// `nvext.matched_stop`) is `stop_reason: stop_sequence` plus the string.
+    #[test]
+    fn test_user_stop_sequence_match_is_reported() {
+        let ctx = crate::protocols::unified::AnthropicContext {
+            stop_sequences: vec!["lazy".to_string(), "END".to_string()],
+            ..Default::default()
+        };
+        let matched = Some(serde_json::json!({"matched_stop": "lazy"}));
+
+        let response = chat_completion_to_anthropic_response(
+            stopped_chat_response(matched.clone()),
+            "m",
+            Some(&ctx),
+        );
+        assert_eq!(
+            response.stop_reason,
+            Some(AnthropicStopReason::StopSequence)
+        );
+        assert_eq!(response.stop_sequence.as_deref(), Some("lazy"));
+
+        // A stop that is not one of the request's sequences stays end_turn.
+        let other = Some(serde_json::json!({"matched_stop": "<|im_end|>"}));
+        let response =
+            chat_completion_to_anthropic_response(stopped_chat_response(other), "m", Some(&ctx));
+        assert_eq!(response.stop_reason, Some(AnthropicStopReason::EndTurn));
+        assert_eq!(response.stop_sequence, None);
+
+        // Plain EOS (no matched_stop) and unrelated nvext stay end_turn.
+        let response =
+            chat_completion_to_anthropic_response(stopped_chat_response(None), "m", Some(&ctx));
+        assert_eq!(response.stop_reason, Some(AnthropicStopReason::EndTurn));
+        let response = chat_completion_to_anthropic_response(
+            stopped_chat_response(Some(serde_json::json!({"worker_id": "w1"}))),
+            "m",
+            Some(&ctx),
+        );
+        assert_eq!(response.stop_reason, Some(AnthropicStopReason::EndTurn));
+
+        // Tool use wins over a later user stop: `tool_use`, no stop_sequence.
+        let mut with_tools = stopped_chat_response(matched.clone());
+        with_tools.inner.choices[0].finish_reason =
+            Some(dynamo_protocols::types::FinishReason::ToolCalls);
+        let response = chat_completion_to_anthropic_response(with_tools, "m", Some(&ctx));
+        assert_eq!(response.stop_reason, Some(AnthropicStopReason::ToolUse));
+        assert_eq!(response.stop_sequence, None);
+
+        // Without the request context the match cannot be confirmed.
+        let response =
+            chat_completion_to_anthropic_response(stopped_chat_response(matched), "m", None);
+        assert_eq!(response.stop_reason, Some(AnthropicStopReason::EndTurn));
+        assert_eq!(response.stop_sequence, None);
+    }
+
+    #[allow(deprecated)]
     #[test]
     fn test_chat_completion_to_anthropic_response() {
         let chat_resp = NvCreateChatCompletionResponse {
@@ -819,6 +955,26 @@ mod tests {
         assert_eq!(response.usage.cache_read_input_tokens, Some(11));
         assert_eq!(response.usage.cache_creation_input_tokens, Some(0));
         assert_eq!(response.usage.output_tokens, 5);
+    }
+
+    /// MP-1654: an absent or zero cached count must still serialize as
+    /// `cache_read_input_tokens: 0`, never be dropped.
+    #[test]
+    fn test_anthropic_usage_reports_zero_cache_read_explicitly() {
+        let usage = CompletionUsage {
+            prompt_tokens: 12,
+            completion_tokens: 5,
+            total_tokens: 17,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+
+        let usage = completion_usage_to_anthropic(&usage);
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.cache_read_input_tokens, Some(0));
+        assert_eq!(usage.cache_creation_input_tokens, Some(0));
+        let wire = serde_json::to_string(&usage).unwrap();
+        assert!(wire.contains("\"cache_read_input_tokens\":0"), "{wire}");
     }
 
     #[test]
