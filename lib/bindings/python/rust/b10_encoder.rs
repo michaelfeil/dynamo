@@ -36,11 +36,11 @@ pub(crate) struct MultiModalEncoderClient {
 #[pymethods]
 impl MultiModalEncoderClient {
     #[new]
-    #[pyo3(signature = (*, url, api_key=None, cache_urls=Vec::new(), proxy=None, request_timeout_s=300.0, max_retries=1, max_concurrent_requests=64))]
+    #[pyo3(signature = (*, url, api_key, cache_urls=Vec::new(), proxy=None, request_timeout_s=300.0, max_retries=1, max_concurrent_requests=64))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         url: String,
-        api_key: Option<String>,
+        api_key: String,
         cache_urls: Vec<String>,
         proxy: Option<String>,
         request_timeout_s: f64,
@@ -49,7 +49,7 @@ impl MultiModalEncoderClient {
     ) -> PyResult<Self> {
         let transport = MultiModalClient::new(HttpEncoderConfig {
             url,
-            api_key: api_key.unwrap_or_default(),
+            api_key,
             cache_urls,
             proxy,
             request_timeout_s,

@@ -44,7 +44,7 @@ class MultiModalEncoderClient:
         self,
         *,
         url: str,
-        api_key: Optional[str] = None,
+        api_key: str,
         cache_urls: List[str] = [],
         proxy: Optional[str] = None,
         request_timeout_s: float = 300.0,
