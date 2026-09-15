@@ -140,7 +140,7 @@ impl FirstResponseGuard {
 
 /// Keep a frontend-owned resource alive until the addressed worker produces
 /// its first response item or closes the response stream.
-pub fn attach_first_response_guard<T: Data>(
+pub fn attach_first_response_guard<T: Send + Sync>(
     context: &mut context::Context<T>,
     guard: EngineContextGuard,
 ) {
@@ -151,7 +151,7 @@ pub fn attach_first_response_guard<T: Data>(
 }
 
 /// Share a take-once first-response guard with a derived request context.
-pub fn propagate_first_response_guard<S: Data, T: Data>(
+pub fn propagate_first_response_guard<S: Send + Sync, T: Send + Sync>(
     source: &context::Context<S>,
     target: &mut context::Context<T>,
 ) -> Result<(), Error> {
@@ -1092,13 +1092,7 @@ where
 {
     /// Unary final hop. Only the payload is borrowed; detached work must own
     /// its serialized bytes, and the returned stream must not borrow the payload.
-    async fn generate(
-        &self,
-        request: &T,
-        context: SingleIn<()>,
-        address: String,
-        instance: Option<Instance>,
-    ) -> Result<ManyOut<U>, Error>;
+    async fn generate(&self, request: SingleIn<AddressedRequest<&T>>) -> Result<ManyOut<U>, Error>;
 
     /// Bidirectional final hop (streaming input).
     async fn generate_bidirectional(
@@ -1123,13 +1117,9 @@ where
     T: Data + Serialize,
     U: Data + for<'de> Deserialize<'de> + MaybeError,
 {
-    async fn generate(
-        &self,
-        request: &T,
-        context: SingleIn<()>,
-        address: String,
-        instance: Option<Instance>,
-    ) -> Result<ManyOut<U>, Error> {
+    async fn generate(&self, request: SingleIn<AddressedRequest<&T>>) -> Result<ManyOut<U>, Error> {
+        let (addressed, context) = request.into_parts();
+        let (request, address, instance) = addressed.into_parts();
         self.dispatch_borrowed::<T, U>(request, context, address, instance)
             .await
     }
@@ -1316,14 +1306,15 @@ mod tests {
         let router = AddressedPushRouter::new(client.clone(), responses).unwrap();
         let request = vec![123u64];
         let (dropped_tx, mut dropped_rx) = oneshot::channel();
-        let mut context = Context::new(());
+        let mut context = Context::new(&request);
         attach_first_response_guard(&mut context, Arc::new(DropSignal(Some(dropped_tx))));
         {
-            let dispatch = router.dispatch_borrowed::<_, Annotated<u64>>(
-                &request,
-                context,
-                "worker".into(),
-                None,
+            let dispatch = <AddressedPushRouter as super::StreamingDispatch<
+                Vec<u64>,
+                Annotated<u64>,
+            >>::generate(
+                router.as_ref(),
+                context.map(|payload| super::AddressedRequest::new(payload, "worker".into())),
             );
             tokio::pin!(dispatch);
             tokio::select! {

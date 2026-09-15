@@ -1985,7 +1985,7 @@ impl Client {
         context: Option<context::Context>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let request: rmpv::Value = pythonize::depythonize(&request.into_bound(py))?;
-        let (request, request_ctx) = create_request_context(request, &context).into_parts();
+        let request_ctx = create_request_context(request, &context);
         let annotated = annotated.unwrap_or(false);
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -1998,13 +1998,13 @@ impl Client {
                     let span =
                         get_span_for_direct_context(&context, "direct", &instance_id.to_string());
                     client
-                        .direct(&request, request_ctx, instance_id)
+                        .direct(request_ctx, instance_id)
                         .instrument(span)
                         .await
                         .map_err(to_pyerr)?
                 }
                 _ => client
-                    .direct(&request, request_ctx, instance_id)
+                    .direct(request_ctx, instance_id)
                     .await
                     .map_err(to_pyerr)?,
             };

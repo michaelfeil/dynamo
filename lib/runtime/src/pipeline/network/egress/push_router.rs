@@ -13,7 +13,7 @@ use crate::{
     engine::{AsyncEngine, AsyncEngineContext, Data},
     metrics::frontend_perf::{STAGE_DURATION_SECONDS, STAGE_ROUTE},
     pipeline::{
-        AddressedPushRouter, Error, ManyIn, ManyOut, SingleIn, StreamingDispatch,
+        AddressedPushRouter, AddressedRequest, Error, ManyIn, ManyOut, SingleIn, StreamingDispatch,
         error::{PipelineError, PipelineErrorExt},
     },
     protocols::{EndpointId, maybe_error::MaybeError},
@@ -1001,9 +1001,9 @@ where
             .await
     }
 
-    /// Dispatch a borrowed payload to exactly one endpoint without transport fallback.
-    /// The context is owned by the response stream; the payload is borrowed only
-    /// until this call returns.
+    /// Dispatch to exactly one endpoint without transport fallback.
+    /// The request can carry an owned payload or a borrow. The response stream
+    /// does not borrow the payload.
     ///
     /// ```no_run
     /// # use dynamo_runtime::pipeline::{ManyOut, PushRouter, SingleIn};
@@ -1012,17 +1012,19 @@ where
     ///     -> anyhow::Result<ManyOut<Annotated<String>>>
     /// {
     ///     let payload = vec![1, 2, 3];
-    ///     let response = router.direct(&payload, SingleIn::new(()), worker).await?;
+    ///     let response = router.direct(SingleIn::new(&payload), worker).await?;
     ///     drop(payload);
     ///     Ok(response)
     /// }
     /// ```
-    pub async fn direct(
+    pub async fn direct<P>(
         &self,
-        payload: &T,
-        context: SingleIn<()>,
+        request: SingleIn<P>,
         instance_id: u64,
-    ) -> anyhow::Result<ManyOut<U>> {
+    ) -> anyhow::Result<ManyOut<U>>
+    where
+        P: Borrow<T> + Send + Sync,
+    {
         tracing::info!(
             router_mode = "direct",
             worker_id = instance_id,
@@ -1030,7 +1032,7 @@ where
         );
         self.generate_with_fault_detection_prepared_inner(
             instance_id,
-            (payload, context),
+            request,
             TransportFallback::Deny,
             OverloadCheck::Required,
             |_, _| Ok(()),
@@ -1705,7 +1707,7 @@ where
     ) -> anyhow::Result<ManyOut<U>> {
         self.generate_with_fault_detection_prepared_inner(
             instance_id,
-            request.into_parts(),
+            request,
             fallback,
             overload_check,
             |_, _| Ok(()),
@@ -1726,7 +1728,7 @@ where
     {
         self.generate_with_fault_detection_prepared_inner(
             instance_id,
-            request.into_parts(),
+            request,
             fallback,
             OverloadCheck::Required,
             prepare,
@@ -1737,13 +1739,13 @@ where
     async fn generate_with_fault_detection_prepared_inner<P, M, F>(
         &self,
         instance_id: u64,
-        (mut payload, request): (P, SingleIn<()>),
+        mut request: SingleIn<P>,
         fallback: TransportFallback<'_>,
         overload_check: OverloadCheck,
         prepare: F,
     ) -> anyhow::Result<(M, ManyOut<U>)>
     where
-        P: Borrow<T>,
+        P: Borrow<T> + Send + Sync,
         F: FnOnce(&mut P, u64) -> anyhow::Result<M>,
     {
         let route_start = Instant::now();
@@ -1789,13 +1791,17 @@ where
             return Err(error);
         }
 
-        let metadata = match prepare(&mut payload, instance_id) {
+        let metadata = match prepare(&mut request, instance_id) {
             Ok(metadata) => metadata,
             Err(error) => {
                 record_route_error(&route_span, error.as_ref());
                 return Err(error);
             }
         };
+        let (payload, context) = request.into_parts();
+        let request =
+            context.map(|()| AddressedRequest::with_instance(payload.borrow(), address, instance));
+
         STAGE_DURATION_SECONDS
             .with_label_values(&[STAGE_ROUTE])
             .observe(route_start.elapsed().as_secs_f64());
@@ -1803,7 +1809,7 @@ where
         let _nvtx_transport = dynamo_nvtx_range!(transport_kind);
         let stream = self
             .addressed
-            .generate(payload.borrow(), request, address, Some(instance))
+            .generate(request)
             .instrument(route_span.clone())
             .await;
         let stream = self.wrap_with_fault_detection(stream, instance_id, route_span)?;
@@ -2853,7 +2859,7 @@ mod tests {
             .unwrap();
 
         let unary_error = router
-            .direct(&42, SingleIn::new(()), stale_id)
+            .direct(SingleIn::new(42), stale_id)
             .await
             .unwrap_err();
         assert_cannot_connect(&unary_error);
@@ -3544,11 +3550,10 @@ mod tests {
     impl StreamingDispatch<u64, TestResponse> for RecordingDispatch {
         async fn generate(
             &self,
-            payload: &u64,
-            _context: SingleIn<()>,
-            address: String,
-            instance: Option<Instance>,
+            request: SingleIn<AddressedRequest<&u64>>,
         ) -> Result<ManyOut<TestResponse>, Error> {
+            let (addressed, _) = request.into_parts();
+            let (payload, address, instance) = addressed.into_parts();
             self.unary
                 .lock()
                 .unwrap()
@@ -3643,20 +3648,17 @@ mod tests {
         let expected = serde_json::to_value(&payload).unwrap();
         for attempt in 0..2 {
             let mut context = SingleIn::with_id_and_metadata(
-                (),
+                &payload,
                 format!("attempt-{attempt}"),
                 Default::default(),
             );
             context.insert_metadata("attempt", attempt.to_string());
-            let error = router
-                .direct(&payload, context, worker_id)
-                .await
-                .unwrap_err();
+            let error = router.direct(context, worker_id).await.unwrap_err();
             assert!(error.to_string().contains("retry this request"));
         }
         assert!(
             router
-                .direct(&payload, SingleIn::new(()), worker_id)
+                .direct(SingleIn::new(&payload), worker_id)
                 .await
                 .is_err()
         );
@@ -3719,6 +3721,17 @@ mod tests {
             assert_eq!(*dispatched, Some(instance_id));
             assert!(!address.is_empty(), "selected transport address expected");
         }
+
+        let mut response = {
+            let payload = 43;
+            router
+                .direct(SingleIn::new(&payload), instance_id)
+                .await
+                .unwrap()
+        };
+        assert!(response.next().await.is_some());
+        while response.next().await.is_some() {}
+        assert_eq!(dispatch.unary.lock().unwrap()[1].0, 43);
 
         // Bidirectional hop reaches the supplied dispatch with the same worker.
         let input: ManyIn<u64> =

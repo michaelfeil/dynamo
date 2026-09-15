@@ -255,8 +255,8 @@ mod tests {
         distributed::{DiscoveryBackend, DistributedConfig, RequestPlaneMode},
         engine::{AsyncEngine, AsyncEngineContext},
         pipeline::{
-            Context, Error, ManyIn, ManyOut, PushRouter, ResponseStream, RouterMode, SingleIn,
-            StreamingDispatch, context::Controller,
+            AddressedRequest, Context, Error, ManyIn, ManyOut, PushRouter, ResponseStream,
+            RouterMode, SingleIn, StreamingDispatch, context::Controller,
         },
         storage::kv,
         traits::DistributedRuntimeProvider,
@@ -318,11 +318,10 @@ mod tests {
     impl StreamingDispatch<PreprocessedRequest, LlmResponse> for RecordingDispatch {
         async fn generate(
             &self,
-            _request: &PreprocessedRequest,
-            _context: SingleIn<()>,
-            _address: String,
-            instance: Option<Instance>,
+            request: SingleIn<AddressedRequest<&PreprocessedRequest>>,
         ) -> Result<ManyOut<LlmResponse>, Error> {
+            let (addressed, _) = request.transfer(());
+            let (_, _, instance) = addressed.into_parts();
             self.worker_ids
                 .lock()
                 .unwrap()
