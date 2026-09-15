@@ -327,22 +327,14 @@ fn serialize_control_message(control_message: &RequestControlMessage) -> Result<
     Ok(ctrl)
 }
 
-/// Build the request control message, and serialize for transfer.
-///
-/// `request` provides the optional unary request payload. Should set for
-/// SingleIn generation.
-/// `send_conn_info` provides the connection info for the request stream.
-/// Should set for ManyIn generation.
-fn build_request_envelope<T>(
+/// Package the control message and an already-encoded unary payload.
+fn build_request_envelope(
     context: &context::Context<()>,
     recv_conn_info: ConnectionInfo,
     send_conn_info: Option<ConnectionInfo>,
-    request: Option<&T>,
+    data: Option<Vec<u8>>,
     payload_codec: RequestPlanePayloadCodec,
-) -> Result<bytes::Bytes, Error>
-where
-    T: serde::Serialize,
-{
+) -> Result<bytes::Bytes, Error> {
     let request_id = context.id();
     let request_type = if send_conn_info.is_some() {
         RequestType::ManyIn
@@ -361,10 +353,6 @@ where
     };
 
     let ctrl = serialize_control_message(&control_message)?;
-    let data: Option<Vec<u8>> = match request {
-        Some(req) => Some(payload_codec.encode(req)?),
-        None => None,
-    };
 
     let msg = match data {
         Some(d) => {
@@ -688,6 +676,7 @@ impl AddressedPushRouter {
             Some(&instance),
             None,
             Some(input_stream),
+            Instant::now(),
         )
         .await
     }
@@ -704,8 +693,9 @@ impl AddressedPushRouter {
         context: &context::Context<()>,
         address: String,
         instance: Option<&Instance>,
-        request: Option<&T>,
+        request: Option<Vec<u8>>,
         input_stream: Option<crate::engine::DataStream<T>>,
+        queue_start: Instant,
     ) -> Result<ManyOut<U>, Error>
     where
         T: Data + Serialize,
@@ -713,7 +703,6 @@ impl AddressedPushRouter {
     {
         let engine_ctx = context.context();
 
-        let queue_start = Instant::now();
         REQUEST_PLANE_INFLIGHT.inc();
         let inflight_guard = InflightGuard::new();
 
@@ -1023,10 +1012,31 @@ where
         let (addressed_request, context) = request.transfer(());
         let (request, address, instance_info) = addressed_request.into_parts();
 
+        self.dispatch_borrowed::<T, U>(&request, context, address, instance_info)
+            .await
+    }
+}
+
+impl AddressedPushRouter {
+    async fn dispatch_borrowed<T, U>(
+        &self,
+        request: &T,
+        context: SingleIn<()>,
+        address: String,
+        instance_info: Option<Instance>,
+    ) -> Result<ManyOut<U>, Error>
+    where
+        T: Data + Serialize,
+        U: Data + for<'de> Deserialize<'de> + MaybeError,
+    {
         let first_response_guard = context
             .get_optional::<FirstResponseGuard>(FIRST_RESPONSE_GUARD_CONTEXT_KEY)
             .map_err(Error::msg)?;
 
+        // Retained dispatch can outlive the caller. Only encoded bytes may cross
+        // that boundary; the payload itself is borrowed for this call.
+        let queue_start = Instant::now();
+        let payload = payload_codec_for_worker(instance_info.as_ref()).encode(request)?;
         if let Some(guard) = first_response_guard.and_then(|guard| guard.take()) {
             let permit =
                 try_acquire_retained_dispatch_permit(&RETAINED_FIRST_RESPONSE_DISPATCH_PERMITS)?;
@@ -1037,8 +1047,9 @@ where
                         &context,
                         address,
                         instance_info.as_ref(),
-                        Some(&request),
+                        Some(payload),
                         None,
+                        queue_start,
                     )
                     .await
             };
@@ -1049,8 +1060,9 @@ where
             &context,
             address,
             instance_info.as_ref(),
-            Some(&request),
+            Some(payload),
             None,
+            queue_start,
         )
         .await
     }
@@ -1080,6 +1092,18 @@ where
 {
     /// Unary final hop: typed request in, typed response stream out.
     async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error>;
+
+    /// Unary dispatch borrowing the payload until this call returns.
+    /// Transports must override this to support borrowed `.direct()` requests.
+    async fn generate_borrowed(
+        &self,
+        _request: &T,
+        _context: SingleIn<()>,
+        _address: String,
+        _instance: Option<Instance>,
+    ) -> Result<ManyOut<U>, Error> {
+        anyhow::bail!("this transport does not support borrowed unary requests")
+    }
 
     /// Bidirectional final hop (streaming input).
     async fn generate_bidirectional(
@@ -1111,6 +1135,17 @@ where
             self, request,
         )
         .await
+    }
+
+    async fn generate_borrowed(
+        &self,
+        request: &T,
+        context: SingleIn<()>,
+        address: String,
+        instance: Option<Instance>,
+    ) -> Result<ManyOut<U>, Error> {
+        self.dispatch_borrowed::<T, U>(request, context, address, instance)
+            .await
     }
 
     async fn generate_bidirectional(
@@ -1215,7 +1250,7 @@ mod tests {
                 info: "{}".to_string(),
             },
             None,
-            Some(&request),
+            Some(payload_codec.encode(&request).unwrap()),
             payload_codec,
         )
         .expect("legacy-worker request envelope should encode");
@@ -1228,6 +1263,82 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<TestRequest>(&message.data).unwrap(),
             request
+        );
+    }
+
+    #[tokio::test]
+    async fn borrowed_payload_survives_cancelled_dispatch_as_encoded_bytes() {
+        use super::{AddressedPushRouter, RequestPlaneClient, tcp};
+        use crate::pipeline::network::egress::unified_client::Headers;
+
+        struct BlockedClient {
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            sent: std::sync::Mutex<Option<bytes::Bytes>>,
+        }
+        #[async_trait::async_trait]
+        impl RequestPlaneClient for BlockedClient {
+            async fn send_request(
+                &self,
+                _address: String,
+                payload: bytes::Bytes,
+                _headers: Headers,
+            ) -> anyhow::Result<bytes::Bytes> {
+                self.started.notify_one();
+                self.release.notified().await;
+                *self.sent.lock().unwrap() = Some(payload);
+                anyhow::bail!("finished retained dispatch")
+            }
+            fn transport_name(&self) -> &'static str {
+                "test"
+            }
+            fn is_healthy(&self) -> bool {
+                true
+            }
+        }
+
+        let client = Arc::new(BlockedClient {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            sent: std::sync::Mutex::new(None),
+        });
+        let responses = tcp::server::TcpStreamServer::new(tcp::server::ServerOptions {
+            interface: Some("127.0.0.1".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let router = AddressedPushRouter::new(client.clone(), responses).unwrap();
+        let request = vec![123u64];
+        let (dropped_tx, mut dropped_rx) = oneshot::channel();
+        let mut context = Context::new(());
+        attach_first_response_guard(&mut context, Arc::new(DropSignal(Some(dropped_tx))));
+        {
+            let dispatch = router.dispatch_borrowed::<_, Annotated<u64>>(
+                &request,
+                context,
+                "worker".into(),
+                None,
+            );
+            tokio::pin!(dispatch);
+            tokio::select! {
+                _ = client.started.notified() => {},
+                result = &mut dispatch => panic!("dispatch completed before release: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("dispatch did not start"),
+            }
+        }
+        drop(request);
+        assert_eq!(dropped_rx.try_recv(), Err(TryRecvError::Empty));
+        client.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let buffer = client.sent.lock().unwrap().take().unwrap();
+        let message = TwoPartCodec::default().decode_message(buffer).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Vec<u64>>(&message.data).unwrap(),
+            vec![123]
         );
     }
 
