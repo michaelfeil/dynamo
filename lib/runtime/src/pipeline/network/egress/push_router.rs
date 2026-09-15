@@ -1705,13 +1705,14 @@ where
         fallback: TransportFallback<'_>,
         overload_check: OverloadCheck,
     ) -> anyhow::Result<ManyOut<U>> {
-        self.generate_with_fault_detection_prepared_inner(
+        // Keep owned dispatch state off the stacks of nested routing futures.
+        Box::pin(self.generate_with_fault_detection_prepared_inner(
             instance_id,
             request,
             fallback,
             overload_check,
             |_, _| Ok(()),
-        )
+        ))
         .await
         .map(|(_, stream)| stream)
     }
@@ -1726,13 +1727,14 @@ where
     where
         F: FnOnce(&mut T, u64) -> anyhow::Result<M>,
     {
-        self.generate_with_fault_detection_prepared_inner(
+        // Keep owned dispatch state off the stacks of nested routing futures.
+        Box::pin(self.generate_with_fault_detection_prepared_inner(
             instance_id,
             request,
             fallback,
             OverloadCheck::Required,
             prepare,
-        )
+        ))
         .await
     }
 
