@@ -1386,9 +1386,10 @@ reports a confirmed `nvext.matched_stop` as `stop_reason: stop_sequence` with
 the matched string (MP-1550). Internal stops, token limits and tool-use finishes
 keep their existing reason. Streaming retains match metadata independently of
 the finish chunk. Messages requests ask for continuous usage, and the converter
-emits `message_start` once after recording the first chunk's prompt/cache counts
-(MP-1654); both cache fields are explicit, including zero. Final-only-usage
-backends remain streaming and reconcile at end. Preserve the shared event
+emits `message_start` once with input counts only when the first chunk includes
+an explicit cached-token count (including zero); missing cache metadata keeps
+initial input at zero (MP-1654). Both cache fields are explicit. Provisional
+and final-only usage backends remain streaming and reconcile at end. Preserve the shared event
 generation and pending-text/tool-block ordering from #846 when replaying.
 
 `BasetenExt.mocker_config` per-request passthrough field: a free-form

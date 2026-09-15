@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use axum::response::sse::Event;
-use dynamo_protocols::types::{ChatCompletionMessageContent, CompletionUsage};
+use dynamo_protocols::types::ChatCompletionMessageContent;
 use uuid::Uuid;
 
 use super::types::{
@@ -97,15 +97,12 @@ impl AnthropicStreamConverter {
         converter
     }
 
-    fn record_usage(&mut self, usage: &CompletionUsage) {
-        self.usage = completion_usage_to_anthropic(usage);
-    }
-
-    /// Emit once, after recording the first chunk's authoritative usage. Backends
-    /// without first-chunk usage still stream immediately and reconcile at end.
+    /// Emit once, with authoritative input tokens or the zero fallback.
+    /// The full recorded usage is kept separately for final reconciliation.
     fn emit_start_events_with<T>(
         &mut self,
         make_event: impl Fn(&str, &AnthropicStreamEvent) -> T,
+        input_tokens: u32,
     ) -> Vec<T> {
         if self.message_start_emitted {
             return Vec::new();
@@ -121,7 +118,10 @@ impl AnthropicStreamConverter {
             model: self.model.clone(),
             stop_reason: None,
             stop_sequence: None,
-            usage: self.usage.clone(),
+            usage: AnthropicUsage {
+                input_tokens,
+                ..self.usage.clone()
+            },
         };
 
         let event = AnthropicStreamEvent::MessageStart { message };
@@ -141,11 +141,21 @@ impl AnthropicStreamConverter {
         chunk: &NvCreateChatCompletionStreamResponse,
         make_event: impl Fn(&str, &AnthropicStreamEvent) -> T,
     ) -> Vec<T> {
-        // Continuous usage supplies prompt/cache counts before message_start.
+        let mut initial_input_tokens = 0;
         if let Some(usage) = &chunk.inner.usage {
-            self.record_usage(usage);
+            self.usage = completion_usage_to_anthropic(usage);
+            // Continuous usage may know prompt length before the backend reports
+            // cache hits. Only an explicit cached count (including zero) is authoritative.
+            if usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+                .is_some()
+            {
+                initial_input_tokens = self.usage.input_tokens;
+            }
         }
-        let mut events = self.emit_start_events_with(&make_event);
+        let mut events = self.emit_start_events_with(&make_event, initial_input_tokens);
         // Metadata can arrive separately from the finish reason (including on
         // a choices-empty usage chunk). Only retain request-owned stop strings.
         if let Some(matched) =
@@ -433,7 +443,7 @@ impl AnthropicStreamConverter {
         make_event: impl Fn(&str, &AnthropicStreamEvent) -> T,
     ) -> Vec<T> {
         // An empty successful stream must still open before it closes.
-        let mut events = self.emit_start_events_with(&make_event);
+        let mut events = self.emit_start_events_with(&make_event, 0);
 
         // Close thinking block if started and not already closed mid-stream
         if self.thinking_block_started && !self.thinking_block_closed {
@@ -555,7 +565,7 @@ mod tests {
     use super::*;
     use dynamo_protocols::types::{
         ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCallChunk,
-        ChatCompletionStreamResponseDelta, FunctionCallStream, FunctionType,
+        ChatCompletionStreamResponseDelta, CompletionUsage, FunctionCallStream, FunctionType,
     };
 
     fn text_chunk(text: &str) -> NvCreateChatCompletionStreamResponse {
@@ -935,8 +945,106 @@ mod tests {
         assert_eq!(end_usage["cache_read_input_tokens"], 7100);
     }
 
-    /// MP-1654, production path, cold prompt: `cache_read_input_tokens: 0` is
-    /// present on the wire in both `message_start` and `message_delta`.
+    /// Exercise the real generator: it emits provisional prompt usage before
+    /// token backends report cache metadata, often only on the terminal chunk.
+    #[tokio::test]
+    async fn test_generator_to_converter_initial_usage_requires_cache_metadata() {
+        use crate::protocols::common::llm_backend::{BackendOutput, FinishReason};
+        use crate::protocols::openai::{
+            DeltaGeneratorExt, chat_completions::NvCreateChatCompletionRequest,
+        };
+        use dynamo_protocols::types::PromptTokensDetails;
+
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+        }))
+        .unwrap();
+        for (first_cached, final_cached, expected_start_input) in [
+            (None, 7100, 0),
+            (Some(None), 7100, 0),
+            (None, 0, 0),
+            (Some(Some(0)), 0, 7125),
+            (Some(Some(7100)), 7100, 25),
+        ] {
+            let mut generator = request.response_generator("cache-usage".into());
+            generator.update_isl(7125);
+            let mut first: BackendOutput = serde_json::from_value(serde_json::json!({
+                "token_ids": [1], "tokens": ["OK"], "text": "OK", "index": 0
+            }))
+            .unwrap();
+            first.completion_usage = first_cached.map(|cached_tokens| CompletionUsage {
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    audio_tokens: None,
+                    cached_tokens,
+                }),
+                ..usage_chunk(7125, None, 1).inner.usage.unwrap()
+            });
+            let first_chunk = generator.choice_from_postprocessor(first.clone()).unwrap();
+            assert_eq!(
+                first_chunk.inner.usage.as_ref().unwrap().prompt_tokens,
+                7125
+            );
+            let mut conv = AnthropicStreamConverter::new("m".into());
+            let mut frames = sse_frames(conv.process_chunk(&first_chunk)).await;
+            assert_eq!(
+                frames
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "message_start",
+                    "content_block_start",
+                    "content_block_delta"
+                ],
+                "unknown cache usage must not buffer content"
+            );
+            let start = &frames[0].1["message"]["usage"];
+            assert_eq!(
+                start["input_tokens"], expected_start_input,
+                "{first_cached:?}"
+            );
+            assert_eq!(
+                start["cache_read_input_tokens"],
+                first_cached.flatten().unwrap_or(0)
+            );
+            assert_eq!(start["cache_creation_input_tokens"], 0);
+            assert_eq!(start["output_tokens"], 1);
+
+            let last = BackendOutput {
+                token_ids: vec![2],
+                tokens: vec![Some(".".into())],
+                text: Some(".".into()),
+                finish_reason: Some(FinishReason::Stop),
+                completion_usage: usage_chunk(7125, Some(final_cached), 2).inner.usage,
+                ..first
+            };
+            let last_chunk = generator.choice_from_postprocessor(last).unwrap();
+            let mut events = conv.process_chunk(&last_chunk);
+            events.extend(conv.process_chunk(&generator.create_usage_chunk()));
+            events.extend(conv.emit_end_events());
+            frames.extend(sse_frames(events).await);
+            let end = &frames
+                .iter()
+                .find(|(name, _)| name == "message_delta")
+                .unwrap()
+                .1["usage"];
+            assert_eq!(end["input_tokens"], 7125 - final_cached);
+            assert_eq!(end["cache_read_input_tokens"], final_cached);
+            assert_eq!(end["output_tokens"], 2);
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|(name, _)| name == "message_start")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// Missing cache metadata uses a zero start, but still reconciles at end;
+    /// `cache_read_input_tokens: 0` is explicit on both events.
     #[tokio::test]
     async fn test_production_sse_cold_prompt_writes_explicit_zero_cache_read() {
         let mut conv = AnthropicStreamConverter::new("test-model".into());
@@ -946,7 +1054,7 @@ mod tests {
         let frames = sse_frames(events).await;
         let start = &frames[0].1;
         assert_eq!(start["type"], "message_start");
-        assert_eq!(start["message"]["usage"]["input_tokens"], 7039);
+        assert_eq!(start["message"]["usage"]["input_tokens"], 0);
         assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 0);
         let delta = frames
             .iter()
@@ -997,7 +1105,7 @@ mod tests {
     fn test_text_block_stops_before_tool_block_starts() {
         let mut conv = AnthropicStreamConverter::new("test-model".into());
         // Keep these assertions focused on content-block ordering.
-        let _ = conv.emit_start_events_with(make_tagged_event);
+        let _ = conv.emit_start_events_with(make_tagged_event, 0);
 
         // Stream some text
         let text_events = conv.process_chunk_tagged(&text_chunk("I'll edit the file."));
@@ -1092,7 +1200,7 @@ mod tests {
     fn test_tool_only_response_no_text_block() {
         let mut conv = AnthropicStreamConverter::new("test-model".into());
         // Keep these assertions focused on content-block ordering.
-        let _ = conv.emit_start_events_with(make_tagged_event);
+        let _ = conv.emit_start_events_with(make_tagged_event, 0);
 
         let tool_events = conv.process_chunk_tagged(&tool_call_chunk(
             0,
@@ -1172,7 +1280,7 @@ mod tests {
     fn test_thinking_text_then_tool_call() {
         let mut conv = AnthropicStreamConverter::new("test-model".into());
         // Keep these assertions focused on content-block ordering.
-        let _ = conv.emit_start_events_with(make_tagged_event);
+        let _ = conv.emit_start_events_with(make_tagged_event, 0);
 
         // 1. Reasoning tokens → thinking block starts
         let ev = conv.process_chunk_tagged(&reasoning_chunk("Let me think..."));
@@ -1259,7 +1367,7 @@ mod tests {
     fn test_multiple_tool_calls_each_stopped_inline() {
         let mut conv = AnthropicStreamConverter::new("test-model".into());
         // Keep these assertions focused on content-block ordering.
-        let _ = conv.emit_start_events_with(make_tagged_event);
+        let _ = conv.emit_start_events_with(make_tagged_event, 0);
 
         let events1 = conv.process_chunk_tagged(&tool_call_chunk(
             0,
@@ -1313,7 +1421,7 @@ mod tests {
             ..Default::default()
         };
         let mut conv = AnthropicStreamConverter::with_context("test-model".into(), ctx);
-        let _ = conv.emit_start_events_with(make_tagged_event);
+        let _ = conv.emit_start_events_with(make_tagged_event, 0);
         assert!(conv.api_context.is_some());
         assert_eq!(
             conv.api_context.as_ref().unwrap().service_tier.as_deref(),
@@ -1355,7 +1463,7 @@ mod tests {
     fn test_streamed_tool_args_close_only_when_json_complete() {
         let mut conv = AnthropicStreamConverter::new("test-model".into());
         // Keep these assertions focused on content-block ordering.
-        let _ = conv.emit_start_events_with(make_tagged_event);
+        let _ = conv.emit_start_events_with(make_tagged_event, 0);
 
         // Chunk 1: id + name + empty args prefix. Block opens, empty delta
         // emitted, but block must NOT close (args don't parse yet).
@@ -1417,7 +1525,7 @@ mod tests {
     fn test_streamed_tool_args_unclosed_finalized_in_end_events() {
         let mut conv = AnthropicStreamConverter::new("test-model".into());
         // Keep these assertions focused on content-block ordering.
-        let _ = conv.emit_start_events_with(make_tagged_event);
+        let _ = conv.emit_start_events_with(make_tagged_event, 0);
 
         let ev1 =
             conv.process_chunk_tagged(&tool_call_chunk(0, Some("call-1"), Some("Write"), Some("")));

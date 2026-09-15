@@ -602,9 +602,11 @@ pub enum ReasoningContent {
 
 impl<'de> Deserialize<'de> for ReasoningContent {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Untagged struct variants accept only maps; derived structs also accept [text].
         #[derive(Deserialize)]
-        struct TextBlock {
-            text: String,
+        #[serde(untagged)]
+        enum TextBlock {
+            Text { text: String },
         }
 
         #[derive(Deserialize)]
@@ -625,11 +627,11 @@ impl<'de> Deserialize<'de> for ReasoningContent {
         Ok(match input {
             Input::Text(text) => Self::Text(text),
             Input::Segments(segments) => Self::Segments(segments),
-            Input::Block(block) => Self::Text(block.text),
+            Input::Block(TextBlock::Text { text }) => Self::Text(text),
             Input::Blocks(blocks) => Self::Text(
                 blocks
                     .into_iter()
-                    .map(|block| block.text)
+                    .map(|TextBlock::Text { text }| text)
                     .filter(|text| !text.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -1254,6 +1256,9 @@ mod tests {
             json!(false),
             json!([1]),
             json!([null]),
+            json!([["first"], ["second"]]),
+            json!([{"text":"first"}, ["second"]]),
+            json!([["first"], {"text":"second"}]),
             json!({"text":null}),
             json!({"text":42}),
             json!({"summary":"summary"}),

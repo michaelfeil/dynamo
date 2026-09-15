@@ -490,8 +490,8 @@ async fn anthropic_messages(
 
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // `message_start` is emitted by the converter on the first engine chunk
-        // (or at stream end) so its usage carries real prompt/cached counts.
+        // `message_start` is emitted on the first engine chunk (or at stream end),
+        // with input usage only when the converter has explicit cache accounting.
         let converter = match anthropic_ctx {
             Some(ctx) => AnthropicStreamConverter::with_context(model_for_resp, ctx),
             None => AnthropicStreamConverter::new(model_for_resp),
