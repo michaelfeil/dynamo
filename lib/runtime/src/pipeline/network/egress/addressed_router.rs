@@ -11,7 +11,7 @@ use super::*;
 use crate::component::Instance;
 use crate::discovery::EndpointInstanceId;
 use crate::dynamo_nvtx_range;
-use crate::engine::{AsyncEngine, AsyncEngineContextProvider, Data, EngineContextGuard};
+use crate::engine::{AsyncEngineContextProvider, Data, EngineContextGuard};
 use crate::error::{DynamoError, ErrorType};
 use crate::logging::inject_trace_headers_into_map;
 use crate::metrics::frontend_perf::STAGE_DURATION_SECONDS;
@@ -1118,87 +1118,6 @@ mod rejection_detection_tests {
     }
 }
 
-#[async_trait::async_trait]
-impl<T, U> AsyncEngine<SingleIn<AddressedRequest<T>>, ManyOut<U>, Error> for AddressedPushRouter
-where
-    T: Data + Serialize,
-    U: Data + for<'de> Deserialize<'de> + MaybeError,
-{
-    async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error> {
-        let (addressed_request, context) = request.transfer(());
-        let establish_timeout = addressed_request.establish_timeout();
-        let (request, address, instance_info) = addressed_request.into_parts();
-
-        self.dispatch_borrowed::<T, U>(&request, context, address, instance_info, establish_timeout)
-            .await
-    }
-}
-
-impl AddressedPushRouter {
-    async fn dispatch_borrowed<T, U>(
-        &self,
-        request: &T,
-        context: SingleIn<()>,
-        address: String,
-        instance_info: Option<Instance>,
-        establish_timeout: Option<Duration>,
-    ) -> Result<ManyOut<U>, Error>
-    where
-        T: Data + Serialize,
-        U: Data + for<'de> Deserialize<'de> + MaybeError,
-    {
-        let first_response_guard = context
-            .get_optional::<FirstResponseGuard>(FIRST_RESPONSE_GUARD_CONTEXT_KEY)
-            .map_err(Error::msg)?;
-
-        // Retained dispatch can outlive the caller. Only encoded bytes may cross
-        // that boundary; the payload itself is borrowed for this call.
-        let queue_start = Instant::now();
-        let payload = payload_codec_for_worker(instance_info.as_ref()).encode(request)?;
-        if let Some(guard) = first_response_guard.and_then(|guard| guard.take()) {
-            let permit =
-                try_acquire_retained_dispatch_permit(&RETAINED_FIRST_RESPONSE_DISPATCH_PERMITS)?;
-            let (acked, establish) = match establish_timeout {
-                Some(timeout) => {
-                    let (acked_tx, acked_rx) = tokio::sync::oneshot::channel();
-                    (Some(acked_tx), Some((timeout, acked_rx)))
-                }
-                None => (None, None),
-            };
-            let router = self.clone();
-            let dispatch = async move {
-                router
-                    .dispatch_and_finalize::<T, U>(
-                        &context,
-                        address,
-                        instance_info.as_ref(),
-                        Some(payload),
-                        None,
-                        PrologueWait::Retained { acked },
-                        queue_start,
-                    )
-                    .await
-            };
-            return dispatch_with_first_response_guard(dispatch, guard, permit, establish).await;
-        }
-
-        let prologue_wait = match establish_timeout {
-            Some(timeout) => PrologueWait::Deadline(timeout),
-            None => PrologueWait::Unbounded,
-        };
-        self.dispatch_and_finalize::<T, U>(
-            &context,
-            address,
-            instance_info.as_ref(),
-            Some(payload),
-            None,
-            prologue_wait,
-            queue_start,
-        )
-        .await
-    }
-}
-
 /// Transport seam beneath `PushRouter`: given an already-selected worker (typed
 /// request + resolved address), dispatch the final hop and return a typed stream.
 /// Selection, occupancy, fault detection, and migration stay in `PushRouter`
@@ -1250,9 +1169,56 @@ where
     async fn generate(&self, request: SingleIn<AddressedRequest<&T>>) -> Result<ManyOut<U>, Error> {
         let (addressed, context) = request.into_parts();
         let establish_timeout = addressed.establish_timeout();
-        let (request, address, instance) = addressed.into_parts();
-        self.dispatch_borrowed::<T, U>(request, context, address, instance, establish_timeout)
-            .await
+        let (request, address, instance_info) = addressed.into_parts();
+        let first_response_guard = context
+            .get_optional::<FirstResponseGuard>(FIRST_RESPONSE_GUARD_CONTEXT_KEY)
+            .map_err(Error::msg)?;
+
+        // Retained dispatch can outlive the caller. Only encoded bytes may cross
+        // that boundary; the payload itself is borrowed for this call.
+        let queue_start = Instant::now();
+        let payload = payload_codec_for_worker(instance_info.as_ref()).encode(request)?;
+        if let Some(guard) = first_response_guard.and_then(|guard| guard.take()) {
+            let permit =
+                try_acquire_retained_dispatch_permit(&RETAINED_FIRST_RESPONSE_DISPATCH_PERMITS)?;
+            let (acked, establish) = match establish_timeout {
+                Some(timeout) => {
+                    let (acked_tx, acked_rx) = tokio::sync::oneshot::channel();
+                    (Some(acked_tx), Some((timeout, acked_rx)))
+                }
+                None => (None, None),
+            };
+            let router = self.clone();
+            let dispatch = async move {
+                router
+                    .dispatch_and_finalize::<T, U>(
+                        &context,
+                        address,
+                        instance_info.as_ref(),
+                        Some(payload),
+                        None,
+                        PrologueWait::Retained { acked },
+                        queue_start,
+                    )
+                    .await
+            };
+            return dispatch_with_first_response_guard(dispatch, guard, permit, establish).await;
+        }
+
+        let prologue_wait = match establish_timeout {
+            Some(timeout) => PrologueWait::Deadline(timeout),
+            None => PrologueWait::Unbounded,
+        };
+        self.dispatch_and_finalize::<T, U>(
+            &context,
+            address,
+            instance_info.as_ref(),
+            Some(payload),
+            None,
+            prologue_wait,
+            queue_start,
+        )
+        .await
     }
 
     async fn generate_bidirectional(
