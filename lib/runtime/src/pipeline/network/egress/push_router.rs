@@ -901,19 +901,23 @@ where
     }
 
     /// Issue a request to the next available instance in a round-robin fashion
-    pub async fn round_robin(&self, request: SingleIn<T>) -> anyhow::Result<ManyOut<U>> {
+    pub async fn round_robin<P>(&self, request: SingleIn<P>) -> anyhow::Result<ManyOut<U>>
+    where
+        P: Borrow<T> + Send + Sync,
+    {
         self.round_robin_prepared(request, |_, _| Ok(()))
             .await
             .map(|(_, stream)| stream)
     }
 
-    async fn round_robin_prepared<M, F>(
+    async fn round_robin_prepared<P, M, F>(
         &self,
-        request: SingleIn<T>,
+        request: SingleIn<P>,
         prepare: F,
     ) -> anyhow::Result<(M, ManyOut<U>)>
     where
-        F: FnOnce(&mut T, u64) -> anyhow::Result<M>,
+        P: Borrow<T> + Send + Sync,
+        F: FnOnce(&mut P, u64) -> anyhow::Result<M>,
     {
         let (instance_id, candidate_count) =
             self.select_untracked_worker(self.round_robin_picker.as_ref())?;
@@ -929,19 +933,23 @@ where
     }
 
     /// Issue a request to a random endpoint
-    pub async fn random(&self, request: SingleIn<T>) -> anyhow::Result<ManyOut<U>> {
+    pub async fn random<P>(&self, request: SingleIn<P>) -> anyhow::Result<ManyOut<U>>
+    where
+        P: Borrow<T> + Send + Sync,
+    {
         self.random_prepared(request, |_, _| Ok(()))
             .await
             .map(|(_, stream)| stream)
     }
 
-    async fn random_prepared<M, F>(
+    async fn random_prepared<P, M, F>(
         &self,
-        request: SingleIn<T>,
+        request: SingleIn<P>,
         prepare: F,
     ) -> anyhow::Result<(M, ManyOut<U>)>
     where
-        F: FnOnce(&mut T, u64) -> anyhow::Result<M>,
+        P: Borrow<T> + Send + Sync,
+        F: FnOnce(&mut P, u64) -> anyhow::Result<M>,
     {
         let (instance_id, candidate_count) =
             self.select_untracked_worker(self.random_picker.as_ref())?;
@@ -1261,15 +1269,16 @@ where
         }
     }
 
-    async fn dispatch_selected<M, F>(
+    async fn dispatch_selected<P, M, F>(
         &self,
         instance_id: u64,
-        request: SingleIn<T>,
+        request: SingleIn<P>,
         mut permit: Option<OccupancyPermit>,
         prepare: F,
     ) -> anyhow::Result<(M, ManyOut<U>)>
     where
-        F: FnOnce(&mut T, u64) -> anyhow::Result<M>,
+        P: Borrow<T> + Send + Sync,
+        F: FnOnce(&mut P, u64) -> anyhow::Result<M>,
     {
         let (metadata, stream) = self
             .generate_with_fault_detection_prepared(
@@ -1717,15 +1726,16 @@ where
         .map(|(_, stream)| stream)
     }
 
-    async fn generate_with_fault_detection_prepared<M, F>(
+    async fn generate_with_fault_detection_prepared<P, M, F>(
         &self,
         instance_id: u64,
-        request: SingleIn<T>,
+        request: SingleIn<P>,
         fallback: TransportFallback<'_>,
         prepare: F,
     ) -> anyhow::Result<(M, ManyOut<U>)>
     where
-        F: FnOnce(&mut T, u64) -> anyhow::Result<M>,
+        P: Borrow<T> + Send + Sync,
+        F: FnOnce(&mut P, u64) -> anyhow::Result<M>,
     {
         // Keep owned dispatch state off the stacks of nested routing futures.
         Box::pin(self.generate_with_fault_detection_prepared_inner(
@@ -3583,7 +3593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_retries_borrow_payload_and_preserve_context() {
+    async fn routing_retries_borrow_payload_and_preserve_context() {
         use crate::pipeline::network::egress::unified_client::{Headers, RequestPlaneClient};
         use crate::pipeline::network::{RequestControlMessage, TwoPartCodec};
 
@@ -3648,14 +3658,19 @@ mod tests {
             tokens: vec![1, 2, 3],
         };
         let expected = serde_json::to_value(&payload).unwrap();
-        for attempt in 0..2 {
+        for attempt in 0..6 {
             let mut context = SingleIn::with_id_and_metadata(
                 &payload,
                 format!("attempt-{attempt}"),
                 Default::default(),
             );
             context.insert_metadata("attempt", attempt.to_string());
-            let error = router.direct(context, worker_id).await.unwrap_err();
+            let error = match attempt / 2 {
+                0 => router.direct(context, worker_id).await,
+                1 => router.random(context).await,
+                _ => router.round_robin(context).await,
+            }
+            .unwrap_err();
             assert!(error.to_string().contains("retry this request"));
         }
         assert!(
@@ -3666,7 +3681,7 @@ mod tests {
         );
         drop(payload);
         let requests = transport.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 7);
         for (attempt, (control, data)) in requests.iter().enumerate() {
             assert_eq!(
                 control
@@ -3675,7 +3690,7 @@ mod tests {
                     .unwrap(),
                 expected
             );
-            if attempt < 2 {
+            if attempt < 6 {
                 assert_eq!(control.id, format!("attempt-{attempt}"));
                 assert_eq!(control.metadata["attempt"], attempt.to_string());
             }
@@ -3724,16 +3739,26 @@ mod tests {
             assert!(!address.is_empty(), "selected transport address expected");
         }
 
-        let mut response = {
-            let payload = 43;
-            router
-                .direct(SingleIn::new(&payload), instance_id)
-                .await
+        for mode in [
+            RouterMode::Direct,
+            RouterMode::Random,
+            RouterMode::RoundRobin,
+        ] {
+            let mut response = {
+                let payload = 43;
+                let request = SingleIn::new(&payload);
+                match mode {
+                    RouterMode::Direct => router.direct(request, instance_id).await,
+                    RouterMode::Random => router.random(request).await,
+                    RouterMode::RoundRobin => router.round_robin(request).await,
+                    _ => unreachable!(),
+                }
                 .unwrap()
-        };
-        assert!(response.next().await.is_some());
-        while response.next().await.is_some() {}
-        assert_eq!(dispatch.unary.lock().unwrap()[1].0, 43);
+            };
+            assert!(response.next().await.is_some());
+            while response.next().await.is_some() {}
+            assert_eq!(dispatch.unary.lock().unwrap().last().unwrap().0, 43);
+        }
 
         // Bidirectional hop reaches the supplied dispatch with the same worker.
         let input: ManyIn<u64> =
