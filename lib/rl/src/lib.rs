@@ -419,8 +419,9 @@ async fn call_worker_routes(
     });
     let instance_id = target.instance_id;
 
-    let request = SingleIn::new(request_value);
-    let mut stream = router.direct(request, instance_id).await?;
+    let mut stream = router
+        .direct(&request_value, SingleIn::new(()), instance_id)
+        .await?;
 
     while let Some(chunk) = stream.next().await {
         if let Some(data) = chunk.data {

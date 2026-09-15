@@ -1090,20 +1090,15 @@ where
     T: Data + Serialize,
     U: Data + for<'de> Deserialize<'de> + MaybeError,
 {
-    /// Unary final hop: typed request in, typed response stream out.
-    async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error>;
-
-    /// Unary dispatch borrowing the payload until this call returns.
-    /// Transports must override this to support borrowed `.direct()` requests.
-    async fn generate_borrowed(
+    /// Unary final hop. Only the payload is borrowed; detached work must own
+    /// its serialized bytes, and the returned stream must not borrow the payload.
+    async fn generate(
         &self,
-        _request: &T,
-        _context: SingleIn<()>,
-        _address: String,
-        _instance: Option<Instance>,
-    ) -> Result<ManyOut<U>, Error> {
-        anyhow::bail!("this transport does not support borrowed unary requests")
-    }
+        request: &T,
+        context: SingleIn<()>,
+        address: String,
+        instance: Option<Instance>,
+    ) -> Result<ManyOut<U>, Error>;
 
     /// Bidirectional final hop (streaming input).
     async fn generate_bidirectional(
@@ -1128,16 +1123,7 @@ where
     T: Data + Serialize,
     U: Data + for<'de> Deserialize<'de> + MaybeError,
 {
-    async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error> {
-        // Delegate to the existing `AsyncEngine` impl (still used directly by the
-        // KV recovery worker-query path); behavior unchanged.
-        <Self as AsyncEngine<SingleIn<AddressedRequest<T>>, ManyOut<U>, Error>>::generate(
-            self, request,
-        )
-        .await
-    }
-
-    async fn generate_borrowed(
+    async fn generate(
         &self,
         request: &T,
         context: SingleIn<()>,
@@ -1229,41 +1215,60 @@ mod tests {
     }
 
     #[test]
-    fn legacy_worker_without_codec_metadata_receives_json() {
-        let worker = Instance {
-            component: "worker".to_string(),
-            endpoint: "generate".to_string(),
-            namespace: "default".to_string(),
-            instance_id: 42,
-            transport: TransportType::Nats("worker.generate".to_string()),
-            device_type: None,
-            request_plane_codec: None,
-        };
-        let payload_codec = payload_codec_for_worker(Some(&worker));
-        assert_eq!(payload_codec, RequestPlanePayloadCodec::Json);
-
-        let request = TestRequest { value: 123 };
-        let buffer = build_request_envelope(
-            &Context::new(()),
-            ConnectionInfo {
-                transport: "tcp".to_string(),
-                info: "{}".to_string(),
-            },
+    fn unary_wire_format_preserves_legacy_and_negotiated_codecs() {
+        for advertised in [
             None,
-            Some(payload_codec.encode(&request).unwrap()),
-            payload_codec,
-        )
-        .expect("legacy-worker request envelope should encode");
-        let message = TwoPartCodec::default()
-            .decode_message(buffer)
-            .expect("request envelope should decode");
-
-        let control: RequestControlMessage = serde_json::from_slice(&message.header).unwrap();
-        assert_eq!(control.payload_codec, RequestPlanePayloadCodec::Json);
-        assert_eq!(
-            serde_json::from_slice::<TestRequest>(&message.data).unwrap(),
-            request
-        );
+            Some(RequestPlanePayloadCodec::Json),
+            Some(RequestPlanePayloadCodec::Msgpack),
+        ] {
+            let worker = Instance {
+                component: "worker".into(),
+                endpoint: "generate".into(),
+                namespace: "default".into(),
+                instance_id: 42,
+                transport: TransportType::Nats("worker.generate".into()),
+                device_type: None,
+                request_plane_codec: advertised,
+            };
+            let payload_codec = payload_codec_for_worker(Some(&worker));
+            assert_eq!(
+                payload_codec,
+                advertised.unwrap_or(RequestPlanePayloadCodec::Json)
+            );
+            let request = TestRequest { value: 123 };
+            let metadata = BTreeMap::from([("attempt".into(), "1".into())]);
+            let context = Context::with_id_and_metadata((), "request-123".into(), metadata.clone());
+            let mut control = base_control_message(metadata);
+            control.payload_codec = payload_codec;
+            let buffer = build_request_envelope(
+                &context,
+                control.connection_info.clone(),
+                None,
+                Some(payload_codec.encode(&request).unwrap()),
+                payload_codec,
+            )
+            .unwrap();
+            // Fixed payload bytes from the pre-borrowing wire format.
+            let data = match payload_codec {
+                RequestPlanePayloadCodec::Json => br#"{"value":123}"#.to_vec(),
+                RequestPlanePayloadCodec::Msgpack => {
+                    vec![0x81, 0xa5, b'v', b'a', b'l', b'u', b'e', 123]
+                }
+            };
+            let codec = TwoPartCodec::default();
+            let expected = codec
+                .encode_message(super::TwoPartMessage::from_parts(
+                    serde_json::to_vec(&control).unwrap().into(),
+                    data.into(),
+                ))
+                .unwrap();
+            assert_eq!(buffer, expected);
+            let message = codec.decode_message(buffer).unwrap();
+            assert_eq!(
+                payload_codec.decode::<TestRequest>(&message.data).unwrap(),
+                request
+            );
+        }
     }
 
     #[tokio::test]
