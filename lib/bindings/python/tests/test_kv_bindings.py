@@ -208,7 +208,7 @@ def test_radix_tree_thread_safety(
 @pytest.mark.timeout(5)
 @pytest.mark.asyncio
 async def test_selection_service_selects_registered_worker(monkeypatch):
-    monkeypatch.setenv("DYN_USE_KV_EVENTS", "false")
+    monkeypatch.setenv("DYN_ROUTER_USE_KV_EVENTS", "false")
     service = SelectionService(indexer_threads=1)
 
     try:
@@ -239,7 +239,7 @@ async def test_selection_service_selects_registered_worker(monkeypatch):
         assert selected["dp_rank"] == 0
         assert selected["endpoint"] == "http://worker-1:8000"
     finally:
-        service.shutdown()
+        await service.shutdown_async()
 
 
 @pytest.mark.skipif(
@@ -249,7 +249,7 @@ async def test_selection_service_selects_registered_worker(monkeypatch):
 @pytest.mark.timeout(5)
 @pytest.mark.asyncio
 async def test_selection_service_malformed_payload_raises_value_error(monkeypatch):
-    monkeypatch.setenv("DYN_USE_KV_EVENTS", "false")
+    monkeypatch.setenv("DYN_ROUTER_USE_KV_EVENTS", "false")
     service = SelectionService(indexer_threads=1)
 
     try:
@@ -267,7 +267,7 @@ async def test_selection_service_malformed_payload_raises_value_error(monkeypatc
 @pytest.mark.timeout(5)
 @pytest.mark.asyncio
 async def test_selection_service_not_ready_carries_status(monkeypatch):
-    monkeypatch.setenv("DYN_USE_KV_EVENTS", "false")
+    monkeypatch.setenv("DYN_ROUTER_USE_KV_EVENTS", "false")
     service = SelectionService(indexer_threads=1)
 
     try:

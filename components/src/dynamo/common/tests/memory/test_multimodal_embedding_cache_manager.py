@@ -4,11 +4,13 @@
 """Unit tests for MultimodalEmbeddingCacheManager."""
 
 import pytest
-import torch
 
-from dynamo.common.memory.multimodal_embedding_cache_manager import (
+torch = pytest.importorskip("torch")
+
+from dynamo.common.memory.multimodal_embedding_cache_manager import (  # noqa: E402
     CachedEmbedding,
     CacheMutation,
+    CacheReservation,
     MultimodalEmbeddingCacheManager,
 )
 
@@ -35,6 +37,9 @@ class TestMultimodalEmbeddingCacheManagerBasicOperations:
         assert retrieved is not None
         assert torch.equal(retrieved.tensor, tensor)
         assert retrieved.image_grid_thw is None
+        assert retrieved.video_grid_thw is None
+        assert retrieved.second_per_grid_ts is None
+        assert retrieved.video_timestamps is None
 
     def test_set_and_get_with_grid(self):
         cache = MultimodalEmbeddingCacheManager(capacity_bytes=1024 * 1024)
@@ -269,21 +274,107 @@ class TestCachedEmbeddingNamedTuple:
 
     def test_fields(self):
         tensor = torch.randn(4, 4)
-        grid = [[1, 2, 3]]
-        entry = CachedEmbedding(tensor=tensor, image_grid_thw=grid)
+        video_grid = [[1, 2, 3]]
+        timestamps = [[0.0, 0.5]]
+        entry = CachedEmbedding(
+            tensor=tensor,
+            video_grid_thw=video_grid,
+            second_per_grid_ts=0.5,
+            video_timestamps=timestamps,
+        )
 
         assert torch.equal(entry.tensor, tensor)
-        assert entry.image_grid_thw == grid
+        assert entry.image_grid_thw is None
+        assert entry.video_grid_thw == video_grid
+        assert entry.second_per_grid_ts == 0.5
+        assert entry.video_timestamps == timestamps
 
     def test_none_grid(self):
         tensor = torch.randn(4, 4)
         entry = CachedEmbedding(tensor=tensor, image_grid_thw=None)
         assert entry.image_grid_thw is None
+        assert entry.video_grid_thw is None
+        assert entry.second_per_grid_ts is None
+        assert entry.video_timestamps is None
 
     def test_unpacking(self):
         tensor = torch.randn(4, 4)
         grid = [[1, 2, 3]]
         entry = CachedEmbedding(tensor=tensor, image_grid_thw=grid)
-        t, g = entry
+        t, image_grid, video_grid, second_per_grid_ts, video_timestamps = entry
         assert torch.equal(t, tensor)
-        assert g == grid
+        assert image_grid == grid
+        assert video_grid is None
+        assert second_per_grid_ts is None
+        assert video_timestamps is None
+
+
+class TestMakeRoomFor:
+    """Tests for admission and eviction decided ahead of the entry's tensor."""
+
+    @staticmethod
+    def _entry_bytes(element_count: int) -> int:
+        return torch.zeros(element_count).element_size() * element_count
+
+    def test_reports_the_keys_it_evicted(self):
+        entry_bytes = self._entry_bytes(1024)
+        cache = MultimodalEmbeddingCacheManager(capacity_bytes=2 * entry_bytes)
+        cache.set("a", CachedEmbedding(torch.zeros(1024)))
+        cache.set("b", CachedEmbedding(torch.zeros(1024)))
+
+        reservation = cache.make_room_for("c", entry_bytes)
+
+        assert reservation == CacheReservation(True, ["a"])
+        assert cache.get("a") is None
+        assert cache.get("b") is not None
+
+    def test_rejects_an_entry_larger_than_capacity_and_keeps_the_cache(self):
+        entry_bytes = self._entry_bytes(1024)
+        cache = MultimodalEmbeddingCacheManager(capacity_bytes=entry_bytes)
+        cache.set("a", CachedEmbedding(torch.zeros(1024)))
+
+        reservation = cache.make_room_for("b", 2 * entry_bytes)
+
+        assert reservation == CacheReservation(False, [])
+        assert cache.stats["entries"] == 1
+        assert cache.stats["evictions"] == 0
+
+    def test_reserves_nothing_so_an_abandoned_store_leaks_no_capacity(self):
+        entry_bytes = self._entry_bytes(1024)
+        cache = MultimodalEmbeddingCacheManager(capacity_bytes=4 * entry_bytes)
+        cache.set("a", CachedEmbedding(torch.zeros(1024)))
+
+        assert cache.make_room_for("b", entry_bytes).admitted
+        # Nothing was evicted and nothing was charged, so a caller whose
+        # allocation then fails leaves the cache exactly as it found it.
+        assert cache.stats["current_bytes"] == entry_bytes
+        assert cache.stats["entries"] == 1
+
+    def test_a_following_set_counts_each_eviction_once(self):
+        entry_bytes = self._entry_bytes(1024)
+        cache = MultimodalEmbeddingCacheManager(capacity_bytes=2 * entry_bytes)
+        cache.set("a", CachedEmbedding(torch.zeros(1024)))
+        cache.set("b", CachedEmbedding(torch.zeros(1024)))
+
+        cache.make_room_for("c", entry_bytes)
+        assert cache.set("c", CachedEmbedding(torch.zeros(1024)))
+
+        assert cache.stats["evictions"] == 1
+        assert cache.keys() == ["b", "c"]
+        assert cache.stats["current_bytes"] == 2 * entry_bytes
+
+    def test_drops_a_replaced_entry_rather_than_promising_its_bytes_back(self):
+        entry_bytes = self._entry_bytes(1024)
+        cache = MultimodalEmbeddingCacheManager(capacity_bytes=2 * entry_bytes)
+        cache.set("a", CachedEmbedding(torch.zeros(1024)))
+        cache.set("b", CachedEmbedding(torch.zeros(1024)))
+
+        reservation = cache.make_room_for("b", entry_bytes)
+
+        # The entry under "b" is released now, so the caller's allocation does
+        # not run alongside it. That release is not an eviction, and it leaves
+        # every other key alone.
+        assert reservation == CacheReservation(True, [])
+        assert cache.keys() == ["a"]
+        assert cache.stats["current_bytes"] == entry_bytes
+        assert cache.stats["evictions"] == 0

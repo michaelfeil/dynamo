@@ -3,13 +3,19 @@
 
 """Unit tests for AudioGenerationHandler."""
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 try:
-    from dynamo.common.protocols.audio_protocol import NvCreateAudioSpeechRequest
+    from dynamo.common.protocols.audio_protocol import (
+        AudioNvExt,
+        NvCreateAudioSpeechRequest,
+    )
     from dynamo.common.utils.output_modalities import RequestType
+    from dynamo.vllm.omni import audio_handler as audio_handler_module
     from dynamo.vllm.omni.audio_handler import AudioGenerationHandler
 except ImportError:
     pytest.skip("vLLM omni dependencies not available", allow_module_level=True)
@@ -17,6 +23,7 @@ except ImportError:
 pytestmark = [
     pytest.mark.unit,
     pytest.mark.vllm,
+    pytest.mark.multimodal,
     pytest.mark.gpu_0,
     pytest.mark.pre_merge,
 ]
@@ -158,6 +165,58 @@ class TestIsTtsModel:
         assert handler._is_tts_model() is False
 
 
+def test_tts_prompt_len_uses_prompt_embeds_builder(monkeypatch):
+    estimator = MagicMock(return_value=37)
+    monkeypatch.setattr(
+        audio_handler_module,
+        "Qwen3TTSPromptEmbedsBuilder",
+        SimpleNamespace(estimate_prompt_len_from_additional_information=estimator),
+    )
+
+    handler = _make_audio_handler()
+    tokenizer = MagicMock(return_value={"input_ids": [1, 2]})
+    handler._tts_tokenizer = tokenizer
+    codec_language_id = {"english": 1}
+    spk_is_dialect = {"vivian": "english"}
+    handler.engine_client.model_config.hf_config = SimpleNamespace(
+        talker_config=SimpleNamespace(
+            codec_language_id=codec_language_id,
+            spk_is_dialect=spk_is_dialect,
+        )
+    )
+    tts_params = {"task_type": ["CustomVoice"], "input": "hello"}
+
+    assert handler._estimate_tts_prompt_len(tts_params) == 37
+
+    kwargs = estimator.call_args.kwargs
+    assert kwargs["additional_information"] is tts_params
+    assert kwargs["task_type"] == "CustomVoice"
+    assert kwargs["codec_language_id"] is codec_language_id
+    assert kwargs["spk_is_dialect"] is spk_is_dialect
+    assert kwargs["tokenize_prompt"]("hello") == [1, 2]
+    tokenizer.assert_called_once_with("hello", padding=False)
+
+
+def test_tts_prompt_len_falls_back_when_builder_is_unavailable(monkeypatch):
+    monkeypatch.setattr(audio_handler_module, "Qwen3TTSPromptEmbedsBuilder", None)
+
+    assert _make_audio_handler()._estimate_tts_prompt_len({}) == 2048
+
+
+def test_tts_prompt_len_propagates_estimator_errors(monkeypatch):
+    estimator = MagicMock(side_effect=RuntimeError("estimator failed"))
+    monkeypatch.setattr(
+        audio_handler_module,
+        "Qwen3TTSPromptEmbedsBuilder",
+        SimpleNamespace(estimate_prompt_len_from_additional_information=estimator),
+    )
+    handler = _make_audio_handler()
+    handler._tts_tokenizer = MagicMock(return_value={"input_ids": [1, 2]})
+
+    with pytest.raises(RuntimeError, match="estimator failed"):
+        handler._estimate_tts_prompt_len({})
+
+
 class TestEngineInputsFromAudio:
     """Tests for build_engine_inputs."""
 
@@ -169,11 +228,27 @@ class TestEngineInputsFromAudio:
         stage.model_stage = "diffusion"
         handler.engine_client.stage_list = [stage]
 
-        req = NvCreateAudioSpeechRequest(input="Hello world")
+        req = NvCreateAudioSpeechRequest(
+            input="Hello world",
+            nvext=AudioNvExt(frontend_accepts_audio_chunks=True),
+        )
         inputs = await handler.build_engine_inputs(req)
         assert inputs.request_type == RequestType.AUDIO_GENERATION
         assert inputs.prompt["prompt"] == "Hello world"
         assert inputs.sampling_params_list is None
+        assert inputs.stream_audio is True
+
+    @pytest.mark.asyncio
+    async def test_legacy_frontend_gets_complete_response(self):
+        """Workers aggregate audio unless the frontend advertises that it accepts chunks."""
+        handler = _make_audio_handler()
+        handler.engine_client.stage_list = None
+
+        inputs = await handler.build_engine_inputs(
+            NvCreateAudioSpeechRequest(input="hello")
+        )
+
+        assert inputs.stream_audio is False
 
     @pytest.mark.asyncio
     async def test_empty_input_rejected(self):
@@ -187,6 +262,134 @@ class TestEngineInputsFromAudio:
         """Speed from request is stored in EngineInputs."""
         handler = _make_audio_handler()
         handler.engine_client.stage_list = None  # non-TTS path
-        req = NvCreateAudioSpeechRequest(input="hello", speed=2.0)
+        req = NvCreateAudioSpeechRequest(
+            input="hello",
+            speed=2.0,
+            nvext=AudioNvExt(frontend_accepts_audio_chunks=True),
+        )
         inputs = await handler.build_engine_inputs(req)
         assert inputs.speed == 2.0
+        assert inputs.stream_audio is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "request_args",
+        [
+            {"response_format": "mp3"},
+            {"response_format": "pcm", "data_source": "url"},
+        ],
+    )
+    async def test_non_streaming_eligibility(self, request_args):
+        handler = _make_audio_handler()
+        handler.engine_client.stage_list = None
+
+        inputs = await handler.build_engine_inputs(
+            NvCreateAudioSpeechRequest(
+                input="hello",
+                nvext=AudioNvExt(frontend_accepts_audio_chunks=True),
+                **request_args,
+            )
+        )
+
+        assert inputs.stream_audio is False
+
+
+class TestResolveRefAudio:
+    """ref_audio is client-supplied, so every failure must be a clean rejection."""
+
+    @staticmethod
+    def _wav_bytes(samples=1600, rate=16000):
+        import io
+
+        import numpy as np
+        import soundfile as sf
+
+        buf = io.BytesIO()
+        # Random content so the base64 payload really contains '+' and '/'.
+        rng = np.random.default_rng(0)
+        sf.write(
+            buf, rng.standard_normal(samples).astype("float32"), rate, format="WAV"
+        )
+        return buf.getvalue()
+
+    @staticmethod
+    def _data_uri(payload: bytes) -> str:
+        import base64
+
+        return "data:audio/wav;base64," + base64.b64encode(payload).decode()
+
+    def test_decodes_a_valid_data_uri(self):
+        handler = _make_audio_handler()
+        wav = self._wav_bytes()
+        data, rate = asyncio.run(handler._resolve_ref_audio(self._data_uri(wav)))
+        assert len(data) == 1600 and rate == 16000
+
+    def test_decodes_a_percent_encoded_payload(self):
+        # A data URI that travelled through a URL has '+' and '/' escaped.
+        # Permissive base64 silently dropped the '%' and produced wrong bytes.
+        import base64
+        import urllib.parse
+
+        handler = _make_audio_handler()
+        wav = self._wav_bytes()
+        encoded = base64.b64encode(wav).decode()
+        assert "+" in encoded or "/" in encoded
+        quoted = urllib.parse.quote(encoded, safe="=")
+        data, rate = asyncio.run(
+            handler._resolve_ref_audio(f"data:audio/wav;base64,{quoted}")
+        )
+        assert len(data) == 1600 and rate == 16000
+
+    @pytest.mark.parametrize(
+        "uri, expected",
+        [
+            ("data:audio/wav", "missing ',' separator"),
+            ("data:audio/wav,RIFFraw", "expected base64 payload"),
+            ("data:audio/wav;base64,!!not-base64!!", "Malformed base64"),
+        ],
+    )
+    def test_rejects_malformed_data_uris(self, uri, expected):
+        handler = _make_audio_handler()
+        with pytest.raises(ValueError, match=expected):
+            asyncio.run(handler._resolve_ref_audio(uri))
+
+    @pytest.mark.parametrize("payload", [b"", b"abcd"])
+    def test_rejects_valid_base64_that_is_not_audio(self, payload):
+        # Reaches soundfile, which raises LibsndfileError (a RuntimeError);
+        # unguarded that surfaces as a 500 rather than a bad-request error.
+        handler = _make_audio_handler()
+        with pytest.raises(ValueError, match="not readable audio"):
+            asyncio.run(handler._resolve_ref_audio(self._data_uri(payload)))
+
+    def test_rejects_an_oversized_data_uri_before_decoding(self):
+        handler = _make_audio_handler(tts_ref_audio_max_bytes=16)
+        with pytest.raises(ValueError, match="too large"):
+            asyncio.run(handler._resolve_ref_audio(self._data_uri(self._wav_bytes())))
+
+    def test_accepts_a_payload_exactly_at_the_limit(self):
+        # The encoded guard must not consume any of the decoded budget: base64
+        # expansion and the URI header are not audio bytes.
+        wav = self._wav_bytes()
+        handler = _make_audio_handler(tts_ref_audio_max_bytes=len(wav))
+        data, _ = asyncio.run(handler._resolve_ref_audio(self._data_uri(wav)))
+        assert len(data) == 1600
+
+    def test_percent_encoding_does_not_consume_the_decoded_budget(self):
+        # Percent escapes cost 3 URI characters per base64 character, so a
+        # naive length estimate rejects a payload whose decoded size fits.
+        import base64
+        import urllib.parse
+
+        wav = self._wav_bytes()
+        quoted = urllib.parse.quote(base64.b64encode(wav).decode(), safe="=")
+        assert len(quoted) > len(wav) * 4 // 3  # really is inflated
+        handler = _make_audio_handler(tts_ref_audio_max_bytes=len(wav))
+        data, _ = asyncio.run(
+            handler._resolve_ref_audio(f"data:audio/wav;base64,{quoted}")
+        )
+        assert len(data) == 1600
+
+    def test_rejects_an_unsupported_scheme(self):
+        handler = _make_audio_handler()
+        with pytest.raises(ValueError, match="must be a URL"):
+            asyncio.run(handler._resolve_ref_audio("ftp://example.com/a.wav"))

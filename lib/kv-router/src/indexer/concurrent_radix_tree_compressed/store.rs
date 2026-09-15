@@ -67,6 +67,8 @@ impl ConcurrentRadixTreeCompressed {
     ) -> Result<StoreParentResolution, KvCacheEventError> {
         loop {
             let node = self.lookup_store_parent_node(lookup, worker, parent_hash, op, id)?;
+            // NOTE(perf): Combining coverage rejection and edge planning into
+            // one state snapshot regressed throughput. Keep these phases separate.
             self.reject_uncovered_store_parent(lookup, worker, &node, parent_hash, id)?;
 
             let Some(plan) = node.plan_store_parent_edge(parent_hash, &op.blocks) else {
@@ -248,12 +250,6 @@ impl ConcurrentRadixTreeCompressed {
             .child_lookup_plan(cursor.last_ext_hash, first_local);
 
         let shape_version = match plan {
-            ParentChildPlan::Stale => {
-                return Ok(StoreInsertStep::RetryParent {
-                    parent: cursor.parent.clone(),
-                    parent_is_anchor: cursor.parent_is_anchor,
-                });
-            }
             ParentChildPlan::StaleParent { hash } => {
                 let Some(resolved) =
                     self.resolve_lookup(lookup, worker, hash, LookupRepairDirection::TowardTail)
@@ -274,7 +270,8 @@ impl ConcurrentRadixTreeCompressed {
                 });
             }
             ParentChildPlan::Descend(child) => return Ok(StoreInsertStep::Descend(child)),
-            ParentChildPlan::MissingChild { shape_version } => shape_version,
+            ParentChildPlan::InteriorParent { shape_version }
+            | ParentChildPlan::MissingChild { shape_version } => shape_version,
         };
 
         if let Some(parent_hash) = cursor.last_ext_hash
@@ -420,15 +417,6 @@ impl ConcurrentRadixTreeCompressed {
                     ) else {
                         continue;
                     };
-                    if let Some((expected, actual)) = scan.block_hash_mismatch {
-                        duplicate_store = false;
-                        tracing::warn!(
-                            ?expected,
-                            ?actual,
-                            "block_hash mismatch: sequence hashes should be uniform across workers"
-                        );
-                    }
-
                     return ChildInsertStep::Done(Self::finish_with_lookup_update(
                         lookup,
                         worker,
@@ -451,14 +439,6 @@ impl ConcurrentRadixTreeCompressed {
                 ) else {
                     continue;
                 };
-                if let Some((expected, actual)) = scan.block_hash_mismatch {
-                    tracing::warn!(
-                        ?expected,
-                        ?actual,
-                        "block_hash mismatch: sequence hashes should be uniform across workers"
-                    );
-                }
-
                 return ChildInsertStep::Done(self.finish_after_split_lookup(
                     lookup,
                     worker,
@@ -479,14 +459,6 @@ impl ConcurrentRadixTreeCompressed {
             else {
                 continue;
             };
-            if let Some((expected, actual)) = scan.block_hash_mismatch {
-                duplicate_store = false;
-                tracing::warn!(
-                    ?expected,
-                    ?actual,
-                    "block_hash mismatch: sequence hashes should be uniform across workers"
-                );
-            }
             if promoted {
                 duplicate_store = false;
             }
@@ -571,5 +543,17 @@ impl ConcurrentRadixTreeCompressed {
         }
 
         Ok(StoreInsertOutcome { duplicate_store })
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_blocks_from_for_test(
+        &self,
+        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        worker: WorkerWithDpRank,
+        parent: &SharedNode,
+        seed_hash: ExternalSequenceBlockHash,
+        blocks: &[KvCacheStoredBlockData],
+    ) -> Result<StoreInsertOutcome, KvCacheEventError> {
+        self.insert_blocks_from(lookup, worker, parent, false, Some(seed_hash), blocks)
     }
 }

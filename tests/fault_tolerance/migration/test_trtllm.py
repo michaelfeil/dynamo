@@ -15,8 +15,8 @@ import shutil
 
 import pytest
 
-from tests.utils.constants import FAULT_TOLERANCE_MODEL_NAME
-from tests.utils.managed_process import ManagedProcess
+from tests.utils.constants import FAULT_TOLERANCE_MODEL_NAME, DynamoPortRange
+from tests.utils.managed_process import ManagedProcess, check_health_ready
 from tests.utils.payloads import check_models_api
 from tests.utils.port_utils import allocate_port, deallocate_port
 
@@ -80,7 +80,7 @@ class DynamoWorkerProcess(ManagedProcess):
         request: pytest request fixture
         worker_id: Unique identifier for the worker (e.g., "worker1", "prefill1")
         frontend_port: Port where the frontend is running
-        mode: "prefill_and_decode" for aggregated, "prefill" or "decode" for disaggregated
+        mode: "agg" for aggregated, "prefill" or "decode" for disaggregated
     """
 
     def __init__(
@@ -88,10 +88,11 @@ class DynamoWorkerProcess(ManagedProcess):
         request,
         worker_id: str,
         frontend_port: int,
-        mode: str = "prefill_and_decode",
+        mode: str = "agg",
     ):
         self.worker_id = worker_id
-        self.system_port = allocate_port(9100)
+        self.system_port = allocate_port(DynamoPortRange.SERVE.value)
+        request.addfinalizer(lambda port=self.system_port: deallocate_port(port))
         self.mode = mode
 
         command = [
@@ -109,7 +110,7 @@ class DynamoWorkerProcess(ManagedProcess):
             "--free-gpu-memory-fraction",
             "0.15",  # avoid validation error on TRT-LLM available memory checks
         ]
-        if mode != "prefill_and_decode":
+        if mode != "agg":
             config_file = (
                 f"test_request_migration_trtllm_config_{self.system_port}.yaml"
             )
@@ -140,9 +141,9 @@ class DynamoWorkerProcess(ManagedProcess):
 
         # Configure health check based on worker type
         health_check_urls = [
-            (f"http://localhost:{self.system_port}/health", self.is_ready)
+            (f"http://localhost:{self.system_port}/health", check_health_ready)
         ]
-        if mode in ["decode", "prefill_and_decode"]:
+        if mode in ["decode", "agg"]:
             health_check_urls.append(
                 (f"http://localhost:{frontend_port}/v1/models", check_models_api)
             )
@@ -179,20 +180,6 @@ class DynamoWorkerProcess(ManagedProcess):
             logging.warning(f"Failed to release TRT-LLM worker port: {e}")
 
         return super().__exit__(exc_type, exc_val, exc_tb)
-
-    def is_ready(self, response) -> bool:
-        """Check the health of the worker process"""
-        try:
-            data = response.json()
-            if data.get("status") == "ready":
-                logger.info(f"{self.worker_id} status is ready")
-                return True
-            logger.warning(
-                f"{self.worker_id} status is not ready: {data.get('status')}"
-            )
-        except ValueError:
-            logger.warning(f"{self.worker_id} health response is not valid JSON")
-        return False
 
 
 @pytest.mark.timeout(290)  # 3x average

@@ -274,6 +274,8 @@ impl MockerBackend {
             endpoint_types: args.common.endpoint_types,
             custom_jinja_template: args.common.custom_jinja_template,
             disaggregation_mode,
+            route_to_encoder: args.common.route_to_encoder,
+            enable_rl: args.common.enable_rl,
             model_name: args.model_path,
             served_model_name: Some(args.model_name),
             tool_call_parser,
@@ -304,7 +306,8 @@ impl LLMEngine for MockerBackend {
             KvEventPublishers::default(),
             Some(self.cancel.clone()),
             FpmPublisher::default(),
-        );
+        )
+        .map_err(|error| engine_shutdown(format!("failed to start Mocker scheduler: {error:#}")))?;
 
         // The `initialized()` check + these `set()` calls are not atomic,
         // so concurrent `start()` callers could both pass the check and
@@ -352,6 +355,7 @@ impl LLMEngine for MockerBackend {
         Ok(EngineConfig {
             model: self.model_name.clone(),
             served_model_name: Some(self.model_name.clone()),
+            model_aliases: Vec::new(),
             runtime_data: Default::default(),
             llm: Some(LlmRegistration {
                 context_length: Some(self.context_length),
@@ -361,6 +365,7 @@ impl LLMEngine for MockerBackend {
                 max_num_batched_tokens: self.engine_args.max_num_batched_tokens.map(|v| v as u64),
                 data_parallel_size: None,
                 data_parallel_start_rank: None,
+                enable_eagle: false,
                 // Mocker has no real KV transport, so it never advertises a
                 // bootstrap address.
                 bootstrap_host: None,
@@ -426,7 +431,7 @@ impl LLMEngine for MockerBackend {
         }
 
         let direct = DirectRequest {
-            tokens: request.token_ids.clone(),
+            tokens: request.token_ids.as_ref().clone(),
             max_output_tokens,
             uuid: Some(uuid),
             dp_rank: DP_RANK,
@@ -443,8 +448,16 @@ impl LLMEngine for MockerBackend {
             },
         );
 
+        // Install the guard before enqueueing so a closed compatibility lane
+        // also releases the active entry.
+        let mut guard = ActiveRequestGuard {
+            uuid,
+            active: self.active.clone(),
+            kv_used_blocks: self.kv_used_blocks.clone(),
+            blocks_held: 0,
+        };
+
         if request_tx.send(direct).is_err() {
-            self.active.remove(&uuid);
             return Err(engine_shutdown("scheduler is not accepting requests"));
         }
 
@@ -456,13 +469,7 @@ impl LLMEngine for MockerBackend {
         let blocks_held = prompt_len.div_ceil(block_size) as u64;
         self.kv_used_blocks
             .fetch_add(blocks_held, Ordering::Relaxed);
-
-        let guard = ActiveRequestGuard {
-            uuid,
-            active: self.active.clone(),
-            kv_used_blocks: self.kv_used_blocks.clone(),
-            blocks_held,
-        };
+        guard.blocks_held = blocks_held;
 
         Ok(Box::pin(async_stream::stream! {
             let _guard = guard;
@@ -884,6 +891,29 @@ mod tests {
         );
 
         engine.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_scheduler_queue_cleans_up_pending_request() {
+        let engine = test_engine();
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        drop(request_rx);
+        assert!(engine.request_tx.set(request_tx).is_ok());
+
+        let result = engine
+            .generate(request(Some(1)), gen_ctx(Context::new(()).context()))
+            .await;
+        let Err(err) = result else {
+            panic!("closed scheduler queue must reject the request");
+        };
+        assert_eq!(
+            err.error_type(),
+            ErrorType::Backend(BackendError::EngineShutdown)
+        );
+        assert!(
+            engine.active.is_empty(),
+            "failed enqueue must be removed from active state"
+        );
     }
 
     #[tokio::test]

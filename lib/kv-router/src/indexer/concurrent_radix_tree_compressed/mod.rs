@@ -19,9 +19,10 @@ use super::{
     MatchDetails, PreBoundEventCounters, SyncIndexer, WorkerLookupStats, WorkerTask,
 };
 use crate::cleanup::{CleanupGuard, CleanupState};
-use crate::lookup_update::update_arc_lookup_for_keys;
+use crate::lookup_update::{update_arc_lookup_for_keys, update_existing_arc_lookup_for_keys};
 use crate::protocols::*;
 
+mod children;
 mod node;
 mod types;
 use node::*;
@@ -235,8 +236,7 @@ impl ConcurrentRadixTreeCompressed {
             KvCacheEventData::Stored(op) => self.apply_stored(lookup, worker, op, id, counters),
             KvCacheEventData::Removed(op) => self.apply_removed(lookup, worker, op, id),
             KvCacheEventData::Cleared => {
-                lookup.entry(worker).or_default();
-                self.clear_all_blocks(lookup, worker.worker_id);
+                self.erase_worker_coverage(lookup, WorkerRemovalTarget::DpRank(worker), true);
                 Ok(())
             }
         }
