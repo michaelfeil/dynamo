@@ -42,6 +42,16 @@ pub struct CommonExt {
     #[builder(default, setter(strip_option))]
     pub include_stop_str_in_output: Option<bool>,
 
+    /// vLLM-compat template control. `false` with a trailing non-empty
+    /// assistant text message opts the request into prefill continuation
+    /// (the processor renders `continue_final_message` instead of opening a
+    /// fresh turn). Forwarded verbatim; without a declared field serde routes
+    /// it into `unsupported_fields`, which is `skip_serializing`, so the opt-in
+    /// would never reach the processor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub add_generation_prompt: Option<bool>,
+
     /// Guided Decoding Options
     /// If specified, the output will be a JSON object. Can be a string, an object, or null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +219,7 @@ mod tests {
             min_p: None,
             repetition_penalty: None,
             include_stop_str_in_output: None,
+            add_generation_prompt: None,
             guided_json: None,
             guided_regex: None,
             guided_grammar: None,

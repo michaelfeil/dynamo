@@ -414,3 +414,35 @@ fn test_b10_invalid_thinking_is_not_silently_dropped() {
     assert!(err_str.contains("enabled"));
     assert!(err_str.contains("disabled"));
 }
+
+#[test]
+fn test_chat_completions_add_generation_prompt_round_trips() {
+    // `add_generation_prompt: false` is the vLLM-compat opt-in for assistant
+    // prefill continuation; it must survive deserialization AND be forwarded
+    // to the processor on serialization (an undeclared field lands in the
+    // `skip_serializing` catch-all and silently vanishes).
+    let json = serde_json::json!({
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure, the answer is"}
+        ],
+        "add_generation_prompt": false
+    });
+    let request: NvCreateChatCompletionRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(request.common.add_generation_prompt, Some(false));
+    let out = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        out.get("add_generation_prompt"),
+        Some(&serde_json::Value::Bool(false))
+    );
+
+    let json = serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let request: NvCreateChatCompletionRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(request.common.add_generation_prompt, None);
+    let out = serde_json::to_value(&request).unwrap();
+    assert!(out.get("add_generation_prompt").is_none());
+}

@@ -445,10 +445,33 @@ impl From<DeltaChoice> for dynamo_protocols::types::ChatChoice {
         // incomplete — reporting ToolCalls there tells clients a truncated
         // call is complete and ready to execute (customer-reported as
         // "malformed tool outputs").
-        let has_tool_calls = delta
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty());
+        // On a truncated generation the trailing tool call was cut
+        // mid-arguments; shipping it hands clients unparseable JSON. Drop the
+        // trailing call when its arguments are not complete JSON — the
+        // preserved `length` finish reason already tells clients the turn was
+        // cut short.
+        let mut tool_calls = delta.tool_calls;
+        if matches!(
+            delta.finish_reason,
+            Some(dynamo_protocols::types::FinishReason::Length)
+                | Some(dynamo_protocols::types::FinishReason::ContentFilter)
+        ) && let Some(calls) = tool_calls.as_mut()
+        {
+            let truncated_tail = calls.last().is_some_and(|call| {
+                serde_json::from_str::<serde_json::Value>(&call.function.arguments).is_err()
+            });
+            if truncated_tail {
+                let dropped = calls.pop();
+                tracing::warn!(
+                    name = dropped.map(|c| c.function.name).unwrap_or_default(),
+                    "dropping truncated trailing tool call with incomplete arguments"
+                );
+            }
+            if calls.is_empty() {
+                tool_calls = None;
+            }
+        }
+        let has_tool_calls = tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
         let finish_reason = match delta.finish_reason {
             None | Some(dynamo_protocols::types::FinishReason::Stop) if has_tool_calls => {
                 Some(dynamo_protocols::types::FinishReason::ToolCalls)
@@ -471,7 +494,7 @@ impl From<DeltaChoice> for dynamo_protocols::types::ChatChoice {
             message: dynamo_protocols::types::ChatCompletionResponseMessage {
                 role: delta.role.expect("delta should have a Role"),
                 content,
-                tool_calls: delta.tool_calls,
+                tool_calls,
                 refusal: None,
                 function_call: None,
                 audio: None,
@@ -1286,6 +1309,91 @@ mod tests {
             choice.finish_reason,
             Some(dynamo_protocols::types::FinishReason::Length)
         );
+    }
+
+    #[rstest::rstest]
+    #[case(dynamo_protocols::types::FinishReason::Length)]
+    #[case(dynamo_protocols::types::FinishReason::ContentFilter)]
+    #[tokio::test]
+    async fn test_truncated_trailing_tool_call_dropped_on_truncation(
+        #[case] finish_reason: dynamo_protocols::types::FinishReason,
+    ) {
+        // A `length` finish cuts the trailing tool call mid-arguments; the
+        // incomplete call must be dropped while completed calls survive.
+        let chunks = vec![
+            dynamo_protocols::types::ChatCompletionMessageToolCallChunk {
+                index: 0,
+                id: Some("call_0".to_string()),
+                r#type: Some(dynamo_protocols::types::FunctionType::Function),
+                function: Some(dynamo_protocols::types::FunctionCallStream {
+                    name: Some("activity_log".to_string()),
+                    arguments: Some(r#"{"action": "search"}"#.to_string()),
+                }),
+            },
+            dynamo_protocols::types::ChatCompletionMessageToolCallChunk {
+                index: 1,
+                id: Some("call_1".to_string()),
+                r#type: Some(dynamo_protocols::types::FunctionType::Function),
+                function: Some(dynamo_protocols::types::FunctionCallStream {
+                    name: Some("activity_log".to_string()),
+                    arguments: Some(r#"{"action": "crea"#.to_string()),
+                }),
+            },
+        ];
+        let annotated_delta = create_test_delta_with_tool_chunks(
+            0,
+            chunks,
+            Some(finish_reason),
+            Some(dynamo_protocols::types::Role::Assistant),
+        );
+        let stream = Box::pin(stream::iter(vec![annotated_delta]));
+
+        let result = DeltaAggregator::apply(stream, ParsingOptions::default()).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        let choice = &response.inner.choices[0];
+
+        let tool_calls = choice.message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_0");
+        assert_eq!(choice.finish_reason, Some(finish_reason));
+    }
+
+    #[rstest::rstest]
+    #[case(dynamo_protocols::types::FinishReason::Length)]
+    #[case(dynamo_protocols::types::FinishReason::ContentFilter)]
+    #[tokio::test]
+    async fn test_truncated_only_tool_call_dropped_on_truncation(
+        #[case] finish_reason: dynamo_protocols::types::FinishReason,
+    ) {
+        // When the truncated call was the only one, tool_calls must come back
+        // empty rather than shipping unparseable arguments.
+        let chunks = vec![
+            dynamo_protocols::types::ChatCompletionMessageToolCallChunk {
+                index: 0,
+                id: Some("call_0".to_string()),
+                r#type: Some(dynamo_protocols::types::FunctionType::Function),
+                function: Some(dynamo_protocols::types::FunctionCallStream {
+                    name: Some("activity_log".to_string()),
+                    arguments: Some(r#"{"action": "create", "field_values": {"ti"#.to_string()),
+                }),
+            },
+        ];
+        let annotated_delta = create_test_delta_with_tool_chunks(
+            0,
+            chunks,
+            Some(finish_reason),
+            Some(dynamo_protocols::types::Role::Assistant),
+        );
+        let stream = Box::pin(stream::iter(vec![annotated_delta]));
+
+        let result = DeltaAggregator::apply(stream, ParsingOptions::default()).await;
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        let choice = &response.inner.choices[0];
+
+        assert!(choice.message.tool_calls.is_none());
+        assert_eq!(choice.finish_reason, Some(finish_reason));
     }
 
     #[tokio::test]

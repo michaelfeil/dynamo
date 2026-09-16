@@ -1430,6 +1430,18 @@ Run HTTP service tests for OpenAI chat/completions, Anthropic streaming,
 tool-calling, reasoning/thinking fields, logprobs, dynamic temperature,
 Baseten extension validation, `stream_options`, and unknown-parameter handling.
 
+
+GLM-5.3 runtime compatibility from `crw/toolchoice-processor-standdown-v1.2`:
+keep a chat-processor-supplied structural-tag grammar intact while retaining
+forced/named tool-call jailing, and forward `add_generation_prompt` to the
+processor for assistant-prefill continuation. Aggregated chat responses drop
+an incomplete trailing tool call on `length` or `content_filter`, preserving
+completed calls and the original finish reason. Aggregated Responses include
+raw reasoning content when no summary was requested; summaries remain opt-in.
+The typed router-denial binding fix is already on main via #780 and must not
+be replayed. These are Baseten release compatibility decisions; review the
+reasoning and truncated-call contracts explicitly during future rebases.
+
 ## PATCH-007: Python Bindings and Service-Facing APIs
 
 Status: `keep`

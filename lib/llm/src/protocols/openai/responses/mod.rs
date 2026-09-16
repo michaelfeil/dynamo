@@ -9,9 +9,9 @@ use dynamo_protocols::types::responses::{
     AssistantRole, FunctionToolCall, IncludeEnum, IncompleteDetails, InputTokenDetails,
     Instructions, NamespaceToolParamTool, OutputItem, OutputMessage, OutputMessageContent,
     OutputStatus, OutputTextContent, OutputTokenDetails, PromptCacheRetention, Reasoning,
-    ReasoningItem, Response, ResponseTextParam, ResponseUsage, ServiceTier, Status, SummaryPart,
-    SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam,
-    Truncation,
+    ReasoningItem, ReasoningItemContent, ReasoningTextContent, Response, ResponseTextParam,
+    ResponseUsage, ServiceTier, Status, SummaryPart, SummaryTextContent,
+    TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam, Truncation,
 };
 use dynamo_runtime::protocols::annotated::AnnotationsProvider;
 use serde::{Deserialize, Serialize};
@@ -553,17 +553,31 @@ pub fn chat_completion_to_response(
             }
         }
 
-        // Map reasoning_content to a Reasoning output item
+        // Return raw reasoning content unless the caller requested a summary.
         if let Some(reasoning_text) = choice.message.reasoning_content
             && !reasoning_text.is_empty()
-            && params.reasoning_summary_requested()
         {
+            let (summary, content) = if params.reasoning_summary_requested() {
+                (
+                    vec![SummaryPart::SummaryText(SummaryTextContent {
+                        text: reasoning_text,
+                    })],
+                    None,
+                )
+            } else {
+                (
+                    Vec::new(),
+                    Some(vec![ReasoningItemContent::ReasoningText(
+                        ReasoningTextContent {
+                            text: reasoning_text,
+                        },
+                    )]),
+                )
+            };
             output.push(OutputItem::Reasoning(ReasoningItem {
                 id: Some(format!("rs_{}", Uuid::new_v4().simple())),
-                summary: vec![SummaryPart::SummaryText(SummaryTextContent {
-                    text: reasoning_text,
-                })],
-                content: None,
+                summary,
+                content,
                 encrypted_content: None,
                 status: Some(OutputStatus::Completed),
             }));
@@ -2653,12 +2667,23 @@ thinking
             None,
         )
         .unwrap();
-        assert!(
-            unrequested
-                .inner
-                .output
-                .iter()
-                .all(|item| !matches!(item, OutputItem::Reasoning(_)))
+        let reasoning = unrequested
+            .inner
+            .output
+            .iter()
+            .find_map(|item| match item {
+                OutputItem::Reasoning(reasoning) => Some(reasoning),
+                _ => None,
+            })
+            .expect("reasoning output without a summary request");
+        assert!(reasoning.summary.is_empty());
+        assert_eq!(
+            reasoning.content,
+            Some(vec![ReasoningItemContent::ReasoningText(
+                ReasoningTextContent {
+                    text: "private reasoning".into(),
+                }
+            )])
         );
 
         let params = ResponseParams {
@@ -2680,6 +2705,7 @@ thinking
                 _ => None,
             })
             .expect("requested reasoning summary output");
+        assert!(reasoning.content.is_none());
         assert_eq!(
             reasoning.summary,
             vec![SummaryPart::SummaryText(SummaryTextContent {
