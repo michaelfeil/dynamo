@@ -258,11 +258,18 @@ pub fn validate_top_p(top_p: Option<f32>) -> Result<(), anyhow::Error> {
 }
 
 // Validate top_k
+//
+// -1 and 0 both mean "consider all tokens". Engines disagree on which one is
+// valid (TRT-LLM takes 0 and rejects -1, SGLang the reverse), so accept both
+// here and let each engine adapter convert.
 pub fn validate_top_k(top_k: Option<i32>) -> Result<(), anyhow::Error> {
     match top_k {
         None => Ok(()),
-        Some(k) if k == -1 || k >= 1 => Ok(()),
-        _ => anyhow::bail!("Top_k must be null, -1, or greater than or equal to 1"),
+        Some(k) if k >= -1 => Ok(()),
+        Some(k) => anyhow::bail!(
+            "Top_k must be null or greater than or equal to -1, got {}",
+            k
+        ),
     }
 }
 
@@ -799,4 +806,31 @@ where
         anyhow::bail!("Value {} is out of range [{}, {}]", value, range.0, range.1);
     }
     Ok(Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b10_top_k_accepts_both_all_tokens_sentinels() {
+        // -1 is the vLLM/SGLang spelling, 0 the TRT-LLM/OpenAI-provider one.
+        assert!(validate_top_k(Some(-1)).is_ok());
+        assert!(validate_top_k(Some(0)).is_ok());
+    }
+
+    #[test]
+    fn b10_top_k_accepts_null_and_positive() {
+        assert!(validate_top_k(None).is_ok());
+        assert!(validate_top_k(Some(1)).is_ok());
+        assert!(validate_top_k(Some(50)).is_ok());
+    }
+
+    #[test]
+    fn b10_top_k_rejects_below_minus_one() {
+        // No provider uses these as a sentinel, so they are client bugs.
+        let err = validate_top_k(Some(-2)).expect_err("-2 is not a sentinel");
+        assert!(err.to_string().contains("greater than or equal to -1"));
+        assert!(validate_top_k(Some(-100)).is_err());
+    }
 }

@@ -167,9 +167,10 @@ pub struct AnthropicCreateMessageRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
-    /// Top-K sampling parameter.
+    /// Top-K sampling parameter. Signed to match `CommonExt::top_k`, so -1
+    /// ("consider all tokens") is accepted as on the OpenAI surfaces.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<u32>,
+    pub top_k: Option<i32>,
 
     /// Custom stop sequences.
     #[serde(skip_serializing_if = "Option::is_none")]

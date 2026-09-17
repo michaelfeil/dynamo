@@ -321,7 +321,7 @@ pub struct SamplingOptions {
     pub top_p: Option<f32>,
 
     /// Integer that controls the number of top tokens to consider. Set
-    /// to -1 to consider all tokens.
+    /// to -1 or 0 to consider all tokens.
     pub top_k: Option<i32>,
 
     /// Float that represents the minimum probability for a token to be
