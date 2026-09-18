@@ -24,9 +24,7 @@ pytestmark = [
 def test_tool_binding():
     assert "glm47" in TOOL_PARSER_FAMILIES
     parser = ToolCallStream(
-        "glm47",
-        [{"name": "weather", "parameters": {"type": "object"}}],
-        source="dynamo",
+        "glm47", [{"name": "weather", "parameters": {"type": "object"}}]
     )
     assert not parser.prefers_tokens
     output = parser.step("<tool_call>weather</tool_call>")
@@ -46,7 +44,7 @@ def test_tool_binding():
 
 def test_unified_binding():
     assert "qwen3" in UNIFIED_PARSER_FAMILIES
-    parser = UnifiedParserStream("qwen3", source="dynamo")
+    parser = UnifiedParserStream("qwen3")
     events = parser.step("<think>reason</think>answer") + parser.finish()
     assert [(event.kind, event.text, event.call) for event in events] == [
         ("reasoning", "reason", None),
@@ -58,13 +56,6 @@ def test_unified_binding():
 
 
 def test_invalid_configuration():
-    for constructor, family in [
-        (ToolCallStream, "glm47"),
-        (UnifiedParserStream, "qwen3"),
-    ]:
-        with pytest.raises(ValueError, match="unsupported parser source"):
-            constructor(family, source="missing")
-        constructor(family).finish()
     with pytest.raises(ValueError):
         ToolCallStream("missing")
     with pytest.raises(ValueError):

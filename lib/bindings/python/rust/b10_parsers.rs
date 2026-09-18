@@ -96,16 +96,11 @@ pub struct PyToolStream {
 #[pymethods]
 impl PyToolStream {
     #[new]
-    #[pyo3(signature = (family, tools=None, *, source="dynamo"))]
-    fn new(
-        py: Python<'_>,
-        family: String,
-        tools: Option<&Bound<'_, PyAny>>,
-        source: &str,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (family, tools=None))]
+    fn new(py: Python<'_>, family: String, tools: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
         let tools = tools_from_python(tools)?;
         let inner = py
-            .allow_threads(|| ToolCallStream::with_source(source, &family, &tools))
+            .allow_threads(|| ToolCallStream::new(&family, &tools))
             .map_err(value_error)?;
         Ok(Self {
             inner: Mutex::new(inner),
@@ -158,13 +153,12 @@ pub struct PyUnifiedStream {
 #[pymethods]
 impl PyUnifiedStream {
     #[new]
-    #[pyo3(signature = (family, tools=None, *, source="dynamo", prompt_token_ids=None, starting_state="none", tool_output_mode="native", named_tool=None, invalid_guided_payload="reject"))]
+    #[pyo3(signature = (family, tools=None, *, prompt_token_ids=None, starting_state="none", tool_output_mode="native", named_tool=None, invalid_guided_payload="reject"))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         family: String,
         tools: Option<&Bound<'_, PyAny>>,
-        source: &str,
         prompt_token_ids: Option<Vec<u32>>,
         starting_state: &str,
         tool_output_mode: &str,
@@ -181,7 +175,7 @@ impl PyUnifiedStream {
         )
         .map_err(value_error)?;
         let inner = py
-            .allow_threads(|| UnifiedStream::with_source(source, &family, &tools, init))
+            .allow_threads(|| UnifiedStream::new(&family, &tools, init))
             .map_err(value_error)?;
         Ok(Self {
             inner: Mutex::new(inner),

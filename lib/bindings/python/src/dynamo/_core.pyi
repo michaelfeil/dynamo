@@ -70,13 +70,7 @@ class ParserStreamError(RuntimeError):
     events: list[ParserEvent]
 
 class ToolCallStream:
-    def __init__(
-        self,
-        family: str,
-        tools: list[dict[str, Any]] | None = None,
-        *,
-        source: str = "dynamo",
-    ) -> None: ...
+    def __init__(self, family: str, tools: list[dict[str, Any]] | None = None) -> None: ...
     @property
     def preserve_special_tokens(self) -> bool: ...
     @property
@@ -91,7 +85,6 @@ class UnifiedParserStream:
         family: str,
         tools: list[dict[str, Any]] | None = None,
         *,
-        source: str = "dynamo",
         prompt_token_ids: list[int] | None = None,
         starting_state: Literal["none", "reasoning", "response"] = "none",
         tool_output_mode: Literal["native", "guided_json"] = "native",

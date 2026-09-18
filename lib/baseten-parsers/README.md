@@ -15,9 +15,7 @@ Alternative backends implement the re-exported peer-shaped `ToolParser` or
 `UnifiedParser` contracts and enter through `from_parser(Box<dyn ...>)`. They
 receive the same lifecycle and result normalization without requiring upstream
 registry mutation or changes to the binding. Named Python construction selects
-the built-in upstream registry via keyword-only `source="dynamo"` (the default
-for both Python constructors). Unsupported sources raise `ValueError`, with
-selection and validation in Rust (`with_source`). Additional named backends require Rust factory
+the built-in upstream registry; additional named backends require Rust factory
 integration, not Python callbacks.
 
 ## Python
@@ -25,7 +23,7 @@ integration, not Python callbacks.
 ```python
 from dynamo.parsers import ToolCallStream, TOOL_PARSER_FAMILIES
 
-parser = ToolCallStream("glm47", source="dynamo", tools=[
+parser = ToolCallStream("glm47", tools=[
     {"name": "weather", "parameters": {
         "type": "object", "properties": {"city": {"type": "string"}}
     }}
