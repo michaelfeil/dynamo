@@ -115,6 +115,24 @@ fn independent_choices_and_truncated_glm_call() {
 }
 
 #[test]
+fn named_sources_are_explicit_and_validated_in_rust() {
+    assert!(ToolCallStream::with_source("dynamo", "glm47", &tools()).is_ok());
+    assert!(
+        UnifiedStream::with_source("dynamo", "qwen3", &[], UnifiedParserInit::default()).is_ok()
+    );
+    for source in ["", "missing", "Dynamo"] {
+        let error = ToolCallStream::with_source(source, "glm47", &[])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unsupported parser source"));
+        let error = UnifiedStream::with_source(source, "qwen3", &[], UnifiedParserInit::default())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unsupported parser source"));
+    }
+}
+
+#[test]
 fn invalid_family_and_unsupported_token_input_fail_loudly() {
     assert!(ToolCallStream::new("missing", &[]).is_err());
     assert!(UnifiedStream::new("missing", &[], UnifiedParserInit::default()).is_err());

@@ -114,6 +114,15 @@ pub struct ToolCallStream {
 
 impl ToolCallStream {
     pub fn new(family: &str, tools: &[Tool]) -> Result<Self> {
+        Self::with_source("dynamo", family, tools)
+    }
+
+    /// Select a named Rust backend; unknown sources never fall back silently.
+    pub fn with_source(source: &str, family: &str, tools: &[Tool]) -> Result<Self> {
+        ensure!(
+            source == "dynamo",
+            "unsupported parser source: {source:?}; expected \"dynamo\""
+        );
         Ok(Self::from_parser(upstream::create_tool_parser_for_family(
             family, tools,
         )?))
@@ -198,6 +207,20 @@ pub struct UnifiedStream {
 
 impl UnifiedStream {
     pub fn new(family: &str, tools: &[Tool], init: UnifiedParserInit) -> Result<Self> {
+        Self::with_source("dynamo", family, tools, init)
+    }
+
+    /// Select a named Rust backend; unknown sources never fall back silently.
+    pub fn with_source(
+        source: &str,
+        family: &str,
+        tools: &[Tool],
+        init: UnifiedParserInit,
+    ) -> Result<Self> {
+        ensure!(
+            source == "dynamo",
+            "unsupported parser source: {source:?}; expected \"dynamo\""
+        );
         Self::from_parser(
             upstream::create_unified_parser_for_family(family, tools)?,
             init,
