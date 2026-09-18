@@ -13,13 +13,14 @@
 //!
 //! Also holds the [`ROUTER_GUARD_ATTEMPTS`] / [`ROUTER_GUARD_RETRY_DELAY`] /
 //! [`ROUTER_GUARD_CLEANUP_GRACE_PERIOD`] /
-//! [`ROUTER_GUARD_NOTIFY_TIMEOUT`] timeouts used across the `b10_client`
+//! [`router_guard_notify_timeout`] timeouts used across the `b10_client`
 //! submodules.
 
 use anyhow::Result;
 use dynamo_kv_router::protocols::{RouterBackpressureReason, RouterResponse as RsRouterResponse};
 use dynamo_runtime::pipeline::context::Context as RsContext;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, oneshot};
@@ -30,7 +31,19 @@ use super::coordinator::{RouterGuardClient, callback_router_instance_ids, first_
 pub(super) const ROUTER_GUARD_ATTEMPTS: usize = 2;
 pub(super) const ROUTER_GUARD_RETRY_DELAY: Duration = Duration::from_millis(50);
 pub(super) const ROUTER_GUARD_CLEANUP_GRACE_PERIOD: Duration = Duration::from_millis(500);
-pub const ROUTER_GUARD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Backstop after which an armed guard frees its router request (10 minutes by default).
+pub fn router_guard_notify_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("DYN_ROUTER_GUARD_NOTIFY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(10 * 60))
+    })
+}
+
 /// Per-attempt cap on a single `mark_prefill` / `mark_free` callback to an
 /// instance of the KV router. When the cap fires the in-flight future is
 /// aborted, the attempt is recorded as an error so the outer

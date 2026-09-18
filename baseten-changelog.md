@@ -429,6 +429,10 @@ and 529s). Known follow-ups, not yet ported: the discovery `endpoint_watcher`
 still publishes an empty instance list on local cancellation, and the router
 guard leak deserves a liveness lease instead of relying on the 300 s expiry.
 
+`DYN_ROUTER_GUARD_NOTIFY_TIMEOUT_SECS` makes the frontend router-guard notify timeout
+configurable (default 600 s), the counterpart of the router's `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` (#825);
+raise both above the longest expected stream (basetenlabs/dynamo#847).
+
 Replay notes:
 
 Port behavior, not necessarily implementation. Upstream may have refactored

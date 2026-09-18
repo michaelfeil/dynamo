@@ -60,7 +60,7 @@ fn from_rmpv_value<T: DeserializeOwned>(value: &rmpv::Value) -> Result<T> {
 use super::DROP_THIS_MESSAGE_KEY;
 use super::guard::{
     ROUTER_GUARD_ATTEMPTS, ROUTER_GUARD_CALLBACK_TIMEOUT, ROUTER_GUARD_CLEANUP_GRACE_PERIOD,
-    ROUTER_GUARD_NOTIFY_TIMEOUT, RouterRequestGuard,
+    RouterRequestGuard, router_guard_notify_timeout,
 };
 use super::payload_copy::PayloadCopy;
 use super::types::{
@@ -260,7 +260,7 @@ impl RouterWorkerCoordinator {
             allow_cancel_routing,
             allow_cancel_setup,
             options.wait_for_first_response,
-            ROUTER_GUARD_NOTIFY_TIMEOUT,
+            router_guard_notify_timeout(),
             options.tracing_enabled,
             phase,
         );
