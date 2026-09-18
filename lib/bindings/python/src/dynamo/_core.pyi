@@ -36,6 +36,66 @@ materialize one Python ``int`` object per token to cross the binding.
 
 B10_DROP_THIS_MESSAGE_KEY: str
 
+PARSER_UPSTREAM_REVISION: str
+TOOL_PARSER_FAMILIES: list[str]
+UNIFIED_PARSER_FAMILIES: list[str]
+
+class ParserToolCall:
+    @property
+    def tool_index(self) -> int: ...
+    @property
+    def id(self) -> str | None: ...
+    @property
+    def name(self) -> str | None: ...
+    @property
+    def arguments(self) -> str: ...
+    @property
+    def complete(self) -> bool: ...
+
+class ToolParseOutput:
+    @property
+    def normal_text(self) -> str: ...
+    @property
+    def calls(self) -> list[ParserToolCall]: ...
+
+class ParserEvent:
+    @property
+    def kind(self) -> Literal["text", "reasoning", "tool_call"]: ...
+    @property
+    def text(self) -> str | None: ...
+    @property
+    def call(self) -> ParserToolCall | None: ...
+
+class ParserStreamError(RuntimeError):
+    events: list[ParserEvent]
+
+class ToolCallStream:
+    def __init__(self, family: str, tools: list[dict[str, Any]] | None = None) -> None: ...
+    @property
+    def preserve_special_tokens(self) -> bool: ...
+    @property
+    def prefers_tokens(self) -> bool: ...
+    def step(self, text: str) -> ToolParseOutput: ...
+    def step_tokens(self, token_ids: list[int]) -> ToolParseOutput: ...
+    def finish(self) -> ToolParseOutput: ...
+
+class UnifiedParserStream:
+    def __init__(
+        self,
+        family: str,
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        prompt_token_ids: list[int] | None = None,
+        starting_state: Literal["none", "reasoning", "response"] = "none",
+        tool_output_mode: Literal["native", "guided_json"] = "native",
+        named_tool: str | None = None,
+        invalid_guided_payload: Literal["reject", "recover_as_text", "stream_best_effort"] = "reject",
+    ) -> None: ...
+    @property
+    def preserve_special_tokens(self) -> bool: ...
+    def step(self, text: str) -> list[ParserEvent]: ...
+    def finish(self) -> list[ParserEvent]: ...
+
 class EncoderHttpError(RuntimeError):
     status_code: int
 

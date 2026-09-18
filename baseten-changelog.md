@@ -1756,6 +1756,18 @@ or smoke-test the router and OpenAI service examples.
 
 ## PATCH-008: Model, Parser, vLLM, and Multimodal Compatibility
 
+Rust-owned parser API (#881):
+
+- Adds `baseten-parsers` around public `dynamo-parsers-v2` 0.6.1, pinned to
+  frontend-crates `23b402787dab4c1a859c07488cce42927362db3e`; no parser source copy.
+- Exposes all upstream tool/unified families through `dynamo.parsers` in the
+  Dynamo wheel. Rust owns configuration, lifecycle, call IDs, ordered events,
+  and partial-error output; PyO3 only adapts values and releases the GIL.
+- Alternative Rust backends use the same peer-shaped traits and `from_parser`
+  constructors. Existing serving paths remain unchanged pending Baseten parity.
+- Rebase: retain the packaging boundary; review the upstream pin/API and model
+  behavior before upgrading. No throughput improvement is claimed.
+
 Status: `mixed`
 
 Source commits:

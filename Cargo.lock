@@ -1101,6 +1101,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "baseten-parsers"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "dynamo-parsers-v2",
+ "serde_json",
+]
+
+[[package]]
 name = "baseten_performance_client_core"
 version = "0.1.13-post.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2899,13 +2908,29 @@ version = "1.2.0"
 dependencies = [
  "anyhow",
  "num-traits",
- "openai-harmony",
+ "openai-harmony 0.0.3",
  "regex",
  "rstest 0.25.0",
  "rustpython-parser",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "dynamo-parsers-v2"
+version = "0.6.1"
+source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=23b402787dab4c1a859c07488cce42927362db3e#23b402787dab4c1a859c07488cce42927362db3e"
+dependencies = [
+ "anyhow",
+ "num-traits",
+ "openai-harmony 0.0.8",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
  "tracing",
  "uuid",
 ]
@@ -6321,6 +6346,30 @@ name = "openai-harmony"
 version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6b7fd6b7d01a317c58d85a22b7cc314e14a2fef0dfdb93b819738d09caece16"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bstr",
+ "clap 4.6.1",
+ "fancy-regex 0.13.0",
+ "futures",
+ "image",
+ "regex",
+ "reqwest 0.12.28",
+ "rustc-hash 1.1.0",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "openai-harmony"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e77e82af451fc95deeb728a40b84db8ee82d341e136c268de415123a560b9b72"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

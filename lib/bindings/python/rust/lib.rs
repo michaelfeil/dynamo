@@ -75,6 +75,7 @@ impl From<RouterMode> for RsRouterMode {
 mod b10_client;
 mod b10_encoder;
 mod b10_health;
+mod b10_parsers;
 mod b10_rate_limiter;
 mod backend;
 mod context;
@@ -265,6 +266,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     engine::add_to_module(m)?;
     errors::register_exceptions(m)?;
     parsers::add_to_module(m)?;
+    b10_parsers::add_to_module(m)?;
     backend::add_to_module(m)?;
 
     m.add_class::<prometheus_metrics::RuntimeMetrics>()?;

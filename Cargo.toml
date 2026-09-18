@@ -3,6 +3,7 @@
 
 [workspace]
 members = [
+    "lib/baseten-parsers",
     "lib/baseten-configmap",
     "lib/llm",
     "lib/runtime",
@@ -46,6 +47,7 @@ repository = "https://github.com/ai-dynamo/dynamo.git"
 keywords = ["llm", "genai", "inference", "nvidia", "distributed"]
 
 [workspace.dependencies]
+baseten-parsers = { path = "lib/baseten-parsers", version = "1.2.0" }
 # Local crates
 baseten-configmap = { path = "lib/baseten-configmap", version = "1.2.0" }
 dynamo-runtime = { path = "lib/runtime", version = "1.2.0" }

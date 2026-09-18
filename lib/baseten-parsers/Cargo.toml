@@ -1,0 +1,13 @@
+[package]
+name = "baseten-parsers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Request-scoped Baseten adapters for upstream Dynamo streaming parsers"
+
+[dependencies]
+anyhow.workspace = true
+dynamo-parsers-v2 = { version = "=0.6.1", git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "23b402787dab4c1a859c07488cce42927362db3e" }
+
+[dev-dependencies]
+serde_json.workspace = true
