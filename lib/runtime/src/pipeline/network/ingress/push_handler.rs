@@ -154,11 +154,26 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
         U: Data + Serialize + MaybeError + std::fmt::Debug,
     {
         let context = stream.context();
+        // Reuse cancellation futures so each response does not recreate their waiters.
+        let stopped = context.stopped();
+        let killed = context.killed();
+        tokio::pin!(stopped, killed);
 
         // TODO: Detect end-of-stream using Server-Sent Events (SSE)
         let mut send_complete_final = true;
         let mut saw_error_response = false;
-        while let Some(resp) = stream.next().await {
+        loop {
+            // Exit the pump when the request context is stopped/killed even if the
+            // engine stream never yields again: a hung stream would otherwise pin the
+            // handler and leak inflight accounting until the process restarts.
+            let resp = tokio::select! {
+                // Cancellation is not successful EOF, even if both are ready.
+                biased;
+                _ = &mut stopped => return,
+                _ = &mut killed => return,
+                resp = stream.next() => resp,
+            };
+            let Some(resp) = resp else { break };
             tracing::trace!("Sending response: {:?}", resp);
             let is_error = resp.err().is_some();
             if is_error {
@@ -263,6 +278,7 @@ impl<Req: PipelineIO + Sync, Resp: PipelineIO> Ingress<Req, Resp> {
         }
     }
 }
+
 /// The output of [`IngressDispatch::parse_and_build_request`]: the typed
 /// request the engine consumes, plus the bits of the on-wire control
 /// message the shared handler needs after parsing (the response-stream
@@ -539,5 +555,94 @@ where
         request_id: Option<String>,
     ) -> Result<(), PipelineError> {
         self.handle_payload_shared(payload, request_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::{ResponseStream, context::Controller};
+    use crate::protocols::annotated::Annotated;
+    use futures::FutureExt;
+    use std::time::Duration;
+
+    type Response = Annotated<String>;
+
+    #[rstest::rstest]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(false, true)]
+    #[case(true, true)]
+    #[tokio::test]
+    async fn cancellation_skips_final_and_health_notification(
+        #[case] kill: bool,
+        #[case] eof_ready: bool,
+    ) {
+        let ingress = Ingress::<SingleIn<String>, ManyOut<Response>>::new();
+        let notifier = Arc::new(tokio::sync::Notify::new());
+        ingress
+            .set_endpoint_health_check_notifier(notifier.clone())
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let publisher = StreamSender { tx, prologue: None };
+        let context = Arc::new(Controller::new("pump-cancellation".into()));
+        let dropped = Arc::new(());
+        let stream_marker = dropped.clone();
+        let stream = futures::stream::poll_fn(move |_| {
+            let _ = &stream_marker;
+            if eof_ready {
+                std::task::Poll::Ready(None::<Response>)
+            } else {
+                std::task::Poll::Pending
+            }
+        });
+        let stream = ResponseStream::new(Box::pin(stream), context.clone());
+        let pump = ingress.pump_response_stream(stream, &publisher, RequestPlanePayloadCodec::Json);
+        tokio::pin!(pump);
+        if !eof_ready {
+            // Start the pump before cancellation, with a stream that never wakes it.
+            assert!(futures::poll!(&mut pump).is_pending());
+        }
+        if kill {
+            context.kill();
+        } else {
+            context.stop_generating();
+        }
+        tokio::time::timeout(Duration::from_secs(1), &mut pump)
+            .await
+            .expect("cancellation must unblock the pump");
+        assert_eq!(Arc::strong_count(&dropped), 1, "stream must be dropped");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(notifier.notified().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_eof_sends_final_and_notifies_health() {
+        let ingress = Ingress::<SingleIn<String>, ManyOut<Response>>::new();
+        let notifier = Arc::new(tokio::sync::Notify::new());
+        ingress
+            .set_endpoint_health_check_notifier(notifier.clone())
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let publisher = StreamSender { tx, prologue: None };
+        let context = Arc::new(Controller::new("pump-eof".into()));
+        let stream = ResponseStream::new(Box::pin(futures::stream::empty::<Response>()), context);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            ingress.pump_response_stream(stream, &publisher, RequestPlanePayloadCodec::Json),
+        )
+        .await
+        .expect("normal EOF must complete");
+        let TwoPartMessageType::DataOnly(data) = rx.try_recv().unwrap().into_message_type() else {
+            panic!("expected final data frame");
+        };
+        let final_frame: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(final_frame["complete_final"], true);
+        assert!(final_frame["data"].is_null());
+        assert!(rx.try_recv().is_err());
+        assert!(notifier.notified().now_or_never().is_some());
     }
 }

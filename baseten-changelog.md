@@ -274,6 +274,19 @@ the target container stack.
 
 Status: `keep`
 
+Ingress pump cancellation escape: `pump_response_stream` in
+`lib/runtime/src/pipeline/network/ingress/push_handler.rs` now selects on the
+request context's `stopped()`/`killed()` futures alongside `stream.next()`.
+Previously a response stream that stopped yielding without terminating pinned
+the work handler forever: `RequestMetricsGuard` never dropped, so
+`dynamo_component_inflight_requests` and the queue accounting built on the same
+request lifecycle leaked upward until the process restarted. Observed on a
+single-worker GLM-5.3-Fast candidate under shadowed production traffic with
+frequent client disconnects: the router's inflight gauge pinned at ~265 while
+the engine idled, ~97% of requests rejected with `max_queued_isl_tokens_exceeded`
+429s, and a router restart restored serving instantly. No upstream PR; keep until
+upstream adds equivalent cancellation handling in the pump.
+
 TCP request-size preflight: port of upstream
 [ai-dynamo/dynamo#14110](https://github.com/ai-dynamo/dynamo/pull/14110)
 (`8e9a96f53bc3d8caae7559f578706525205fa4ae`). Validate the full encoded frame
