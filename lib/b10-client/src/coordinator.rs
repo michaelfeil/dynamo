@@ -675,6 +675,11 @@ pub async fn route_request(
     let mut last_error = None;
     for attempt in 0..ROUTER_GUARD_ATTEMPTS {
         for (instance_index, &instance_id) in instance_ids.iter().enumerate() {
+            // Recheck the parent before every attempt, including after retry
+            // backoff, so a cancelled request cannot enter another router queue.
+            if cancellation_denial_for_optional_context(&context, allow_cancel_routing).is_some() {
+                anyhow::bail!("routing cancelled before router attempt");
+            }
             let has_more_route_attempts =
                 attempt + 1 < ROUTER_GUARD_ATTEMPTS || instance_index + 1 < instance_ids.len();
             // RouterGuardClient::direct takes RsContext<rmpv::Value> by value,
