@@ -62,3 +62,31 @@ def test_invalid_configuration():
         ToolCallStream("glm47", [{"parameters": {}}])
     with pytest.raises(ValueError):
         UnifiedParserStream("qwen3", starting_state="invalid")
+
+
+def test_reasoning_binding():
+    from dynamo.parsers import REASONING_PARSER_FAMILIES, ReasoningParserStream
+
+    assert "deepseek_v4" in REASONING_PARSER_FAMILIES
+    parser = ReasoningParserStream("deepseek_v4", in_reasoning=True)
+    outputs = [parser.step(ch) for ch in "café 杭州</think>answer"]
+    outputs.append(parser.finish())
+    assert "".join(out.reasoning_text for out in outputs) == "café 杭州"
+    assert "".join(out.normal_text for out in outputs) == "answer"
+    with pytest.raises(ParserStreamError, match="closed"):
+        parser.finish()
+    with pytest.raises(ParserStreamError, match="closed"):
+        parser.step("late")
+    with pytest.raises(ValueError, match="unknown reasoning parser"):
+        ReasoningParserStream("typo")
+
+
+def test_reasoning_eof_and_request_isolation():
+    from dynamo.parsers import ReasoningParserStream
+
+    reasoning = ReasoningParserStream("qwen3")
+    plain = ReasoningParserStream("deepseek_r1", in_reasoning=False)
+    assert reasoning.step("<think>reason</thi").reasoning_text == "reason"
+    assert plain.step("answer", token_ids=[]).normal_text == "answer"
+    assert reasoning.finish().reasoning_text == "</thi"
+    assert plain.finish().reasoning_text == ""

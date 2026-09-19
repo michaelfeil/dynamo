@@ -210,7 +210,73 @@ impl PyUnifiedStream {
     }
 }
 
+#[pyclass(
+    name = "ReasoningParseOutput",
+    module = "dynamo._core",
+    frozen,
+    get_all
+)]
+pub struct PyReasoningOutput {
+    normal_text: String,
+    reasoning_text: String,
+}
+
+impl From<baseten_parsers::ReasoningOutput> for PyReasoningOutput {
+    fn from(output: baseten_parsers::ReasoningOutput) -> Self {
+        Self {
+            normal_text: output.normal_text,
+            reasoning_text: output.reasoning_text,
+        }
+    }
+}
+
+#[pyclass(name = "ReasoningParserStream", module = "dynamo._core")]
+pub struct PyReasoningStream {
+    inner: Mutex<baseten_parsers::ReasoningStream>,
+}
+
+#[pymethods]
+impl PyReasoningStream {
+    #[new]
+    #[pyo3(signature = (family, *, in_reasoning=None))]
+    fn new(py: Python<'_>, family: String, in_reasoning: Option<bool>) -> PyResult<Self> {
+        let parser = py
+            .allow_threads(|| baseten_parsers::ReasoningStream::new(&family, in_reasoning))
+            .map_err(value_error)?;
+        Ok(Self {
+            inner: Mutex::new(parser),
+        })
+    }
+
+    #[pyo3(signature = (text, token_ids=None))]
+    fn step(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        token_ids: Option<Vec<u32>>,
+    ) -> PyResult<PyReasoningOutput> {
+        py.allow_threads(|| {
+            self.inner
+                .lock()
+                .step(text, token_ids.as_deref().unwrap_or_default())
+        })
+        .map(Into::into)
+        .map_err(|error| stream_error(py, error, Vec::new()))
+    }
+
+    fn finish(&self, py: Python<'_>) -> PyResult<PyReasoningOutput> {
+        py.allow_threads(|| self.inner.lock().finish())
+            .map(Into::into)
+            .map_err(|error| stream_error(py, error, Vec::new()))
+    }
+}
+
 pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyReasoningOutput>()?;
+    m.add_class::<PyReasoningStream>()?;
+    let mut families = baseten_parsers::reasoning_parser_families();
+    families.sort_unstable();
+    m.add("REASONING_PARSER_FAMILIES", families)?;
     m.add_class::<PyToolCall>()?;
     m.add_class::<PyToolOutput>()?;
     m.add_class::<PyEvent>()?;

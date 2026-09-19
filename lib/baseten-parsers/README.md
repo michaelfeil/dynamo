@@ -97,3 +97,36 @@ GLM Unicode partitions, EOF, independent choices, token input, and lifecycle.
 `lib/bindings/python/tests/test_b10_parsers.py` checks the installed binding.
 Model grammar conformance remains in upstream; these adapter tests are not proof
 of compatibility with every existing Baseten model configuration.
+
+## Standalone reasoning extraction
+
+`ReasoningParserStream` exposes the existing in-tree `dynamo-parsers` reasoning
+registry through the same Python module. It reuses those implementations directly;
+no copied grammar or additional parser state machine is needed. Its families are
+listed in `REASONING_PARSER_FAMILIES` and are independent of the pinned v2 tool and
+unified registries (and their `PARSER_UPSTREAM_REVISION`).
+
+```python
+from dynamo.parsers import ReasoningParserStream
+
+# The prompt already contains <think>.
+parser = ReasoningParserStream("deepseek_v4", in_reasoning=True)
+first = parser.step("Let me check.</thi")
+second = parser.step("nk>The answer is 42.")
+tail = parser.finish()
+reasoning_content = "".join(x.reasoning_text for x in (first, second, tail))
+content = "".join(x.normal_text for x in (first, second, tail))
+```
+
+Outputs are deltas with delimiter tokens removed. Keep special tokens in decoded
+input so the parser can recognize them. Call `finish()` to flush incomplete
+markers at EOF, and create one parser per response choice. `in_reasoning=None`
+retains the model default; a boolean invokes the existing parser's initial-state
+override (support is family-dependent). Unknown families raise `ValueError`.
+`step(text, token_ids=...)` optionally passes the corresponding chunk's token IDs
+for token-aware families. Rust parsing releases the GIL.
+
+Feed `normal_text` into a separate tool parser when using a sequential pipeline.
+Do not apply this again to reasoning already extracted by `UnifiedParserStream`.
+This API makes the backend available to Python callers; it does not automatically
+replace SGLang/vLLM frontend parser selection.

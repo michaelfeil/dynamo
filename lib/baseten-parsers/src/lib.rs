@@ -265,3 +265,53 @@ impl UnifiedStream {
         }
     }
 }
+
+pub use dynamo_parsers::reasoning::{
+    ParserResult as ReasoningOutput, ReasoningParser,
+    get_available_reasoning_parsers as reasoning_parser_families,
+};
+
+/// Standalone reasoning extraction using Dynamo's existing model grammars.
+/// One instance belongs to one response choice; finalization is terminal.
+pub struct ReasoningStream {
+    parser: Box<dyn ReasoningParser>,
+    closed: bool,
+}
+
+impl ReasoningStream {
+    /// `None` retains the model default; `Some` overrides prompt reasoning state.
+    pub fn new(family: &str, in_reasoning: Option<bool>) -> Result<Self> {
+        let family = family.to_lowercase();
+        ensure!(
+            reasoning_parser_families().contains(&family.as_str()),
+            "unknown reasoning parser: {family}"
+        );
+        let parser =
+            dynamo_parsers::reasoning::ReasoningParserType::get_reasoning_parser_from_name(&family);
+        Ok(Self::from_parser(Box::new(parser), in_reasoning))
+    }
+
+    pub fn from_parser(mut parser: Box<dyn ReasoningParser>, in_reasoning: Option<bool>) -> Self {
+        if let Some(state) = in_reasoning {
+            parser.set_in_reasoning(state);
+        }
+        Self {
+            parser,
+            closed: false,
+        }
+    }
+
+    /// Text and its corresponding token IDs describe the same incremental chunk.
+    pub fn step(&mut self, text: &str, token_ids: &[u32]) -> Result<ReasoningOutput> {
+        ensure!(!self.closed, "parser stream is closed");
+        Ok(self
+            .parser
+            .parse_reasoning_streaming_incremental(text, token_ids))
+    }
+
+    pub fn finish(&mut self) -> Result<ReasoningOutput> {
+        ensure!(!self.closed, "parser stream is closed");
+        self.closed = true;
+        Ok(self.parser.finish_reasoning_stream())
+    }
+}

@@ -37,6 +37,7 @@ materialize one Python ``int`` object per token to cross the binding.
 B10_DROP_THIS_MESSAGE_KEY: str
 
 PARSER_UPSTREAM_REVISION: str
+REASONING_PARSER_FAMILIES: list[str]
 TOOL_PARSER_FAMILIES: list[str]
 UNIFIED_PARSER_FAMILIES: list[str]
 
@@ -3657,3 +3658,16 @@ class backend:
             event_loop: Any,
         ) -> None: ...
         def run(self) -> Awaitable[None]: ...
+
+class ReasoningParseOutput:
+    @property
+    def normal_text(self) -> str: ...
+    @property
+    def reasoning_text(self) -> str: ...
+
+class ReasoningParserStream:
+    def __init__(self, family: str, *, in_reasoning: bool | None = None) -> None: ...
+    def step(
+        self, text: str, token_ids: list[int] | None = None
+    ) -> ReasoningParseOutput: ...
+    def finish(self) -> ReasoningParseOutput: ...

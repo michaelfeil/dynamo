@@ -1010,6 +1010,7 @@ name = "baseten-parsers"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "dynamo-parsers",
  "dynamo-parsers-v2",
 ]
 

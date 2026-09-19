@@ -5,11 +5,14 @@
 
 from dynamo._core import (
     PARSER_UPSTREAM_REVISION,
+    REASONING_PARSER_FAMILIES,
     TOOL_PARSER_FAMILIES,
     UNIFIED_PARSER_FAMILIES,
     ParserEvent,
     ParserStreamError,
     ParserToolCall,
+    ReasoningParseOutput,
+    ReasoningParserStream,
     ToolCallStream,
     ToolParseOutput,
     UnifiedParserStream,
@@ -17,11 +20,14 @@ from dynamo._core import (
 
 __all__ = [
     "PARSER_UPSTREAM_REVISION",
+    "REASONING_PARSER_FAMILIES",
     "TOOL_PARSER_FAMILIES",
     "UNIFIED_PARSER_FAMILIES",
     "ParserEvent",
     "ParserStreamError",
     "ParserToolCall",
+    "ReasoningParseOutput",
+    "ReasoningParserStream",
     "ToolCallStream",
     "ToolParseOutput",
     "UnifiedParserStream",

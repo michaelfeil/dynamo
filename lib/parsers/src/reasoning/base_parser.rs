@@ -312,7 +312,7 @@ impl ReasoningParser for BasicReasoningParser {
                             .map(|tok| overlap(&current_text, tok))
                             .unwrap_or(0);
                         let ol = ol_end.max(ol_tool);
-                        if ol >= 2 {
+                        if ol > 0 {
                             let safe_end = current_text.len() - ol;
                             if safe_end > 0 {
                                 accumulated_reasoning.push_str(&current_text[..safe_end]);
@@ -339,10 +339,10 @@ impl ReasoningParser for BasicReasoningParser {
                 } else {
                     // No complete start token — check for partial at end of buffer
                     // (e.g., "Hello world <th" where "<th" is a prefix of "<think>").
-                    // Require overlap >= 2 so a lone `<` passes through for tool call
-                    // XML tags like `<invoke>` or `<minimax:tool_call>`.
+                    // Even a single opening character may begin a split delimiter.
+                    // Nonmatching tool markup is released on the next chunk.
                     let ol = overlap(&current_text, &self.think_start_token);
-                    if ol >= 2 {
+                    if ol > 0 {
                         let safe_end = current_text.len() - ol;
                         if safe_end > 0 {
                             accumulated_normal.push_str(&current_text[..safe_end]);
@@ -677,11 +677,9 @@ mod tests {
     }
 
     #[test] // REASONING.batch.3.a
-    fn test_post_reasoning_angle_bracket_not_buffered() {
-        // After reasoning ends, a standalone `<` should pass through immediately
-        // as normal text. It must NOT be buffered as a potential prefix of <think>
-        // or </think>, because that would cause the downstream tool call jail to
-        // miss the `<` (e.g., `<invoke` becomes `invoke`).
+    fn test_post_reasoning_angle_bracket_released_with_tool_markup() {
+        // A possible delimiter prefix is deferred until the next chunk resolves it.
+        // Tool markup must still reach downstream intact, including its opening `<`.
         let mut parser =
             BasicReasoningParser::new("<think>".to_string(), "</think>".to_string(), false, true);
 
@@ -691,14 +689,14 @@ mod tests {
         assert_eq!(r1.reasoning_text, "reasoning content");
         assert_eq!(r1.normal_text, "");
 
-        // After reasoning ends, a lone `<` must pass through as normal text
+        // Defer a lone `<` until its role is known.
         let r2 = parser.parse_reasoning_streaming_incremental("<", &[]);
-        assert_eq!(r2.normal_text, "<");
+        assert_eq!(r2.normal_text, "");
         assert_eq!(r2.reasoning_text, "");
 
-        // The next token should arrive independently (not merged with buffered `<`)
+        // Non-reasoning markup releases the buffered prefix intact.
         let r3 = parser.parse_reasoning_streaming_incremental("invoke name=\"get_weather\">", &[]);
-        assert_eq!(r3.normal_text, "invoke name=\"get_weather\">");
+        assert_eq!(r3.normal_text, "<invoke name=\"get_weather\">");
         assert_eq!(r3.reasoning_text, "");
     }
 
@@ -723,12 +721,12 @@ mod tests {
         let r4 = parser.parse_reasoning_streaming_incremental("\n", &[]);
         assert_eq!(r4.normal_text, "\n");
 
-        // `<` arriving as a separate token after reasoning must NOT be buffered
+        // Buffer the potential delimiter prefix, then release the whole tool opener.
         let r5 = parser.parse_reasoning_streaming_incremental("<", &[]);
-        assert_eq!(r5.normal_text, "<");
+        assert_eq!(r5.normal_text, "");
 
         let r6 = parser.parse_reasoning_streaming_incremental("invoke name=\"get_weather\">", &[]);
-        assert_eq!(r6.normal_text, "invoke name=\"get_weather\">");
+        assert_eq!(r6.normal_text, "<invoke name=\"get_weather\">");
     }
 
     #[test] // REASONING.stream.2.b, REASONING.batch.6.a, REASONING.batch.2.c
@@ -843,20 +841,20 @@ mod tests {
 
     #[test] // REASONING.batch.3.a, helper
     fn test_lone_angle_bracket_between_reasoning_blocks() {
-        // A lone `<` between reasoning blocks should pass through (not buffer)
+        // A lone `<` is delayed, without changing the concatenated tool markup.
         let mut parser =
             BasicReasoningParser::new("<think>".to_string(), "</think>".to_string(), false, true);
 
         let r1 = parser.parse_reasoning_streaming_incremental("<think>thought</think>", &[]);
         assert_eq!(r1.reasoning_text, "thought");
 
-        // Lone `<` must not be buffered — could be a tool call
+        // A possible tool call and a possible think marker share this prefix.
         let r2 = parser.parse_reasoning_streaming_incremental("<", &[]);
-        assert_eq!(r2.normal_text, "<");
+        assert_eq!(r2.normal_text, "");
         assert_eq!(r2.reasoning_text, "");
 
         let r3 = parser.parse_reasoning_streaming_incremental("tool_call>", &[]);
-        assert_eq!(r3.normal_text, "tool_call>");
+        assert_eq!(r3.normal_text, "<tool_call>");
         assert_eq!(r3.reasoning_text, "");
 
         // But a real <think> should still work after
