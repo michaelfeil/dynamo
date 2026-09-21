@@ -31,12 +31,14 @@
 //!   in-flight load.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
 use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
+use dynamo_kv_router::indexer::RoutingDecisionHashes;
 use dynamo_kv_router::protocols::{
-    RoutingConstraints, TokensWithHashes, WorkerId, WorkerWithDpRank,
+    BlockHashOptions, LocalBlockHash, RoutingConstraints, WorkerId, WorkerWithDpRank,
+    compute_block_hash_for_seq,
 };
 use dynamo_llm::kv_router::{
     ACTIVE_SEQUENCES_SUBJECT, FindBestMatchOutcome, KvRouter,
@@ -50,9 +52,13 @@ use dynamo_runtime::distributed::{DiscoveryBackend, DistributedConfig, RequestPl
 use dynamo_runtime::metrics::MetricsHierarchy;
 use dynamo_runtime::slug::Slug;
 use dynamo_runtime::storage::kv;
+use dynamo_runtime::transports::event_plane::{
+    EventEnvelope, EventPublisher, EventSubscriber, TypedEventSubscriber,
+};
 use dynamo_runtime::{DistributedRuntime, Runtime};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{EndpointId, ModelStagePolicy},
@@ -420,8 +426,23 @@ impl GwpRouterRegistry {
 /// | sticky hit                   | `GwpRouter::add_request`    |
 /// | upstream response headers    | [`GwpRouter::mark_prefill_completed`] |
 /// | stream end / abort / error   | [`GwpRouter::free`]         |
+const ROUTING_DECISIONS_SUBJECT: &str = "gwp_routing_decision_events";
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RoutingDecisionEvent {
+    worker: WorkerWithDpRank,
+    block_size: u32,
+    local_hashes: Vec<LocalBlockHash>,
+}
+
+struct DecisionSync {
+    publisher: Arc<EventPublisher>,
+    ttl: std::time::Duration,
+}
+
 pub struct GwpRouter {
     kv: KvRouter<GwpWorkerSelector>,
+    decision_sync: DecisionSync,
     observed_loads: ObservedLoadStore,
     selection_policies: SelectionPolicyStore,
     block_size: u32,
@@ -453,6 +474,16 @@ impl GwpRouter {
         let selection_policies = SelectionPolicyStore::default();
         let selector = GwpWorkerSelector::new(observed_loads.clone(), selection_policies.clone());
 
+        let decision_sync = DecisionSync {
+            publisher: Arc::new(
+                EventPublisher::for_component(&component, ROUTING_DECISIONS_SUBJECT).await?,
+            ),
+            ttl: std::time::Duration::from_secs(approx_indexer_ttl_secs),
+        };
+        let subscriber = EventSubscriber::for_component(&component, ROUTING_DECISIONS_SUBJECT)
+            .await?
+            .typed::<RoutingDecisionEvent>();
+
         let kv = KvRouter::new(
             endpoint,
             client,
@@ -469,8 +500,9 @@ impl GwpRouter {
         )
         .await?;
 
-        Ok(Arc::new(Self {
+        let router = Arc::new(Self {
             kv,
+            decision_sync,
             observed_loads,
             selection_policies,
             block_size,
@@ -478,7 +510,68 @@ impl GwpRouter {
             workers_tx: tx,
             metrics,
             _drt: drt,
-        }))
+        });
+
+        tokio::spawn(Self::consume_peer_decisions(
+            Arc::downgrade(&router),
+            subscriber,
+            router._drt.runtime().child_token(),
+        ));
+
+        Ok(router)
+    }
+
+    async fn consume_peer_decisions(
+        router: Weak<Self>,
+        mut subscriber: TypedEventSubscriber<RoutingDecisionEvent>,
+        cancel: CancellationToken,
+    ) {
+        loop {
+            let (envelope, event) = tokio::select! {
+                _ = cancel.cancelled() => return,
+                next = subscriber.next() => match next {
+                    None => {
+                        if let Some(router) = router.upgrade() {
+                            tracing::warn!(component = %router.component_name, "peer routing decision stream ended; sync stopped for this model");
+                        }
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "failed to receive peer routing decision");
+                        continue;
+                    }
+                    Some(Ok(next)) => next,
+                },
+            };
+            let Some(router) = router.upgrade() else {
+                return;
+            };
+            router.apply_peer_decision(&envelope, event).await;
+        }
+    }
+
+    /// Drop self-echoes, block-size mismatches, and events older than the TTL;
+    /// record the rest like a local confirmation.
+    async fn apply_peer_decision(&self, envelope: &EventEnvelope, event: RoutingDecisionEvent) {
+        let published =
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(envelope.published_at);
+        let stale = std::time::SystemTime::now()
+            .duration_since(published)
+            .is_ok_and(|age| age > self.decision_sync.ttl);
+        if envelope.publisher_id == self._drt.discovery().instance_id()
+            || event.block_size != self.block_size
+            || stale
+        {
+            return;
+        }
+        let hashes = RoutingDecisionHashes::from_local_hashes(event.local_hashes);
+        if let Err(error) = self
+            .kv
+            .record_routing_decision_hashes(hashes, event.worker)
+            .await
+        {
+            tracing::warn!(%error, "failed to apply peer routing decision");
+        }
     }
 
     pub fn block_size(&self) -> u32 {
@@ -695,14 +788,37 @@ impl GwpRouter {
         tokens: &[u32],
         worker: WorkerWithDpRank,
     ) {
-        let tokens_with_hashes = TokensWithHashes::new(tokens.to_vec(), self.block_size);
-        if let Err(error) = self
-            .kv
-            .record_routing_decision(tokens_with_hashes, worker)
-            .await
-        {
-            tracing::warn!(rid, %error, "failed to record confirmed routing decision");
+        let local_hashes =
+            compute_block_hash_for_seq(tokens, self.block_size, BlockHashOptions::default());
+        if local_hashes.is_empty() {
+            return;
         }
+        let hashes = RoutingDecisionHashes::from_local_hashes(local_hashes.clone());
+        if let Err(error) = self.kv.record_routing_decision_hashes(hashes, worker).await {
+            tracing::warn!(rid, %error, "failed to record confirmed routing decision");
+            return;
+        }
+        // Fire-and-forget, same posture as the active-sequence replica events.
+        let event = RoutingDecisionEvent {
+            worker,
+            block_size: self.block_size,
+            local_hashes,
+        };
+        let publisher = Arc::clone(&self.decision_sync.publisher);
+        let rid = rid.to_string();
+        tokio::spawn(async move {
+            if let Err(error) = publisher.publish(&event).await {
+                tracing::warn!(rid, %error, "failed to publish routing decision");
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cached_blocks(&self, tokens: &[u32], worker: WorkerWithDpRank) -> u32 {
+        self.kv
+            .get_overlap_blocks(tokens, None, worker, None)
+            .await
+            .unwrap()
     }
 
     /// Upstream response headers: prefill is done, decode load begins.
@@ -758,6 +874,82 @@ mod tests {
             );
         }
         snapshot
+    }
+
+    /// Two replicas on shared file discovery over real ZMQ: B learns A's
+    /// confirmation; crafted envelopes hit each drop rule.
+    #[tokio::test]
+    async fn replica_confirmations_reach_peers_and_stale_events_are_dropped() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join(format!("gwp-sync-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = || async {
+            let mut config = DistributedConfig::process_local();
+            config.discovery_backend = DiscoveryBackend::KvStore(kv::Selector::File(dir.clone()));
+            let registry = GwpRouterRegistry::new_with_distributed_config(4, 30, config)
+                .await
+                .unwrap();
+            let router = registry
+                .ensure_model(&OracleVersionId::new("sync-model").unwrap())
+                .await
+                .unwrap();
+            router
+                .workers_tx
+                .send(HashMap::from([
+                    (1, ModelRuntimeConfig::default()),
+                    (2, ModelRuntimeConfig::default()),
+                ]))
+                .unwrap();
+            (registry.drt.discovery().instance_id(), router)
+        };
+        let (ida, ra) = registry().await;
+        let (idb, rb) = registry().await;
+        let (worker, other) = (
+            WorkerWithDpRank::from_worker_id(1),
+            WorkerWithDpRank::from_worker_id(2),
+        );
+
+        // Republish until receipt: discovery and ZMQ's slow-joiner window are async.
+        let tokens: Vec<u32> = (0..16).collect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rb.cached_blocks(&tokens, worker).await == 0 {
+                ra.record_routing_decision("rid-a", &tokens, worker).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("peer learned confirmed prefix");
+        assert_eq!(rb.cached_blocks(&tokens, worker).await, 4);
+        assert_eq!(rb.cached_blocks(&tokens, other).await, 0);
+
+        // (publisher, age, block_size, expected blocks learned by B for `other`)
+        let cases = [
+            (ida, Duration::from_secs(31), 4, 0), // stale
+            (ida, Duration::ZERO, 8, 0),          // block_size mismatch
+            (idb, Duration::ZERO, 4, 0),          // self echo
+            (ida, Duration::ZERO, 4, 2),          // fresh
+        ];
+        for (i, (publisher_id, age, block_size, expected)) in cases.into_iter().enumerate() {
+            let tokens: Vec<u32> = (100 * i as u32..100 * i as u32 + 8).collect();
+            let envelope = EventEnvelope {
+                publisher_id,
+                sequence: 0,
+                published_at: (SystemTime::now() - age)
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                topic: ROUTING_DECISIONS_SUBJECT.into(),
+                payload: Default::default(),
+            };
+            let event = RoutingDecisionEvent {
+                worker: other,
+                block_size,
+                local_hashes: compute_block_hash_for_seq(&tokens, 4, BlockHashOptions::default()),
+            };
+            rb.apply_peer_decision(&envelope, event).await;
+            assert_eq!(rb.cached_blocks(&tokens, other).await, expected, "case {i}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn process_local_model_router(

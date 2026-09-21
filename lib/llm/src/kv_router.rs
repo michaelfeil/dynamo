@@ -491,7 +491,7 @@ where
             .await
     }
 
-    pub(crate) async fn record_routing_decision_hashes(
+    pub async fn record_routing_decision_hashes(
         &self,
         hashes: RoutingDecisionHashes,
         worker: WorkerWithDpRank,
