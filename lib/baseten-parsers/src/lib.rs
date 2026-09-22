@@ -11,7 +11,7 @@ pub use upstream::{
     UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
 };
 
-pub const UPSTREAM_REVISION: &str = "23b402787dab4c1a859c07488cce42927362db3e";
+pub const UPSTREAM_REVISION: &str = "bb20dd01b6257cff9b739be2b18e7a444980d04a";
 
 /// Normalized call delta, including any identifier supplied by the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]

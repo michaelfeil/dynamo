@@ -1,9 +1,15 @@
 # Baseten parsers
 
-Pure Rust lifecycle adapters around public `dynamo-parsers-v2` 0.6.1, pinned to
-`ai-dynamo/frontend-crates` revision `23b402787dab4c1a859c07488cce42927362db3e`.
+Pure Rust lifecycle adapters around public `dynamo-parsers-v2` 0.6.3, pinned to
+`ai-dynamo/frontend-crates` revision `bb20dd01b6257cff9b739be2b18e7a444980d04a`.
 No Python dependency in this crate. Python bindings ship in the Dynamo wheel as
 `dynamo.parsers`; no separate Python package is required.
+
+The Git revision selects the source; the version is an additional consistency
+check, not a crates.io fallback. This pin includes frontend-crates #247, #248,
+and #253. Advance the manifest revision and `UPSTREAM_REVISION` together, then
+update both the workspace and Python-binding lockfiles. New upstream commits
+can be selected before a crates.io release; use their declared crate version.
 
 Rust owns parser creation, configuration validation (`request_init`), lifecycle,
 call-ID normalization, and ordered events including partial errors. The bindings

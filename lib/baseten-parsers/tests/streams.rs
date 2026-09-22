@@ -278,3 +278,53 @@ fn configuration_validation_is_rust_owned() {
     assert!(request_init(vec![], "none", "native", Some("weather".into()), "reject").is_err());
     assert!(request_init(vec![], "none", "native", None, "invalid").is_err());
 }
+
+#[test]
+fn pinned_upstream_fixes_survive_the_tool_adapter() {
+    let cases = [
+        (
+            "deepseek_v4",
+            json!({"type": "string"}),
+            "<think>checking</think><｜DSML｜tool_calls><｜DSML｜invoke name=\"inspect\"><｜DSML｜parameter name=\"value\" string=\"true\">  café\n</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>",
+            "<think>checking</think>",
+            json!({"value": "  café\n"}),
+        ),
+        (
+            "glm47",
+            json!({"allOf": [{"type": ["integer", "string"]}, {"type": "integer"}]}),
+            "<tool_call>inspect<arg_key>value</arg_key><arg_value>42</arg_value></tool_call>",
+            "",
+            json!({"value": 42}),
+        ),
+    ];
+    for (family, schema, input, normal_text, arguments) in cases {
+        let tools = [Tool {
+            name: "inspect".into(),
+            description: None,
+            parameters: json!({"type": "object", "properties": {"value": schema}}),
+            strict: None,
+        }];
+        for character_chunks in [false, true] {
+            let mut parser = ToolCallStream::new(family, &tools).unwrap();
+            let mut result = ToolParseResult::default();
+            if character_chunks {
+                for c in input.chars() {
+                    result.append(parser.step(ToolParserInput::Text(&c.to_string())).unwrap());
+                }
+            } else {
+                result.append(parser.step(ToolParserInput::Text(input)).unwrap());
+            }
+            result.append(parser.finish().unwrap());
+            let result = result.coalesce_calls();
+            assert_eq!(result.normal_text, normal_text, "{family}");
+            assert_eq!(result.calls.len(), 1, "{family}");
+            assert_eq!(result.calls[0].name.as_deref(), Some("inspect"));
+            assert!(result.calls[0].complete);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.calls[0].arguments).unwrap(),
+                arguments,
+                "{family}"
+            );
+        }
+    }
+}
