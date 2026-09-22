@@ -371,7 +371,8 @@ impl RouterWorkerCoordinator {
             return Err(PyValueError::new_err("block_size must be positive"));
         }
 
-        let shutdown_token = router_client.endpoint.drt().runtime().child_token();
+        // Primary token: cancelled after the drain, so guards can still free their router bookings.
+        let shutdown_token = router_client.endpoint.drt().runtime().primary_token();
         let inner = CoreRouterWorkerCoordinator::from_push_routers(
             router_client.router,
             worker_client.router,

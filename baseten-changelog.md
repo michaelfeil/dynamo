@@ -312,6 +312,10 @@ registration latency and CPU/request improved under contention, while average
 round-trip p99 worsened. These are transport measurements, not model-serving results.
 Drop this port when the corresponding upstream implementation is incorporated.
 
+Shutdown guard-token lifetime (basetenlabs/dynamo#868): the b10 coordinator
+guard tokens (both coordinator constructors) now cancel with the primary token
+(after the drain), not the endpoint shutdown token (before it).
+
 Cancellation-future reuse (basetenlabs/dynamo#787): cherry-pick of upstream
 [ai-dynamo/dynamo#11149](https://github.com/ai-dynamo/dynamo/pull/11149)
 (`1820df91b570f53e8c51d519d9ff5d7d4105267d`), adapted to this fork's stream APIs.

@@ -178,7 +178,8 @@ impl GenerationCoordinatorRuntime {
         );
         let snapshot = config.snapshot();
         let settings = &snapshot.generation_coordinator;
-        let shutdown_token = runtime.child_token();
+        // Primary token: cancelled after the drain, so guards can still free their router bookings.
+        let shutdown_token = runtime.primary_token();
         let listener = Some(Listener {
             runtime: runtime.clone(),
             address: settings.listen_address(),
