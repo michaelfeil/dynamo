@@ -126,6 +126,11 @@ fn flatten_guard_callback_timeout(
 
 pub(super) struct RouterRequestGuardState {
     router: Arc<dyn RouterGuardClient>,
+    /// The caller's `request_id` plus a short random suffix: the booking key
+    /// on the router and the id the callbacks name.
+    router_unique_request_id: String,
+    /// The single request id, used for tracing. Sent as the `request-id`
+    /// header so router logs and spans for the callbacks line up.
     request_id: String,
     preferred_instance_id: u64,
     prefill_requested: AtomicBool,
@@ -152,10 +157,9 @@ pub(super) struct RouterRequestGuardState {
 /// - `RouterRequestGuard::new_provisional` arms a cleanup task BEFORE the
 ///   router's `direct()` reply is observed, so a cancellation between
 ///   admit-on-router and first-response still reclaims the router's slot via
-///   `mark_free`. The caller MUST convert the provisional guard with
-///   `RouterRequestGuard::commit` (response ready) or
-///   `RouterRequestGuard::dismiss` (router denied) before dropping, so the
-///   cleanup task's behaviour is well-defined.
+///   `mark_free`. The caller either converts the provisional guard with
+///   `RouterRequestGuard::commit` (response ready) or drops it (any error:
+///   admission is unknown, so it fails closed via `mark_free`).
 pub struct RouterRequestGuard {
     state: Arc<RouterRequestGuardState>,
     /// Raw JSON of the router response. `None` on a provisional guard until
@@ -183,6 +187,7 @@ impl RouterRequestGuard {
     ) -> Self {
         Self::construct(
             router,
+            request_id.clone(),
             request_id,
             preferred_instance_id,
             Some(new_response),
@@ -196,27 +201,26 @@ impl RouterRequestGuard {
     /// cleanup task is spawned immediately so a cancellation between
     /// admit-on-router and first-response still reclaims the router's slot
     /// via `mark_free`. The cleanup task's behaviour is well-defined under
-    /// three exit pathways from the caller:
-    /// - [`Self::dismiss`] for a pre-admission clean error or in-band
-    ///   cancel -- stops the cleanup task without sending `mark_free`
-    ///   (admission never happened, so `mark_free` would be wasted traffic).
+    /// two exit pathways from the caller:
     /// - [`Self::commit`] for a clean admit (`New`) or clean denial
     ///   (`Backpressure`); installs the response and either keeps the
     ///   cleanup task armed (New, awaiting a later `Drop` once the request
     ///   is consumed) or signals it to exit without `mark_free` (Backpressure).
-    /// - `drop` without `commit`/`dismiss` for an ambiguous post-admission
-    ///   state -- Race Site 12 fail-closed semantics. `Drop` sets `dropped`
+    /// - `drop` without `commit` for an error (admission unknown, including a
+    ///   `direct()` failure that may have booked) -- fail-closed. `Drop` sets `dropped`
     ///   and `free_requested` and notifies the cleanup task, which fires
     ///   `mark_free` asynchronously. Spurious `mark_free` is benign because
     ///   the router's `free` tolerates unknown `request_id`s idempotently.
     pub(super) fn new_provisional(
         router: Arc<dyn RouterGuardClient>,
+        router_unique_request_id: String,
         request_id: String,
         preferred_instance_id: u64,
         notify_timeout: Duration,
     ) -> Self {
         Self::construct(
             router,
+            router_unique_request_id,
             request_id,
             preferred_instance_id,
             None,
@@ -226,8 +230,10 @@ impl RouterRequestGuard {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn construct(
         router: Arc<dyn RouterGuardClient>,
+        router_unique_request_id: String,
         request_id: String,
         preferred_instance_id: u64,
         new_response: Option<rmpv::Value>,
@@ -239,6 +245,7 @@ impl RouterRequestGuard {
         let shutdown_token = router.shutdown_token();
         let state = Arc::new(RouterRequestGuardState {
             router,
+            router_unique_request_id,
             request_id,
             preferred_instance_id,
             prefill_requested: AtomicBool::new(false),
@@ -282,17 +289,6 @@ impl RouterRequestGuard {
             self.state.notify.notify_one();
         }
         self
-    }
-
-    /// Dismiss a provisional guard WITHOUT sending `mark_free`. Use when the
-    /// router returned a clean error or an in-band cancellation: no admission
-    /// happened, so `mark_free` would be wasted traffic. Sets `cleanup_done`
-    /// and notifies the cleanup task so it exits on its next loop iteration;
-    /// `Drop` is then a no-op because `armed=false && cleanup_done=true`.
-    pub(super) fn dismiss(mut self) {
-        self.armed = false;
-        self.state.cleanup_done.store(true, Ordering::Release);
-        self.state.notify.notify_one();
     }
 
     /// The raw JSON of the initial router response, for surfacing to Python.
@@ -409,6 +405,7 @@ impl RouterRequestGuard {
             if !self.state.cleanup_done.load(Ordering::Acquire) {
                 tracing::warn!(
                     request_id = %self.state.request_id,
+                    router_unique_request_id = %self.state.router_unique_request_id,
                     "router request guard cleanup signal already consumed; mark_free completion uncertain"
                 );
             }
@@ -419,12 +416,14 @@ impl RouterRequestGuard {
             Ok(Err(_)) => {
                 tracing::warn!(
                     request_id = %self.state.request_id,
+                    router_unique_request_id = %self.state.router_unique_request_id,
                     "router request guard cleanup task exited without signaling; mark_free completion uncertain"
                 );
             }
             Err(_) => {
                 tracing::warn!(
                     request_id = %self.state.request_id,
+                    router_unique_request_id = %self.state.router_unique_request_id,
                     timeout_ms = timeout.as_millis(),
                     "router request guard cleanup did not complete within timeout; proceeding anyway"
                 );
@@ -441,6 +440,7 @@ impl Drop for RouterRequestGuard {
             if free_requested {
                 tracing::debug!(
                     request_id = %self.state.request_id,
+                    router_unique_request_id = %self.state.router_unique_request_id,
                     endpoint = %self.state.router.endpoint_id(),
                     preferred_router_instance_id = self.state.preferred_instance_id,
                     prefill_requested,
@@ -450,6 +450,7 @@ impl Drop for RouterRequestGuard {
             } else {
                 tracing::warn!(
                     request_id = %self.state.request_id,
+                    router_unique_request_id = %self.state.router_unique_request_id,
                     endpoint = %self.state.router.endpoint_id(),
                     preferred_router_instance_id = self.state.preferred_instance_id,
                     prefill_requested,
@@ -474,7 +475,7 @@ async fn send_router_guard_mark(
     let preemptible = matches!(mark, GuardMark::Prefill);
     let request: rmpv::Value = serde_json::from_value(serde_json::json!({
         "method": method,
-        "request_id": state.request_id.clone(),
+        "request_id": state.router_unique_request_id.clone(),
     }))?;
     let mut last_error = None;
 
@@ -501,14 +502,19 @@ async fn send_router_guard_mark(
                 return Ok(GuardMarkSendResult::PreemptedByFree);
             }
 
+            // Same as the routing attempt: the context id is the booking key,
+            // the `request-id` header is the plain `request_id`.
+            let mut metadata = std::collections::BTreeMap::new();
+            metadata.insert("request-id".to_string(), state.request_id.clone());
             let request_ctx = RsContext::with_id_and_metadata(
                 request.clone(),
-                state.request_id.clone(),
-                Default::default(),
+                state.router_unique_request_id.clone(),
+                metadata,
             );
             let span = tracing::info_span!(
                 "kv_router.router_request_guard_callback",
                 request_id = %state.request_id,
+                router_unique_request_id = %state.router_unique_request_id,
                 router_instance_id = instance_id,
                 preferred_router_instance_id = state.preferred_instance_id,
                 attempt = attempt + 1,
@@ -556,6 +562,7 @@ async fn send_router_guard_mark(
                             slow_logged = true;
                             tracing::warn!(
                                 request_id = %state.request_id,
+                                router_unique_request_id = %state.router_unique_request_id,
                                 method,
                                 router_instance_id = instance_id,
                                 preferred_router_instance_id = state.preferred_instance_id,
@@ -576,6 +583,7 @@ async fn send_router_guard_mark(
                             slow_logged = true;
                             tracing::warn!(
                                 request_id = %state.request_id,
+                                router_unique_request_id = %state.router_unique_request_id,
                                 method,
                                 router_instance_id = instance_id,
                                 preferred_router_instance_id = state.preferred_instance_id,
@@ -595,6 +603,7 @@ async fn send_router_guard_mark(
                     if instance_id != state.preferred_instance_id {
                         tracing::warn!(
                             request_id = %state.request_id,
+                            router_unique_request_id = %state.router_unique_request_id,
                             method,
                             preferred_router_instance_id = state.preferred_instance_id,
                             fallback_router_instance_id = instance_id,
@@ -607,6 +616,7 @@ async fn send_router_guard_mark(
                     last_error = Some(err.to_string());
                     tracing::warn!(
                         request_id = %state.request_id,
+                        router_unique_request_id = %state.router_unique_request_id,
                         method,
                         router_instance_id = instance_id,
                         attempt = attempt + 1,
@@ -621,7 +631,7 @@ async fn send_router_guard_mark(
 
     Err(anyhow::anyhow!(
         "router callback {method} failed for request {}{}",
-        state.request_id,
+        state.router_unique_request_id,
         last_error.map(|err| format!(": {err}")).unwrap_or_default()
     ))
 }
@@ -643,6 +653,7 @@ async fn router_request_guard_cleanup(
             if let Err(err) = free_result {
                 tracing::error!(
                     request_id = %state.request_id,
+                    router_unique_request_id = %state.router_unique_request_id,
                     error = %err,
                     "router request guard failed to free request"
                 );
@@ -666,6 +677,7 @@ async fn router_request_guard_cleanup(
         {
             tracing::warn!(
                 request_id = %state.request_id,
+                router_unique_request_id = %state.router_unique_request_id,
                 timeout_secs = state.notify_timeout.as_secs(),
                 "router request guard cleanup timed out waiting for notify; freeing request"
             );

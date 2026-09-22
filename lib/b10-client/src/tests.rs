@@ -102,6 +102,8 @@ struct RouterGuardClientForTesting {
     prefill_callback_delay: Mutex<Duration>,
     mark_free_callback_delay: Mutex<Duration>,
     route_contexts: Mutex<Vec<Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>>>,
+    route_request_id_headers: Mutex<Vec<Option<String>>>,
+    callback_request_id_headers: Mutex<Vec<Option<String>>>,
     calls: Mutex<Vec<(u64, rmpv::Value)>>,
     load_query_sessions: Mutex<Vec<Option<String>>>,
     detailed_calls: Mutex<Vec<DetailedCall>>,
@@ -134,6 +136,8 @@ impl RouterGuardClientForTesting {
             prefill_callback_delay: Mutex::new(Duration::ZERO),
             mark_free_callback_delay: Mutex::new(Duration::ZERO),
             route_contexts: Mutex::new(Vec::new()),
+            route_request_id_headers: Mutex::new(Vec::new()),
+            callback_request_id_headers: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             load_query_sessions: Mutex::new(Vec::new()),
             detailed_calls: Mutex::new(Vec::new()),
@@ -225,6 +229,14 @@ impl RouterGuardClientForTesting {
     fn route_contexts(&self) -> Vec<Arc<dyn dynamo_runtime::pipeline::AsyncEngineContext>> {
         self.route_contexts.lock().unwrap().clone()
     }
+    /// `request-id` metadata of every routing attempt: what the router logs.
+    fn route_request_id_headers(&self) -> Vec<Option<String>> {
+        self.route_request_id_headers.lock().unwrap().clone()
+    }
+    /// `request-id` metadata of every mark_free / mark_prefill callback.
+    fn callback_request_id_headers(&self) -> Vec<Option<String>> {
+        self.callback_request_id_headers.lock().unwrap().clone()
+    }
 
     fn shutdown(&self) {
         self.shutdown_token.cancel();
@@ -277,6 +289,10 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         self.calls.lock().unwrap().push((instance_id, data.clone()));
         if method != "mark_free" && method != "mark_prefill" {
             self.route_contexts.lock().unwrap().push(context.clone());
+            self.route_request_id_headers
+                .lock()
+                .unwrap()
+                .push(request.metadata().get("request-id").cloned());
         }
 
         // Method-aware fixed acknowledgements for cleanup callbacks:
@@ -285,6 +301,10 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         // shared fake would starve). The wire form carries the
         // success tag the cleanup task checks for.
         if method == "mark_free" || method == "mark_prefill" {
+            self.callback_request_id_headers
+                .lock()
+                .unwrap()
+                .push(request.metadata().get("request-id").cloned());
             let callback_delay = if method == "mark_prefill" {
                 *self.prefill_callback_delay.lock().unwrap()
             } else {
@@ -824,6 +844,26 @@ fn route_response_new(worker_id: u64) -> Result<RsRouterResponse, String> {
         best_overlap_blocks: 0,
         dp_strict_rank: false,
     })
+}
+
+/// `router_unique_request_id` of every routing attempt (`new`), in order.
+/// The router keys a booking by the request context id.
+fn router_unique_request_ids(router: &RouterGuardClientForTesting) -> Vec<String> {
+    router
+        .route_contexts()
+        .iter()
+        .map(|ctx| ctx.id().to_string())
+        .collect()
+}
+
+/// `router_unique_request_id` named by every `mark_free`, in order.
+fn mark_free_router_unique_request_ids(router: &RouterGuardClientForTesting) -> Vec<String> {
+    router
+        .calls()
+        .iter()
+        .filter(|(_, data)| data["method"].as_str() == Some("mark_free"))
+        .map(|(_, data)| data["request_id"].as_str().unwrap_or("").to_string())
+        .collect()
 }
 
 fn backpressure_response(
@@ -3847,5 +3887,131 @@ async fn generation_coordinator_shields_prefill_to_decode_handoff() {
     assert_eq!(
         decode_worker.calls()[0].1["disaggregated_params"]["disagg_request_id"].as_u64(),
         Some(9)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn b10_cancelled_request_frees_booking_when_router_direct_fails() {
+    // The router can admit and book a request, then fail to deliver the
+    // routing decision, which surfaces here as a `direct` error. If the
+    // caller was cancelled while the call was in flight, that booking has no
+    // other owner, so the guard must free it rather than being dismissed.
+    let router = RouterGuardClientForTesting::new(
+        vec![7],
+        vec![7],
+        vec![
+            Err("Disconnected: Worker disconnected before response stream was established".into()),
+            Err("Disconnected: Worker disconnected before response stream was established".into()),
+        ],
+    );
+    router.set_open_delay(Duration::from_secs(10));
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
+    let context = build_test_context("test-cancelled-direct-failure");
+    let cancel_handle = context.clone();
+
+    let route = tokio::spawn(connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-cancelled-direct-failure",
+        context,
+        Vec::new(),
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Duration::from_secs(600),
+    ));
+
+    // Client goes away while the routing call is in flight.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    cancel_handle.inner().stop_generating();
+
+    let outcome = route
+        .await
+        .expect("route task joins")
+        .expect("denied, not raised");
+
+    assert!(matches!(
+        outcome,
+        RouteAndConnectOutcome::Denied(DeniedRequest::Cancelled())
+    ));
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(router.method_call_count("mark_free"), 1);
+    // The free names the unique id of the attempt that may have booked.
+    assert_eq!(
+        mark_free_router_unique_request_ids(&router),
+        router_unique_request_ids(&router)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn b10_retry_after_router_error_uses_fresh_router_unique_request_id() {
+    // A failed attempt's `mark_free` can land after the retry is admitted.
+    // The router frees by request id, so a shared id would free the retry's
+    // live booking. Each attempt gets its own id.
+    let router = RouterGuardClientForTesting::new(
+        vec![7],
+        vec![7],
+        vec![
+            Err("connection failed before admission".into()),
+            route_response_new(1),
+        ],
+    );
+    // Well past the retry backoff, so the free lands after attempt 2 booked.
+    router.set_mark_free_callback_delay(Duration::from_secs(1));
+
+    // As in production, the caller's request id is its context id.
+    let (guard, source, _timings) = route_request(
+        router.clone(),
+        make_routing_request(),
+        "req-fresh-id-per-attempt".to_string(),
+        Some(build_test_context("req-fresh-id-per-attempt")),
+        Vec::new(),
+        Duration::from_secs(600),
+        false,
+        true,
+    )
+    .await
+    .expect("route succeeds");
+
+    assert!(guard.routed(), "retry must be admitted");
+    assert!(matches!(source, RouteSource::Routed { worker_id: 1 }));
+
+    let attempt_ids = router_unique_request_ids(&router);
+    assert_eq!(attempt_ids.len(), 2);
+    assert_ne!(attempt_ids[0], attempt_ids[1]);
+    assert!(
+        attempt_ids
+            .iter()
+            .all(|id| id.starts_with("req-fresh-id-per-attempt."))
+    );
+    // The router logs and spans the plain request_id, not the unique one.
+    assert!(
+        router
+            .route_request_id_headers()
+            .iter()
+            .all(|h| h.as_deref() == Some("req-fresh-id-per-attempt"))
+    );
+
+    // Let the slow free for attempt 1 land while attempt 2's guard is live.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(router.method_call_count("mark_free"), 1);
+    assert_eq!(
+        mark_free_router_unique_request_ids(&router),
+        vec![attempt_ids[0].clone()],
+        "the late free must name the failed attempt, never the live one"
+    );
+
+    // Releasing the live guard frees attempt 2 under its own id.
+    drop(guard);
+    wait_for_method_call_count(&router, "mark_free", 2, Duration::from_secs(2)).await;
+    assert_eq!(mark_free_router_unique_request_ids(&router), attempt_ids);
+    // Callbacks carry the plain request_id in the header too.
+    assert!(
+        router
+            .callback_request_id_headers()
+            .iter()
+            .all(|h| h.as_deref() == Some("req-fresh-id-per-attempt"))
     );
 }

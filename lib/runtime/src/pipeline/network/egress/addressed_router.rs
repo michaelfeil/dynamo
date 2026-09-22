@@ -333,7 +333,10 @@ where
         // Prepare trace headers using shared helper
         let mut headers = std::collections::HashMap::new();
         inject_trace_headers_into_map(&mut headers);
-        headers.insert("request-id".to_string(), request_id.clone());
+        headers.insert(
+            "request-id".to_string(),
+            request_id_header(context.metadata(), &request_id),
+        );
 
         // Stamp send time right before the transport write so the network
         // transit metric excludes serialization/encoding overhead.
@@ -472,13 +475,34 @@ where
     }
 }
 
+/// `request-id` header for the request plane: the id the receiver logs and
+/// puts on its spans. A sender whose context id is scoped per attempt names
+/// the caller's id in metadata so traces still line up.
+fn request_id_header(
+    metadata: &std::collections::BTreeMap<String, String>,
+    context_id: &str,
+) -> String {
+    metadata
+        .get("request-id")
+        .cloned()
+        .unwrap_or_else(|| context_id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CONTROL_MESSAGE_MAX_BYTES, ConnectionInfo, RequestControlMessage, RequestPlanePayloadCodec,
-        RequestType, ResponseType, serialize_control_message,
+        RequestType, ResponseType, request_id_header, serialize_control_message,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn request_id_header_prefers_sender_declared_id() {
+        let mut metadata = BTreeMap::new();
+        assert_eq!(request_id_header(&metadata, "req.1a2b"), "req.1a2b");
+        metadata.insert("request-id".to_string(), "req".to_string());
+        assert_eq!(request_id_header(&metadata, "req.1a2b"), "req");
+    }
 
     fn base_control_message(metadata: BTreeMap<String, String>) -> RequestControlMessage {
         RequestControlMessage {

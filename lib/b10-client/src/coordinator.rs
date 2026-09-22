@@ -325,17 +325,20 @@ fn log_route_and_connect_denied(
 fn create_detached_router_request_context(
     request: rmpv::Value,
     parent_ctx: &Option<RequestContext>,
+    router_unique_request_id: &str,
     request_id: &str,
     follow_parent_cancellation: bool,
 ) -> (RsContext<rmpv::Value>, Option<tokio::task::JoinHandle<()>>) {
-    let request_ctx = RsContext::with_id_and_metadata(
-        request,
-        request_id.to_string(),
-        parent_ctx
-            .as_ref()
-            .map(|ctx| ctx.metadata_snapshot())
-            .unwrap_or_default(),
-    );
+    let mut metadata = parent_ctx
+        .as_ref()
+        .map(|ctx| ctx.metadata_snapshot())
+        .unwrap_or_default();
+    // The router logs and spans `request-id` from this header, which the
+    // egress otherwise derives from the context id. That is now the
+    // per-attempt id, so name the plain `request_id` here.
+    metadata.insert("request-id".to_string(), request_id.to_string());
+    let request_ctx =
+        RsContext::with_id_and_metadata(request, router_unique_request_id.to_string(), metadata);
 
     let cancellation_forwarder = if follow_parent_cancellation && let Some(parent_ctx) = parent_ctx
     {
@@ -355,6 +358,7 @@ fn create_detached_router_request_context(
             let route_for_stop = route_context.clone();
             let route_for_timeout = route_context.clone();
             let request_id = request_id.to_string();
+            let router_unique_request_id = router_unique_request_id.to_string();
             Some(tokio::spawn(async move {
                 tokio::select! {
                     biased;
@@ -373,6 +377,7 @@ fn create_detached_router_request_context(
                     _ = tokio::time::sleep(ROUTE_FIRST_RESPONSE_TIMEOUT + Duration::from_secs(1)) => {
                         tracing::debug!(
                             request_id = %request_id,
+                            router_unique_request_id = %router_unique_request_id,
                             timeout_secs = ROUTE_FIRST_RESPONSE_TIMEOUT.as_secs(),
                             "detached route context cancellation forwarder expired"
                         );
@@ -685,12 +690,18 @@ pub async fn route_request(
             }
             let has_more_route_attempts =
                 attempt + 1 < ROUTER_GUARD_ATTEMPTS || instance_index + 1 < instance_ids.len();
+            // Each attempt gets its own id. The router keys the booking and
+            // `mark_free` by the request context id, so a late `mark_free` for
+            // a failed attempt cannot hit a retry's booking. The worker still
+            // receives the plain `request_id`.
+            let router_unique_request_id = new_router_unique_request_id(&request_id);
             // RouterGuardClient::direct takes RsContext<rmpv::Value> by value,
             // so the payload is materialized here and only here. Everything
             // above this point passes the Arc.
             let (request_ctx, mut cancellation_forwarder) = create_detached_router_request_context(
                 (*request).clone(),
                 &context,
+                &router_unique_request_id,
                 &request_id,
                 allow_cancel_routing,
             );
@@ -704,28 +715,24 @@ pub async fn route_request(
             // outer future is cancelled after the router admitted the
             // request internally but before we observe a response, the
             // (always-detached) cleanup task fires `mark_free` so the
-            // router's slot is reclaimed. On `direct` returning a clean Err
-            // (router denied) `dismiss` stops the cleanup task without
-            // sending `mark_free`; on success `commit` installs the
-            // response and the cleanup task remains armed (for `New`) or
-            // exits immediately (for `Backpressure`). For an unexpected
-            // variant (not `New` / `Backpressure`) `route_request` fails
-            // closed -- it requests `mark_free`, drops the provisional guard,
-            // and surfaces a `RouteSource::ProtocolError`.
+            // router's slot is reclaimed. On `direct` Err the router may
+            // already have booked, so drop the guard after `mark_free()`
+            // (`free` is idempotent). On success `commit` installs the
+            // response and the cleanup task stays armed (`New`) or exits
+            // (`Backpressure`). Any other variant fails closed: `mark_free`,
+            // drop the guard, return `RouteSource::ProtocolError`.
             let provisional_guard = RouterRequestGuard::new_provisional(
                 router.clone(),
+                router_unique_request_id.clone(),
                 request_id.clone(),
                 instance_id,
                 notify_timeout,
             );
 
-            // Stage 1: open the router stream. An `Err` HERE means the
-            // router never admitted the request (clean denial or in-band
-            // context cancel): `dismiss` the provisional guard so the
-            // cleanup task exits WITHOUT sending `mark_free`. The detached
-            // route context is still killed and, when another route attempt
-            // remains, the retry backs off so any queued router coroutine can
-            // observe cancellation before the same request id is reused.
+            // Stage 1: open the router stream. The router may have booked
+            // before an `Err` surfaces here, so free rather than dismiss. The
+            // detached route context is killed and, when another route
+            // attempt remains, the retry backs off.
             let stream_open_started = Instant::now();
             let stream = match router
                 .direct(request_ctx, instance_id)
@@ -760,16 +767,18 @@ pub async fn route_request(
                     let elapsed = stream_open_started.elapsed();
                     route_context.kill_with_reason(Some("router_direct_failed"));
                     abort_cancellation_forwarder(&mut cancellation_forwarder);
-                    provisional_guard.dismiss();
+                    provisional_guard.mark_free();
+                    drop(provisional_guard);
                     last_error = Some(err.to_string());
                     tracing::warn!(
                         request_id = %request_id,
+                        router_unique_request_id = %router_unique_request_id,
                         router_instance_id = instance_id,
                         attempt = attempt + 1,
                         attempts = ROUTER_GUARD_ATTEMPTS,
                         elapsed_ms = elapsed.as_millis(),
                         error = %err,
-                        "route_request router.direct failed (no admission)"
+                        "route_request router.direct failed (admission unknown)"
                     );
                     if has_more_route_attempts {
                         tokio::time::sleep(ROUTER_GUARD_CLEANUP_GRACE_PERIOD).await;
@@ -983,6 +992,14 @@ pub async fn route_request(
         "failed to route request through any KV router{}",
         last_error.map(|err| format!(": {err}")).unwrap_or_default()
     ))
+}
+
+/// Id for one routing attempt: the `request_id` plus a short random suffix.
+/// Distinct attempts (retries here, stale-route re-routes in
+/// `route_and_connect`) can never free each other's bookings. The worker,
+/// and the router's `request-id` header, still get the plain `request_id`.
+fn new_router_unique_request_id(request_id: &str) -> String {
+    format!("{request_id}.{:04x}", rand::rng().random::<u16>())
 }
 
 fn rotated_instance_ids(mut instance_ids: Vec<u64>) -> Vec<u64> {
