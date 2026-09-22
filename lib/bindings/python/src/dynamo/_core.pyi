@@ -973,12 +973,22 @@ class DeniedRequest:
 
     class FirstWorkerEventFailed:
         """
-        ``wait_for_first_response`` waited for the routed worker stream's first
-        event, but the stream ended or produced an error before that event could
-        be handled.
+        The worker stream failed before the worker produced a response: the
+        stream could not be opened (non-stale open failure), ended without an
+        event, or broke with a connection-class error. The failure is not
+        attributable to the request.
         """
         error: str
-        """The error encountered while waiting for the first worker stream event."""
+        """The stream open or first-event error."""
+        ...
+
+    class WorkerErrorResponse:
+        """
+        The worker stream's first event was an error the worker itself produced:
+        the worker received the request and failed it.
+        """
+        error: str
+        """The worker's error message."""
         ...
 
     ...

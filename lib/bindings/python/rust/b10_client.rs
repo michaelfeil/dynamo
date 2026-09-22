@@ -450,13 +450,15 @@ impl RouterWorkerCoordinator {
     /// worker stream item — never raising in those cases. Discriminate in Python with
     /// `isinstance(result, AdmittedRequest)` / `isinstance(result, DeniedRequest)`
     /// (and `isinstance(result, DeniedRequest.<Variant>)` for the denial reason);
-    /// first-event failures are returned as
-    /// `DeniedRequest.FirstWorkerEventFailed`, not raised.
+    /// stream failures before the first worker event (a non-stale open
+    /// failure included) are returned as
+    /// `DeniedRequest.FirstWorkerEventFailed`, and a worker-produced
+    /// first-event error as `DeniedRequest.WorkerErrorResponse` — not raised.
     /// On a successful route, `response_stream()` yields the worker generation
     /// tokens, timing/reroute accessors report route/connect setup seconds and
     /// stale reroutes, and `mark_prefill()` / `mark_free()` drive the
-    /// KV-lifecycle callbacks to the router. A non-stale worker-open failure (or a
-    /// non-object `worker_args`) IS raised, not returned as a `DeniedRequest`.
+    /// KV-lifecycle callbacks to the router. A non-object `worker_args`
+    /// IS raised, not returned as a `DeniedRequest`.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (context, routing_kwargs, worker_args=None, require_available=None, annotated=false, cancellation=CancellationPolicy::Cancellable, max_reroutes=1, tracing_enabled=false, wait_for_first_response=false, mark_prefill_on_response=false, phase=None))]
     fn route_and_worker<'p>(

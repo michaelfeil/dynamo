@@ -154,6 +154,7 @@ message DeniedRequest
     PROTOCOL_ERROR = 5;
     CANCELLED = 6;
     FIRST_WORKER_EVENT_FAILED = 7;
+    WORKER_ERROR_RESPONSE = 8;
   }
   Kind kind = 1;
   optional string reason = 2;

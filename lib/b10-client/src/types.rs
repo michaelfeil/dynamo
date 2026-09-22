@@ -168,4 +168,9 @@ pub enum DeniedRequest {
     FirstWorkerEventFailed {
         error: String,
     },
+    /// The worker stream's first event was an error the worker itself
+    /// produced: the worker received the request and failed it.
+    WorkerErrorResponse {
+        error: String,
+    },
 }

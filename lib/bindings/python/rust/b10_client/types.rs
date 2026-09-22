@@ -310,12 +310,19 @@ pub(crate) enum DeniedRequest {
     /// already admitted the request, the coordinator requested `mark_free`
     /// before returning this denial.
     Cancelled(),
-    /// `wait_for_first_response` waited for the routed worker stream's first
-    /// event, but the stream ended or produced an error before that event could
-    /// be handled.
+    /// The worker stream failed before the worker produced a response: the
+    /// stream could not be opened (non-stale open failure), ended without an
+    /// event, or broke with a connection-class error. Not attributable to
+    /// the request.
     FirstWorkerEventFailed {
         /// The error encountered while waiting for the first worker stream
         /// event.
+        error: String,
+    },
+    /// The worker stream's first event was an error the worker itself
+    /// produced: the worker received the request and failed it.
+    WorkerErrorResponse {
+        /// The worker's error message.
         error: String,
     },
 }
@@ -343,6 +350,7 @@ impl From<CoreDeniedRequest> for DeniedRequest {
             CoreDeniedRequest::FirstWorkerEventFailed { error } => {
                 Self::FirstWorkerEventFailed { error }
             }
+            CoreDeniedRequest::WorkerErrorResponse { error } => Self::WorkerErrorResponse { error },
         }
     }
 }

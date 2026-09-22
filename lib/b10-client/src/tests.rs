@@ -96,6 +96,8 @@ struct RouterGuardClientForTesting {
     auto_remove_on_error: AtomicBool,
     stream_items_polled: Arc<AtomicUsize>,
     open_delay: Mutex<Duration>,
+    /// When set, scripted `Err` responses are typed `DynamoError`s of this kind.
+    open_error_type: Mutex<Option<dynamo_runtime::error::ErrorType>>,
     first_response_delay: Mutex<Duration>,
     prefill_callback_delay: Mutex<Duration>,
     mark_free_callback_delay: Mutex<Duration>,
@@ -127,6 +129,7 @@ impl RouterGuardClientForTesting {
             auto_remove_on_error: AtomicBool::new(false),
             stream_items_polled: Arc::new(AtomicUsize::new(0)),
             open_delay: Mutex::new(Duration::ZERO),
+            open_error_type: Mutex::new(None),
             first_response_delay: Mutex::new(Duration::ZERO),
             prefill_callback_delay: Mutex::new(Duration::ZERO),
             mark_free_callback_delay: Mutex::new(Duration::ZERO),
@@ -143,6 +146,9 @@ impl RouterGuardClientForTesting {
     }
     fn set_auto_remove_on_error(&self, on: bool) {
         self.auto_remove_on_error.store(on, Ordering::Release);
+    }
+    fn set_open_error_type(&self, error_type: dynamo_runtime::error::ErrorType) {
+        *self.open_error_type.lock().unwrap() = Some(error_type);
     }
     fn set_open_delay(&self, delay: Duration) {
         *self.open_delay.lock().unwrap() = delay;
@@ -397,7 +403,14 @@ impl RouterGuardClient for RouterGuardClientForTesting {
                 if self.auto_remove_on_error.load(Ordering::Acquire) {
                     self.remove_instance(instance_id);
                 }
-                Err(anyhow::anyhow!(err))
+                match *self.open_error_type.lock().unwrap() {
+                    Some(error_type) => Err(dynamo_runtime::error::DynamoError::builder()
+                        .error_type(error_type)
+                        .message(err)
+                        .build()
+                        .into()),
+                    None => Err(anyhow::anyhow!(err)),
+                }
             }
         };
 
@@ -1374,6 +1387,115 @@ async fn route_and_connect_wait_for_first_response_failure_returns_denied() {
 }
 
 #[tokio::test]
+async fn route_and_connect_disconnected_first_event_returns_first_worker_event_failed() {
+    use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+    use dynamo_runtime::protocols::maybe_error::MaybeError;
+    // A worker dying mid-request does not end the stream silently: the
+    // transport synthesizes a top-level Disconnected error frame ("Stream
+    // ended before generation completed", addressed_router.rs). A worker whose
+    // engine connection died raises the Backend subtype. An engine that is
+    // shutting down or out of resources never answered either. All retriable.
+    for error_type in [
+        ErrorType::Disconnected,
+        ErrorType::Backend(BackendError::Disconnected),
+        ErrorType::Backend(BackendError::EngineShutdown),
+        ErrorType::ResourceExhausted,
+    ] {
+        let router =
+            RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+        let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
+        worker.set_annotated_stream_chunks(vec![vec![RsAnnotated::from_err(
+            DynamoError::builder()
+                .error_type(error_type)
+                .message("Stream ended before generation completed")
+                .build(),
+        )]]);
+        let context = build_test_context("test-disconnected-first-event");
+
+        let outcome = route_and_connect(
+            router.clone() as Arc<dyn RouterGuardClient>,
+            worker.clone() as Arc<dyn RouterGuardClient>,
+            make_routing_request(),
+            "req-disconnected-first-event".to_string(),
+            context,
+            Vec::new(),
+            make_worker_request(),
+            TEST_BLOCK_SIZE,
+            0,
+            true,
+            true,
+            true,
+            Duration::from_secs(60),
+            false,
+            None,
+        )
+        .await
+        .expect("disconnected first event should be a denial, not a raised error");
+
+        match outcome {
+            RouteAndConnectOutcome::Denied(DeniedRequest::FirstWorkerEventFailed { error }) => {
+                assert!(
+                    error.contains("Stream ended before generation completed"),
+                    "unexpected error for {error_type:?}: {error}"
+                );
+            }
+            other => panic!(
+                "expected Denied(FirstWorkerEventFailed) for {error_type:?}, got {:?}",
+                other
+            ),
+        }
+
+        wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+        assert_eq!(worker.method_call_count("generate"), 1);
+    }
+}
+
+#[tokio::test]
+async fn route_and_connect_worker_error_first_event_returns_worker_error_response() {
+    // The first stream event is an error frame the worker produced: the
+    // worker received the request and failed it -> WorkerErrorResponse.
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(vec![], vec![1], Vec::new());
+    worker.set_annotated_stream_chunks(vec![vec![RsAnnotated::from_error(
+        "ValueError: top_k must be >= 0".to_string(),
+    )]]);
+    let context = build_test_context("test-worker-error-first-event");
+
+    let outcome = route_and_connect(
+        router.clone() as Arc<dyn RouterGuardClient>,
+        worker.clone() as Arc<dyn RouterGuardClient>,
+        make_routing_request(),
+        "req-worker-error-first-event".to_string(),
+        context,
+        Vec::new(),
+        make_worker_request(),
+        TEST_BLOCK_SIZE,
+        0,
+        true,
+        true,
+        true,
+        Duration::from_secs(60),
+        false,
+        None,
+    )
+    .await
+    .expect("worker error first event should be a denial, not a raised error");
+
+    match outcome {
+        RouteAndConnectOutcome::Denied(DeniedRequest::WorkerErrorResponse { error }) => {
+            assert!(
+                error.contains("top_k must be >= 0"),
+                "unexpected error: {error}"
+            );
+        }
+        other => panic!("expected Denied(WorkerErrorResponse), got {:?}", other),
+    }
+
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(worker.method_call_count("generate"), 1);
+}
+
+#[tokio::test]
 async fn route_and_connect_proactive_stale_reroutes_then_connects() {
     // First route returns worker 1 -- but the worker fake's instance set
     // only contains 2, so the proactive stale check fires before any
@@ -1569,22 +1691,22 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
 }
 
 #[tokio::test]
-async fn route_and_connect_non_stale_open_error_raises_and_frees_guard() {
-    // worker fake's first direct errors, but auto_remove_on_error is OFF,
-    // so the worker remains in the instance set and connect_worker takes
-    // the `Other(err)` arm (not `StaleWorker`), which route_and_connect
-    // propagates as `Err` -- the test caller sees a panic if connect()
-    // returned Ok. After the raise, the armed guard's drop fires
-    // mark_free.
+async fn route_and_connect_non_stale_open_error_returns_denied_and_frees_guard() {
+    // The worker fake's first direct fails with a connection-class error
+    // (the egress types a refused connection as CannotConnect), but
+    // auto_remove_on_error is OFF, so the worker remains in the instance set
+    // and connect_worker returns `Denied(FirstWorkerEventFailed)` (not
+    // `Stale`, not a raise). The armed guard's drop fires mark_free.
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(
         vec![],
         vec![1],
         vec![Err("non_stale_open_error".to_string())],
     );
+    worker.set_open_error_type(dynamo_runtime::error::ErrorType::CannotConnect);
     let context = build_test_context("test-non-stale-raise");
 
-    let err = connect(
+    let outcome = connect(
         router.clone(),
         worker.clone(),
         make_routing_request(),
@@ -1598,18 +1720,66 @@ async fn route_and_connect_non_stale_open_error_raises_and_frees_guard() {
         Duration::from_secs(60),
     )
     .await
-    .expect_err("non-stale open failure raises");
+    .expect("non-stale open failure is a denial, not a raised error");
 
-    assert!(
-        err.to_string().contains("non_stale_open_error"),
-        "error should carry the worker's open error, got: {}",
-        err
-    );
+    match outcome {
+        RouteAndConnectOutcome::Denied(DeniedRequest::FirstWorkerEventFailed { error }) => {
+            assert!(
+                error.contains("worker stream open failed")
+                    && error.contains("non_stale_open_error"),
+                "error should carry the worker's open error, got: {error}"
+            );
+        }
+        other => panic!("expected Denied(FirstWorkerEventFailed), got {:?}", other),
+    }
 
     wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
     assert_eq!(router.method_call_count("mark_free"), 1);
     assert_eq!(worker.method_call_count("generate"), 1);
     assert_eq!(worker.completed_direct_count(), 0);
+}
+
+#[tokio::test]
+async fn route_and_connect_deterministic_open_error_is_raised_and_frees_guard() {
+    // The egress rejects an oversized or unencodable payload with
+    // InvalidArgument before any worker sees it. That is deterministic: a
+    // retry would fail the same way, so it must not become a retriable
+    // denial. It is raised, as before this classification existed, and the
+    // guard still frees the booking.
+    let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+    let worker = RouterGuardClientForTesting::new(
+        vec![],
+        vec![1],
+        vec![Err(
+            "Request payload is too large for this deployment".to_string()
+        )],
+    );
+    worker.set_open_error_type(dynamo_runtime::error::ErrorType::InvalidArgument);
+    let context = build_test_context("test-deterministic-open-error");
+
+    let err = connect(
+        router.clone(),
+        worker.clone(),
+        make_routing_request(),
+        "req-deterministic-open-error",
+        context,
+        Vec::new(),
+        make_worker_request(),
+        0,
+        true,
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect_err("a deterministic open error is raised, not denied as retriable");
+    assert!(
+        err.to_string().contains("payload is too large"),
+        "raised error should carry the egress message, got: {err}"
+    );
+
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+    assert_eq!(router.method_call_count("mark_free"), 1);
+    assert_eq!(worker.method_call_count("generate"), 1);
 }
 
 #[tokio::test]

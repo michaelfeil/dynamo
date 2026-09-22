@@ -22,12 +22,14 @@ use dynamo_kv_router::protocols::{
 };
 use dynamo_llm::discovery::{RuntimeConfigWatch, runtime_config_watch};
 use dynamo_runtime::component::Endpoint;
+use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
 use dynamo_runtime::pipeline::{
     AsyncEngineContextProvider, EngineStream, PushRouter, ResponseStream, async_trait,
     context::Context as RsContext,
 };
 use dynamo_runtime::prelude::DistributedRuntimeProvider;
 use dynamo_runtime::protocols::annotated::Annotated as RsAnnotated;
+use dynamo_runtime::protocols::maybe_error::MaybeError;
 use futures::StreamExt;
 use rand::Rng;
 use serde::{Serialize, de::DeserializeOwned};
@@ -296,6 +298,7 @@ fn denied_request_kind(denied: &DeniedRequest) -> String {
         DeniedRequest::ProtocolError { .. } => "protocol_error".to_string(),
         DeniedRequest::Cancelled() => "cancelled".to_string(),
         DeniedRequest::FirstWorkerEventFailed { .. } => "first_worker_event_failed".to_string(),
+        DeniedRequest::WorkerErrorResponse { .. } => "worker_error_response".to_string(),
     }
 }
 
@@ -1311,18 +1314,53 @@ struct WorkerConnectTimings {
     sentinel_event_duration: Option<Duration>,
 }
 
+/// True when a pre-first-response error says nothing about the request
+/// itself, so another worker can safely be asked: the connection failed or
+/// dropped, the engine is shutting down, or it is out of resources. The
+/// transport synthesizes the top-level types (addressed_router: Disconnected
+/// "Stream ended before generation completed"); a worker whose own engine
+/// connection died raises the Backend subtypes. Everything else — including
+/// `InvalidArgument` and `Unknown`, where unmapped worker exceptions land —
+/// is deterministic and must not be retried.
+fn retriable_before_first_response(error_type: &DynamoErrorType) -> bool {
+    matches!(
+        error_type,
+        DynamoErrorType::CannotConnect
+            | DynamoErrorType::Disconnected
+            | DynamoErrorType::ConnectionTimeout
+            | DynamoErrorType::ResponseTimeout
+            | DynamoErrorType::ResourceExhausted
+            | DynamoErrorType::Backend(
+                BackendError::CannotConnect
+                    | BackendError::Disconnected
+                    | BackendError::ConnectionTimeout
+                    | BackendError::ResponseTimeout
+                    | BackendError::EngineShutdown
+                    | BackendError::StreamIncomplete
+            )
+    )
+}
+
 async fn wait_for_first_worker_event(
     stream: &mut EngineStream<RsAnnotated<rmpv::Value>>,
     worker_id: u64,
-) -> Result<RsAnnotated<rmpv::Value>> {
-    let first = stream
-        .next()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("worker stream ended before first event"))?;
+) -> Result<RsAnnotated<rmpv::Value>, DeniedRequest> {
+    let Some(first) = stream.next().await else {
+        return Err(DeniedRequest::FirstWorkerEventFailed {
+            error: "worker stream ended before first event".to_string(),
+        });
+    };
 
-    let first = first
-        .ok()
-        .map_err(|err| anyhow::anyhow!("worker stream first event was an error: {err}"))?;
+    if let Some(err) = first.err() {
+        let error = format!("worker stream first event was an error: {err}");
+        // A retriable frame means the request never got an answer from this
+        // worker; any other error frame is the worker failing the request.
+        return Err(if retriable_before_first_response(&err.error_type()) {
+            DeniedRequest::FirstWorkerEventFailed { error }
+        } else {
+            DeniedRequest::WorkerErrorResponse { error }
+        });
+    }
 
     tracing::debug!(
         worker_id = %worker_id,
@@ -1382,10 +1420,13 @@ fn prepend_first_worker_event(
 /// reactively (when `.direct()` returns an error and the worker has since
 /// vanished). A stale route returns [`OpenResult::Stale`] so the loop
 /// re-routes, carrying the staged `payload` back when the pre-check fired
-/// before it was resolved. Any other open error returns [`OpenResult::Other`] so it is
-/// raised. The armed `guard` is moved INTO `open_fut` (the proactive pre-check
-/// alone does not move the guard because it returns before `open_fut` is
-/// constructed) so an outer cancellation during a shielded open drops the
+/// before it was resolved. A non-stale connection-class open error returns
+/// `Denied(FirstWorkerEventFailed)`; deterministic or untyped open errors and
+/// setup errors before the open (payload resolution, non-object
+/// `worker_args`) return [`OpenResult::Other`] so they are raised. The armed
+/// `guard` is moved INTO `open_fut` (the proactive pre-check alone does not
+/// move the guard because it returns before `open_fut` is constructed) so an
+/// outer cancellation during a shielded open drops the
 /// guard inside the shielded task AFTER the open future resolves -- avoiding
 /// a race where `mark_free` fires while the worker open is still in-flight
 /// and could succeed. The `Stale` arms call `mark_free` +
@@ -1480,18 +1521,16 @@ async fn connect_worker(
                     let first_response_started = Instant::now();
                     let first = match wait_for_first_worker_event(&mut stream, worker_id).await {
                         Ok(first) => first,
-                        Err(err) => {
+                        Err(denied) => {
                             let stable_routing_id = wgc.stable_routing_id(worker_id);
                             tracing::warn!(
                                 worker_id = %worker_id,
                                 stable_routing_id = stable_routing_id.as_deref().unwrap_or("unavailable"),
-                                error = %err,
+                                denied = ?denied,
                                 "connect_worker: failed while waiting for first worker stream event"
                             );
                             drop(guard);
-                            return OpenResult::Denied(DeniedRequest::FirstWorkerEventFailed {
-                                error: err.to_string(),
-                            });
+                            return OpenResult::Denied(denied);
                         }
                     };
                     let first_event_duration = first_response_started.elapsed();
@@ -1523,11 +1562,24 @@ async fn connect_worker(
                         error = %err,
                         "connect_worker: worker open failed (non-stale)"
                     );
-                    // No re-route happens on `Other`; drop the guard without
-                    // waiting for cleanup so the caller's error path is not
-                    // blocked on the (best-effort) mark_free round-trip.
+                    // Drop the guard without waiting for cleanup so this path is
+                    // not blocked on the (best-effort) mark_free round-trip.
                     drop(guard);
-                    OpenResult::Other(err)
+                    // Connection-class open errors mean the worker never got
+                    // the request: deny as retriable. Deterministic ones — an
+                    // oversized or unencodable payload is `InvalidArgument`
+                    // from the egress — and untyped errors are raised as
+                    // before, so they are not retried.
+                    let retriable = err
+                        .downcast_ref::<DynamoError>()
+                        .is_some_and(|e| retriable_before_first_response(&e.error_type()));
+                    if retriable {
+                        OpenResult::Denied(DeniedRequest::FirstWorkerEventFailed {
+                            error: format!("worker stream open failed: {err}"),
+                        })
+                    } else {
+                        OpenResult::Other(err)
+                    }
                 } else {
                     tracing::info!(
                         worker_id = %worker_id,
@@ -1561,8 +1613,9 @@ async fn connect_worker(
 }
 
 /// Outcome of the `route_and_connect` loop: either the worker stream opened
-/// (ready to hand back as an `AdmittedRequest`) or a denial. A non-stale open
-/// failure propagates as `Err` from the loop and is raised by the caller.
+/// (ready to hand back as an `AdmittedRequest`) or a denial. A connection-class
+/// open failure is `Denied(FirstWorkerEventFailed)`; deterministic open errors
+/// and pre-open setup errors propagate as `Err` and are raised by the caller.
 #[allow(clippy::large_enum_variant)]
 pub enum RouteAndConnectOutcome {
     Connected {

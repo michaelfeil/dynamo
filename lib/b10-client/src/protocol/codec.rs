@@ -443,6 +443,10 @@ fn denied_request_to_wire(value: DeniedRequest) -> DeniedRequestV1 {
             output.kind = DeniedKindV1::FirstWorkerEventFailed.into();
             output.error = Some(error);
         }
+        DeniedRequest::WorkerErrorResponse { error } => {
+            output.kind = DeniedKindV1::WorkerErrorResponse.into();
+            output.error = Some(error);
+        }
     }
     output
 }
@@ -506,6 +510,9 @@ impl TryFrom<DeniedRequestV1> for DeniedRequest {
             },
             DeniedKindV1::Cancelled => Self::Cancelled(),
             DeniedKindV1::FirstWorkerEventFailed => Self::FirstWorkerEventFailed {
+                error: value.error.context("worker denial is missing error")?,
+            },
+            DeniedKindV1::WorkerErrorResponse => Self::WorkerErrorResponse {
                 error: value.error.context("worker denial is missing error")?,
             },
             DeniedKindV1::Unspecified => bail!("generation denial kind is unspecified"),
