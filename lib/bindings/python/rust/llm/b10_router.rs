@@ -307,7 +307,7 @@ where
         )
         .await?,
     );
-    let router = Ingress::for_engine(kv_router.clone())?;
+    let router = Ingress::for_engine(kv_router.as_engine())?;
 
     // now startup is complete, but not yet serving
     start_serving_complete.0.store(true, Ordering::SeqCst);

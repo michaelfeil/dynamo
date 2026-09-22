@@ -287,6 +287,19 @@ the engine idled, ~97% of requests rejected with `max_queued_isl_tokens_exceeded
 429s, and a router restart restored serving instantly. No upstream PR; keep until
 upstream adds equivalent cancellation handling in the pump.
 
+Commit-router stream-first admission (basetenlabs/dynamo#895): the standalone
+router engine (`KvRouter::as_engine`) returns the response stream before
+running admission and yields the routing decision as the stream's first item.
+The ingress prologue is therefore sent before the admission wait, so a client
+disconnect while a request is queued is handled by the pump fix above:
+dropping the stream drops the scheduler future, closes its response channel,
+and the queue prune releases the pending entry without waiting for the
+stale-request reaper. Post-setup errors are delivered as annotated stream
+errors, which the b10 client already surfaces via `first_stream_response`.
+A booking whose decision is never delivered is handled by the scheduler
+booking guard (basetenlabs/dynamo#904). Removes the need for the
+transport-layer pre-prologue workaround (#884).
+
 TCP request-size preflight: port of upstream
 [ai-dynamo/dynamo#14110](https://github.com/ai-dynamo/dynamo/pull/14110)
 (`8e9a96f53bc3d8caae7559f578706525205fa4ae`). Validate the full encoded frame

@@ -5,7 +5,7 @@ use super::*;
 use std::{collections::HashMap, sync::Arc};
 
 use dynamo_kv_router::protocols::RouterRequest;
-use dynamo_runtime::pipeline::{AsyncEngine, SingleIn};
+use dynamo_runtime::pipeline::SingleIn;
 
 use crate::{
     kv_router::{BasetenWorkerSelector, b10_worker_selector::B10WorkerSelector},
@@ -28,7 +28,7 @@ fn request_context(id: &str, method: &str) -> SingleIn<RouterRequest> {
 }
 
 async fn response_body<Sel>(
-    router: &KvRouter<Sel>,
+    router: &Arc<KvRouter<Sel>>,
     request: SingleIn<RouterRequest>,
 ) -> RouterResponse
 where
@@ -36,6 +36,7 @@ where
 {
     use futures::StreamExt;
     router
+        .as_engine()
         .generate(request)
         .await
         .unwrap()
@@ -61,6 +62,8 @@ async fn bid_affinity_missing_bound_expired_and_normal_booking() {
     )
     .await
     .with_session_affinity_coordinator(affinity.clone());
+
+    let router = Arc::new(router);
     assert!(matches!(
         response_body(&router, request_context("live", "bid")).await,
         RouterResponse::Bid {
@@ -156,6 +159,8 @@ async fn bid_affinity_requires_an_eligible_selected_worker_and_rank() {
         let router = make_test_router(BasetenWorkerSelector::B10(B10WorkerSelector::new()), None)
             .await
             .with_session_affinity_coordinator(affinity.clone());
+
+        let router = Arc::new(router);
         let mut request = dynamo_runtime::pipeline::Context::new(
             serde_json::from_value::<RouterRequest>(serde_json::json!({
                 "method": "bid", "tokens": [11, 12, 21],

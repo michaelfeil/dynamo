@@ -24,6 +24,7 @@ use dynamo_kv_router::{
     },
     scheduling::OverloadedWorkerProvider,
 };
+use dynamo_runtime::pipeline::ServerStreamingEngine;
 use dynamo_runtime::{
     component::{Client, Component, Endpoint},
     discovery::DiscoveryQuery,
@@ -36,7 +37,6 @@ use dynamo_runtime::{
     protocols::annotated::Annotated,
     traits::DistributedRuntimeProvider,
 };
-use futures::stream;
 use tracing::Instrument;
 use validator::Validate;
 
@@ -1119,11 +1119,35 @@ where
     }
 }
 
+/// The standalone commit router as a request-plane engine. Holds an `Arc` so
+/// the deferred stream can run admission after `generate()` has returned.
+struct KvRouterEngine<Sel>
+where
+    Sel: dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig>,
+{
+    router: Arc<KvRouter<Sel>>,
+}
+
+impl<Sel> KvRouter<Sel>
+where
+    Sel: dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
+{
+    /// Engine for `Ingress::for_engine`. Returns the response stream before
+    /// admission and yields the routing decision as its first item.
+    pub fn as_engine(
+        self: &Arc<Self>,
+    ) -> ServerStreamingEngine<RouterRequest, Annotated<RouterResponse>> {
+        Arc::new(KvRouterEngine {
+            router: self.clone(),
+        })
+    }
+}
+
 // NOTE: KVRouter works like a PushRouter,
 // but without the reverse proxy functionality, but based on contract of 3 request types
 #[async_trait]
 impl<Sel> AsyncEngine<SingleIn<RouterRequest>, ManyOut<Annotated<RouterResponse>>, Error>
-    for KvRouter<Sel>
+    for KvRouterEngine<Sel>
 where
     Sel: dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
 {
@@ -1131,9 +1155,33 @@ where
         &self,
         request: SingleIn<RouterRequest>,
     ) -> Result<ManyOut<Annotated<RouterResponse>>> {
+        // Return the stream first and produce the routing decision as its
+        // first item. The prologue is then sent before any admission wait, so
+        // the request stays cancellable on the normal pump path (#853).
         let (request, ctx) = request.into_parts();
+        let engine_ctx = ctx.context();
+        let router = self.router.clone();
+        let stream = async_stream::stream! {
+            match router.route(request, ctx).await {
+                Ok(response) => yield Annotated::from_data(response),
+                Err(error) => yield Annotated::from_error(error.to_string()),
+            }
+        };
+        Ok(ResponseStream::new(Box::pin(stream), engine_ctx))
+    }
+}
+
+impl<Sel> KvRouter<Sel>
+where
+    Sel: dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
+{
+    /// Route one request and produce its response.
+    async fn route(
+        &self,
+        request: RouterRequest,
+        ctx: dynamo_runtime::pipeline::Context<()>,
+    ) -> Result<RouterResponse> {
         let context_id = ctx.context().id().to_string();
-        // Handle different request types
         let response = match request {
             RouterRequest::Bid {
                 tokens,
@@ -1332,10 +1380,7 @@ where
                         .b10_potential_loads_cache
                         .get(cache_key, Instant::now())
                 {
-                    return Ok(ResponseStream::new(
-                        Box::pin(stream::iter(vec![Annotated::from_data(response)])),
-                        ctx.context(),
-                    ));
+                    return Ok(response);
                 }
                 // Same overlap-aware pipeline as main-v1.0.0; block_mm_infos
                 // (when provided) is forwarded so MM-conditioned hashes drive
@@ -1358,9 +1403,7 @@ where
             }
         };
 
-        let response = Annotated::from_data(response);
-        let stream = stream::iter(vec![response]);
-        Ok(ResponseStream::new(Box::pin(stream), ctx.context()))
+        Ok(response)
     }
 }
 
@@ -1534,6 +1577,18 @@ mod tests {
             .unwrap()
     }
 
+    fn test_router_config() -> KvRouterConfig {
+        KvRouterConfig {
+            overlap_score_credit: 0.0,
+            router_temperature: 0.0,
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            shared_cache_multiplier: 0.5,
+            skip_initial_worker_wait: true,
+            ..Default::default()
+        }
+    }
+
     async fn make_test_router(
         selector: impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig>
         + Send
@@ -1543,24 +1598,27 @@ mod tests {
     ) -> KvRouter<
         impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
     > {
-        let component = make_test_component("shared-cache-router").await;
-        let endpoint = component.endpoint("backend");
-        let client = endpoint.client().await.unwrap();
-
         let mut workers = HashMap::new();
         workers.insert(0, ModelRuntimeConfig::default());
         workers.insert(1, ModelRuntimeConfig::default());
-        let (_tx, rx) = watch::channel(workers);
+        make_test_router_with(selector, shared_cache, workers, test_router_config()).await
+    }
 
-        let config = KvRouterConfig {
-            overlap_score_credit: 0.0,
-            router_temperature: 0.0,
-            use_kv_events: false,
-            router_track_active_blocks: false,
-            shared_cache_multiplier: 0.5,
-            skip_initial_worker_wait: true,
-            ..Default::default()
-        };
+    async fn make_test_router_with(
+        selector: impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig>
+        + Send
+        + Sync
+        + 'static,
+        shared_cache: Option<Box<dyn SharedKvCache>>,
+        workers: HashMap<u64, ModelRuntimeConfig>,
+        config: KvRouterConfig,
+    ) -> KvRouter<
+        impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
+    > {
+        let component = make_test_component("shared-cache-router").await;
+        let endpoint = component.endpoint("backend");
+        let client = endpoint.client().await.unwrap();
+        let (_tx, rx) = watch::channel(workers);
 
         KvRouter::new(
             endpoint,
@@ -1580,6 +1638,112 @@ mod tests {
         .unwrap()
     }
 
+    fn booked_requests<Sel>(router: &KvRouter<Sel>) -> usize
+    where
+        Sel: dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
+    {
+        router
+            .scheduler
+            .get_potential_loads(None, 0, HashMap::new(), false, false)
+            .iter()
+            .map(|load| load.active_requests)
+            .sum()
+    }
+
+    fn new_request(
+        request_id: &str,
+        tokens: usize,
+    ) -> dynamo_runtime::pipeline::Context<RouterRequest> {
+        dynamo_runtime::pipeline::Context::with_id_and_metadata(
+            RouterRequest::New {
+                tokens: dynamo_kv_router::protocols::TokenBlob::from(vec![7u32; tokens]),
+                block_mm_infos: None,
+                routing_constraints: dynamo_kv_router::protocols::RoutingConstraints::default(),
+                allowed_worker_ids: None,
+                priority_jump: 0.0,
+                priority_load_shed_percent: 0,
+                do_not_queue: false,
+            },
+            request_id.to_string(),
+            Default::default(),
+        )
+    }
+
+    async fn wait_until(mut cond: impl FnMut() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !cond() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition not reached in time");
+    }
+
+    /// Admission runs inside the stream, not inside `generate()`. With the
+    /// only worker busy, `generate()` still returns, the first item stays
+    /// pending, and dropping the stream removes the queued request without
+    /// booking it.
+    #[tokio::test]
+    async fn b10_generate_returns_before_admission_and_a_dropped_stream_is_pruned() {
+        use futures::StreamExt;
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            0,
+            ModelRuntimeConfig {
+                max_num_batched_tokens: Some(64),
+                ..ModelRuntimeConfig::default()
+            },
+        );
+        let router = make_test_router_with(
+            PreferredWorkerRecordingSelector {
+                seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+                selected_worker: WorkerWithDpRank::from_worker_id(0),
+            },
+            None,
+            workers,
+            KvRouterConfig {
+                router_queue_threshold: Some(0.0),
+                ..test_router_config()
+            },
+        )
+        .await;
+        let router = Arc::new(router);
+
+        // The first request occupies the only worker.
+        let mut first = router
+            .as_engine()
+            .generate(new_request("first", 16))
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.next().await.unwrap().data.unwrap(),
+            RouterResponse::New { .. }
+        ));
+
+        // Admission for the second is blocked, yet the stream comes back at once.
+        let mut second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            router.as_engine().generate(new_request("second", 16)),
+        )
+        .await
+        .expect("generate() must return before admission")
+        .unwrap();
+        assert!(futures::poll!(second.next()).is_pending());
+        wait_until(|| router.pending_count() == 1).await;
+        assert_eq!(router.pending_isl_tokens(), 16);
+
+        // The client goes away. The queue drops the dead entry on its next
+        // pass, here triggered by the first request finishing, and books
+        // nothing for it.
+        drop(second);
+        router.free("first").await.unwrap();
+        wait_until(|| router.pending_count() == 0).await;
+        assert_eq!(router.pending_isl_tokens(), 0);
+        assert_eq!(booked_requests(&router), 0);
+        drop(first);
+    }
+
     #[tokio::test]
     async fn standalone_router_uses_context_session_affinity_as_soft_preference() {
         use futures::StreamExt;
@@ -1597,6 +1761,7 @@ mod tests {
         .with_session_affinity_coordinator(
             AffinityCoordinator::new(std::time::Duration::from_secs(300)).unwrap(),
         );
+        let router = Arc::new(router);
 
         for request_id in ["first", "second"] {
             let mut request = dynamo_runtime::pipeline::Context::with_id_and_metadata(
@@ -1605,7 +1770,7 @@ mod tests {
                 Default::default(),
             );
             request.insert_metadata(SESSION_AFFINITY_CONTEXT_KEY, "shared-session");
-            let mut response = router.generate(request).await.unwrap();
+            let mut response = router.as_engine().generate(request).await.unwrap();
             assert!(matches!(
                 response.next().await.unwrap().data.unwrap(),
                 RouterResponse::New { affinity: Some(hit), .. }
