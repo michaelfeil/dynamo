@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use baseten_parsers::{
-    Call, Event, Tool, ToolCallStream, ToolParserInput, UnifiedStream, request_init,
+    Call, Event, Tool, ToolParserInput, ToolStream, UnifiedStream, request_init,
 };
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -90,17 +90,22 @@ fn stream_error(py: Python<'_>, error: anyhow::Error, events: Vec<PyEvent>) -> P
 
 #[pyclass(name = "ToolCallStream", module = "dynamo._core")]
 pub struct PyToolStream {
-    inner: Mutex<ToolCallStream>,
+    inner: Mutex<ToolStream>,
 }
 
 #[pymethods]
 impl PyToolStream {
     #[new]
-    #[pyo3(signature = (family, tools=None))]
-    fn new(py: Python<'_>, family: String, tools: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+    #[pyo3(signature = (family, tools=None, *, backend="dynamo"))]
+    fn new(
+        py: Python<'_>,
+        family: String,
+        tools: Option<&Bound<'_, PyAny>>,
+        backend: &str,
+    ) -> PyResult<Self> {
         let tools = tools_from_python(tools)?;
         let inner = py
-            .allow_threads(|| ToolCallStream::new(&family, &tools))
+            .allow_threads(|| ToolStream::new(backend, &family, &tools))
             .map_err(value_error)?;
         Ok(Self {
             inner: Mutex::new(inner),
@@ -115,6 +120,11 @@ impl PyToolStream {
     #[getter]
     fn prefers_tokens(&self) -> bool {
         self.inner.lock().prefers_tokens()
+    }
+
+    #[getter]
+    fn completion_semantics(&self) -> &'static str {
+        self.inner.lock().completion_semantics()
     }
 
     fn step(&self, py: Python<'_>, text: String) -> PyResult<PyToolOutput> {
@@ -141,7 +151,13 @@ impl PyToolStream {
                 normal_text: output.normal_text,
                 calls: output.calls.into_iter().map(Into::into).collect(),
             })
-            .map_err(|error| stream_error(py, error, Vec::new()))
+            .map_err(|error| {
+                stream_error(
+                    py,
+                    error.error,
+                    error.events.into_iter().map(Into::into).collect(),
+                )
+            })
     }
 }
 
@@ -283,6 +299,14 @@ pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyToolStream>()?;
     m.add_class::<PyUnifiedStream>()?;
     m.add("ParserStreamError", m.py().get_type::<ParserStreamError>())?;
+    m.add(
+        "VLLM_TOOL_PARSER_FAMILIES",
+        baseten_parsers::vllm::FAMILIES.to_vec(),
+    )?;
+    m.add(
+        "VLLM_PARSER_UPSTREAM_REVISION",
+        baseten_parsers::vllm::UPSTREAM_REVISION,
+    )?;
     m.add(
         "TOOL_PARSER_FAMILIES",
         baseten_parsers::REGISTERED_FAMILIES.to_vec(),

@@ -136,3 +136,56 @@ Feed `normal_text` into a separate tool parser when using a sequential pipeline.
 Do not apply this again to reasoning already extracted by `UnifiedParserStream`.
 This API makes the backend available to Python callers; it does not automatically
 replace SGLang/vLLM frontend parser selection.
+
+## vLLM Rust tool backend
+
+Select the upstream vLLM tool parser explicitly:
+
+```python
+from dynamo.parsers import ToolCallStream, VLLM_TOOL_PARSER_FAMILIES
+
+parser = ToolCallStream("glm47", tools=tools, backend="vllm")
+output = parser.step(delta_text)
+tail = parser.finish()
+```
+
+The default remains `backend="dynamo"`. `VLLM_TOOL_PARSER_FAMILIES` lists the
+available vLLM families; `VLLM_PARSER_UPSTREAM_REVISION` identifies the source
+snapshot. This backend covers the upstream standalone tool parsers, including
+DeepSeek V3/V3.1/V3.2/V4/V4.1, GLM 4.5/4.7, Qwen3-Coder/XML, MiniMax M2/M3,
+Kimi K2, and the JSON tool families. It does not replace reasoning or unified
+parsers. Unsupported family names fail without falling back to another backend.
+
+The upstream `vllm-parser` crate is a direct Git dependency pinned to
+`f84325c48c0acc1e3703103788c5f2976e719762`; no parser source is copied into this
+repository. Its tokenizer dependencies also compile, but this does not build
+the vLLM server or Python distribution. When upgrading, update the Cargo pin
+and `vllm::UPSTREAM_REVISION` together, regenerate both lockfiles, and rerun the
+adapter and Python binding tests.
+
+`completion_semantics` describes the meaning of `call.complete`:
+
+- `native`: the backend reports a completed native call. vLLM's DSML, GLM,
+  Qwen3-Coder, MiniMax, MiMo, and Seed-OSS parsers buffer a full call before
+  emitting arguments.
+- `stream_boundary`: vLLM's incremental JSON/Kimi parsers forward unfinished
+  arguments immediately. A separate empty-argument completion delta is emitted
+  when another call starts, visible text resumes, or `finish()` succeeds. This
+  follows vLLM's response assembler; it is not a delimiter-consumption or JSON
+  schema-validation signal. Only one call is active at a time.
+
+Always concatenate argument fragments by tool index. Completion deltas may have
+no name and empty arguments. Model-supplied IDs survive end-of-stream cleanup.
+A truncated call that causes a parser error is not marked complete. vLLM grammar
+and EOF behavior remain upstream behavior and may differ from Dynamo.
+
+Errors close the request stream. Python `ParserStreamError.events` retains text
+and call events committed before a later failure in the same step. Rust callers
+can use `vllm::VllmToolStream::advance` for ordered events or `ToolStream` for the
+existing text/calls projection. No automatic plain-text recovery is applied.
+vLLM tool parsers accept decoded text only; rejected token input does not advance
+the parser. Respect `preserve_special_tokens` when configuring decoding.
+
+Validation includes the unmodified upstream unit tests, adapter lifecycle and
+chunk-boundary tests, and binding tests. No speed or correctness advantage over
+Dynamo is claimed without workload-specific comparisons.

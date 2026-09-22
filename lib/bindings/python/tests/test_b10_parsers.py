@@ -90,3 +90,48 @@ def test_reasoning_eof_and_request_isolation():
     assert plain.step("answer", token_ids=[]).normal_text == "answer"
     assert reasoning.finish().reasoning_text == "</thi"
     assert plain.finish().reasoning_text == ""
+
+
+def test_vllm_tool_binding():
+    from dynamo.parsers import VLLM_PARSER_UPSTREAM_REVISION, VLLM_TOOL_PARSER_FAMILIES
+
+    assert len(VLLM_PARSER_UPSTREAM_REVISION) == 40
+    assert "glm47" in VLLM_TOOL_PARSER_FAMILIES
+    parser = ToolCallStream("glm47", backend="vllm")
+    assert parser.completion_semantics == "native"
+    assert not parser.prefers_tokens
+    with pytest.raises(ParserStreamError, match="token input"):
+        parser.step_tokens([1])
+    (call,) = parser.step("<tool_call>weather</tool_call>").calls
+    assert (call.name, call.arguments, call.complete) == ("weather", "{}", True)
+    parser.finish()
+    with pytest.raises(ParserStreamError, match="closed"):
+        parser.finish()
+    with pytest.raises(ValueError, match="backend"):
+        ToolCallStream("glm47", backend="typo")
+
+
+def test_vllm_streams_unfinished_arguments():
+    parser = ToolCallStream("kimi_k2", backend="vllm")
+    assert parser.completion_semantics == "stream_boundary"
+    start = parser.step(
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.weather:0"
+        "<|tool_call_argument_begin|>"
+    )
+    assert start.calls[0].name == "weather"
+    (call,) = parser.step('{"city":').calls
+    assert call.arguments == '{"city":'
+    assert not call.complete
+    parser.step('"Paris"}<|tool_call_end|><|tool_calls_section_end|>')
+    (end,) = parser.finish().calls
+    assert end.complete
+    assert end.id == "functions.weather:0"
+
+
+def test_vllm_partial_error_events():
+    parser = ToolCallStream("qwen3_coder", backend="vllm")
+    with pytest.raises(ParserStreamError) as caught:
+        parser.step("visible<tool_call>\n<bad>\n</tool_call>")
+    assert [(e.kind, e.text) for e in caught.value.events] == [("text", "visible")]
+    with pytest.raises(ParserStreamError, match="closed"):
+        parser.step("late")

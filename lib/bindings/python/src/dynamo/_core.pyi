@@ -36,6 +36,8 @@ materialize one Python ``int`` object per token to cross the binding.
 
 B10_DROP_THIS_MESSAGE_KEY: str
 
+VLLM_PARSER_UPSTREAM_REVISION: str
+VLLM_TOOL_PARSER_FAMILIES: list[str]
 PARSER_UPSTREAM_REVISION: str
 REASONING_PARSER_FAMILIES: list[str]
 TOOL_PARSER_FAMILIES: list[str]
@@ -71,7 +73,9 @@ class ParserStreamError(RuntimeError):
     events: list[ParserEvent]
 
 class ToolCallStream:
-    def __init__(self, family: str, tools: list[dict[str, Any]] | None = None) -> None: ...
+    def __init__(self, family: str, tools: list[dict[str, Any]] | None = None, *, backend: Literal["dynamo", "vllm"] = "dynamo") -> None: ...
+    @property
+    def completion_semantics(self) -> Literal["native", "stream_boundary"]: ...
     @property
     def preserve_special_tokens(self) -> bool: ...
     @property

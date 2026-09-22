@@ -3,6 +3,10 @@
 
 //! Request-scoped lifecycle guards around the pinned upstream parser registries.
 
+mod tool_stream;
+pub mod vllm;
+pub use tool_stream::ToolStream;
+
 use anyhow::{Result, bail, ensure};
 pub use dynamo_parsers_v2 as upstream;
 pub use upstream::{

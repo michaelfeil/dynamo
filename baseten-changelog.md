@@ -1760,6 +1760,21 @@ or smoke-test the router and OpenAI service examples.
 
 ## PATCH-008: Model, Parser, vLLM, and Multimodal Compatibility
 
+Optional vLLM Rust tool backend (#902):
+
+- Adds `backend="vllm"` to the existing tool stream API; Dynamo remains the
+  default. Depends directly on the upstream `vllm-parser` Git crate at revision
+  `f84325c48c0acc1e3703103788c5f2976e719762`, without vendored source.
+- The upstream crate also compiles its tokenizer dependencies. Rust owns
+  family selection, call IDs, terminal lifecycle, and committed error events.
+- Preserves partial arguments for incremental families. `completion_semantics`
+  distinguishes native whole-call completion from closure at the next call,
+  visible text, or successful EOF. No automatic text fallback is introduced.
+- Rebase: keep the adapter, binding, and Git pin together; audit completion contracts
+  and rerun adapter/binding tests when updating the vLLM dependency.
+  Existing model serving paths require explicit backend selection and parity
+  checks; no performance or correctness superiority is claimed.
+
 Rust-owned parser API (#881):
 
 - Adds `baseten-parsers` around public `dynamo-parsers-v2` 0.6.1, pinned to
