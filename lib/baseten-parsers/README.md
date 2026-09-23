@@ -1,191 +1,48 @@
 # Baseten parsers
 
-Pure Rust lifecycle adapters around public `dynamo-parsers-v2` 0.6.3, pinned to
-`ai-dynamo/frontend-crates` revision `bb20dd01b6257cff9b739be2b18e7a444980d04a`.
-No Python dependency in this crate. Python bindings ship in the Dynamo wheel as
-`dynamo.parsers`; no separate Python package is required.
+`baseten-parsers` provides one request-scoped Rust stream for ordered visible
+text, reasoning, and tool-call events. Python exposes it as
+`dynamo.parsers.UnifiedParserStream`. Construct one stream per response choice,
+call `step` for each decoded text delta, and call `finish` at end of stream.
 
-The Git revision selects the source; the version is an additional consistency
-check, not a crates.io fallback. This pin includes frontend-crates #247, #248,
-and #253. Advance the manifest revision and `UPSTREAM_REVISION` together, then
-update both the workspace and Python-binding lockfiles. New upstream commits
-can be selected before a crates.io release; use their declared crate version.
+The `backend` argument selects the Rust parser implementation:
 
-Rust owns parser creation, configuration validation (`request_init`), lifecycle,
-call-ID normalization, and ordered events including partial errors. The bindings
-only convert Python values, release the GIL, and translate Rust results/errors.
-`ToolCallStream::advance` and `UnifiedStream::advance` are the same Rust entry
-points used by Python; `None` finalizes the stream.
-
-Alternative backends implement the re-exported peer-shaped `ToolParser` or
-`UnifiedParser` contracts and enter through `from_parser(Box<dyn ...>)`. They
-receive the same lifecycle and result normalization without requiring upstream
-registry mutation or changes to the binding. Named Python construction selects
-the built-in upstream registry; additional named backends require Rust factory
-integration, not Python callbacks.
-
-## Python
+- `dynamo` (default) uses `dynamo-parsers-v2` 0.6.3 from frontend-crates revision
+  `bb20dd01b6257cff9b739be2b18e7a444980d04a`. Available families are in
+  `UNIFIED_PARSER_FAMILIES`.
+- `vllm` uses vLLM's native unified Rust parsers at revision
+  `f84325c48c0acc1e3703103788c5f2976e719762`. Available families are in
+  `VLLM_UNIFIED_PARSER_FAMILIES`. Supply a local `tokenizer.json` path with
+  `tokenizer_path`; vLLM uses it to resolve model markers and prompt state.
+  Its native unified families are `gemma4`, `hy_v3`, `hy_v4`, `inkling`, and
+  `kimi_k3`. vLLM currently accepts `prompt_token_ids` and native tool output;
+  the Dynamo-specific `starting_state`, guided JSON, and invalid-payload
+  policies are rejected for this backend.
 
 ```python
-from dynamo.parsers import ToolCallStream, TOOL_PARSER_FAMILIES
+from dynamo.parsers import UnifiedParserStream
 
-parser = ToolCallStream("glm47", tools=[
-    {"name": "weather", "parameters": {
-        "type": "object", "properties": {"city": {"type": "string"}}
-    }}
-])
-output = parser.step(delta_text)
-# output.normal_text; output.calls: tool_index, id, name, arguments, complete
-tail = parser.finish()
-```
-
-Tool definitions use the flat upstream shape, not OpenAI's `function` wrapper.
-Create one parser per response choice. Concatenate argument fragments by tool
-index; do not parse each fragment as complete JSON. Model-supplied IDs are
-preserved when upstream exposes them; `None` leaves ID generation to the caller.
-
-All upstream tool families are selected through its registry, without a second
-dispatch table: `harmony`, `harmony_text`, `deepseek_v4`, `qwen3_coder`,
-`muse_glimmer`, `minimax_m2`, `minimax_m3`, `gemma4`, `glm47`, `kimi_k2`, `kimi_k3`.
-Read `TOOL_PARSER_FAMILIES` for the authoritative list in the installed wheel.
-
-Check `preserve_special_tokens` before configuring decoding. Harmony advertises
-`prefers_tokens` and accepts `step_tokens(ids)` as well as `step(text)`; do not mix
-input representations within a response. Token input on text-only parsers raises
-instead of invoking upstream's no-op default.
-
-## Ordered reasoning and tool events
-
-```python
-from dynamo.parsers import UnifiedParserStream, UNIFIED_PARSER_FAMILIES
-
-parser = UnifiedParserStream("qwen3", tools=tools, starting_state="none")
+parser = UnifiedParserStream("qwen3", tools=tools)
+# For vLLM: UnifiedParserStream("gemma4", tools=tools,
+#                               backend="vllm", tokenizer_path="/model/tokenizer.json")
 events = parser.step(delta_text)
 events += parser.finish()
 # event.kind: text | reasoning | tool_call
 # event.text for text/reasoning; event.call for tool_call
 ```
 
-Unified families: `deepseek_v4`, `deepseek_v41`, `gemma4`, `qwen3`, `qwen3_coder`,
-`muse_glimmer`, `kimi_k2`, `kimi_k3`, `kimi-k3` (aliases included). Not every tool
-family has an upstream unified implementation; unavailable names fail explicitly.
-Events retain upstream order. Apply answer-only text stops only to visible text,
-not reasoning or tool arguments.
+Tool definitions use the flat upstream shape, with `name`, `parameters`, and
+optional `description` and `strict`. Tool argument fragments are ordered and
+must be concatenated by call index. A `complete` call delta marks closure.
+`preserve_special_tokens` indicates whether the decoder must retain marker
+text. `ParserStreamError.events` contains events committed before an error;
+errors and `finish()` close the stream.
 
-Initialization accepts `prompt_token_ids`, `starting_state` (`none`, `reasoning`,
-`response`), `tool_output_mode` (`native`, `guided_json`), optional `named_tool`
-in guided mode, and `invalid_guided_payload` (`reject`, `recover_as_text`,
-`stream_best_effort`). Support is family-dependent; upstream rejects unsupported
-initialization. Policy remains a caller decision.
+`ToolCallStream` remains importable from `dynamo.parsers` and `dynamo._core`
+for compatibility, but construction raises `RuntimeError`. The standalone
+`ReasoningParserStream` has been removed. Importing `dynamo.parsers` itself
+does not load the native extension; the extension loads when a live parser,
+constant, or exception is requested.
 
-## Lifecycle and compatibility
-
-`finish()` is terminal; subsequent steps or finishes raise. Upstream parse errors
-also close the stream. Invalid input representation is rejected before advancing
-state. `ParserStreamError.events` preserves any unified events committed before
-an error in that step; the caller must handle them explicitly rather than retrying
-the same input. No parser silently falls back to the old implementation.
-
-The wrapper preserves upstream grammar behavior, including GLM's complete-block
-buffering and suppression of incomplete calls at EOF. It does not map model output
-to HTTP errors, generate missing call IDs, enforce request tool-choice policy, or
-change routing/cancellation. Existing response paths are unchanged: selecting this
-backend requires model-specific integration and parity testing.
-
-Rust parsing releases the GIL; Python output objects are materialized once per
-step. No per-step JSON envelope is serialized. No performance improvement is
-claimed without complete binding benchmarks.
-
-## Verification
-
-`cargo test -p baseten-parsers` checks registry coverage, upstream adapter parity,
-GLM Unicode partitions, EOF, independent choices, token input, and lifecycle.
-`lib/bindings/python/tests/test_b10_parsers.py` checks the installed binding.
-Model grammar conformance remains in upstream; these adapter tests are not proof
-of compatibility with every existing Baseten model configuration.
-
-## Standalone reasoning extraction
-
-`ReasoningParserStream` exposes the existing in-tree `dynamo-parsers` reasoning
-registry through the same Python module. It reuses those implementations directly;
-no copied grammar or additional parser state machine is needed. Its families are
-listed in `REASONING_PARSER_FAMILIES` and are independent of the pinned v2 tool and
-unified registries (and their `PARSER_UPSTREAM_REVISION`).
-
-```python
-from dynamo.parsers import ReasoningParserStream
-
-# The prompt already contains <think>.
-parser = ReasoningParserStream("deepseek_v4", in_reasoning=True)
-first = parser.step("Let me check.</thi")
-second = parser.step("nk>The answer is 42.")
-tail = parser.finish()
-reasoning_content = "".join(x.reasoning_text for x in (first, second, tail))
-content = "".join(x.normal_text for x in (first, second, tail))
-```
-
-Outputs are deltas with delimiter tokens removed. Keep special tokens in decoded
-input so the parser can recognize them. Call `finish()` to flush incomplete
-markers at EOF, and create one parser per response choice. `in_reasoning=None`
-retains the model default; a boolean invokes the existing parser's initial-state
-override (support is family-dependent). Unknown families raise `ValueError`.
-`step(text, token_ids=...)` optionally passes the corresponding chunk's token IDs
-for token-aware families. Rust parsing releases the GIL.
-
-Feed `normal_text` into a separate tool parser when using a sequential pipeline.
-Do not apply this again to reasoning already extracted by `UnifiedParserStream`.
-This API makes the backend available to Python callers; it does not automatically
-replace SGLang/vLLM frontend parser selection.
-
-## vLLM Rust tool backend
-
-Select the upstream vLLM tool parser explicitly:
-
-```python
-from dynamo.parsers import ToolCallStream, VLLM_TOOL_PARSER_FAMILIES
-
-parser = ToolCallStream("glm47", tools=tools, backend="vllm")
-output = parser.step(delta_text)
-tail = parser.finish()
-```
-
-The default remains `backend="dynamo"`. `VLLM_TOOL_PARSER_FAMILIES` lists the
-available vLLM families; `VLLM_PARSER_UPSTREAM_REVISION` identifies the source
-snapshot. This backend covers the upstream standalone tool parsers, including
-DeepSeek V3/V3.1/V3.2/V4/V4.1, GLM 4.5/4.7, Qwen3-Coder/XML, MiniMax M2/M3,
-Kimi K2, and the JSON tool families. It does not replace reasoning or unified
-parsers. Unsupported family names fail without falling back to another backend.
-
-The upstream `vllm-parser` crate is a direct Git dependency pinned to
-`f84325c48c0acc1e3703103788c5f2976e719762`; no parser source is copied into this
-repository. Its tokenizer dependencies also compile, but this does not build
-the vLLM server or Python distribution. When upgrading, update the Cargo pin
-and `vllm::UPSTREAM_REVISION` together, regenerate both lockfiles, and rerun the
-adapter and Python binding tests.
-
-`completion_semantics` describes the meaning of `call.complete`:
-
-- `native`: the backend reports a completed native call. vLLM's DSML, GLM,
-  Qwen3-Coder, MiniMax, MiMo, and Seed-OSS parsers buffer a full call before
-  emitting arguments.
-- `stream_boundary`: vLLM's incremental JSON/Kimi parsers forward unfinished
-  arguments immediately. A separate empty-argument completion delta is emitted
-  when another call starts, visible text resumes, or `finish()` succeeds. This
-  follows vLLM's response assembler; it is not a delimiter-consumption or JSON
-  schema-validation signal. Only one call is active at a time.
-
-Always concatenate argument fragments by tool index. Completion deltas may have
-no name and empty arguments. Model-supplied IDs survive end-of-stream cleanup.
-A truncated call that causes a parser error is not marked complete. vLLM grammar
-and EOF behavior remain upstream behavior and may differ from Dynamo.
-
-Errors close the request stream. Python `ParserStreamError.events` retains text
-and call events committed before a later failure in the same step. Rust callers
-can use `vllm::VllmToolStream::advance` for ordered events or `ToolStream` for the
-existing text/calls projection. No automatic plain-text recovery is applied.
-vLLM tool parsers accept decoded text only; rejected token input does not advance
-the parser. Respect `preserve_special_tokens` when configuring decoding.
-
-Validation includes the unmodified upstream unit tests, adapter lifecycle and
-chunk-boundary tests, and binding tests. No speed or correctness advantage over
-Dynamo is claimed without workload-specific comparisons.
+Run `cargo test -p baseten-parsers` for the Rust adapter checks. The Python
+binding smoke checks are in `lib/bindings/python/tests/test_b10_parsers.py`.

@@ -6,7 +6,6 @@
 import pytest
 
 from dynamo.parsers import (
-    TOOL_PARSER_FAMILIES,
     UNIFIED_PARSER_FAMILIES,
     ParserStreamError,
     ToolCallStream,
@@ -19,27 +18,6 @@ pytestmark = [
     pytest.mark.pre_merge,
     pytest.mark.unit,
 ]
-
-
-def test_tool_binding():
-    assert "glm47" in TOOL_PARSER_FAMILIES
-    parser = ToolCallStream(
-        "glm47", [{"name": "weather", "parameters": {"type": "object"}}]
-    )
-    assert not parser.prefers_tokens
-    output = parser.step("<tool_call>weather</tool_call>")
-    assert output.normal_text == ""
-    (call,) = output.calls
-    assert (call.tool_index, call.id, call.name, call.arguments, call.complete) == (
-        0,
-        None,
-        "weather",
-        "{}",
-        True,
-    )
-    parser.finish()
-    with pytest.raises(ParserStreamError, match="closed"):
-        parser.step("late")
 
 
 def test_unified_binding():
@@ -55,83 +33,53 @@ def test_unified_binding():
     assert error.value.events == []
 
 
+def test_unified_reasoning_and_tool_call_binding():
+    parser = UnifiedParserStream(
+        "qwen3", [{"name": "weather", "parameters": {"type": "object"}}]
+    )
+    events = (
+        parser.step(
+            "<think>Check.</think>Looking up. "
+            "<tool_call><function=weather></function></tool_call>Done."
+        )
+        + parser.finish()
+    )
+    assert [(event.kind, event.text) for event in events] == [
+        ("reasoning", "Check."),
+        ("text", "Looking up. "),
+        ("tool_call", None),
+        ("text", "Done."),
+    ]
+    (call,) = [event.call for event in events if event.kind == "tool_call"]
+    assert (call.tool_index, call.name, call.arguments, call.complete) == (
+        0,
+        "weather",
+        "{}",
+        True,
+    )
+
+
 def test_invalid_configuration():
     with pytest.raises(ValueError):
-        ToolCallStream("missing")
+        UnifiedParserStream("missing")
     with pytest.raises(ValueError):
-        ToolCallStream("glm47", [{"parameters": {}}])
+        UnifiedParserStream("qwen3", [{"parameters": {}}])
     with pytest.raises(ValueError):
         UnifiedParserStream("qwen3", starting_state="invalid")
 
 
-def test_reasoning_binding():
-    from dynamo.parsers import REASONING_PARSER_FAMILIES, ReasoningParserStream
+def test_removed_tool_stream_name_remains_importable():
+    from dynamo._core import ToolCallStream as CoreToolCallStream
 
-    assert "deepseek_v4" in REASONING_PARSER_FAMILIES
-    parser = ReasoningParserStream("deepseek_v4", in_reasoning=True)
-    outputs = [parser.step(ch) for ch in "café 杭州</think>answer"]
-    outputs.append(parser.finish())
-    assert "".join(out.reasoning_text for out in outputs) == "café 杭州"
-    assert "".join(out.normal_text for out in outputs) == "answer"
-    with pytest.raises(ParserStreamError, match="closed"):
-        parser.finish()
-    with pytest.raises(ParserStreamError, match="closed"):
-        parser.step("late")
-    with pytest.raises(ValueError, match="unknown reasoning parser"):
-        ReasoningParserStream("typo")
+    with pytest.raises(RuntimeError, match="use UnifiedParserStream"):
+        ToolCallStream("harmony")
+    with pytest.raises(RuntimeError, match="use UnifiedParserStream"):
+        CoreToolCallStream("harmony")
 
 
-def test_reasoning_eof_and_request_isolation():
-    from dynamo.parsers import ReasoningParserStream
+def test_vllm_unified_requires_tokenizer_path():
+    from dynamo.parsers import VLLM_UNIFIED_PARSER_FAMILIES
 
-    reasoning = ReasoningParserStream("qwen3")
-    plain = ReasoningParserStream("deepseek_r1", in_reasoning=False)
-    assert reasoning.step("<think>reason</thi").reasoning_text == "reason"
-    assert plain.step("answer", token_ids=[]).normal_text == "answer"
-    assert reasoning.finish().reasoning_text == "</thi"
-    assert plain.finish().reasoning_text == ""
-
-
-def test_vllm_tool_binding():
-    from dynamo.parsers import VLLM_PARSER_UPSTREAM_REVISION, VLLM_TOOL_PARSER_FAMILIES
-
-    assert len(VLLM_PARSER_UPSTREAM_REVISION) == 40
-    assert "glm47" in VLLM_TOOL_PARSER_FAMILIES
-    parser = ToolCallStream("glm47", backend="vllm")
-    assert parser.completion_semantics == "native"
-    assert not parser.prefers_tokens
-    with pytest.raises(ParserStreamError, match="token input"):
-        parser.step_tokens([1])
-    (call,) = parser.step("<tool_call>weather</tool_call>").calls
-    assert (call.name, call.arguments, call.complete) == ("weather", "{}", True)
-    parser.finish()
-    with pytest.raises(ParserStreamError, match="closed"):
-        parser.finish()
-    with pytest.raises(ValueError, match="backend"):
-        ToolCallStream("glm47", backend="typo")
-
-
-def test_vllm_streams_unfinished_arguments():
-    parser = ToolCallStream("kimi_k2", backend="vllm")
-    assert parser.completion_semantics == "stream_boundary"
-    start = parser.step(
-        "<|tool_calls_section_begin|><|tool_call_begin|>functions.weather:0"
-        "<|tool_call_argument_begin|>"
-    )
-    assert start.calls[0].name == "weather"
-    (call,) = parser.step('{"city":').calls
-    assert call.arguments == '{"city":'
-    assert not call.complete
-    parser.step('"Paris"}<|tool_call_end|><|tool_calls_section_end|>')
-    (end,) = parser.finish().calls
-    assert end.complete
-    assert end.id == "functions.weather:0"
-
-
-def test_vllm_partial_error_events():
-    parser = ToolCallStream("qwen3_coder", backend="vllm")
-    with pytest.raises(ParserStreamError) as caught:
-        parser.step("visible<tool_call>\n<bad>\n</tool_call>")
-    assert [(e.kind, e.text) for e in caught.value.events] == [("text", "visible")]
-    with pytest.raises(ParserStreamError, match="closed"):
-        parser.step("late")
+    assert "gemma4" in VLLM_UNIFIED_PARSER_FAMILIES
+    with pytest.raises(ValueError, match="tokenizer_path"):
+        UnifiedParserStream("gemma4", backend="vllm")

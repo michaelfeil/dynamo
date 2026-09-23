@@ -3,16 +3,13 @@
 
 //! Request-scoped lifecycle guards around the pinned upstream parser registries.
 
-mod tool_stream;
 pub mod vllm;
-pub use tool_stream::ToolStream;
 
 use anyhow::{Result, bail, ensure};
 pub use dynamo_parsers_v2 as upstream;
 pub use upstream::{
-    InvalidGuidedPayloadPolicy, REGISTERED_FAMILIES, REGISTERED_UNIFIED_FAMILIES, Tool,
-    ToolParseResult, ToolParser, ToolParserInput, UnifiedParser, UnifiedParserInit,
-    UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
+    InvalidGuidedPayloadPolicy, REGISTERED_UNIFIED_FAMILIES, Tool, UnifiedParser,
+    UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
 };
 
 pub const UPSTREAM_REVISION: &str = "bb20dd01b6257cff9b739be2b18e7a444980d04a";
@@ -37,12 +34,6 @@ impl Call {
             complete: call.complete,
         }
     }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct ToolOutput {
-    pub normal_text: String,
-    pub calls: Vec<Call>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,103 +95,12 @@ pub fn request_init(
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InputMode {
-    Text,
-    Tokens,
-}
-
-pub struct ToolCallStream {
-    parser: Box<dyn upstream::ToolParser>,
-    mode: Option<InputMode>,
-    closed: bool,
-}
-
-impl ToolCallStream {
-    pub fn new(family: &str, tools: &[Tool]) -> Result<Self> {
-        Ok(Self::from_parser(upstream::create_tool_parser_for_family(
-            family, tools,
-        )?))
-    }
-
-    /// Wrap another backend implementing the peer-shaped `ToolParser` contract.
-    pub fn from_parser(parser: Box<dyn ToolParser>) -> Self {
-        Self {
-            parser,
-            mode: None,
-            closed: false,
-        }
-    }
-
-    pub fn preserve_special_tokens(&self) -> bool {
-        self.parser.preserve_special_tokens()
-    }
-
-    pub fn prefers_tokens(&self) -> bool {
-        self.parser.prefers_tokens()
-    }
-
-    pub fn tool_call_id(&self, index: usize) -> Option<&str> {
-        self.parser.tool_call_id(index)
-    }
-
-    pub fn step(&mut self, input: ToolParserInput<'_>) -> Result<ToolParseResult> {
-        ensure!(!self.closed, "parser stream is closed");
-        let mode = match input {
-            ToolParserInput::Text(_) => InputMode::Text,
-            ToolParserInput::Tokens(_) => {
-                // Upstream's default push_tokens silently returns no output.
-                ensure!(
-                    self.prefers_tokens(),
-                    "this parser does not support token input"
-                );
-                InputMode::Tokens
-            }
-        };
-        ensure!(
-            self.mode.is_none_or(|previous| previous == mode),
-            "cannot mix text and token input"
-        );
-        self.mode = Some(mode);
-        let result = self.parser.push_input(input);
-        if result.is_err() {
-            self.closed = true;
-        }
-        result
-    }
-
-    pub fn finish(&mut self) -> Result<ToolParseResult> {
-        ensure!(!self.closed, "parser stream is closed");
-        self.closed = true;
-        self.parser.finish()
-    }
-
-    /// Advance or finalize (`None`), resolving model-supplied IDs in Rust.
-    pub fn advance(&mut self, input: Option<ToolParserInput<'_>>) -> Result<ToolOutput> {
-        let output = match input {
-            Some(input) => self.step(input)?,
-            None => self.finish()?,
-        };
-        Ok(ToolOutput {
-            normal_text: output.normal_text,
-            calls: output
-                .calls
-                .into_iter()
-                .map(|call| {
-                    let index = call.tool_index;
-                    Call::new(call, self.tool_call_id(index))
-                })
-                .collect(),
-        })
-    }
-}
-
-pub struct UnifiedStream {
+struct DynamoStream {
     parser: Box<dyn upstream::UnifiedParser>,
     closed: bool,
 }
 
-impl UnifiedStream {
+impl DynamoStream {
     pub fn new(family: &str, tools: &[Tool], init: UnifiedParserInit) -> Result<Self> {
         Self::from_parser(
             upstream::create_unified_parser_for_family(family, tools)?,
@@ -208,7 +108,7 @@ impl UnifiedStream {
         )
     }
 
-    /// Wrap another backend without changing lifecycle or binding code.
+    /// Wrap a parser implementing Dynamo's unified trait.
     pub fn from_parser(
         mut parser: Box<dyn UnifiedParser>,
         init: UnifiedParserInit,
@@ -270,52 +170,75 @@ impl UnifiedStream {
     }
 }
 
-pub use dynamo_parsers::reasoning::{
-    ParserResult as ReasoningOutput, ReasoningParser,
-    get_available_reasoning_parsers as reasoning_parser_families,
-};
-
-/// Standalone reasoning extraction using Dynamo's existing model grammars.
-/// One instance belongs to one response choice; finalization is terminal.
-pub struct ReasoningStream {
-    parser: Box<dyn ReasoningParser>,
-    closed: bool,
+enum Backend {
+    Dynamo(DynamoStream),
+    Vllm(vllm::VllmUnifiedStream),
 }
 
-impl ReasoningStream {
-    /// `None` retains the model default; `Some` overrides prompt reasoning state.
-    pub fn new(family: &str, in_reasoning: Option<bool>) -> Result<Self> {
-        let family = family.to_lowercase();
-        ensure!(
-            reasoning_parser_families().contains(&family.as_str()),
-            "unknown reasoning parser: {family}"
-        );
-        let parser =
-            dynamo_parsers::reasoning::ReasoningParserType::get_reasoning_parser_from_name(&family);
-        Ok(Self::from_parser(Box::new(parser), in_reasoning))
+/// One ordered reasoning, text, and tool-call stream for either Rust backend.
+pub struct UnifiedStream {
+    backend: Backend,
+}
+
+impl UnifiedStream {
+    pub fn new(family: &str, tools: &[Tool], init: UnifiedParserInit) -> Result<Self> {
+        Ok(Self {
+            backend: Backend::Dynamo(DynamoStream::new(family, tools, init)?),
+        })
     }
 
-    pub fn from_parser(mut parser: Box<dyn ReasoningParser>, in_reasoning: Option<bool>) -> Self {
-        if let Some(state) = in_reasoning {
-            parser.set_in_reasoning(state);
+    pub fn new_with_backend(
+        backend: &str,
+        family: &str,
+        tools: &[Tool],
+        init: UnifiedParserInit,
+        tokenizer_path: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        match backend {
+            "dynamo" => {
+                ensure!(
+                    tokenizer_path.is_none(),
+                    "tokenizer_path is only used by vLLM"
+                );
+                Self::new(family, tools, init)
+            }
+            "vllm" => {
+                let path = tokenizer_path
+                    .ok_or_else(|| anyhow::anyhow!("vLLM requires tokenizer_path"))?;
+                Ok(Self {
+                    backend: Backend::Vllm(vllm::VllmUnifiedStream::new(
+                        family, tools, init, path,
+                    )?),
+                })
+            }
+            _ => bail!("unknown unified parser backend: {backend}"),
         }
-        Self {
-            parser,
-            closed: false,
+    }
+
+    pub fn from_parser(parser: Box<dyn UnifiedParser>, init: UnifiedParserInit) -> Result<Self> {
+        Ok(Self {
+            backend: Backend::Dynamo(DynamoStream::from_parser(parser, init)?),
+        })
+    }
+
+    pub fn preserve_special_tokens(&self) -> bool {
+        match &self.backend {
+            Backend::Dynamo(parser) => parser.preserve_special_tokens(),
+            Backend::Vllm(parser) => parser.preserve_special_tokens(),
         }
     }
 
-    /// Text and its corresponding token IDs describe the same incremental chunk.
-    pub fn step(&mut self, text: &str, token_ids: &[u32]) -> Result<ReasoningOutput> {
-        ensure!(!self.closed, "parser stream is closed");
-        Ok(self
-            .parser
-            .parse_reasoning_streaming_incremental(text, token_ids))
+    pub fn tool_call_id(&self, index: usize) -> Option<&str> {
+        match &self.backend {
+            Backend::Dynamo(parser) => parser.tool_call_id(index),
+            Backend::Vllm(parser) => parser.tool_call_id(index),
+        }
     }
 
-    pub fn finish(&mut self) -> Result<ReasoningOutput> {
-        ensure!(!self.closed, "parser stream is closed");
-        self.closed = true;
-        Ok(self.parser.finish_reasoning_stream())
+    pub fn advance(&mut self, text: Option<&str>) -> std::result::Result<Vec<Event>, StreamError> {
+        match &mut self.backend {
+            Backend::Dynamo(parser) => parser.advance(text),
+            Backend::Vllm(parser) => parser.advance(text),
+        }
     }
 }

@@ -1773,6 +1773,16 @@ or smoke-test the router and OpenAI service examples.
 
 ## PATCH-008: Model, Parser, vLLM, and Multimodal Compatibility
 
+Unified Rust parser API (#915):
+
+- Replaces the separate tool-only and reasoning streams with `UnifiedParserStream`
+  for both Dynamo and vLLM. vLLM uses its native unified families and requires a
+  local tokenizer path; existing upstream revision pins are preserved.
+- Keeps `ToolCallStream` importable as a stub that fails on construction and
+  removes `ReasoningParserStream`. Python native exports load lazily.
+- Rebase: retain backend selection, ordered events, lifecycle handling, and the
+  compatibility stub together. This supersedes the tool-only API from #902.
+
 Optional vLLM Rust tool backend (#902):
 
 - Adds `backend="vllm"` to the existing tool stream API; Dynamo remains the
