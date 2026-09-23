@@ -138,6 +138,8 @@ pub(super) struct RouterRequestGuardState {
     dropped: AtomicBool,
     cleanup_done: AtomicBool,
     notify_timeout: Duration,
+    /// Set at admission; the notify backstop runs only after that.
+    admitted: AtomicBool,
     shutdown_token: dynamo_runtime::CancellationToken,
     notify: Notify,
     /// Receiver for the cleanup task's completion signal. Taken (once) by
@@ -193,6 +195,7 @@ impl RouterRequestGuard {
             Some(new_response),
             Some(response),
             armed,
+            true,
             notify_timeout,
         )
     }
@@ -226,6 +229,7 @@ impl RouterRequestGuard {
             None,
             None,
             true,
+            false,
             notify_timeout,
         )
     }
@@ -239,6 +243,7 @@ impl RouterRequestGuard {
         new_response: Option<rmpv::Value>,
         response: Option<RsRouterResponse>,
         armed: bool,
+        admitted: bool,
         notify_timeout: Duration,
     ) -> Self {
         let (cleanup_done_tx, cleanup_done_rx) = oneshot::channel();
@@ -253,6 +258,7 @@ impl RouterRequestGuard {
             dropped: AtomicBool::new(false),
             cleanup_done: AtomicBool::new(!armed),
             notify_timeout,
+            admitted: AtomicBool::new(admitted),
             shutdown_token,
             notify: Notify::new(),
             cleanup_done_rx: Mutex::new(Some(cleanup_done_rx)),
@@ -284,10 +290,14 @@ impl RouterRequestGuard {
         self.new_response = Some(new_response);
         self.response = Some(response);
         self.armed = armed;
-        if !armed {
+        if armed {
+            self.state.admitted.store(true, Ordering::Release);
+        } else {
             self.state.cleanup_done.store(true, Ordering::Release);
-            self.state.notify.notify_one();
         }
+        // Wakes the cleanup task: it exits when unarmed, or starts its
+        // notify backstop now that the request is admitted.
+        self.state.notify.notify_one();
         self
     }
 
@@ -671,10 +681,15 @@ async fn router_request_guard_cleanup(
             continue;
         }
 
-        if tokio::time::timeout(state.notify_timeout, wait_for_guard_signal(&state))
-            .await
-            .is_err()
-        {
+        let timed_out = if state.admitted.load(Ordering::Acquire) {
+            tokio::time::timeout(state.notify_timeout, wait_for_guard_signal(&state))
+                .await
+                .is_err()
+        } else {
+            wait_for_guard_signal(&state).await;
+            false
+        };
+        if timed_out {
             tracing::warn!(
                 request_id = %state.request_id,
                 router_unique_request_id = %state.router_unique_request_id,

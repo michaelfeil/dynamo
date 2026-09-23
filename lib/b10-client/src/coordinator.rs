@@ -78,7 +78,6 @@ pub type JsonPushRouter = PushRouter<rmpv::Value, RsAnnotated<rmpv::Value>>;
 
 const ROUTE_STREAM_OPEN_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD: Duration = Duration::from_secs(1);
-const ROUTE_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(590);
 const DURATION_LOG_MS_PRECISION: f64 = 1_000.0;
 
 /// High-level B10 client that routes a request and opens the selected worker.
@@ -356,9 +355,6 @@ fn create_detached_router_request_context(
             let route_for_parent = route_context.clone();
             let route_for_kill = route_context.clone();
             let route_for_stop = route_context.clone();
-            let route_for_timeout = route_context.clone();
-            let request_id = request_id.to_string();
-            let router_unique_request_id = router_unique_request_id.to_string();
             Some(tokio::spawn(async move {
                 tokio::select! {
                     biased;
@@ -374,15 +370,6 @@ fn create_detached_router_request_context(
                     }
                     _ = route_for_kill.killed() => {}
                     _ = route_for_stop.stopped() => {}
-                    _ = tokio::time::sleep(ROUTE_FIRST_RESPONSE_TIMEOUT + Duration::from_secs(1)) => {
-                        tracing::debug!(
-                            request_id = %request_id,
-                            router_unique_request_id = %router_unique_request_id,
-                            timeout_secs = ROUTE_FIRST_RESPONSE_TIMEOUT.as_secs(),
-                            "detached route context cancellation forwarder expired"
-                        );
-                        route_for_timeout.kill_with_reason(Some("route_context_forwarder_timeout"));
-                    }
                 }
             }))
         }
@@ -788,27 +775,15 @@ pub async fn route_request(
             };
             let (stream, stream_connect_duration) = stream;
 
-            // Stage 2: read the first stream item. The router has now
-            // admitted the request internally, so an `Err` here (stream
-            // ended before data, decode failure, malformed JSON) is a
-            // POST-ADMISSION error: the slot may be reserved on the router.
-            // Request `mark_free` before dropping the provisional guard. The
-            // cleanup task sends `mark_free` asynchronously. The router's
-            // `ActiveSequencesMultiWorker::free` tolerates spurious
-            // `mark_free` for unknown request_ids (idempotent
-            // `RequestNotFound` arm at
-            // lib/kv-router/src/sequences/multi_worker.rs:482 logs at
-            // debug and returns Ok). A first-response timeout additionally
-            // kills the detached route context so the router coroutine is
-            // cancelled instead of only freeing scheduler state.
+            // Stage 2: read the first stream item, the routing decision or an
+            // error frame. The queue wait happens here, with no timeout: a
+            // queued request waits until the router admits it or the client
+            // leaves. The router may have booked before an `Err`, so request
+            // `mark_free` before dropping the provisional guard (the router's
+            // `free` is idempotent for unknown ids).
             let first_response_started = Instant::now();
-            let router_response = match tokio::time::timeout(
-                ROUTE_FIRST_RESPONSE_TIMEOUT,
-                first_stream_response(stream),
-            )
-            .await
-            {
-                Ok(Ok(response)) => {
+            let router_response = match first_stream_response(stream).await {
+                Ok(response) => {
                     let elapsed = first_response_started.elapsed();
                     if elapsed >= ROUTE_FIRST_RESPONSE_SLOW_LOG_THRESHOLD {
                         tracing::warn!(
@@ -832,7 +807,7 @@ pub async fn route_request(
                     }
                     response
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     last_error = Some(err.to_string());
                     tracing::warn!(
                         request_id = %request_id,
@@ -852,43 +827,6 @@ pub async fn route_request(
                         .await;
                     drop(provisional_guard);
                     continue;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        router_instance_id = instance_id,
-                        attempt = attempt + 1,
-                        attempts = ROUTER_GUARD_ATTEMPTS,
-                        timeout_secs = ROUTE_FIRST_RESPONSE_TIMEOUT.as_secs(),
-                        elapsed_ms = first_response_started.elapsed().as_millis(),
-                        "route_request timed out waiting for first router response; \
-                         freeing provisional guard, killing detached route context, \
-                         and returning router backpressure"
-                    );
-                    provisional_guard.mark_free();
-                    route_context.kill_with_reason(Some("router_first_response_timeout"));
-                    abort_cancellation_forwarder(&mut cancellation_forwarder);
-                    provisional_guard
-                        .wait_for_cleanup(ROUTER_GUARD_CLEANUP_GRACE_PERIOD)
-                        .await;
-                    drop(provisional_guard);
-                    let response = router_backpressure_response()?;
-                    let guard = RouterRequestGuard::new(
-                        router,
-                        request_id,
-                        instance_id,
-                        response.data,
-                        response.response,
-                        false,
-                        notify_timeout,
-                    );
-                    return Ok((
-                        guard,
-                        RouteSource::RouterBackpressure,
-                        RouteRequestTimings {
-                            stream_connect_duration,
-                        },
-                    ));
                 }
             };
             abort_cancellation_forwarder(&mut cancellation_forwarder);

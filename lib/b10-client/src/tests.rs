@@ -2130,17 +2130,20 @@ async fn route_request_success_aborts_parent_cancellation_forwarder() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn route_and_connect_first_response_timeout_kills_route_context_and_backpressures() {
+async fn b10_queued_request_waits_for_admission_past_the_guard_backstop() {
+    // The router admits after 700s; the guard backstop is 60s. The request
+    // must still be served, and the guard must not have freed anything while
+    // it was queued.
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
-    router.set_first_response_delay(Duration::from_secs(600));
+    router.set_first_response_delay(Duration::from_secs(700));
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
-    let context = build_test_context("test-first-response-timeout");
+    let context = build_test_context("test-queued-past-backstop");
 
     let outcome = connect(
         router.clone(),
         worker.clone(),
         make_routing_request(),
-        "req-first-response-timeout",
+        "req-queued-past-backstop",
         context,
         Vec::new(),
         make_worker_request(),
@@ -2150,31 +2153,42 @@ async fn route_and_connect_first_response_timeout_kills_route_context_and_backpr
         Duration::from_secs(60),
     )
     .await
-    .expect("timeout maps to router backpressure, not an error");
+    .expect("route succeeds after the queue wait");
 
-    match outcome {
-        RouteAndConnectOutcome::Denied(DeniedRequest::RouterBackpressure {
-            reason,
-            queued_isl_tokens,
-            max_queued_isl_tokens,
-        }) => {
-            assert_eq!(reason, "do_not_queue");
-            assert_eq!(queued_isl_tokens, 0);
-            assert_eq!(max_queued_isl_tokens, None);
-        }
-        other => panic!("expected Denied(RouterBackpressure), got {:?}", other),
-    }
-
-    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
-    assert_eq!(router.method_call_count("mark_free"), 1);
-    assert_eq!(worker.method_call_count("generate"), 0);
-
-    let route_contexts = router.route_contexts();
-    assert_eq!(route_contexts.len(), 1);
     assert!(
-        route_contexts[0].is_killed(),
-        "timeout should kill the detached route context"
+        matches!(outcome, RouteAndConnectOutcome::Connected { .. }),
+        "{outcome:?}"
     );
+    assert_eq!(router.method_call_count("mark_free"), 0);
+    assert_eq!(worker.method_call_count("generate"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn b10_notify_backstop_counts_from_admission() {
+    // Guard created at t=0, admitted at t=4, backstop 20s: no free at t=21,
+    // freed by t=25.
+    let router = RouterGuardClientForTesting::new(
+        vec![7],
+        vec![7],
+        vec![new_response(), free_marked_response()],
+    );
+    router.set_first_response_delay(Duration::from_secs(4));
+
+    let (guard, source) = route(
+        router.clone(),
+        jv!({"method": "new", "tokens": [1]}),
+        "req-backstop-from-admission",
+        vec![],
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(matches!(source, RouteSource::Routed { worker_id: 1 }));
+
+    tokio::time::sleep(Duration::from_secs(17)).await;
+    assert_eq!(router.method_call_count("mark_free"), 0);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(1)).await;
+    drop(guard);
 }
 
 #[tokio::test]

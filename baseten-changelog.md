@@ -1029,6 +1029,10 @@ Upstream sync note:
   `book_and_respond`, which the fork base predates). Preserve the focused
   scheduler queue regressions for cancelled pending requests and response
   delivery rollback.
+The frontend does not time out a queued request: it waits until the router
+admits it or the client leaves. The guard's notify backstop counts from
+admission, and the router's request expiry counts from the first prefill mark,
+so the frontend frees a long request before the router expires it (#910).
 
 Queued-request cancellation, current state (2026-09):
 

@@ -34,6 +34,8 @@ use super::prompt_registry::WorkerLoadSnapshot;
 use crate::protocols::PrefillLoadHint;
 
 /// Duration after which stale requests may be expired (10 minutes by default).
+/// Keep it at or above the frontend's `DYN_ROUTER_GUARD_NOTIFY_TIMEOUT_SECS`, so
+/// the frontend frees a booking before the router expires it as an orphan.
 fn active_request_expiry_duration() -> Duration {
     static EXPIRY_DURATION: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
@@ -267,8 +269,13 @@ impl ActiveSequences {
 
     /// Mark prefill as completed for a request, removing it from prompt-load tracking.
     pub(super) fn mark_prefill_completed(&mut self, request_id: &RequestId, decay_now: Instant) {
-        self.b10_prefill_phase.remove(request_id);
+        let first_mark = self.b10_prefill_phase.remove(request_id);
         let _ = self.prefill.remove(request_id, decay_now);
+        // First mark only: restart the expiry clock so the frontend, whose
+        // backstop restarts at this mark, frees a long request first.
+        if first_mark && let Some(state) = self.requests.get_mut(request_id) {
+            state.started_at = Instant::now();
+        }
         self.validate_state();
     }
 
@@ -867,6 +874,35 @@ mod tests {
         assert_eq!(seq_manager.active_blocks(), 1);
         assert_eq!(seq_manager.active_tokens(Instant::now()), 4);
         seq_manager.assert_consistent();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn b10_prefill_mark_restarts_the_expiry_clock() {
+        let mut seq_manager = ActiveSequences::new(4);
+        seq_manager.add_request_with_prefill_tracking(
+            "r1".to_string(),
+            Some(vec![1, 2]),
+            None,
+            true,
+            tracking_hint(8),
+            Instant::now(),
+        );
+
+        tokio::time::advance(Duration::from_secs(500)).await;
+        seq_manager.mark_prefill_completed(&"r1".to_string(), Instant::now());
+
+        // 700s after booking, 200s after the prefill mark: not expired. A
+        // repeated mark does not restart the clock again.
+        tokio::time::advance(Duration::from_secs(200)).await;
+        assert!(seq_manager.force_expiry().expired_request_ids.is_empty());
+        seq_manager.mark_prefill_completed(&"r1".to_string(), Instant::now());
+
+        // 601s after the first prefill mark: expired.
+        tokio::time::advance(Duration::from_secs(401)).await;
+        assert_eq!(
+            seq_manager.force_expiry().expired_request_ids,
+            HashSet::from(["r1".to_string()])
+        );
     }
 
     #[tokio::test(start_paused = true)]
