@@ -1030,6 +1030,36 @@ Upstream sync note:
   scheduler queue regressions for cancelled pending requests and response
   delivery rollback.
 
+Queued-request cancellation, current state (2026-09):
+
+A request that the frontend gives up on must not stay in the router. Two
+router-side changes carry this; the frontend side (b10-client coordinator,
+per-attempt `router_unique_request_id`, #886) is not covered here.
+
+- #895 `KvRouter::as_engine()`: the router returns the response stream before
+  admission instead of awaiting the scheduler inside `generate()`. A caller
+  that drops the stream while parked closes `resp_tx`, and the existing
+  `b10_prune_cancelled_pending` / `book_and_respond` guard drops the entry
+  instead of booking it. Before this the pump held the stream until admission,
+  so a dropped caller was invisible until it was booked.
+- #906 `SchedulerQueue::free`: `mark_free` for a queued request drops it in
+  O(1). `PendingRequestsLoad` sits next to the heap, maps request id ->
+  isl_tokens and owns the pending gauges; `Free` for a queued id removes it
+  there and subtracts its ISL, leaving the heap entry as a tombstone that pops
+  skip (`remove` returns false) at the admit-loop front, in the drains, and in
+  the cancel prune. Booked ids free the slot as before. `LocalScheduler::free`
+  delegates to it, so slot free and admission run on the actor and cannot
+  interleave with booking of the same id.
+- Still open: a booking whose decision could not be delivered over the network
+  is only rolled back for the in-process oneshot (`book_and_respond`); the
+  detached-stream failure path frees nothing. Tracked as the booking-guard
+  follow-up (#904).
+
+Rebase notes: every heap push goes through `PendingRequestsLoad::insert` and
+every pop through `remove`; never touch `pending_count`/`pending_isl_tokens`
+directly. Regression: `b10_free_drops_a_pending_request_and_admits_the_next`
+fails without #906.
+
 ## PATCH-005: Router Metrics, Tracing, and Observability
 
 Status: `keep`

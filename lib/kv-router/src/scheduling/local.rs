@@ -366,9 +366,7 @@ where
     }
 
     pub async fn free(&self, request_id: &str) -> Result<(), SequenceError> {
-        self.slots.free(&request_id.to_string(), Instant::now())?;
-        self.queue.update().await;
-        Ok(())
+        self.queue.free(request_id).await
     }
 
     pub fn pending_count(&self) -> usize {

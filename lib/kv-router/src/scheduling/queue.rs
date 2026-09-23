@@ -28,7 +28,9 @@ use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, RouterBackpressureReason, WorkerConfigLike, WorkerId,
     WorkerSelectionResult, WorkerWithDpRank,
 };
-use crate::sequences::{ActiveSequencesMultiWorker, SequencePublisher, SequenceRequest};
+use crate::sequences::{
+    ActiveSequencesMultiWorker, RequestId, SequenceError, SequencePublisher, SequenceRequest,
+};
 
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)
 pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
@@ -98,6 +100,90 @@ impl<K: Ord + Eq> PartialOrd for QueueEntry<K> {
     }
 }
 
+/// Load of the live pending requests, by id, owning the pending gauges.
+/// `free` drops a request here in O(1); its heap entry stays behind as a
+/// tombstone that `remove` rejects, so it is neither counted nor admitted.
+///
+/// Relies on request ids being unique per routing attempt (the frontend
+/// appends a per-attempt suffix): a reused id would make a stale heap entry
+/// look live again, so cancellation and retry depend on that invariant.
+struct PendingRequestsLoad {
+    /// request id -> isl_tokens for entries that have a request id.
+    live: HashMap<RequestId, usize>,
+    request_count: Arc<AtomicUsize>,
+    isl_tokens: Arc<AtomicUsize>,
+}
+
+impl PendingRequestsLoad {
+    fn new(request_count: Arc<AtomicUsize>, isl_tokens: Arc<AtomicUsize>) -> Self {
+        Self {
+            live: HashMap::new(),
+            request_count,
+            isl_tokens,
+        }
+    }
+
+    fn isl_tokens(&self) -> usize {
+        self.isl_tokens.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Count an entry about to be pushed.
+    fn insert(&mut self, request: &SchedulingRequest) {
+        if let Some(request_id) = &request.maybe_request_id
+            && let Some(old_isl_tokens) = self.live.insert(request_id.clone(), request.isl_tokens)
+        {
+            // Same id queued twice: the older entry is now a tombstone.
+            tracing::warn!(request_id, "duplicate request id in router queue");
+            self.subtract_isl_tokens(old_isl_tokens);
+        }
+        self.request_count.fetch_add(1, AtomicOrdering::Relaxed);
+        self.isl_tokens
+            .fetch_add(request.isl_tokens, AtomicOrdering::Relaxed);
+    }
+
+    /// False for a tombstone: a request freed while it was still queued.
+    fn is_request_pending(&self, request: &SchedulingRequest) -> bool {
+        request
+            .maybe_request_id
+            .as_ref()
+            .is_none_or(|id| self.live.contains_key(id))
+    }
+
+    /// Uncount a popped entry. Returns false for a tombstone; the caller
+    /// drops it. Entries without a request id are never in `live`.
+    fn remove(&mut self, request: &SchedulingRequest) -> bool {
+        match &request.maybe_request_id {
+            Some(request_id) => self.free(request_id),
+            None => {
+                self.subtract_isl_tokens(request.isl_tokens);
+                true
+            }
+        }
+    }
+
+    /// Free a pending request without touching the heap. False if not pending.
+    fn free(&mut self, request_id: &RequestId) -> bool {
+        let Some(isl_tokens) = self.live.remove(request_id) else {
+            return false;
+        };
+        self.subtract_isl_tokens(isl_tokens);
+        true
+    }
+
+    /// One request leaves: drop it from `request_count` and its tokens from
+    /// `isl_tokens`.
+    fn subtract_isl_tokens(&self, isl_tokens: usize) {
+        let prev_count = self.request_count.fetch_sub(1, AtomicOrdering::Relaxed);
+        let prev_isl_tokens = self
+            .isl_tokens
+            .fetch_sub(isl_tokens, AtomicOrdering::Relaxed);
+        debug_assert!(
+            prev_count > 0 && prev_isl_tokens >= isl_tokens,
+            "pending gauge underflow: count={prev_count} isl={prev_isl_tokens} request_isl_tokens={isl_tokens}"
+        );
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 /// Inputs of the most recent queue-admission evaluations, snapshotted with
 /// Relaxed atomics on the admission path and exported as gauges.
@@ -147,6 +233,10 @@ enum AdmissionCommand {
     Update {
         ack_tx: oneshot::Sender<()>,
     },
+    Free {
+        request_id: RequestId,
+        ack_tx: oneshot::Sender<Result<(), SequenceError>>,
+    },
     UpdateThreshold {
         threshold_frac: Option<f64>,
         ack_tx: oneshot::Sender<()>,
@@ -166,8 +256,7 @@ struct SchedulerQueueActor<
 > {
     config: baseten_configmap::ConfigReader,
     pending: BinaryHeap<QueueEntry<S::Key>>,
-    pending_count: Arc<AtomicUsize>,
-    pending_isl_tokens: Arc<AtomicUsize>,
+    pending_load: PendingRequestsLoad,
     cancelled_requests: Arc<AtomicUsize>,
     eval_gauges: Arc<B10QueueEvalGauges>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
@@ -276,8 +365,10 @@ impl<
             config: baseten_configmap::try_current_reader()
                 .unwrap_or_else(|| baseten_configmap::ConfigReader::in_memory(Default::default())),
             pending: BinaryHeap::new(),
-            pending_count: Arc::clone(&pending_count),
-            pending_isl_tokens: Arc::clone(&pending_isl_tokens),
+            pending_load: PendingRequestsLoad::new(
+                Arc::clone(&pending_count),
+                Arc::clone(&pending_isl_tokens),
+            ),
             cancelled_requests: Arc::clone(&cancelled_requests),
             eval_gauges: Arc::clone(&eval_gauges),
             slots: Arc::clone(&slots),
@@ -487,6 +578,24 @@ impl<
         }
     }
 
+    /// Free a request: release its booking, or drop it from the pending
+    /// queue if it is still queued, then run the admission pass.
+    pub async fn free(&self, request_id: &str) -> Result<(), SequenceError> {
+        let request_id = request_id.to_string();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let command = AdmissionCommand::Free {
+            request_id: request_id.clone(),
+            ack_tx,
+        };
+        if self.admission_tx.send(command).await.is_ok()
+            && let Ok(result) = ack_rx.await
+        {
+            return result;
+        }
+        // Actor is gone, so nothing is pending; release the booking directly.
+        self.slots.free(&request_id, Instant::now())
+    }
+
     /// Hot-reload the queue admission threshold.
     /// `None` or non-positive values disable queueing.
     pub async fn update_router_queue_threshold(&self, threshold_frac: Option<f64>) {
@@ -585,6 +694,10 @@ impl<
                     self.handle_update().await;
                     let _ = ack_tx.send(());
                 }
+                AdmissionCommand::Free { request_id, ack_tx } => {
+                    let result = self.handle_free(&request_id).await;
+                    let _ = ack_tx.send(result);
+                }
                 AdmissionCommand::UpdateThreshold {
                     threshold_frac,
                     ack_tx,
@@ -596,10 +709,9 @@ impl<
         }
 
         while let Some(entry) = self.pending.pop() {
-            self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
-            self.pending_isl_tokens
-                .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
-
+            if !self.pending_load.remove(&entry.request) {
+                continue;
+            }
             let mut request = entry.request;
             request.respond(Err(KvSchedulerError::SubscriberShutdown));
         }
@@ -635,14 +747,14 @@ impl<
             if request.do_not_queue {
                 request.respond(Err(KvSchedulerError::Backpressure {
                     reason: RouterBackpressureReason::DoNotQueue,
-                    queued_isl_tokens: self.pending_isl_tokens.load(AtomicOrdering::Relaxed),
+                    queued_isl_tokens: self.pending_load.isl_tokens(),
                     max_queued_isl_tokens: None,
                 }));
                 return;
             }
 
             if !self.queue_depth_tiers.is_unbounded() {
-                let mut pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
+                let mut pending_isl_tokens = self.pending_load.isl_tokens();
                 let tier_cap = self.tier_cap_for_request(&request);
                 if let Some((tier_idx, _)) = tier_cap
                     && let Some(slot) = self.eval_gauges.isl_evaluated_tokens_per_tier.get(tier_idx)
@@ -672,7 +784,7 @@ impl<
                     if self.last_cancel_prune.elapsed() >= ENQUEUE_REJECT_PRUNE_MIN_INTERVAL
                         && self.b10_prune_cancelled_pending() > 0
                     {
-                        pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
+                        pending_isl_tokens = self.pending_load.isl_tokens();
                     }
                     if pending_isl_tokens >= max_isl_tokens {
                         request.respond(Err(KvSchedulerError::Backpressure {
@@ -696,51 +808,40 @@ impl<
                 self.policy
                     .enqueue_key(arrival_offset, SchedulingContext::new(&request, &workers))
             };
-            let isl_tokens = request.isl_tokens;
+            self.pending_load.insert(&request);
             self.pending.push(QueueEntry {
                 key,
                 request,
                 enqueue_at: decay_now,
                 block_hashes,
             });
-            self.pending_count.fetch_add(1, AtomicOrdering::Relaxed);
-            self.pending_isl_tokens
-                .fetch_add(isl_tokens, AtomicOrdering::Relaxed);
             return;
         }
 
         self.admit_one(request, decay_now);
     }
 
-    /// Drop parked entries whose requester has gone away so the pending
-    /// gauges and tier-cap accounting stop counting dead ISL tokens.
-    /// Returns the number of entries removed.
+    /// Drop pending entries whose requester has gone away so the pending
+    /// gauges and tier-cap accounting stop counting dead ISL tokens, and
+    /// collect tombstones left by `free`. Returns the number of live entries
+    /// removed.
     fn b10_prune_cancelled_pending(&mut self) -> usize {
         let mut removed_count = 0usize;
         let mut removed_isl_tokens = 0usize;
+        let pending_load = &mut self.pending_load;
         self.pending.retain(|entry| {
+            if !pending_load.is_request_pending(&entry.request) {
+                return false;
+            }
             let closed = entry.request.response_is_closed();
             if closed {
                 removed_count += 1;
                 removed_isl_tokens += entry.request.isl_tokens;
+                pending_load.remove(&entry.request);
             }
             !closed
         });
         if removed_count > 0 {
-            let current_pending_count = self.pending_count.load(AtomicOrdering::Relaxed);
-            debug_assert!(
-                current_pending_count >= removed_count,
-                "pending_count underflow on cancel prune: pending={current_pending_count} removed={removed_count}"
-            );
-            self.pending_count
-                .fetch_sub(removed_count, AtomicOrdering::Relaxed);
-            let current_pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
-            debug_assert!(
-                current_pending_isl_tokens >= removed_isl_tokens,
-                "pending_isl_tokens underflow on cancel prune: pending={current_pending_isl_tokens} removed={removed_isl_tokens}"
-            );
-            self.pending_isl_tokens
-                .fetch_sub(removed_isl_tokens, AtomicOrdering::Relaxed);
             self.cancelled_requests
                 .fetch_add(removed_count, AtomicOrdering::Relaxed);
             tracing::debug!(
@@ -751,6 +852,20 @@ impl<
         }
         self.last_cancel_prune = Instant::now();
         removed_count
+    }
+
+    /// Free of a pending request drops it from the load tracker and leaves
+    /// its heap entry as a tombstone, so it is never booked for a requester
+    /// that has gone. Free of a booked request releases the slot.
+    async fn handle_free(&mut self, request_id: &RequestId) -> Result<(), SequenceError> {
+        if self.pending_load.free(request_id) {
+            self.cancelled_requests
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            self.slots.free(request_id, Instant::now())?;
+        }
+        self.handle_update().await;
+        Ok(())
     }
 
     async fn handle_update(&mut self) {
@@ -789,6 +904,10 @@ impl<
             let Some(front) = self.pending.peek() else {
                 break;
             };
+            if !self.pending_load.is_request_pending(&front.request) {
+                self.pending.pop();
+                continue;
+            }
             // TODO: This preserves head-of-line blocking for now to keep queue
             // drain overhead bounded to the heap front. A blocked pinned or
             // otherwise constrained request can temporarily stall later
@@ -799,21 +918,7 @@ impl<
                 break;
             }
             let entry = self.pending.pop().expect("heap front vanished before pop");
-            let current_pending_count = self.pending_count.load(AtomicOrdering::Relaxed);
-            debug_assert!(
-                current_pending_count > 0,
-                "pending_count underflow on queue drain"
-            );
-            self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
-            let current_pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
-            debug_assert!(
-                current_pending_isl_tokens >= entry.request.isl_tokens,
-                "pending_isl_tokens underflow: pending={} request_isl_tokens={}",
-                current_pending_isl_tokens,
-                entry.request.isl_tokens
-            );
-            self.pending_isl_tokens
-                .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
+            self.pending_load.remove(&entry.request);
             let mut request = entry.request;
             let refreshed = refresh_overlap(
                 self.overlap_scores_refresh.as_deref(),
@@ -843,16 +948,13 @@ impl<
             if self.all_workers_prefill_busy(threshold, request.eligibility(), admit_now)
                 || self.decode_tokens_busy()
             {
-                let isl_tokens = request.isl_tokens;
+                self.pending_load.insert(&request);
                 self.pending.push(QueueEntry {
                     key: entry.key,
                     request,
                     enqueue_at: entry.enqueue_at,
                     block_hashes: entry.block_hashes,
                 });
-                self.pending_count.fetch_add(1, AtomicOrdering::Relaxed);
-                self.pending_isl_tokens
-                    .fetch_add(isl_tokens, AtomicOrdering::Relaxed);
                 break;
             }
             tracing::debug!("scheduling request from pending queue");
@@ -879,21 +981,9 @@ impl<
         }
 
         while let Some(entry) = self.pending.pop() {
-            let current_pending_count = self.pending_count.load(AtomicOrdering::Relaxed);
-            debug_assert!(
-                current_pending_count > 0,
-                "pending_count underflow on threshold disable"
-            );
-            self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
-            let current_pending_isl_tokens = self.pending_isl_tokens.load(AtomicOrdering::Relaxed);
-            debug_assert!(
-                current_pending_isl_tokens >= entry.request.isl_tokens,
-                "pending_isl_tokens underflow: pending={} request_isl_tokens={}",
-                current_pending_isl_tokens,
-                entry.request.isl_tokens
-            );
-            self.pending_isl_tokens
-                .fetch_sub(entry.request.isl_tokens, AtomicOrdering::Relaxed);
+            if !self.pending_load.remove(&entry.request) {
+                continue;
+            }
             self.admit_one(entry.request, Instant::now());
         }
     }
@@ -2214,6 +2304,40 @@ mod tests {
         queue.update().await;
 
         assert_eq!(queue.pending_count(), 0, "all requests should be drained");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b10_free_drops_a_pending_request_and_admits_the_next() {
+        let block_size = 16;
+        let isl = 512;
+        let (queue, slots) = make_queue(1, block_size, isl, Some(0.0));
+
+        let (req1, rx1) = make_request("req-1", isl);
+        queue.enqueue(req1).await;
+        let _resp1 = rx1.await.unwrap().unwrap();
+        let (req2, rx2) = make_request("req-2", isl);
+        queue.enqueue(req2).await;
+        let (req3, rx3) = make_request("req-3", isl);
+        queue.enqueue(req3).await;
+        assert_eq!(queue.pending_count(), 2);
+
+        // req-2's requester gives up while it is queued: the gauges drop it
+        // at once and it is never booked.
+        queue.free("req-2").await.unwrap();
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.pending_isl_tokens(), isl);
+        assert_eq!(queue.b10_cancelled_requests_count(), 1);
+
+        // Freeing the booked request skips req-2's tombstone at the heap
+        // front and admits req-3.
+        queue.free("req-1").await.unwrap();
+        let _resp3 = rx3.await.unwrap().unwrap();
+        assert!(
+            rx2.await.is_err(),
+            "freed pending request must not get a decision"
+        );
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(slots.active_request_counts().values().sum::<usize>(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
