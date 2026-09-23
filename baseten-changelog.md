@@ -1832,6 +1832,14 @@ Optional vLLM Rust tool backend (#902):
   Existing model serving paths require explicit backend selection and parity
   checks; no performance or correctness superiority is claimed.
 
+Harmony unified adapter:
+
+- Adds `harmony`, `gpt_oss`, and `gpt-oss` to the default unified parser backend
+  using frontend-crates v1 reasoning/tool parsers at the same pin as v2.
+- Keeps ordered output and stable call IDs; retains v1's complete-call buffering
+  and EOF behavior. Native Harmony output only; no serving-path migration.
+- Rebase: retain the v1 dependency, factory, and binding family enumeration together.
+
 Rust-owned parser API (#881):
 
 - Adds `baseten-parsers` around public `dynamo-parsers-v2` 0.6.1, pinned to

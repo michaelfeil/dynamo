@@ -7,6 +7,9 @@ description = "Request-scoped Baseten adapters for upstream Dynamo streaming par
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+dynamo-parsers-v1 = { package = "dynamo-parsers", git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "bb20dd01b6257cff9b739be2b18e7a444980d04a" }
 vllm-parser = { git = "https://github.com/vllm-project/vllm.git", rev = "f84325c48c0acc1e3703103788c5f2976e719762" }
 vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "f84325c48c0acc1e3703103788c5f2976e719762" }
 dynamo-parsers-v2 = { version = "=0.6.3", git = "https://github.com/ai-dynamo/frontend-crates.git", rev = "bb20dd01b6257cff9b739be2b18e7a444980d04a" }

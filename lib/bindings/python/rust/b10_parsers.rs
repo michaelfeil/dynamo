@@ -195,7 +195,7 @@ pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add(
         "UNIFIED_PARSER_FAMILIES",
-        baseten_parsers::REGISTERED_UNIFIED_FAMILIES.to_vec(),
+        baseten_parsers::unified_parser_families(),
     )?;
     m.add(
         "PARSER_UPSTREAM_REVISION",

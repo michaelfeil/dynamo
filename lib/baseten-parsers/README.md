@@ -9,7 +9,8 @@ The `backend` argument selects the Rust parser implementation:
 
 - `dynamo` (default) uses `dynamo-parsers-v2` 0.6.3 from frontend-crates revision
   `bb20dd01b6257cff9b739be2b18e7a444980d04a`. Available families are in
-  `UNIFIED_PARSER_FAMILIES`.
+  `UNIFIED_PARSER_FAMILIES`. Harmony (`harmony`, `gpt_oss`, `gpt-oss`) uses the
+  v1 gpt-oss reasoning and Harmony tool parsers from that same upstream revision.
 - `vllm` uses vLLM's native unified Rust parsers at revision
   `f84325c48c0acc1e3703103788c5f2976e719762`. Available families are in
   `VLLM_UNIFIED_PARSER_FAMILIES`. Supply a local `tokenizer.json` path with
@@ -46,3 +47,30 @@ constant, or exception is requested.
 
 Run `cargo test -p baseten-parsers` for the Rust adapter checks. The Python
 binding smoke checks are in `lib/bindings/python/tests/test_b10_parsers.py`.
+
+## Harmony (gpt-oss)
+
+```python
+import dynamo.parsers as parsers
+
+parser = parsers.UnifiedParserStream("harmony", tools=tools,
+    prompt_token_ids=rendered_prompt_token_ids)
+```
+
+The prompt must end with an assistant generation prefix. With no prompt tokens,
+`starting_state="none"` expects the continuation of an assistant header, such as
+`<|channel|>analysis<|message|>`. `reasoning` and `response` start directly inside
+those channels. Keep Harmony special tokens in decoded output. The adapter normalizes HF
+spellings (`<|im_start|>`, `<|meta_sep|>`, etc.) to v1's canonical `<|start|>`, `<|channel|>`, `<|message|>`, `<|end|>`, `<|call|>`,
+and `<|return|>` spellings.
+
+The adapter preserves v1 semantics: text/reasoning stream incrementally, calls
+are buffered until `<|call|>` and emitted as complete calls with stable IDs, and
+unfinished calls are dropped at EOF. It preserves v1's separators between repeated
+channels. Guided JSON is rejected; forced tool output must retain native Harmony
+envelopes. V1's internal parsing/recovery behavior is unchanged, including its
+handling of malformed input; this adapter does not add stricter validation.
+
+The serving layer still owns generation stops, prompt rendering, and finish
+reasons. This adds a selectable Rust parser, not a replacement of Baseten's Python
+Harmony processor or a claim of gpt-oss model-serving parity.

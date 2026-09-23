@@ -3,6 +3,7 @@
 
 //! Request-scoped lifecycle guards around the pinned upstream parser registries.
 
+mod harmony;
 pub mod vllm;
 
 use anyhow::{Result, bail, ensure};
@@ -13,6 +14,15 @@ pub use upstream::{
 };
 
 pub const UPSTREAM_REVISION: &str = "bb20dd01b6257cff9b739be2b18e7a444980d04a";
+
+/// Families accepted by the Dynamo backend, including local v1 adapters.
+pub fn unified_parser_families() -> Vec<&'static str> {
+    REGISTERED_UNIFIED_FAMILIES
+        .iter()
+        .chain(harmony::FAMILIES)
+        .copied()
+        .collect()
+}
 
 /// Normalized call delta, including any identifier supplied by the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,10 +112,12 @@ struct DynamoStream {
 
 impl DynamoStream {
     pub fn new(family: &str, tools: &[Tool], init: UnifiedParserInit) -> Result<Self> {
-        Self::from_parser(
-            upstream::create_unified_parser_for_family(family, tools)?,
-            init,
-        )
+        let parser: Box<dyn UnifiedParser> = if harmony::FAMILIES.contains(&family) {
+            Box::new(harmony::HarmonyParser::new(tools)?)
+        } else {
+            upstream::create_unified_parser_for_family(family, tools)?
+        };
+        Self::from_parser(parser, init)
     }
 
     /// Wrap a parser implementing Dynamo's unified trait.

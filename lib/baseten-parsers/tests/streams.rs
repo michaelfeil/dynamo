@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use baseten_parsers::{
-    Event, REGISTERED_UNIFIED_FAMILIES, Tool, UnifiedParserInit, UnifiedParserOutput,
-    UnifiedStream, request_init, upstream,
+    Event, Tool, UnifiedParserInit, UnifiedParserOutput, UnifiedStream, request_init,
+    unified_parser_families, upstream,
 };
 use serde_json::json;
 
@@ -18,7 +18,7 @@ fn tools() -> Vec<Tool> {
 
 #[test]
 fn registered_families_use_the_unified_lifecycle() {
-    for family in REGISTERED_UNIFIED_FAMILIES {
+    for family in unified_parser_families() {
         let mut stream =
             UnifiedStream::new(family, &tools(), UnifiedParserInit::default()).unwrap();
         stream.advance(Some("hello")).unwrap();
@@ -105,4 +105,97 @@ fn invalid_configuration_is_rejected_in_rust() {
     assert!(request_init(vec![], "invalid", "native", None, "reject").is_err());
     assert!(request_init(vec![], "none", "native", Some("weather".into()), "reject").is_err());
     assert!(request_init(vec![], "none", "native", None, "invalid").is_err());
+}
+
+#[test]
+fn harmony_v1_preserves_order_at_every_character_boundary() {
+    let text = "<|channel|>analysis<|message|>Check 🌤️.<|end|>\
+        <|start|>assistant<|channel|>commentary<|message|>Looking up.<|end|>\
+        <|start|>assistant to=functions.weather<|channel|>commentary<|message|>{\"city\":\"Paris\"}<|call|>\
+        <|start|>assistant<|channel|>analysis<|message|>Checked.<|end|>\
+        <|start|>assistant<|channel|>final<|message|>Sunny.<|return|>";
+    fn parse(parts: &[&str]) -> Vec<upstream::UnifiedEvent> {
+        let mut parser =
+            UnifiedStream::new("harmony", &tools(), UnifiedParserInit::default()).unwrap();
+        assert!(parser.preserve_special_tokens());
+        let mut events = Vec::new();
+        for part in parts {
+            events.extend(parser.advance(Some(part)).unwrap());
+        }
+        events.extend(parser.advance(None).unwrap());
+        let mut output = UnifiedParserOutput::default();
+        for event in events {
+            match event {
+                Event::Text(text) => output.push_text(text),
+                Event::Reasoning(text) => output.push_reasoning(text),
+                Event::ToolCall(call) => {
+                    assert!(call.complete);
+                    assert_eq!(call.tool_index, 0);
+                    assert_eq!(parser.tool_call_id(0), call.id.as_deref());
+                    assert!(call.id.is_some());
+                    output.push_call(upstream::ToolCallDelta {
+                        tool_index: call.tool_index,
+                        name: call.name,
+                        arguments: call.arguments,
+                        complete: call.complete,
+                    });
+                }
+            }
+        }
+        upstream::assemble(&output.events)
+    }
+    let expected = parse(&[text]);
+    assert!(matches!(
+        &expected[..],
+        [
+            upstream::UnifiedEvent::Reasoning { .. },
+            upstream::UnifiedEvent::Text { .. },
+            upstream::UnifiedEvent::ToolCall { .. },
+            upstream::UnifiedEvent::Reasoning { .. },
+            upstream::UnifiedEvent::Text { .. }
+        ]
+    ));
+    let hf_text = text
+        .replace("<|channel|>", "<|meta_sep|>")
+        .replace("<|message|>", "<|im_sep|>")
+        .replace("<|start|>", "<|im_start|>")
+        .replace("<|end|>", "<|im_end|>")
+        .replace("<|call|>", "<|ghissue|>")
+        .replace("<|return|>", "<|fim_suffix|>");
+    for text in [text, hf_text.as_str()] {
+        for (at, _) in text.char_indices() {
+            assert_eq!(parse(&[&text[..at], &text[at..]]), expected, "split {at}");
+        }
+        let pieces: Vec<_> = text
+            .char_indices()
+            .map(|(at, c)| &text[at..at + c.len_utf8()])
+            .collect();
+        assert_eq!(parse(&pieces), expected);
+    }
+}
+
+#[test]
+fn harmony_v1_initialization_and_unfinished_calls() {
+    let prompt = upstream::encode_harmony(
+        "<|start|>user<|message|>Hi<|end|><|start|>assistant<|channel|>analysis<|message|>",
+    )
+    .unwrap();
+    let mut stream =
+        UnifiedStream::new("gpt_oss", &tools(), UnifiedParserInit::native(&prompt)).unwrap();
+    assert_eq!(
+        stream.advance(Some("Thinking")).unwrap(),
+        vec![Event::Reasoning("Thinking".into())]
+    );
+    stream.advance(Some("<|end|><|start|>assistant to=functions.weather<|channel|>commentary<|message|>{\"city\":\"Par")).unwrap();
+    assert!(stream.advance(None).unwrap().is_empty());
+    assert!(stream.advance(Some("late")).is_err());
+
+    let init = request_init(vec![], "response", "native", None, "reject").unwrap();
+    let mut stream = UnifiedStream::new("gpt-oss", &tools(), init).unwrap();
+    assert_eq!(
+        stream.advance(Some("Hello")).unwrap(),
+        vec![Event::Text("Hello".into())]
+    );
+    let init = request_init(vec![], "none", "guided_json", None, "reject").unwrap();
+    assert!(UnifiedStream::new("harmony", &tools(), init).is_err());
 }
