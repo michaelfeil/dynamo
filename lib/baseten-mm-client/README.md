@@ -35,6 +35,9 @@ the transparent-route header. `proxy` enables cacheable PUT requests. When unset
 the client reads `BDN_PROXY` unless `DYNAMO_DISABLE_BDN_PROXY` is `1` or `true`
 (case-insensitive). BDN URLs without credentials get the standard BDN credentials;
 existing credentials are preserved. An explicit `proxy` overrides the environment.
+If `ETCD_ENDPOINTS` contains `.svc.localnet`, client construction fails unless a
+proxy is configured or `DYNAMO_DISABLE_BDN_PROXY` is set. Production multimodal
+encoder calls must pass through BDN; the disable switch is an emergency bypass.
 Response order matches input order. Dropping the batch future cancels pending work.
 
 `ReplayRequest` serializes the original encoder input together with its expected

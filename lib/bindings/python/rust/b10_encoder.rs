@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use baseten_mm_client::{HttpEncoderConfig, MultiModalClient};
+use baseten_mm_client::{HttpEncoderConfig, MultiModalClient, ProductionBdnProxyRequired};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -56,7 +57,13 @@ impl MultiModalEncoderClient {
             max_retries,
             max_concurrent_requests,
         })
-        .map_err(to_pyerr)?;
+        .map_err(|error| {
+            if error.downcast_ref::<ProductionBdnProxyRequired>().is_some() {
+                PyValueError::new_err(error.to_string())
+            } else {
+                to_pyerr(error)
+            }
+        })?;
         Ok(Self { transport })
     }
 

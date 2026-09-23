@@ -14,6 +14,20 @@ use baseten_performance_client_core::http::HttpMethod;
 use baseten_performance_client_core::{PerformanceClientCore, RequestProcessingPreference};
 use std::collections::HashMap;
 
+#[derive(Debug)]
+pub struct ProductionBdnProxyRequired;
+
+impl std::fmt::Display for ProductionBdnProxyRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "This deployment is configured for multimodal encoding and ETCD_ENDPOINTS indicates production (.svc.localnet). Unbuffered calls to the image encoder are not permitted. Deploy with BDN as a proxy (BDN_PROXY, Helm bdnProxy.enabled, or BIS bdn_proxy_config.enabled). For an emergency bypass, set DYNAMO_DISABLE_BDN_PROXY=1; this is not recommended."
+        )
+    }
+}
+
+impl std::error::Error for ProductionBdnProxyRequired {}
+
 impl MultiModalClient {
     pub async fn replay(&self, requests: Vec<ReplayRequest>) -> Result<Vec<MultiModalResponse>> {
         let inputs = requests.iter().map(|item| item.request.clone()).collect();
@@ -95,10 +109,11 @@ pub struct EncoderBatch {
 impl MultiModalClient {
     pub fn new(config: HttpEncoderConfig) -> Result<Self> {
         let proxy = match config.proxy {
-            Some(proxy) => Some(proxy),
-            None => bdn_proxy(
+            Some(proxy) if !proxy.is_empty() => Some(proxy),
+            _ => bdn_proxy(
                 std::env::var("BDN_PROXY").ok().as_deref(),
                 std::env::var("DYNAMO_DISABLE_BDN_PROXY").ok().as_deref(),
+                std::env::var("ETCD_ENDPOINTS").ok().as_deref(),
             )?,
         };
         let mut headers = HashMap::new();
@@ -191,11 +206,18 @@ impl MultiModalClient {
     }
 }
 
-fn bdn_proxy(proxy: Option<&str>, disabled: Option<&str>) -> Result<Option<String>> {
+fn bdn_proxy(
+    proxy: Option<&str>,
+    disabled: Option<&str>,
+    etcd_endpoints: Option<&str>,
+) -> Result<Option<String>> {
     if disabled.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")) {
         return Ok(None);
     }
     let Some(proxy) = proxy.filter(|value| !value.is_empty()) else {
+        if etcd_endpoints.is_some_and(|endpoints| endpoints.contains(".svc.localnet")) {
+            return Err(ProductionBdnProxyRequired.into());
+        }
         return Ok(None);
     };
     let mut parsed = url::Url::parse(proxy).context("Invalid BDN_PROXY URL")?;
@@ -231,21 +253,43 @@ mod tests {
 
     #[test]
     fn bdn_proxy_configuration() -> Result<()> {
-        assert_eq!(bdn_proxy(None, None)?, None);
-        assert_eq!(bdn_proxy(Some(""), None)?, None);
+        assert_eq!(bdn_proxy(None, None, None)?, None);
+        assert_eq!(
+            bdn_proxy(Some(""), None, Some("http://localhost:2379"))?,
+            None
+        );
+        let error = bdn_proxy(None, None, Some("http://etcd.org.svc.localnet:2379")).unwrap_err();
+        assert!(error.downcast_ref::<ProductionBdnProxyRequired>().is_some());
+        assert!(error.to_string().contains("DYNAMO_DISABLE_BDN_PROXY=1"));
+        assert_eq!(
+            bdn_proxy(None, Some("1"), Some("etcd.org.svc.localnet:2379"))?,
+            None
+        );
         for disabled in ["1", "true", "TRUE"] {
-            assert_eq!(bdn_proxy(Some("not a URL"), Some(disabled))?, None);
+            assert_eq!(
+                bdn_proxy(
+                    Some("not a URL"),
+                    Some(disabled),
+                    Some("etcd.svc.localnet:2379")
+                )?,
+                None
+            );
         }
         assert_eq!(
-            bdn_proxy(Some("http://localhost:8080"), Some("0"))?.as_deref(),
+            bdn_proxy(
+                Some("http://localhost:8080"),
+                Some("0"),
+                Some("etcd.svc.localnet:2379")
+            )?
+            .as_deref(),
             Some("http://bdn:dynamo-image-cache@localhost:8080/")
         );
         assert_eq!(
-            bdn_proxy(Some("http://alice:secret@[::1]:8080"), None)?.as_deref(),
+            bdn_proxy(Some("http://alice:secret@[::1]:8080"), None, None)?.as_deref(),
             Some("http://alice:secret@[::1]:8080/")
         );
-        assert!(bdn_proxy(Some("not a URL"), None).is_err());
-        assert!(bdn_proxy(Some("file:///tmp/proxy"), None).is_err());
+        assert!(bdn_proxy(Some("not a URL"), None, None).is_err());
+        assert!(bdn_proxy(Some("file:///tmp/proxy"), None, None).is_err());
         Ok(())
     }
 
@@ -305,7 +349,7 @@ mod tests {
             });
             let mut config = HttpEncoderConfig::new("http://encoder/encode");
             config.api_key = "secret".into();
-            config.proxy = bdn_proxy(Some(&proxy), None)?;
+            config.proxy = bdn_proxy(Some(&proxy), None, None)?;
             config.max_retries = 0;
             let client = MultiModalClient::new(config)?;
             let request = EncodeRequest::new(Media::Image { image_url: [("url".into(), "https://media/image".into())].into() }, "served");
