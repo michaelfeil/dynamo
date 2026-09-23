@@ -1,6 +1,6 @@
 name: BIS Dynamo Image Push
 
-# Build+push of the Dynamo runtime image, used two ways:
+# Build+push of the Dynamo wheelhouse image, used two ways:
 #
 #   - workflow_dispatch: bis-deploy dispatches it with a branch; the run-name
 #     carries `(prefix=…)` so bis-deploy can correlate the dispatched run.
@@ -8,11 +8,9 @@ name: BIS Dynamo Image Push
 #     fork branch — the pipeline (builders, caches, tag scheme) is identical,
 #     so post-merge is just a thin caller instead of a duplicated copy.
 #
-# The workflow checks out the ref (or the triggering commit), builds native
-# amd64 + arm64 images via the repo's standard `container/build.sh --framework
-# none --push`, stitches them into a multi-arch manifest list under the
-# version-stamped tag (e.g. baseten/dynamo-test:v1.2.0.dev.<sha>-none), and
-# publishes that exact resolved ref as the `image-tag` artifact.
+# The workflow builds amd64 + arm64 wheelhouse images, stitches a multi-arch
+# manifest under the existing version-stamped tag, and publishes that ref as
+# the `image-tag` artifact for the downstream Baseten image build.
 
 run-name: "Dynamo image @ ${{ inputs.ref || github.ref_name }} (prefix=${{ inputs.image-tag-prefix }})"
 
@@ -160,11 +158,10 @@ jobs:
           # --no-tag-latest: builds come from arbitrary refs (dispatch) or the main
           # fork branch (post-merge); nothing here should move the shared
           # latest-none tag implicitly.
-          # --target runtime: consumers only need the runtime env + /opt/dynamo
-          # wheelhouse (the monorepo bis image copies the wheels out); the dev
-          # target's tooling stages (~5 min + huge layers) are dead weight here.
+          # The downstream Baseten image copies the wheelhouse and NIXL core.
+          # Build the wheelhouse stage directly, skipping runtime setup.
           ./container/build.sh --framework none --push --no-tag-latest \
-            --target runtime \
+            --target wheelhouse \
             --platform "${{ matrix.platform }}" \
             --tag "${arch_image_tag}" \
             "${SCCACHE_ARGS[@]}" 2>&1 | tee build.log

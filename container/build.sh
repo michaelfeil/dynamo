@@ -77,7 +77,7 @@ CUSTOM_GID=""
 show_help() {
     echo "usage: build.sh"
     echo "  [--framework {VLLM|TRTLLM|SGLANG|NONE}]  Inference framework (default: VLLM)"
-    echo "  [--target {runtime|dev|local-dev|frontend}] Build target (default: dev)"
+    echo "  [--target {runtime|dev|local-dev|frontend|wheelhouse}] Build target (default: dev)"
     echo "  [--platform PLATFORM]                       Docker platform (default: linux/amd64)"
     echo "  [--cuda-version VERSION]                    CUDA version: 12.9, 13.0, 13.1"
     echo "  [--tag TAG]                                 Custom image tag"

@@ -141,6 +141,7 @@ def validate_args(args):
                 "frontend",
                 "planner",
                 "wheel_builder",
+                "wheelhouse",
                 "base",
             ],
             "cuda_version": ["12.9", "13.0"],
