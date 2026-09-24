@@ -39,8 +39,9 @@ const STARTUP_CONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const WATCH_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const WATCH_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const WATCH_RESYNC_GET_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_LEASE_TTL_SECS: u64 = 30;
 /// etcd's default `--grpc-keepalive-min-time`; pinging faster gets GOAWAY `too_many_pings`.
 const ETCD_SERVER_KEEPALIVE_MIN_TIME: Duration = Duration::from_secs(5);
 
@@ -918,6 +919,7 @@ pub struct ClientOptions {
 impl Default for ClientOptions {
     fn default() -> Self {
         let mut connect_options = None;
+        let lease_ttl = default_lease_ttl();
 
         if let (Ok(username), Ok(password)) = (
             std::env::var(env_etcd::auth::ETCD_AUTH_USERNAME),
@@ -944,6 +946,14 @@ impl Default for ClientOptions {
         // connections leaves watch streams open but silent forever, so deletes are never
         // seen and the reconnect/resync path never runs.
         if let Some((interval, timeout)) = default_keep_alive() {
+            if interval.saturating_add(timeout) >= Duration::from_secs(lease_ttl) {
+                tracing::warn!(
+                    interval_secs = interval.as_secs(),
+                    timeout_secs = timeout.as_secs(),
+                    lease_ttl_secs = lease_ttl,
+                    "etcd keepalive detection can take as long as the primary lease TTL"
+                );
+            }
             connect_options = Some(
                 connect_options
                     .unwrap_or_default()
@@ -955,7 +965,7 @@ impl Default for ClientOptions {
             etcd_url: default_servers(),
             etcd_connect_options: connect_options,
             attach_lease: true,
-            lease_ttl: default_lease_ttl(),
+            lease_ttl,
             startup_connect_timeout: default_startup_connect_timeout(),
         }
     }
@@ -977,21 +987,23 @@ fn default_lease_ttl() -> u64 {
             Ok(ttl) if ttl > 0 => ttl,
             Ok(_) => {
                 tracing::warn!(
-                    "{} must be >= 1; got 0. Falling back to 10.",
-                    env_etcd::ETCD_LEASE_TTL
+                    "{} must be >= 1; got 0. Falling back to {}.",
+                    env_etcd::ETCD_LEASE_TTL,
+                    DEFAULT_LEASE_TTL_SECS
                 );
-                10
+                DEFAULT_LEASE_TTL_SECS
             }
             Err(err) => {
                 tracing::warn!(
-                    "Invalid {}='{}' ({err}). Falling back to 10.",
+                    "Invalid {}='{}' ({err}). Falling back to {}.",
                     env_etcd::ETCD_LEASE_TTL,
-                    raw
+                    raw,
+                    DEFAULT_LEASE_TTL_SECS
                 );
-                10
+                DEFAULT_LEASE_TTL_SECS
             }
         },
-        Err(_) => 10,
+        Err(_) => DEFAULT_LEASE_TTL_SECS,
     }
 }
 
