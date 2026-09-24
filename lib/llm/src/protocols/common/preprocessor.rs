@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use derive_builder::Builder;
@@ -170,6 +170,11 @@ pub struct PreprocessedRequest {
 
     /// Type of prompt
     pub token_ids: Vec<TokenIdType>,
+
+    /// Per-request CPU mocker configuration, including frontend-encoded output.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mocker_config: Option<HashMap<String, serde_json::Value>>,
 
     /// Base64-encoded PyTorch tensor containing pre-computed embeddings
     /// If provided, this takes precedence over token_ids for inference

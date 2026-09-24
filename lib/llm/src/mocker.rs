@@ -589,6 +589,19 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                 .ok_or_else(|| Error::msg("max_output_tokens must be specified for mocker"))?
                 as usize
         };
+        let output_token_ids: Option<Vec<TokenIdType>> = request
+            .mocker_config
+            .as_ref()
+            .and_then(|config| config.get("output_token_ids"))
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
+        let output_limit = output_token_ids
+            .as_ref()
+            .map_or(max_output_tokens, |ids| ids.len().min(max_output_tokens));
+        let natural_stop = !is_prefill
+            && output_token_ids
+                .as_ref()
+                .is_some_and(|ids| ids.len() <= max_output_tokens);
         let native_timing = self
             .native_metrics
             .request_timing(&request.model, dp_rank, is_prefill, request_start)
@@ -614,7 +627,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
         let prompt_tokens_count = request.token_ids.len();
         let direct_request = DirectRequest {
             tokens: request.token_ids.clone(),
-            max_output_tokens,
+            max_output_tokens: output_limit.max(1),
             uuid: Some(request_uuid),
             dp_rank,
             arrival_timestamp_ms: request.request_timestamp_ms,
@@ -698,19 +711,25 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                         }
 
                         // Generate a token (with thinking boundaries if configured)
-                        let token_id = if token_count == 0 && think_len > 0 {
-                            reasoning.as_ref().unwrap().start_thinking_token_id
-                        } else if think_len > 0 && token_count == think_len - 1 {
-                            reasoning.as_ref().unwrap().end_thinking_token_id
+                        let token_ids = if let Some(ids) = &output_token_ids {
+                            ids[..output_limit].get(token_count).copied().into_iter().collect()
                         } else {
-                            generate_random_token()
+                            let token_id = if token_count == 0 && think_len > 0 {
+                                reasoning.as_ref().unwrap().start_thinking_token_id
+                            } else if think_len > 0 && token_count == think_len - 1 {
+                                reasoning.as_ref().unwrap().end_thinking_token_id
+                            } else {
+                                generate_random_token()
+                            };
+                            vec![token_id]
                         };
-                        token_count += 1;
+                        let emitted_tokens = token_ids.len();
+                        token_count += emitted_tokens;
 
                         // The first chunk carries the admission cache truth; the
                         // final chunk repeats cumulative totals (OpenAI convention).
                         let output = LLMEngineOutput {
-                            token_ids: vec![token_id],
+                            token_ids,
                             disaggregated_params: is_prefill.then(|| serde_json::json!("dummy")),
                             completion_usage: signal.cached_tokens.map(|cached| {
                                 usage_with_cached_tokens(prompt_tokens_count, token_count, cached)
@@ -718,7 +737,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                             ..Default::default()
                         };
 
-                        if signal.completed && token_count < max_output_tokens {
+                        if signal.completed && token_count < output_limit {
                             let _ = stream_tx.send(LLMEngineOutput::error("Completion signal received before max tokens reached".to_string()));
                             break;
                         }
@@ -728,7 +747,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                                 tracing::error!("Output stream receiver closed.");
                                 break;
                             }
-                            native_timing.record_tokens(1);
+                            native_timing.record_tokens(emitted_tokens);
 
                             // Prefill-to-decode handoff delay is emitted by the shared mocker core.
                             if is_prefill
@@ -744,7 +763,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                                 server.complete_room(room_id);
                             }
 
-                            let mut final_output = LLMEngineOutput::length();
+                            let mut final_output = if natural_stop { LLMEngineOutput::stop() } else { LLMEngineOutput::length() };
                             final_output.completion_usage = cached_prefix_tokens.map(|cached| {
                                 usage_with_cached_tokens(prompt_tokens_count, token_count, cached)
                             });
@@ -760,7 +779,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
                             tracing::error!("Output stream receiver closed.");
                             break;
                         }
-                        native_timing.record_tokens(1);
+                        native_timing.record_tokens(emitted_tokens);
                     }
 
                     _ = async_context.stopped() => {
@@ -884,8 +903,20 @@ mod tests {
         ManyOut<LLMEngineOutput>,
         mpsc::UnboundedSender<OutputSignal>,
     ) {
+        wired_output_stream(uuid, WorkerType::Prefill, None, 1).await
+    }
+
+    async fn wired_output_stream(
+        uuid: Uuid,
+        worker_type: WorkerType,
+        output: Option<Vec<u32>>,
+        max_tokens: u32,
+    ) -> (
+        ManyOut<LLMEngineOutput>,
+        mpsc::UnboundedSender<OutputSignal>,
+    ) {
         let args = MockEngineArgs::builder()
-            .worker_type(WorkerType::Prefill)
+            .worker_type(worker_type)
             .block_size(4)
             .num_gpu_blocks(64)
             .max_num_batched_tokens(Some(64))
@@ -896,14 +927,29 @@ mod tests {
 
         // Wire the scheduler input channel so `generate` can submit the request
         // without a live runtime; the test drives the output signals directly.
-        let (direct_tx, _direct_rx) = mpsc::unbounded_channel::<DirectRequest>();
+        let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<DirectRequest>();
         engine.request_senders.set(vec![direct_tx]).unwrap();
 
+        let expected_limit = if worker_type == WorkerType::Prefill {
+            1
+        } else {
+            max_tokens as usize
+        };
+        let expected_scheduled = output
+            .as_ref()
+            .map_or(expected_limit, |ids| ids.len().min(expected_limit))
+            .max(1);
         let request = PreprocessedRequest::builder()
+            .mocker_config(output.map(|ids| {
+                std::collections::HashMap::from([(
+                    "output_token_ids".to_string(),
+                    serde_json::json!(ids),
+                )])
+            }))
             .model("mock".to_string())
             .token_ids(vec![1, 2, 3])
             .stop_conditions(StopConditions {
-                max_tokens: Some(1),
+                max_tokens: Some(max_tokens),
                 ..Default::default()
             })
             .sampling_options(SamplingOptions::default())
@@ -919,6 +965,10 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(
+            direct_rx.recv().await.unwrap().max_output_tokens,
+            expected_scheduled
+        );
         let signal_tx = engine
             .active_requests
             .get(&uuid)
@@ -926,6 +976,53 @@ mod tests {
             .value()
             .clone();
         (stream, signal_tx)
+    }
+
+    #[tokio::test]
+    async fn supplied_output_streams_exact_tokens_and_finishes() {
+        for worker_type in [WorkerType::Aggregated, WorkerType::Decode] {
+            for (ids, max_tokens) in [
+                (vec![42, 99, 7], 8),
+                (vec![42, 99, 7], 2),
+                (vec![42, 99, 7], 3),
+                (vec![], 8),
+            ] {
+                let uuid = Uuid::new_v4();
+                let expected = &ids[..ids.len().min(max_tokens as usize)];
+                let (mut stream, sender) =
+                    wired_output_stream(uuid, worker_type, Some(ids.clone()), max_tokens).await;
+                for index in 0..expected.len().max(1) {
+                    sender
+                        .send(OutputSignal {
+                            uuid,
+                            completed: index + 1 == expected.len().max(1),
+                            handoff_delay_ms: None,
+                            cached_tokens: Some(0),
+                        })
+                        .unwrap();
+                }
+                let mut actual = Vec::new();
+                let mut final_chunk = None;
+                while let Some(chunk) = stream.next().await {
+                    actual.extend_from_slice(&chunk.token_ids);
+                    if chunk.finish_reason.is_some() {
+                        final_chunk = Some(chunk);
+                    }
+                }
+                assert_eq!(actual, expected);
+                let final_chunk = final_chunk.unwrap();
+                let expected_finish = if ids.len() <= max_tokens as usize {
+                    LLMEngineOutput::stop()
+                } else {
+                    LLMEngineOutput::length()
+                };
+                assert_eq!(final_chunk.finish_reason, expected_finish.finish_reason);
+                assert_eq!(
+                    final_chunk.completion_usage.unwrap().completion_tokens as usize,
+                    expected.len()
+                );
+            }
+        }
     }
 
     /// The relay is the user-facing half of the feature: the scheduler's admission

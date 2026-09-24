@@ -636,6 +636,21 @@ impl OpenAIPreprocessor {
     ) -> Result<PreprocessedRequestBuilder> {
         let mut builder = PreprocessedRequest::builder();
         builder.model(request.model());
+        if let Some(mut config) = request
+            .baseten_ext()
+            .and_then(|ext| ext.mocker_config.clone())
+        {
+            if let Some(text) = config.remove("output_text") {
+                let text = text
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("mocker_config.output_text must be a string"))?;
+                config.insert(
+                    "output_token_ids".to_string(),
+                    serde_json::json!(self.tokenizer.encode(text)?.token_ids()),
+                );
+            }
+            builder.mocker_config(Some(config));
+        }
 
         let mut stop_conditions = request.extract_stop_conditions()?;
         if let Some(stop_tokens) = &mut stop_conditions.stop_token_ids_hidden {
