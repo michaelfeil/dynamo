@@ -171,6 +171,12 @@ pub mod etcd {
     /// ETCD endpoints (comma-separated list of URLs)
     pub const ETCD_ENDPOINTS: &str = "ETCD_ENDPOINTS";
 
+    /// HTTP/2 keepalive ping interval in seconds for the ETCD gRPC channel (default 0: disabled)
+    pub const DYN_ETCD_KEEPALIVE_INTERVAL_SECS: &str = "DYN_ETCD_KEEPALIVE_INTERVAL_SECS";
+
+    /// Seconds to wait for a keepalive ping ack before the ETCD channel is closed (default 10)
+    pub const DYN_ETCD_KEEPALIVE_TIMEOUT_SECS: &str = "DYN_ETCD_KEEPALIVE_TIMEOUT_SECS";
+
     /// ETCD authentication environment variables
     pub mod auth {
         /// Username for ETCD authentication
@@ -642,6 +648,8 @@ mod tests {
             nats::stream::DYN_NATS_STREAM_MAX_AGE,
             // ETCD
             etcd::ETCD_ENDPOINTS,
+            etcd::DYN_ETCD_KEEPALIVE_INTERVAL_SECS,
+            etcd::DYN_ETCD_KEEPALIVE_TIMEOUT_SECS,
             etcd::auth::ETCD_AUTH_USERNAME,
             etcd::auth::ETCD_AUTH_PASSWORD,
             etcd::auth::ETCD_AUTH_CA,

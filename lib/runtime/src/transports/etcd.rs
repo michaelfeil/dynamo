@@ -786,12 +786,48 @@ impl Default for ClientOptions {
             );
         }
 
+        // Without HTTP/2 keepalive, an etcd member that hangs without closing its TCP
+        // connections leaves watch streams open but silent forever, so deletes are never
+        // seen and the reconnect/resync path never runs.
+        if let Some((interval, timeout)) = keep_alive_from_env() {
+            connect_options = Some(
+                connect_options
+                    .unwrap_or_default()
+                    .with_keep_alive(interval, timeout),
+            );
+        }
+
         ClientOptions {
             etcd_url: default_servers(),
             etcd_connect_options: connect_options,
             attach_lease: true,
         }
     }
+}
+
+const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 0;
+const DEFAULT_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
+
+fn keep_alive_from_env() -> Option<(Duration, Duration)> {
+    let secs = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    };
+    let interval = secs(
+        env_etcd::DYN_ETCD_KEEPALIVE_INTERVAL_SECS,
+        DEFAULT_KEEPALIVE_INTERVAL_SECS,
+    );
+    if interval == 0 {
+        return None;
+    }
+    let timeout = secs(
+        env_etcd::DYN_ETCD_KEEPALIVE_TIMEOUT_SECS,
+        DEFAULT_KEEPALIVE_TIMEOUT_SECS,
+    )
+    .max(1);
+    Some((Duration::from_secs(interval), Duration::from_secs(timeout)))
 }
 
 fn default_servers() -> Vec<String> {

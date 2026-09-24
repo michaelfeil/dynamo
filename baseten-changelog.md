@@ -427,6 +427,17 @@ events during etcd reconnects.
 etcd watch tasks retry stream creation via resync instead of exiting after one
 failed reconnect (basetenlabs/dynamo#905).
 
+The resync only runs after a watch *errors*, so the etcd channel can enable
+HTTP/2 keepalive by setting `DYN_ETCD_KEEPALIVE_INTERVAL_SECS` to a positive
+number of seconds (disabled by default; 10 s acknowledgment timeout, adjustable
+with `DYN_ETCD_KEEPALIVE_TIMEOUT_SECS`). Without it, a member that hangs without
+closing its TCP connections leaves the watch open but silent forever and
+discovery keeps every instance removed after the hang (INC-8410, Glimmer
+2026-09-20: four frontends dialled 14 dead worker endpoints for ~16 h, zero
+watch errors logged).
+Keep the interval at or above etcd's `--grpc-keepalive-min-time` (default 5 s)
+or the server answers with GOAWAY `too_many_pings`.
+
 The frontend HTTP service now registers with the graceful-shutdown tracker for
 the lifetime of its serve+drain future (`HttpService::run` holds a
 `GracefulTaskGuard`, basetenlabs/dynamo#461). Before this, only worker
