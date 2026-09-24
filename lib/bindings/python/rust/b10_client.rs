@@ -152,6 +152,7 @@ fn generation_python_stream(
 #[pyclass]
 pub(crate) struct GenerationCoordinator {
     inner: Arc<GenerationCoordinatorRuntime>,
+    config: baseten_configmap::ConfigReader,
 }
 
 #[pymethods]
@@ -224,17 +225,19 @@ impl GenerationCoordinator {
             block_size: kv_block_size,
             machine_id,
         };
+        let config = baseten_configmap::current_reader();
         Ok(Self {
             inner: Arc::new(
                 GenerationCoordinatorRuntime::new(
                     runtime.inner().clone(),
                     options,
-                    baseten_configmap::current_reader(),
+                    config.clone(),
                     namespace,
                     is_client_force,
                 )
                 .map_err(to_pyerr)?,
             ),
+            config,
         })
     }
 
@@ -247,6 +250,7 @@ impl GenerationCoordinator {
     fn remote(_cls: &Bound<'_, PyType>, backends: BTreeMap<String, String>) -> PyResult<Self> {
         Ok(Self {
             inner: Arc::new(GenerationCoordinatorRuntime::remote(backends).map_err(to_pyerr)?),
+            config: baseten_configmap::current_reader(),
         })
     }
 
@@ -300,6 +304,9 @@ impl GenerationCoordinator {
             context.trace_context().cloned(),
             context.metadata_snapshot(),
         );
+        // Logged here, not in the core coordinator, which a remote coordinator's
+        // HTTP service also runs: each frontend request logs once.
+        core_context.log_request_metadata(&self.config.snapshot().logging.request_metadata_keys);
         let coordinator = Arc::clone(&self.inner);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

@@ -86,6 +86,33 @@ impl GenerationCoordinatorConfig {
     }
 }
 
+/// Frontend request logging. Python owns this section's other fields.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct B10LoggingConfig {
+    /// Context metadata keys logged with each frontend request.
+    pub request_metadata_keys: Vec<String>,
+}
+
+impl B10LoggingConfig {
+    /// Drop keys that can never match: metadata keys taken from HTTP headers arrive lowercased.
+    fn sanitize(mut self) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        self.request_metadata_keys.retain(|key| {
+            let valid = !key.is_empty() && *key == key.to_lowercase() && seen.insert(key.clone());
+            if !valid {
+                tracing::error!(
+                    key = %key,
+                    "b10_logging_config.request_metadata_keys entries must be non-empty, \
+                     lowercase, and unique; ignoring key"
+                );
+            }
+            valid
+        });
+        self
+    }
+}
+
 const BID_WEIGHT_SCALE: u128 = 10_000;
 
 fn validate_bid_weights(decode_token_weight: f64, affinity_multiplier: f64) -> Result<()> {
@@ -469,6 +496,8 @@ struct OverrideConfig {
     #[serde(default)]
     b10_generation_coordinator_config: Option<GenerationCoordinatorConfig>,
     #[serde(default)]
+    b10_logging_config: Option<B10LoggingConfig>,
+    #[serde(default)]
     b10_routing_config: Option<B10RoutingConfigOverride>,
 
     #[serde(default)]
@@ -486,6 +515,8 @@ struct OverrideConfig {
 struct LLMConfig {
     #[serde(default)]
     b10_generation_coordinator_config: GenerationCoordinatorConfig,
+    #[serde(default)]
+    b10_logging_config: B10LoggingConfig,
     #[serde(default)]
     b10_routing_config: B10RoutingConfig,
 
@@ -527,6 +558,7 @@ impl LLMRuntimeConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnifiedConfig {
     pub generation_coordinator: GenerationCoordinatorConfig,
+    pub logging: B10LoggingConfig,
     pub routing: B10RoutingConfig,
     pub router_active_replicas: usize,
     pub runtime: LLMRuntimeConfig,
@@ -537,6 +569,7 @@ impl Default for UnifiedConfig {
     fn default() -> Self {
         Self {
             generation_coordinator: GenerationCoordinatorConfig::default(),
+            logging: B10LoggingConfig::default(),
             routing: B10RoutingConfig::default(),
             router_active_replicas: default_router_active_replicas(),
             runtime: LLMRuntimeConfig::default(),
@@ -680,6 +713,9 @@ impl UnifiedConfig {
             if let Some(coordinator) = &group_config.b10_generation_coordinator_config {
                 root_config.b10_generation_coordinator_config = coordinator.clone();
             }
+            if let Some(logging) = &group_config.b10_logging_config {
+                root_config.b10_logging_config = logging.clone();
+            }
             if let Some(routing_override) = &group_config.b10_routing_config {
                 root_config
                     .b10_routing_config
@@ -717,6 +753,7 @@ impl UnifiedConfig {
         root_config.b10_generation_coordinator_config.validate()?;
         let unified_config = UnifiedConfig {
             generation_coordinator: root_config.b10_generation_coordinator_config,
+            logging: root_config.b10_logging_config.sanitize(),
             router_active_replicas: root_config.b10_routing_config.router_active_replicas,
             routing: root_config.b10_routing_config,
             runtime: runtime_config,
@@ -728,6 +765,7 @@ impl UnifiedConfig {
 
     pub(crate) fn sanitize(mut self) -> Self {
         self.router_active_replicas = self.routing.router_active_replicas;
+        self.logging = self.logging.sanitize();
         self.routing.router_active_request_dp_blend =
             sanitize_router_active_request_dp_blend(self.routing.router_active_request_dp_blend);
         self.routing.router_residency_eviction_cost =
@@ -813,6 +851,52 @@ override_args:
         assert!(
             parse("b10_generation_coordinator_config:\n  bid_decode_token_weight: 429496.7295\n  bid_affinity_multiplier: 429496.7295\n").is_ok()
         );
+    }
+
+    #[test]
+    fn logging_request_metadata_keys_parse_and_sanitize() {
+        let parse = |yaml: &str| {
+            UnifiedConfig::parse(yaml, None, &B10RoutingConfig::default())
+                .unwrap()
+                .logging
+                .request_metadata_keys
+        };
+        assert!(parse("{}").is_empty());
+        // Python-owned fields in the same section are ignored.
+        assert_eq!(
+            parse(
+                "b10_logging_config:\n  default_level: INFO\n  loggers: {a: DEBUG}\n  request_metadata_keys: [x-example-agent-id, x-example-workload-id]\n"
+            ),
+            ["x-example-agent-id", "x-example-workload-id"]
+        );
+        assert_eq!(
+            parse(
+                "b10_logging_config:\n  request_metadata_keys: ['', X-Example-Agent-Id, x-example-id, x-example-id]\n"
+            ),
+            ["x-example-id"]
+        );
+    }
+
+    #[test]
+    fn logging_request_metadata_keys_follow_override_group() {
+        let yaml = r#"
+b10_logging_config: {request_metadata_keys: [x-root]}
+override_args:
+  frontend: {b10_logging_config: {request_metadata_keys: [x-a]}}
+  disabled: {b10_logging_config: {request_metadata_keys: []}}
+  levels_only: {b10_logging_config: {default_level: info}}
+  worker: {tensor_parallel_size: 2}
+"#;
+        for (group, expected) in [
+            (None, vec!["x-root"]),
+            (Some("frontend"), vec!["x-a"]),
+            (Some("disabled"), vec![]),
+            (Some("levels_only"), vec![]),
+            (Some("worker"), vec!["x-root"]),
+        ] {
+            let config = UnifiedConfig::parse(yaml, group, &B10RoutingConfig::default()).unwrap();
+            assert_eq!(config.logging.request_metadata_keys, expected, "{group:?}");
+        }
     }
 
     #[test]

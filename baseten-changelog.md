@@ -2049,6 +2049,18 @@ preserve the `unified_model_logs` / `skip_unified_model_logs` field settings
 exactly as spelled — the pipeline matches only these names, so a renamed or
 dropped marker silently changes customer-facing log visibility.
 
+v1.2 request metadata event: the Python `GenerationCoordinator.generate`
+binding emits an internal INFO `Request metadata` event at generation entry
+with the resolved session affinity ID and selected non-empty context metadata.
+`baseten-configmap` hot-reloads `b10_logging_config.request_metadata_keys`;
+override-group sections replace the root logging section. Session IDs log
+independently of the selected keys. When neither a session ID nor selected values
+are present, no event is emitted. Earlier validation/preprocessing failures and
+cancellations are excluded. Join `b10_request_id` to the Python request summary
+for timing and status. Emission at the binding avoids duplicate events from
+remote coordinator HTTP services. The event has no `unified_model_logs` marker
+and does not report affinity-hit outcomes.
+
 Replay notes:
 
 Replay selectively after functional runtime and router patches are in place.

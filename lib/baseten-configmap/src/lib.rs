@@ -10,8 +10,8 @@ mod reader;
 mod registry;
 
 pub use config::{
-    B10RoutingConfig, CoordinatorAffinityConfig, GenerationCoordinatorConfig, LLMRuntimeConfig,
-    UnifiedConfig, bid_weight_ratio, sanitize_router_temperature,
+    B10LoggingConfig, B10RoutingConfig, CoordinatorAffinityConfig, GenerationCoordinatorConfig,
+    LLMRuntimeConfig, UnifiedConfig, bid_weight_ratio, sanitize_router_temperature,
 };
 pub use logging::set_log_no_changes;
 pub use reader::ConfigReader;

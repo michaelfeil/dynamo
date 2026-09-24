@@ -102,6 +102,30 @@ overrides, and sanitization. It does not merge arbitrary engine/frontend fields 
 change Python's separate override semantics. Related values are coherent within
 one snapshot; separate routing phases may intentionally take newer snapshots.
 
+## Request metadata logging
+
+Rust reads only `request_metadata_keys` from `b10_logging_config`; Python owns the
+section's other fields. An `override_args.<group>.b10_logging_config` section
+replaces the root section, matching Python's configuration semantics.
+
+The Python `GenerationCoordinator.generate` binding emits an internal INFO
+`Request metadata` event at generation entry with the resolved session affinity
+ID whenever present, plus configured, non-empty metadata values. The key list
+controls only extra metadata; an empty list still allows session-ID logging.
+No event is emitted when neither is present. Earlier validation/preprocessing
+failures and cancellations are outside this coverage. Join the frontend summary on
+`b10_request_id` for request timing and status; the event records identity, not
+affinity-hit outcomes.
+
+Keys must be non-empty, lowercase, and unique; others are dropped with an error.
+HTTP headers reach context metadata only through the frontend's
+`DYN_METADATA_HEADER` prefix.
+
+```yaml
+b10_logging_config:
+  request_metadata_keys: [x-example-agent-id, x-example-workload-id]
+```
+
 ## Generation coordinator listener
 
 `GenerationCoordinator` reads the Rust snapshot at construction; `start()` initializes
