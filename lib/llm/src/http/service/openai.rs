@@ -48,7 +48,7 @@ use super::{
 use crate::engines::ValidateRequest;
 use crate::http::service::baseten::{
     attach_worker_response_headers, baseten_session_affinity_from_request,
-    take_worker_response_metadata,
+    insert_baseten_context_metadata, take_worker_response_metadata,
 };
 use crate::preprocessor::PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY;
 use crate::protocols::common::extensions::{
@@ -463,6 +463,7 @@ fn context_from_headers_with_body_session<T: Send + Sync + 'static>(
 ) -> Result<Context<T>, ErrorResponse> {
     let mut metadata = extract_metadata_from_http(headers)
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
+    insert_baseten_context_metadata(&mut metadata, headers);
     stamp_request_start(&mut metadata).map_err(|err| {
         ErrorMessage::internal_server_error(&format!(
             "system clock is before the Unix epoch: {err}"
@@ -3179,12 +3180,28 @@ mod tests {
     fn test_context_from_headers_stamps_request_start() {
         let mut headers = HeaderMap::new();
         headers.insert("x-dynamo-meta-dynamo.request_start", "0".parse().unwrap());
+        headers.insert("x-baseten-org-namespace", "org-1".parse().unwrap());
+        headers.insert("x-baseten-request-id", "request-1".parse().unwrap());
+        headers.insert(
+            "x-baseten-model-apis-version-id",
+            "model-1".parse().unwrap(),
+        );
         let before_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
 
         let context = context_from_headers((), "request-1".to_string(), &headers).unwrap();
+        assert_eq!(context.id(), "request-1");
+        assert_eq!(context.metadata().get("baseten.org_id").unwrap(), "org-1");
+        assert_eq!(
+            context.metadata().get("baseten.request_id").unwrap(),
+            "request-1"
+        );
+        assert_eq!(
+            context.metadata().get("baseten.model_version_id").unwrap(),
+            "model-1"
+        );
 
         let after_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -15,6 +15,11 @@ pub const X_BASETEN_DYN_WORKER_ID_HEADER: &str = "x-baseten-dyn-worker-id";
 pub const X_BASETEN_DYN_PREFILL_WORKER_ID_HEADER: &str = "x-baseten-dyn-prefill-worker-id";
 pub const X_BASETEN_DYN_PREFILL_DP_RANK_HEADER: &str = "x-baseten-dyn-prefill-dp-rank";
 pub const X_BASETEN_DYN_DECODE_DP_RANK_HEADER: &str = "x-baseten-dyn-decode-dp-rank";
+pub const ORG_ID_METADATA_KEY: &str = "baseten.org_id";
+pub const REQUEST_ID_METADATA_KEY: &str = "baseten.request_id";
+pub const MODEL_VERSION_ID_METADATA_KEY: &str = "baseten.model_version_id";
+pub const CF_RAY_METADATA_KEY: &str = "baseten.cf_ray";
+pub const USER_ID_METADATA_KEY: &str = "baseten.user_id";
 const BASETEN_PREFERRED_SESSION_AFFINITY_HEADERS: &[&str] = &[
     "x-baseten-session-id",
     "x-baseten-session",
@@ -233,6 +238,52 @@ pub(crate) fn get_or_create_context_id(headers: &HeaderMap) -> String {
     context_id
 }
 
+/// Copy Baseten-owned request fields into context metadata alongside the
+/// existing composite context ID. Header-derived values take precedence over
+/// client-supplied `x-dynamo-meta-baseten.*` entries.
+pub(crate) fn insert_baseten_context_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    headers: &HeaderMap,
+) {
+    for key in [
+        ORG_ID_METADATA_KEY,
+        REQUEST_ID_METADATA_KEY,
+        MODEL_VERSION_ID_METADATA_KEY,
+        CF_RAY_METADATA_KEY,
+        USER_ID_METADATA_KEY,
+    ] {
+        metadata.remove(key);
+    }
+
+    if let Some(org_id) = nonempty_header(headers, "X-Baseten-Org-Namespace")
+        .or_else(|| nonempty_header(headers, "X-Baseten-Billing-Org-Id"))
+    {
+        metadata.insert(ORG_ID_METADATA_KEY.into(), org_id.into());
+    }
+    if let Some(request_id) = nonempty_header(headers, "X-Baseten-Request-Id") {
+        metadata.insert(
+            REQUEST_ID_METADATA_KEY.into(),
+            request_id.split(':').next().unwrap_or_default().into(),
+        );
+    }
+    if let Some(model_version_id) = nonempty_header(headers, "X-Baseten-Model-APIs-Version-Id")
+        .or_else(|| nonempty_header(headers, "X-Baseten-Model-Version-ID"))
+    {
+        metadata.insert(
+            MODEL_VERSION_ID_METADATA_KEY.into(),
+            model_version_id.into(),
+        );
+    }
+
+    let extras = parse_customer_request_context(headers);
+    if !extras.cf_ray.is_empty() {
+        metadata.insert(CF_RAY_METADATA_KEY.into(), extras.cf_ray);
+    }
+    if !extras.user_id.is_empty() {
+        metadata.insert(USER_ID_METADATA_KEY.into(), extras.user_id);
+    }
+}
+
 /// Header value as `&str`, treating a present-but-empty value as absent so the
 /// fallback chains (and the UUID default) fire on empty headers too.
 fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -301,6 +352,41 @@ mod tests {
             get_or_create_context_id(&headers),
             "my-org--abc123--mv-789--ray-1:chatcmpl-abc"
         );
+        let mut metadata = BTreeMap::new();
+        insert_baseten_context_metadata(&mut metadata, &headers);
+        assert_eq!(metadata.get(ORG_ID_METADATA_KEY).unwrap(), "my-org");
+        assert_eq!(metadata.get(REQUEST_ID_METADATA_KEY).unwrap(), "abc123");
+        assert_eq!(
+            metadata.get(MODEL_VERSION_ID_METADATA_KEY).unwrap(),
+            "mv-789"
+        );
+        assert_eq!(metadata.get(CF_RAY_METADATA_KEY).unwrap(), "ray-1");
+        assert_eq!(metadata.get(USER_ID_METADATA_KEY).unwrap(), "chatcmpl-abc");
+    }
+
+    #[test]
+    fn baseten_metadata_uses_header_fallbacks_and_discards_spoofed_values() {
+        let headers = headers_with(&[
+            ("X-Baseten-Request-Id", "abc123:legacy-ray:legacy-user"),
+            ("X-Baseten-Billing-Org-Id", "billing-org"),
+            ("X-Baseten-Model-Version-ID", "legacy-mv"),
+        ]);
+        let mut metadata = BTreeMap::from([
+            (ORG_ID_METADATA_KEY.into(), "spoofed-org".into()),
+            (REQUEST_ID_METADATA_KEY.into(), "spoofed-request".into()),
+            (CF_RAY_METADATA_KEY.into(), "spoofed-ray".into()),
+        ]);
+
+        insert_baseten_context_metadata(&mut metadata, &headers);
+
+        assert_eq!(metadata.get(ORG_ID_METADATA_KEY).unwrap(), "billing-org");
+        assert_eq!(metadata.get(REQUEST_ID_METADATA_KEY).unwrap(), "abc123");
+        assert_eq!(
+            metadata.get(MODEL_VERSION_ID_METADATA_KEY).unwrap(),
+            "legacy-mv"
+        );
+        assert!(!metadata.contains_key(CF_RAY_METADATA_KEY));
+        assert!(!metadata.contains_key(USER_ID_METADATA_KEY));
     }
 
     #[test]

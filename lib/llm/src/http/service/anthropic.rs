@@ -56,7 +56,7 @@ use crate::types::Annotated;
 // Re-use helpers from sibling modules under service/.
 use super::baseten::{
     attach_worker_response_headers, baseten_session_affinity_from_request,
-    get_or_create_context_id, take_worker_response_metadata,
+    get_or_create_context_id, insert_baseten_context_metadata, take_worker_response_metadata,
 };
 use super::metadata::extract_metadata_from_http;
 use super::openai::get_body_limit;
@@ -226,6 +226,7 @@ async fn handler_anthropic_messages(
             &err.to_string(),
         )
     })?;
+    insert_baseten_context_metadata(&mut metadata, &headers);
     stamp_request_start(&mut metadata).map_err(|err| {
         anthropic_error(
             StatusCode::INTERNAL_SERVER_ERROR,
