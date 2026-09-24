@@ -48,7 +48,7 @@ fn router_queue_busy_fractional() -> bool {
     *ROUTER_QUEUE_BUSY_FRACTIONAL.get_or_init(|| {
         std::env::var(ROUTER_QUEUE_BUSY_FRACTIONAL_ENV)
             .map(|value| matches!(value.to_lowercase().as_str(), "true" | "1" | "yes" | "on"))
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -62,11 +62,11 @@ fn required_busy_workers_for_queueing(eligible_workers: usize, busy_fractional: 
     }
 
     let busy_fraction = if eligible_workers > 200 {
-        0.97
+        0.95
     } else if eligible_workers > 64 {
-        0.98
+        0.96
     } else {
-        0.99
+        0.97
     };
 
     ((eligible_workers as f64 * busy_fraction).floor() as usize).clamp(1, eligible_workers)
@@ -334,7 +334,7 @@ impl<
         }
         if router_queue_busy_fractional() {
             tracing::info!(
-                "Router queue fractional busy admission enabled: require all eligible workers up to 16, floor(0.99*N) above 16, floor(0.98*N) above 64, floor(0.97*N) above 200"
+                "Router queue fractional busy admission enabled: require all eligible workers up to 16, floor(0.97*N) above 16, floor(0.96*N) above 64, floor(0.95*N) above 200"
             );
         }
         if !queue_depth_tiers.is_unbounded() {
@@ -2074,10 +2074,10 @@ mod tests {
         assert_eq!(required_busy_workers_for_queueing(1, true), 1);
         assert_eq!(required_busy_workers_for_queueing(16, true), 16);
         assert_eq!(required_busy_workers_for_queueing(17, true), 16);
-        assert_eq!(required_busy_workers_for_queueing(64, true), 63);
-        assert_eq!(required_busy_workers_for_queueing(65, true), 63);
-        assert_eq!(required_busy_workers_for_queueing(200, true), 196);
-        assert_eq!(required_busy_workers_for_queueing(201, true), 194);
+        assert_eq!(required_busy_workers_for_queueing(64, true), 62);
+        assert_eq!(required_busy_workers_for_queueing(65, true), 62);
+        assert_eq!(required_busy_workers_for_queueing(200, true), 192);
+        assert_eq!(required_busy_workers_for_queueing(201, true), 190);
     }
 
     #[tokio::test(flavor = "multi_thread")]
