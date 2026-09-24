@@ -424,6 +424,9 @@ storage-backed discovery) rebuild or diff local state from that snapshot. This
 prevents stale lease-bound discovery entries from surviving missed delete
 events during etcd reconnects.
 
+etcd watch tasks retry stream creation via resync instead of exiting after one
+failed reconnect (basetenlabs/dynamo#905).
+
 The frontend HTTP service now registers with the graceful-shutdown tracker for
 the lifetime of its serve+drain future (`HttpService::run` holds a
 `GracefulTaskGuard`, basetenlabs/dynamo#461). Before this, only worker

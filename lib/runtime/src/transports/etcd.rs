@@ -467,7 +467,14 @@ impl Client {
                 let watch_stream =
                     match Self::new_watch_stream(&connector, &prefix_str, start_revision).await {
                         Ok(stream) => stream,
-                        Err(_) => return,
+                        Err(err) => {
+                            tracing::warn!(
+                                prefix = %prefix_str,
+                                error = %err,
+                                "failed to establish etcd watch stream; retrying via resync"
+                            );
+                            continue;
+                        }
                     };
 
                 first_connect = false;
