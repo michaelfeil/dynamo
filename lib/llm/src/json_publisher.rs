@@ -54,6 +54,9 @@ pub struct JsonPublisher {
 impl JsonPublisher {
     /// Creates a new JsonPublisher that will send events to the provided component
     pub fn new(component: Component, config: Option<JsonPublisherConfig>) -> Self {
+        log::warn!(
+            "JsonPublisher is deprecated and no longer supported: it can drift from etcd membership, has no liveness support, and is hard to unit test. It is unsupported in Dynamo 1.4.0+; adding new features to it is discouraged."
+        );
         let config = config.unwrap_or_default();
         let (sender, receiver) = mpsc::channel::<(String, JsonValue)>(config.channel_buffer_size);
         let cancellation_token = CancellationToken::new();
