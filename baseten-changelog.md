@@ -437,6 +437,9 @@ discovery keeps every instance removed after the hang (INC-8410, Glimmer
 watch errors logged).
 Keep the interval at or above etcd's `--grpc-keepalive-min-time` (default 5 s)
 or the server answers with GOAWAY `too_many_pings`.
+When the interval plus acknowledgment timeout reaches the 30 s primary lease
+TTL, startup logs a warning because detecting a hung connection may take too
+long to recover that lease. For example, 15 s + 10 s stays below the TTL.
 
 The frontend HTTP service now registers with the graceful-shutdown tracker for
 the lifetime of its serve+drain future (`HttpService::run` holds a

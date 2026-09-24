@@ -827,6 +827,14 @@ fn keep_alive_from_env() -> Option<(Duration, Duration)> {
         DEFAULT_KEEPALIVE_TIMEOUT_SECS,
     )
     .max(1);
+    if interval.saturating_add(timeout) >= PRIMARY_LEASE_TTL_SECS {
+        tracing::warn!(
+            interval_secs = interval,
+            timeout_secs = timeout,
+            lease_ttl_secs = PRIMARY_LEASE_TTL_SECS,
+            "etcd keepalive detection can take as long as the primary lease TTL"
+        );
+    }
     Some((Duration::from_secs(interval), Duration::from_secs(timeout)))
 }
 
