@@ -2758,6 +2758,15 @@ id; structural malformation is still refused by the surrounding serde. The
 chat processor on the monorepo side wraps such strings for dict-iterating
 templates. Baseten-specific; not upstreamable.
 
+Responses custom-tool compatibility (#938): flatten namespace members before
+applying the existing ingress tool policy. Standard Dynamo drops unsupported
+custom declarations, including Responses-Lite `additional_tools`, with warning
+and loss records; supported namespace functions retain their qualified names
+and strictness. Choices targeting dropped tools degrade to `auto`, and choices
+are omitted when no tools survive. Malformed declarations remain rejected and
+strict consumer hooks retain their rejection policy. This restores graceful
+dropping, not custom-tool execution support.
+
 ## CC pivot: frontends on `b10-dynamo-api-translation` (ingress)
 
 The Messages and Responses handlers in lib/llm canonicalize through the shared

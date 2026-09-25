@@ -1769,7 +1769,7 @@ fn adapt_responses(
         hooks,
         dropped,
         ClientProtocol::Responses,
-        tool_entries,
+        flatten_responses_namespaces(tool_entries)?,
         is_responses_server_tool_shaped,
         responses_client_function_tool,
     )?;
@@ -2350,6 +2350,35 @@ fn responses_echoed_tool_call(id: &str, name: &str, raw_args: &str) -> ToolCall 
     }
 }
 
+/// Flatten namespace members before applying the same ingress policy as top-level tools.
+fn flatten_responses_namespaces(entries: Vec<Value>) -> Result<Vec<Value>, RequestRejection> {
+    let mut flattened = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if !matches!(
+            entry.get("type").and_then(Value::as_str),
+            Some("custom" | "namespace")
+        ) {
+            flattened.push(entry);
+            continue;
+        }
+        let tool: ResponsesTool = serde_json::from_value(entry.clone())
+            .map_err(|e| RequestRejection::malformed(format!("invalid tool definition: {e}")))?;
+        let ResponsesTool::Namespace(group) = tool else {
+            flattened.push(entry);
+            continue;
+        };
+        for member in group.tools {
+            let mut member = serde_json::to_value(member).expect("tool parameters serialize");
+            let name = member["name"]
+                .as_str()
+                .expect("namespace members have names");
+            member["name"] = json!(format!("{}__{name}", group.name));
+            flattened.push(member);
+        }
+    }
+    Ok(flattened)
+}
+
 /// A caller-executed Responses tool definition -> a CC function tool. Any other declared tool
 /// (`Tool::Mcp`, `Tool::WebSearch`, …) is refused: only the platform that natively runs it can, and
 /// TB has no execution path for OpenAI's own built-in/remote tools.
@@ -2367,32 +2396,6 @@ fn responses_client_function_tool(
             );
             cc_tool.function.strict = function.strict;
             Ok(vec![cc_tool])
-        }
-        // A namespace group flattens to `{namespace}__{name}` function tools (Codex declares its
-        // MCP apps this way): namespaces exist so member names can overlap between groups, and
-        // the egress side maps emitted calls back to the wire (name, namespace) pair against the
-        // request's declarations.
-        ResponsesTool::Namespace(group) => {
-            let mut members = Vec::with_capacity(group.tools.len());
-            for member in &group.tools {
-                let dynamo_protocols::types::responses::NamespaceToolParamTool::Function(function) =
-                    member
-                else {
-                    return Err(RequestRejection::Unsupported(format!(
-                        "unsupported namespace tool member type \"custom\" in group {:?}",
-                        group.name
-                    )));
-                };
-                let flat_name = format!("{}__{}", group.name, function.name);
-                let mut cc_tool = function_tool(
-                    &flat_name,
-                    function.description.as_deref().unwrap_or_default(),
-                    function.parameters.clone().unwrap_or_else(|| json!({})),
-                );
-                cc_tool.function.strict = function.strict;
-                members.push(cc_tool);
-            }
-            Ok(members)
         }
         other => {
             // Bounded: the entry embeds the client's full tool definition, whole-`Debug` echoes it back.
@@ -2501,15 +2504,13 @@ fn is_anthropic_server_tool_shaped(entry: &Value) -> bool {
         .is_some_and(|kind| kind != "custom")
 }
 
-/// A Responses tool entry that is not a client-executable shape: anything but a `function`, a
-/// `custom` tool, or a `namespace` group (all three translate into client function tools) goes to
-/// the hooks — OpenAI-hosted surfaces (`web_search*`, `mcp`, `file_search`, ...) and any
-/// consumer-defined selection type alike. Shape only; the crate knows no tool namespace.
+/// Only function tools cross the CC bridge. Namespace members are already flattened;
+/// unsupported custom tools follow the consumer's drop/reject policy like hosted tools.
 fn is_responses_server_tool_shaped(entry: &Value) -> bool {
     entry
         .get("type")
         .and_then(Value::as_str)
-        .is_some_and(|kind| !matches!(kind, "function" | "custom" | "namespace"))
+        .is_some_and(|kind| kind != "function")
 }
 
 fn function_tool(name: &str, description: &str, parameters: Value) -> ChatCompletionTool {

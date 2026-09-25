@@ -1740,6 +1740,110 @@ fn drop_server_tools_omits_tool_choice_when_no_tools_survive() {
 }
 
 #[test]
+fn responses_custom_only_tools_drop_without_dangling_choice() {
+    let custom = json!({"type": "custom", "name": "exec", "format": {"type": "text"}});
+    for tools in [
+        json!([custom.clone()]),
+        json!([{"type": "namespace", "name": "functions", "description": "Tools", "tools": [custom]}]),
+    ] {
+        for choice in [json!("required"), json!({"type": "custom", "name": "exec"})] {
+            for additional in [false, true] {
+                let mut body = json!({"model": "m", "input": "hi", "tool_choice": choice});
+                if additional {
+                    body["input"] = json!([
+                        {"type": "additional_tools", "role": "developer", "tools": tools},
+                        {"role": "user", "content": "hi"},
+                    ]);
+                } else {
+                    body["tools"] = tools.clone();
+                }
+                let adapted = adapt_request_json(
+                    body,
+                    ClientProtocol::Responses,
+                    &HeaderMap::new(),
+                    &mut DropServerTools,
+                )
+                .unwrap()
+                .request;
+                assert!(adapted.request.tools.is_none());
+                assert!(adapted.request.tool_choice.is_none());
+                assert!(adapted.server_tool_claims.is_empty());
+                assert_eq!(
+                    adapted
+                        .losses
+                        .iter()
+                        .filter(|l| l.kind == LossKind::ServerToolDropped)
+                        .count(),
+                    1,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn responses_custom_drop_preserves_namespace_functions_and_strict_policy() {
+    let body = json!({
+        "model": "m", "input": "hi",
+        "tools": [
+            {"type": "namespace", "name": "functions", "description": "Tools", "tools": [
+                {"type": "custom", "name": "exec", "format": {
+                    "type": "grammar", "syntax": "lark", "definition": "start: /.+/"
+                }},
+                {"type": "function", "name": "lookup", "description": "Look up", "strict": true,
+                 "parameters": {"type": "object", "properties": {}, "additionalProperties": false}},
+            ]},
+            {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+        ],
+        "tool_choice": {"type": "function", "name": "functions__exec"},
+    });
+    let adapted = adapt_request_json(
+        body.clone(),
+        ClientProtocol::Responses,
+        &HeaderMap::new(),
+        &mut DropServerTools,
+    )
+    .unwrap()
+    .request;
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    assert_eq!(cc["tool_choice"], "auto");
+    let tools = cc["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["function"]["name"], "functions__lookup");
+    assert_eq!(tools[0]["function"]["strict"], true);
+    assert_eq!(tools[1]["function"]["name"], "lookup");
+    assert!(adapted.server_tool_claims.is_empty());
+    assert!(
+        adapt_request_json(
+            body,
+            ClientProtocol::Responses,
+            &HeaderMap::new(),
+            &mut test_hooks(),
+        )
+        .is_err(),
+        "strict consumers still reject unsupported custom tools"
+    );
+}
+
+#[test]
+fn responses_custom_tools_are_validated_before_drop() {
+    for entry in [
+        json!({"type": "custom"}),
+        json!({"type": "namespace", "name": "functions", "description": "Tools", "tools": [{"type": "custom"}]}),
+    ] {
+        let err = adapt_request_json(
+            json!({"model": "m", "input": "hi", "tools": [entry]}),
+            ClientProtocol::Responses,
+            &HeaderMap::new(),
+            &mut DropServerTools,
+        )
+        .err()
+        .unwrap();
+        assert!(err.detail().contains("invalid tool definition"));
+    }
+}
+
+#[test]
 fn drop_server_tools_drops_reserved_cc_selections() {
     let body = serde_json::to_vec(&json!({
         "model": "m",
