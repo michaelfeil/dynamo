@@ -7,10 +7,13 @@ call `step` for each decoded text delta, and call `finish` at end of stream.
 
 The `backend` argument selects the Rust parser implementation:
 
-- `dynamo` (default) uses `dynamo-parsers-v2` 0.6.3 from frontend-crates revision
-  `bb20dd01b6257cff9b739be2b18e7a444980d04a`. Available families are in
-  `UNIFIED_PARSER_FAMILIES`. Harmony (`harmony`, `gpt_oss`, `gpt-oss`) uses the
-  v1 gpt-oss reasoning and Harmony tool parsers from that same upstream revision.
+- `dynamo` (default) uses `dynamo-parsers-v2` 0.7.3 from
+  `michaelfeil/frontend-crates` revision
+  `3316a4dc2a0752297de91714b13b7586931c5926` (the draft
+  [frontend-crates mega stack](https://github.com/ai-dynamo/frontend-crates/pull/291)).
+  Available families are in `UNIFIED_PARSER_FAMILIES`. Harmony (`harmony`,
+  `gpt_oss`, `gpt-oss`) uses the v1 gpt-oss reasoning and Harmony tool parsers
+  from that same revision.
 - `vllm` uses vLLM's native unified Rust parsers at revision
   `f84325c48c0acc1e3703103788c5f2976e719762`. Available families are in
   `VLLM_UNIFIED_PARSER_FAMILIES`. Supply a local `tokenizer.json` path with

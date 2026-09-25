@@ -1051,7 +1051,7 @@ name = "baseten-parsers"
 version = "1.2.0"
 dependencies = [
  "anyhow",
- "dynamo-parsers 9.0.1",
+ "dynamo-parsers 9.1.0",
  "dynamo-parsers-v2",
  "futures",
  "tokio",
@@ -2182,7 +2182,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2515,8 +2515,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers"
-version = "9.0.1"
-source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=bb20dd01b6257cff9b739be2b18e7a444980d04a#bb20dd01b6257cff9b739be2b18e7a444980d04a"
+version = "9.1.0"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=3316a4dc2a0752297de91714b13b7586931c5926#3316a4dc2a0752297de91714b13b7586931c5926"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2525,6 +2525,7 @@ dependencies = [
  "futures",
  "num-traits",
  "openai-harmony 0.0.8",
+ "percent-encoding",
  "regex",
  "rustpython-ruff_python_ast",
  "rustpython-ruff_python_parser",
@@ -2537,8 +2538,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers-v2"
-version = "0.6.3"
-source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=bb20dd01b6257cff9b739be2b18e7a444980d04a#bb20dd01b6257cff9b739be2b18e7a444980d04a"
+version = "0.7.3"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=3316a4dc2a0752297de91714b13b7586931c5926#3316a4dc2a0752297de91714b13b7586931c5926"
 dependencies = [
  "anyhow",
  "num-traits",
@@ -2569,7 +2570,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "6.1.0"
-source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=bb20dd01b6257cff9b739be2b18e7a444980d04a#bb20dd01b6257cff9b739be2b18e7a444980d04a"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=3316a4dc2a0752297de91714b13b7586931c5926#3316a4dc2a0752297de91714b13b7586931c5926"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -2926,7 +2927,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3858,7 +3859,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -4238,7 +4239,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5410,7 +5411,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6735,7 +6736,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.39",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6772,9 +6773,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7273,7 +7274,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8214,7 +8215,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -13,7 +13,7 @@ pub use upstream::{
     UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
 };
 
-pub const UPSTREAM_REVISION: &str = "bb20dd01b6257cff9b739be2b18e7a444980d04a";
+pub const UPSTREAM_REVISION: &str = "3316a4dc2a0752297de91714b13b7586931c5926";
 
 /// Families accepted by the Dynamo backend, including local v1 adapters.
 pub fn unified_parser_families() -> Vec<&'static str> {
