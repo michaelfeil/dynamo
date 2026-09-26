@@ -277,6 +277,10 @@ class DistributedRuntime:
         """
         ...
 
+    async def b10_shutdown_started(self) -> None:
+        """Resolves at runtime shutdown Phase 1 (endpoint shutdown token)."""
+        ...
+
     def set_health_status(self, ready: bool) -> None:
         """
         Explicitly set the system-level health status (Ready / NotReady).

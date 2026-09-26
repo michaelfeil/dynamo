@@ -71,3 +71,15 @@ def test_b10_shutdown_handler_unregisters_endpoint_before_runtime_shutdown(monke
         ]
 
     asyncio.run(run_test())
+
+
+@pytest.mark.asyncio
+async def test_b10_shutdown_started_resolves_when_shutdown_starts(temp_file_store):
+    runtime = runtime_mod.DistributedRuntime(asyncio.get_running_loop(), "file", "tcp")
+    started = asyncio.ensure_future(runtime.b10_shutdown_started())
+    await asyncio.sleep(0.1)
+    assert not started.done()
+
+    runtime.shutdown()
+
+    await asyncio.wait_for(started, timeout=5)

@@ -467,6 +467,9 @@ guard leak deserves a liveness lease instead of relying on the 300 s expiry.
 configurable (default 600 s), the counterpart of the router's `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` (#825);
 raise both above the longest expected stream (basetenlabs/dynamo#847).
 
+`DistributedRuntime.b10_shutdown_started()` lets Python await runtime shutdown Phase 1
+(the endpoint shutdown token), e.g. to answer requests with no response yet with 503.
+
 Replay notes:
 
 Port behavior, not necessarily implementation. Upstream may have refactored

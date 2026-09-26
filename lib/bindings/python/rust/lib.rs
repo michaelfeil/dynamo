@@ -988,6 +988,15 @@ impl DistributedRuntime {
         self.inner.shutdown();
     }
 
+    /// Resolves at runtime shutdown Phase 1 (endpoint shutdown token).
+    fn b10_shutdown_started<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let token = self.inner.child_token();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            token.cancelled().await;
+            Ok(())
+        })
+    }
+
     fn event_loop(&self) -> PyObject {
         self.event_loop.clone()
     }
