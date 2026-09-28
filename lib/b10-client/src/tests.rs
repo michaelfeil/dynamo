@@ -98,6 +98,9 @@ struct RouterGuardClientForTesting {
     open_delay: Mutex<Duration>,
     /// When set, scripted `Err` responses are typed `DynamoError`s of this kind.
     open_error_type: Mutex<Option<dynamo_runtime::error::ErrorType>>,
+    /// Fail opens with a raw `io::Error` of this kind, as the TCP egress does
+    /// for a refused connection to a worker that just died.
+    open_io_error_kind: Mutex<Option<std::io::ErrorKind>>,
     first_response_delay: Mutex<Duration>,
     prefill_callback_delay: Mutex<Duration>,
     mark_free_callback_delay: Mutex<Duration>,
@@ -132,6 +135,7 @@ impl RouterGuardClientForTesting {
             stream_items_polled: Arc::new(AtomicUsize::new(0)),
             open_delay: Mutex::new(Duration::ZERO),
             open_error_type: Mutex::new(None),
+            open_io_error_kind: Mutex::new(None),
             first_response_delay: Mutex::new(Duration::ZERO),
             prefill_callback_delay: Mutex::new(Duration::ZERO),
             mark_free_callback_delay: Mutex::new(Duration::ZERO),
@@ -151,6 +155,10 @@ impl RouterGuardClientForTesting {
     fn set_auto_remove_on_error(&self, on: bool) {
         self.auto_remove_on_error.store(on, Ordering::Release);
     }
+    fn set_open_io_error_kind(&self, kind: std::io::ErrorKind) {
+        *self.open_io_error_kind.lock().unwrap() = Some(kind);
+    }
+
     fn set_open_error_type(&self, error_type: dynamo_runtime::error::ErrorType) {
         *self.open_error_type.lock().unwrap() = Some(error_type);
     }
@@ -422,6 +430,9 @@ impl RouterGuardClient for RouterGuardClientForTesting {
             Err(err) => {
                 if self.auto_remove_on_error.load(Ordering::Acquire) {
                     self.remove_instance(instance_id);
+                }
+                if let Some(kind) = *self.open_io_error_kind.lock().unwrap() {
+                    return Err(anyhow::Error::new(std::io::Error::new(kind, err)));
                 }
                 match *self.open_error_type.lock().unwrap() {
                     Some(error_type) => Err(dynamo_runtime::error::DynamoError::builder()
@@ -1777,6 +1788,77 @@ async fn route_and_connect_non_stale_open_error_returns_denied_and_frees_guard()
     assert_eq!(router.method_call_count("mark_free"), 1);
     assert_eq!(worker.method_call_count("generate"), 1);
     assert_eq!(worker.completed_direct_count(), 0);
+}
+
+#[tokio::test]
+async fn b10_refused_worker_connection_is_a_retriable_denial() {
+    // A worker that just died is still registered, so the router picks it and
+    // the TCP egress fails the open with a raw `io::Error` (ECONNREFUSED), not
+    // a typed DynamoError. The worker never got the request: this must be the
+    // retriable FirstWorkerEventFailed (HTTP 503), not a raised error (500).
+    for kind in [
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::ConnectionReset,
+    ] {
+        let router =
+            RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+        let worker = RouterGuardClientForTesting::new(
+            vec![],
+            vec![1],
+            vec![Err("Connection refused (os error 111)".to_string())],
+        );
+        worker.set_open_io_error_kind(kind);
+        let context = build_test_context("test-refused-worker");
+
+        let outcome = connect(
+            router.clone(),
+            worker.clone(),
+            make_routing_request(),
+            "req-refused-worker",
+            context,
+            Vec::new(),
+            make_worker_request(),
+            0,
+            true,
+            true,
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("a refused worker connection is a denial, not a raised error");
+
+        match outcome {
+            RouteAndConnectOutcome::Denied(DeniedRequest::FirstWorkerEventFailed { error }) => {
+                assert!(
+                    error.contains("worker stream open failed"),
+                    "{kind:?}: error should say the open failed, got: {error}"
+                );
+            }
+            other => panic!("{kind:?}: expected Denied(FirstWorkerEventFailed), got {other:?}"),
+        }
+        wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
+        assert_eq!(router.method_call_count("mark_free"), 1, "{kind:?}");
+    }
+}
+
+#[test]
+fn b10_worker_connection_failed_matches_socket_errors_only() {
+    use super::coordinator::worker_connection_failed;
+    let refused = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+    assert!(worker_connection_failed(&refused));
+    assert!(worker_connection_failed(
+        &refused.context("opening worker stream")
+    ));
+    // The TCP egress reports a connect timeout as io::ErrorKind::TimedOut.
+    let connect_timeout = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "TCP connect timeout to 10.0.0.1:1234",
+    ));
+    assert!(worker_connection_failed(&connect_timeout));
+    let other_io = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    assert!(!worker_connection_failed(&other_io));
+    assert!(!worker_connection_failed(&anyhow::anyhow!(
+        "payload is too large"
+    )));
 }
 
 #[tokio::test]

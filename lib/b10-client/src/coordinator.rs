@@ -1296,6 +1296,25 @@ fn retriable_before_first_response(error_type: &DynamoErrorType) -> bool {
     )
 }
 
+/// A socket error opening the worker stream: the worker never got the request
+/// (e.g. it just died and is still registered). Raw `io::Error`s are not
+/// `DynamoError`s, so they need their own check.
+pub(super) fn worker_connection_failed(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+            )
+        })
+    })
+}
+
 async fn wait_for_first_worker_event(
     stream: &mut EngineStream<RsAnnotated<rmpv::Value>>,
     worker_id: u64,
@@ -1527,7 +1546,8 @@ async fn connect_worker(
                     // before, so they are not retried.
                     let retriable = err
                         .downcast_ref::<DynamoError>()
-                        .is_some_and(|e| retriable_before_first_response(&e.error_type()));
+                        .is_some_and(|e| retriable_before_first_response(&e.error_type()))
+                        || worker_connection_failed(&err);
                     if retriable {
                         OpenResult::Denied(DeniedRequest::FirstWorkerEventFailed {
                             error: format!("worker stream open failed: {err}"),

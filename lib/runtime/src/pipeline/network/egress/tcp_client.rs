@@ -385,7 +385,14 @@ impl TcpConnection {
     async fn connect(addr: SocketAddr, timeout: Duration, channel_buffer: usize) -> Result<Self> {
         let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
-            .map_err(|_| anyhow::anyhow!("TCP connect timeout to {}", addr))??;
+            // Typed as io::ErrorKind::TimedOut so callers can classify it as a
+            // connection failure (the worker never got the request).
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("TCP connect timeout to {addr}"),
+                )
+            })??;
 
         // Configure socket for lower latency
         Self::configure_socket(&stream)?;
