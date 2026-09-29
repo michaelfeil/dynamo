@@ -284,6 +284,7 @@ mod tests {
                     })),
                     strict: None,
                 },
+                defer_loading: None,
             },
             ChatCompletionTool {
                 r#type: ChatCompletionToolType::Function,
@@ -300,6 +301,7 @@ mod tests {
                     })),
                     strict: None,
                 },
+                defer_loading: None,
             },
         ]
     }
@@ -382,6 +384,7 @@ mod tests {
                 })),
                 strict: None,
             },
+            defer_loading: None,
         };
 
         let mut tool_with_conflict = tool.clone();

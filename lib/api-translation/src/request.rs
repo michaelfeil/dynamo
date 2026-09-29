@@ -2522,6 +2522,7 @@ fn function_tool(name: &str, description: &str, parameters: Value) -> ChatComple
             parameters: Some(parameters),
             strict: None,
         },
+        defer_loading: None,
     }
 }
 

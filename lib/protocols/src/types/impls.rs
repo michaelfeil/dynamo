@@ -11,6 +11,7 @@ use super::{
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
     ChatCompletionRequestMessageContentPartAudio, ChatCompletionRequestMessageContentPartAudioUrl,
     ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestMessageContentPartToolReference,
     ChatCompletionRequestMessageContentPartVideo, ChatCompletionRequestToolMessage,
     ChatCompletionRequestUserMessageContentPart, ChatCompletionToolChoiceOption,
     ChatCompletionToolType, FunctionName, ImageUrl, VideoUrl,
@@ -186,6 +187,14 @@ impl From<ChatCompletionRequestMessageContentPartAudioUrl>
 {
     fn from(value: ChatCompletionRequestMessageContentPartAudioUrl) -> Self {
         ChatCompletionRequestUserMessageContentPart::AudioUrl(value)
+    }
+}
+
+impl From<ChatCompletionRequestMessageContentPartToolReference>
+    for ChatCompletionRequestUserMessageContentPart
+{
+    fn from(value: ChatCompletionRequestMessageContentPartToolReference) -> Self {
+        ChatCompletionRequestUserMessageContentPart::ToolReference(value)
     }
 }
 

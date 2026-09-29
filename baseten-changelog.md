@@ -1430,6 +1430,18 @@ client order. Already on main-v1.2.0 and NOT changed here: non-terminal
 `finish_reason` omission, string `error.code`, `document`/`search_result`
 tool_result blocks. Baseten-specific; not upstreamable.
 
+Chat-wire admission for deferred tool loading: `ChatCompletionTool` gains
+tool-level `defer_loading` and the shared request content-part enum gains a
+`tool_reference` part (`{"type": "tool_reference", "tool_name": ...}`), so
+the request bridge no longer strips the marker and no longer 400s a tool
+message carrying references. This makes the worker-side placement
+(basetenlabs/baseten#30380) reachable through the chat wire; before it, the
+marker was dropped at deserialization and the placement never engaged.
+Tool-level is the only wire envelope; the nested `function.defer_loading`
+position stays the render placement (GLM template), not a wire shape.
+Baseten-specific; matches vendor API fields upstream Dynamo does not model
+yet.
+
 Reasoning effort is carried, not judged. `B10ReasoningEffort` types the seven
 canonical levels (`B10_REASONING_EFFORT_LEVELS`: `none`, `minimal`, `low`,
 `medium`, `high`, `xhigh`, `max`) and carries every other value — an unknown

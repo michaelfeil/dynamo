@@ -895,6 +895,7 @@ mod tests {
                     parameters: Some(json!({"type": "object", "properties": {}})),
                     strict: None,
                 },
+                defer_loading: None,
             }
         }
 
@@ -918,6 +919,7 @@ mod tests {
                     parameters: Some(json!({"type": "object", "properties": {}})),
                     strict: None,
                 },
+                defer_loading: None,
             }];
             assert!(
                 validate::validate_tools(&Some(&tools)).is_err(),

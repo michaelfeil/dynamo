@@ -559,6 +559,8 @@ pub struct ChatCompletionTool {
     #[builder(default = "ChatCompletionToolType::Function")]
     pub r#type: ChatCompletionToolType,
     pub function: FunctionObject,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -825,11 +827,24 @@ impl From<Vec<ChatCompletionRequestUserMessageContentPart>>
     }
 }
 
+/// Tool reference content part -- points at a tool by name whose definition
+/// loads lazily (Anthropic `tool_reference` block shape).
+#[derive(Debug, Serialize, Deserialize, Clone, Builder, PartialEq)]
+#[builder(name = "ChatCompletionRequestMessageContentPartToolReferenceArgs")]
+#[builder(pattern = "mutable")]
+#[builder(setter(into, strip_option))]
+#[builder(derive(Debug))]
+#[builder(build_fn(error = "OpenAIError"))]
+pub struct ChatCompletionRequestMessageContentPartToolReference {
+    pub tool_name: String,
+}
+
 /// User message content part with video and audio URL support.
 ///
 /// Extends upstream `ChatCompletionRequestUserMessageContentPart` with:
 /// - `VideoUrl`: video input for multimodal models
 /// - `AudioUrl`: audio URL input (distinct from base64 InputAudio)
+/// - `ToolReference`: reference to a tool whose definition loads lazily
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -839,6 +854,7 @@ pub enum ChatCompletionRequestUserMessageContentPart {
     VideoUrl(ChatCompletionRequestMessageContentPartVideo),
     AudioUrl(ChatCompletionRequestMessageContentPartAudioUrl),
     InputAudio(ChatCompletionRequestMessageContentPartAudio),
+    ToolReference(ChatCompletionRequestMessageContentPartToolReference),
 }
 
 /// Assistant message with reasoning content support.
@@ -1404,6 +1420,62 @@ mod tests {
             serde_json::to_value(ImageDetail::Original).unwrap(),
             serde_json::json!("original")
         );
+    }
+
+    /// `defer_loading` survives the wire round-trip on a marked tool and is
+    /// omitted on an unmarked one (previously stripped at deserialization).
+    #[test]
+    fn chat_tool_defer_loading_round_trips_and_is_omitted_when_absent() {
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "deferred", "parameters": {"type": "object"}},
+                    "defer_loading": true
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "eager", "parameters": {"type": "object"}}
+                }
+            ]
+        }))
+        .unwrap();
+        let tools = request.tools.as_ref().unwrap();
+        assert_eq!(tools[0].defer_loading, Some(true));
+        assert_eq!(tools[1].defer_loading, None);
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized["tools"][0]["defer_loading"], true);
+        assert!(serialized["tools"][1].get("defer_loading").is_none());
+    }
+
+    /// A `tool_reference` part inside a tool message's content array
+    /// deserializes and re-serializes losslessly (previously rejected the
+    /// whole request).
+    #[test]
+    fn tool_message_tool_reference_part_round_trips() {
+        let wire = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": [
+                {"type": "text", "text": "result"},
+                {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"}
+            ]
+        });
+        let message: ChatCompletionRequestMessage = serde_json::from_value(wire.clone()).unwrap();
+        let ChatCompletionRequestMessage::Tool(tool) = &message else {
+            panic!("expected tool message");
+        };
+        let ChatCompletionRequestToolMessageContent::Array(parts) = &tool.content else {
+            panic!("expected content part array");
+        };
+        let ChatCompletionRequestUserMessageContentPart::ToolReference(reference) = &parts[1]
+        else {
+            panic!("expected tool_reference part");
+        };
+        assert_eq!(reference.tool_name, "mcp__slack__read_thread");
+        assert_eq!(serde_json::to_value(message).unwrap(), wire);
     }
 
     #[test]

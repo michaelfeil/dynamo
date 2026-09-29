@@ -60,6 +60,7 @@ fn create_mock_chat_completion_request() -> NvCreateChatCompletionRequest {
                 })),
                 strict: None,
             },
+            defer_loading: None,
         },
         dynamo_protocols::types::ChatCompletionTool {
             r#type: dynamo_protocols::types::ChatCompletionToolType::Function,
@@ -73,6 +74,7 @@ fn create_mock_chat_completion_request() -> NvCreateChatCompletionRequest {
                 })),
                 strict: None,
             },
+            defer_loading: None,
         },
     ];
 
