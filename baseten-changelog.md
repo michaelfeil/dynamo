@@ -1827,6 +1827,9 @@ or smoke-test the router and OpenAI service examples.
 
 ## PATCH-008: Model, Parser, vLLM, and Multimodal Compatibility
 
+Encoder `mm_kwargs` stay in Rust as `MediaEmbedding` handles; worker requests take
+their bytes by move, so embeddings no longer cross into Python and back as copies.
+
 Unified Rust parser API (#915):
 
 - Replaces the separate tool-only and reasoning streams with `UnifiedParserStream`

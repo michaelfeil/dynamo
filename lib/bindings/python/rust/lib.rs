@@ -195,6 +195,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<b10_client::RouterWorkerCoordinator>()?;
     m.add_class::<b10_client::GenerationCoordinator>()?;
     m.add_class::<b10_encoder::MultiModalEncoderClient>()?;
+    m.add_class::<b10_encoder::MediaEmbedding>()?;
     m.add(
         "EncoderHttpError",
         m.py().get_type::<b10_encoder::EncoderHttpError>(),

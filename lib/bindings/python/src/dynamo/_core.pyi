@@ -95,6 +95,14 @@ class UnifiedParserStream:
 class EncoderHttpError(RuntimeError):
     status_code: int
 
+class MediaEmbedding:
+    """Encoder mm_kwargs bytes held in Rust; they move into the worker request without a copy."""
+
+    def __init__(self, data: bytes) -> None: ...
+    def __len__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    def to_bytes(self) -> bytes: ...
+
 class MultiModalEncoderClient:
     def __init__(
         self,

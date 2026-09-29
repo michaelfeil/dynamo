@@ -15,6 +15,7 @@ pub(crate) use types::{
     PyRouterRequestNew, PyRouterWorkerPhase,
 };
 
+use crate::b10_encoder::depythonize_worker_args;
 use crate::llm::local_model::RoutingConstraints as PyRoutingConstraints;
 use crate::{AsyncResponseStream, Client, context, process_stream, to_pyerr};
 use dynamo_b10_client::{
@@ -295,9 +296,9 @@ impl GenerationCoordinator {
         annotated: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
         let routing_request = extract_router_request(py, &routing_kwargs)?;
-        let primary_worker_request = pythonize::depythonize(&worker_args.into_bound(py))?;
+        let primary_worker_request = depythonize_worker_args(&worker_args.into_bound(py))?;
         let decode_worker_request = decode_worker_args
-            .map(|args| pythonize::depythonize(&args.into_bound(py)))
+            .map(|args| depythonize_worker_args(&args.into_bound(py)))
             .transpose()?;
         let core_context = RequestContext::new(
             context.inner(),
@@ -536,7 +537,7 @@ impl RouterWorkerCoordinator {
             do_not_queue,
         };
         let worker_request: rmpv::Value = match worker_args {
-            Some(wa) => pythonize::depythonize(&wa.into_bound(py))?,
+            Some(wa) => depythonize_worker_args(&wa.into_bound(py))?,
             None => rmpv::Value::Map(Vec::new()),
         };
 
