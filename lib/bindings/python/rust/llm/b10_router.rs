@@ -53,6 +53,13 @@ use super::entrypoint::{KvRouterConfig as PyKvRouterConfig, RouterConfig as PyRo
 
 const MAX_WAIT_SECONDS: u64 = 600; // 10 minutes
 
+fn default_max_wait_seconds() -> u64 {
+    std::env::var("DYN_ROUTER_MAX_WAIT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(MAX_WAIT_SECONDS)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AlgoSelector {
     Default,
@@ -473,7 +480,7 @@ async fn get_active_components(component: &Component) -> Option<usize> {
     block_size=32,
     router_component_name="Router".to_string(),
     max_active_routers=None,
-    max_wait_seconds=MAX_WAIT_SECONDS,
+    max_wait_seconds=default_max_wait_seconds(),
     kv_router_config=None,
     kv_router_metrics_port=9091,
     algo_selector="B10".to_string(),
