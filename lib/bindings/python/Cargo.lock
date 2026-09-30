@@ -1051,7 +1051,7 @@ name = "baseten-parsers"
 version = "1.2.0"
 dependencies = [
  "anyhow",
- "dynamo-parsers 9.1.0",
+ "dynamo-parsers 9.2.1",
  "dynamo-parsers-v2",
  "futures",
  "tokio",
@@ -2515,8 +2515,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers"
-version = "9.1.0"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=3316a4dc2a0752297de91714b13b7586931c5926#3316a4dc2a0752297de91714b13b7586931c5926"
+version = "9.2.1"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2525,7 +2525,6 @@ dependencies = [
  "futures",
  "num-traits",
  "openai-harmony 0.0.8",
- "percent-encoding",
  "regex",
  "rustpython-ruff_python_ast",
  "rustpython-ruff_python_parser",
@@ -2538,11 +2537,10 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers-v2"
-version = "0.7.3"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=3316a4dc2a0752297de91714b13b7586931c5926#3316a4dc2a0752297de91714b13b7586931c5926"
+version = "0.7.7"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
 dependencies = [
  "anyhow",
- "num-traits",
  "openai-harmony 0.0.8",
  "regex",
  "serde",
@@ -2570,7 +2568,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "6.1.0"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=3316a4dc2a0752297de91714b13b7586931c5926#3316a4dc2a0752297de91714b13b7586931c5926"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
 dependencies = [
  "async-openai",
  "derive_builder",

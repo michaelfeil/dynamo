@@ -7,10 +7,10 @@ call `step` for each decoded text delta, and call `finish` at end of stream.
 
 The `backend` argument selects the Rust parser implementation:
 
-- `dynamo` (default) uses `dynamo-parsers-v2` 0.7.3 from
+- `dynamo` (default) uses `dynamo-parsers-v2` 0.7.7 from
   `michaelfeil/frontend-crates` revision
-  `3316a4dc2a0752297de91714b13b7586931c5926` (the draft
-  [frontend-crates mega stack](https://github.com/ai-dynamo/frontend-crates/pull/291)).
+  `79b3c206fc7af040e64572f5a630d6348d05a5b5` (the draft
+  [remaining frontend-crates fixes](https://github.com/ai-dynamo/frontend-crates/pull/301)).
   Available families are in `UNIFIED_PARSER_FAMILIES`. Harmony (`harmony`,
   `gpt_oss`, `gpt-oss`) uses the v1 gpt-oss reasoning and Harmony tool parsers
   from that same revision.
