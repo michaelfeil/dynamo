@@ -2516,7 +2516,7 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers"
 version = "9.2.1"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=b6dd7fedb24043ceca9100d97ac277eb12b52036#b6dd7fedb24043ceca9100d97ac277eb12b52036"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2537,8 +2537,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers-v2"
-version = "0.7.7"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
+version = "0.7.8"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=b6dd7fedb24043ceca9100d97ac277eb12b52036#b6dd7fedb24043ceca9100d97ac277eb12b52036"
 dependencies = [
  "anyhow",
  "openai-harmony 0.0.8",
@@ -2568,7 +2568,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "6.1.0"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
+source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=b6dd7fedb24043ceca9100d97ac277eb12b52036#b6dd7fedb24043ceca9100d97ac277eb12b52036"
 dependencies = [
  "async-openai",
  "derive_builder",

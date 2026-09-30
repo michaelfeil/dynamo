@@ -199,3 +199,50 @@ fn harmony_v1_initialization_and_unfinished_calls() {
     let init = request_init(vec![], "none", "guided_json", None, "reject").unwrap();
     assert!(UnifiedStream::new("harmony", &tools(), init).is_err());
 }
+
+#[test]
+fn baseten_kimi3_streaming_exposes_arguments_before_call_closure() {
+    let mut stream =
+        UnifiedStream::new("baseten_kimi3_streaming", &[], UnifiedParserInit::default()).unwrap();
+    assert!(stream.preserve_special_tokens());
+    let mut events = stream
+        .advance(Some(concat!(
+            "<|open|>tools<|sep|><|open|>call tool=\"bash\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"command\" type=\"string\"<|sep|>echo ",
+        )))
+        .unwrap();
+    let next = stream.advance(Some("hello\n")).unwrap();
+    assert!(
+        next.iter()
+            .any(|event| matches!(event, Event::ToolCall(call)
+        if call.arguments == "hello\\n" && !call.complete && call.id.as_deref() == Some("bash:0")))
+    );
+    events.extend(next);
+    events.extend(
+        stream
+            .advance(Some(
+                "<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
+            ))
+            .unwrap(),
+    );
+    events.extend(stream.advance(None).unwrap());
+    let arguments: String = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCall(call) => Some(call.arguments.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+        json!({"command": "echo hello\n"})
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::ToolCall(call) if call.complete))
+            .count(),
+        1
+    );
+    assert!(stream.advance(Some("late")).is_err());
+}

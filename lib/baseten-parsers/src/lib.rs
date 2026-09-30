@@ -13,13 +13,14 @@ pub use upstream::{
     UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
 };
 
-pub const UPSTREAM_REVISION: &str = "79b3c206fc7af040e64572f5a630d6348d05a5b5";
+pub const UPSTREAM_REVISION: &str = "b6dd7fedb24043ceca9100d97ac277eb12b52036";
 
 /// Families accepted by the Dynamo backend, including local v1 adapters.
 pub fn unified_parser_families() -> Vec<&'static str> {
     REGISTERED_UNIFIED_FAMILIES
         .iter()
         .chain(harmony::FAMILIES)
+        .chain(["baseten_kimi3_streaming"].iter())
         .copied()
         .collect()
 }
@@ -114,6 +115,8 @@ impl DynamoStream {
     pub fn new(family: &str, tools: &[Tool], init: UnifiedParserInit) -> Result<Self> {
         let parser: Box<dyn UnifiedParser> = if harmony::FAMILIES.contains(&family) {
             Box::new(harmony::HarmonyParser::new(tools)?)
+        } else if family == "baseten_kimi3_streaming" {
+            upstream::unified::kimi_k3::kimi_k3_streaming_unified(tools)
         } else {
             upstream::create_unified_parser_for_family(family, tools)?
         };

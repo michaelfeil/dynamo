@@ -7,9 +7,9 @@ call `step` for each decoded text delta, and call `finish` at end of stream.
 
 The `backend` argument selects the Rust parser implementation:
 
-- `dynamo` (default) uses `dynamo-parsers-v2` 0.7.7 from
+- `dynamo` (default) uses `dynamo-parsers-v2` 0.7.8 from
   `michaelfeil/frontend-crates` revision
-  `79b3c206fc7af040e64572f5a630d6348d05a5b5` (the draft
+  `b6dd7fedb24043ceca9100d97ac277eb12b52036` (K3 argument streaming, based on the draft
   [remaining frontend-crates fixes](https://github.com/ai-dynamo/frontend-crates/pull/301)).
   Available families are in `UNIFIED_PARSER_FAMILIES`. Harmony (`harmony`,
   `gpt_oss`, `gpt-oss`) uses the v1 gpt-oss reasoning and Harmony tool parsers
@@ -77,3 +77,31 @@ handling of malformed input; this adapter does not add stricter validation.
 The serving layer still owns generation stops, prompt rendering, and finish
 reasons. This adds a selectable Rust parser, not a replacement of Baseten's Python
 Harmony processor or a claim of gpt-oss model-serving parity.
+
+## Kimi K3 argument streaming
+
+Select `baseten_kimi3_streaming` with the `dynamo` backend to emit native K3
+tool arguments chunk by chunk:
+
+```python
+parser = UnifiedParserStream("baseten_kimi3_streaming", tools=tools)
+events = parser.step(delta_text)
+```
+
+It accepts the same K3 XTML input as `kimi_k3`, including reasoning, response,
+call IDs, typed arguments, and raw JSON. Tool names appear at the call header;
+string values are JSON-escaped as they arrive, and typed JSON values also
+stream before their closing marker. Concatenate argument fragments by tool
+index. A fragment can contain an unfinished JSON string or value; `complete`
+becomes true when the call validates. Interpretation and execution of partial
+values belong to the consumer.
+
+The parser retains the original call buffer for validation and holds potential
+structural markers until it can distinguish them from literal data. Malformed
+or truncated input can fail after fragments have been emitted. Duplicate keys
+and invalid typed JSON that require rewriting prior output fail rather than
+revising committed fragments. Handle `ParserStreamError.events` explicitly.
+Guided JSON continues to use the shared guided parser and its configured policy.
+The existing `kimi_k3` selector keeps buffered-call behavior. This selector is
+available through the Rust/Python stream adapter; serving integration remains
+owned by the caller, as for the other unified families above.

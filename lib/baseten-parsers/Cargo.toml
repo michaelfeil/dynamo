@@ -9,10 +9,10 @@ description = "Request-scoped Baseten adapters for upstream Dynamo streaming par
 anyhow.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
-dynamo-parsers-v1 = { package = "dynamo-parsers", version = "=9.2.1", git = "https://github.com/michaelfeil/frontend-crates.git", rev = "79b3c206fc7af040e64572f5a630d6348d05a5b5" }
+dynamo-parsers-v1 = { package = "dynamo-parsers", version = "=9.2.1", git = "https://github.com/michaelfeil/frontend-crates.git", rev = "b6dd7fedb24043ceca9100d97ac277eb12b52036" }
 vllm-parser = { git = "https://github.com/vllm-project/vllm.git", rev = "f84325c48c0acc1e3703103788c5f2976e719762" }
 vllm-tokenizer = { git = "https://github.com/vllm-project/vllm.git", rev = "f84325c48c0acc1e3703103788c5f2976e719762" }
-dynamo-parsers-v2 = { version = "=0.7.7", git = "https://github.com/michaelfeil/frontend-crates.git", rev = "79b3c206fc7af040e64572f5a630d6348d05a5b5" }
+dynamo-parsers-v2 = { version = "=0.7.8", git = "https://github.com/michaelfeil/frontend-crates.git", rev = "b6dd7fedb24043ceca9100d97ac277eb12b52036" }
 
 [dev-dependencies]
 serde_json.workspace = true
