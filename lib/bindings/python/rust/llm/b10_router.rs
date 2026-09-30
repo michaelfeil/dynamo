@@ -51,7 +51,7 @@ use dynamo_runtime::{
 
 use super::entrypoint::{KvRouterConfig as PyKvRouterConfig, RouterConfig as PyRouterConfig};
 
-const MAX_WAIT_SECONDS: u64 = 10 * 365 * 24 * 3600; // 10 years
+const MAX_WAIT_SECONDS: u64 = 600; // 10 minutes
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AlgoSelector {
