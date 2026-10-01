@@ -37,36 +37,39 @@ func (r *lpxRestartProgressResolver) Resolve(
 // resolveCompositeGroveRestartProgress composes child-owned LPX and ordinary Grove observations.
 func resolveCompositeGroveRestartProgress(
 	ctx context.Context,
-	source *v1beta1.DynamoGraphDeployment,
-	ordinaryDGD *v1beta1.DynamoGraphDeployment,
+	req groveReconcileRequest,
 	inProgress []string,
 	ordinaryResolver *groveRestartProgressResolver,
 	lpxResolver *lpxRestartProgressResolver,
 ) []string {
 	ordinary := make([]string, 0, len(inProgress))
-	lpxComponents := make([]string, 0, len(inProgress))
+	delegated := make([]string, 0, len(inProgress))
 	pending := make(map[string]bool, len(inProgress))
+	delegatedNames := make(map[string]struct{})
+	for _, component := range req.DelegatedComponents() {
+		delegatedNames[component.ComponentName] = struct{}{}
+	}
 
 	for _, name := range inProgress {
-		component := source.GetComponentByName(name)
+		component := req.DGD.GetComponentByName(name)
 		if component == nil {
 			continue
 		}
-		if component.IsLPX() {
-			lpxComponents = append(lpxComponents, name)
+		if _, found := delegatedNames[name]; found {
+			delegated = append(delegated, name)
 		} else {
 			ordinary = append(ordinary, name)
 		}
 	}
 
 	// Observe the shared LPX child before ordinary Grove restart progress.
-	if len(lpxComponents) > 0 {
-		for _, name := range lpxResolver.Resolve(ctx, source, lpxComponents) {
+	if len(delegated) > 0 {
+		for _, name := range lpxResolver.Resolve(ctx, req.DGD, delegated) {
 			pending[name] = true
 		}
 	}
 	if len(ordinary) > 0 {
-		for _, name := range ordinaryResolver.Resolve(ctx, ordinaryDGD, ordinary) {
+		for _, name := range ordinaryResolver.Resolve(ctx, req, ordinary) {
 			pending[name] = true
 		}
 	}

@@ -30,7 +30,6 @@ import (
 	commoncontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo"
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,13 +45,12 @@ type groveWorkloadRenderer struct {
 	dockerSecretRetriever DockerSecretRetriever
 }
 
-// grovePodCliqueSetRender couples the desired PCS and rendered DGD to the
-// exact observation used to decide compatibility and the worker hash suffix.
+// grovePodCliqueSetRender couples the desired PCS to the exact observation used
+// to decide compatibility and the worker hash suffix.
 type grovePodCliqueSetRender struct {
-	existing         *grovev1alpha1.PodCliqueSet
-	desired          *grovev1alpha1.PodCliqueSet
-	renderDeployment *nvidiacomv1beta1.DynamoGraphDeployment
-	gpuShapes        map[string]dynamo.GPUShape
+	existing  *grovev1alpha1.PodCliqueSet
+	desired   *grovev1alpha1.PodCliqueSet
+	gpuShapes map[string]dynamo.GPUShape
 }
 
 func newGroveWorkloadRenderer(
@@ -71,12 +69,12 @@ func newGroveWorkloadRenderer(
 
 func (r *groveWorkloadRenderer) Render(
 	ctx context.Context,
-	ordinary *nvidiacomv1beta1.DynamoGraphDeployment,
+	req groveReconcileRequest,
 	restartState *dynamo.RestartState,
 	checkpointInfos map[string]*checkpoint.CheckpointInfo,
 	workerGenerationChanged bool,
 ) (*grovePodCliqueSetRender, error) {
-	if ordinary == nil {
+	if req.DGD == nil {
 		return nil, fmt.Errorf("cannot render Grove PodCliqueSet without a DynamoGraphDeployment")
 	}
 	if r.reader == nil {
@@ -85,8 +83,8 @@ func (r *groveWorkloadRenderer) Render(
 
 	existingPodCliqueSet := &grovev1alpha1.PodCliqueSet{}
 	key := types.NamespacedName{
-		Name:      dynamo.PCSNameForDGD(ordinary.Name, ordinary.Spec.Components),
-		Namespace: ordinary.Namespace,
+		Name:      dynamo.PCSNameForDGD(req.DGD, req.IsDelegated),
+		Namespace: req.DGD.Namespace,
 	}
 	if err := r.reader.Get(ctx, key, existingPodCliqueSet); err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -95,16 +93,11 @@ func (r *groveWorkloadRenderer) Render(
 		existingPodCliqueSet = nil
 	}
 
-	workerHashSuffixNeeded := shouldRenderGroveWorkerHashSuffix(ordinary, existingPodCliqueSet, workerGenerationChanged)
-	renderDeployment, err := groveRenderDeployment(ordinary, existingPodCliqueSet, workerHashSuffixNeeded)
-	if err != nil {
-		return nil, err
-	}
 	// Render ordinary workloads and retain the observed server-owned fields.
-	existingRestartAnnotations := restartAnnotationsFromPodCliqueSet(existingPodCliqueSet)
+	workerHashSuffix := shouldRenderGroveWorkerHashSuffix(req, existingPodCliqueSet, workerGenerationChanged)
 	desired, err := dynamo.GenerateGrovePodCliqueSet(
-		ctx, renderDeployment, r.config, r.runtimeConfig, r.reader,
-		r.dockerSecretRetriever, restartState, existingRestartAnnotations, checkpointInfos,
+		ctx, req.DGD, req.IsDelegated, r.config, r.runtimeConfig, r.reader,
+		r.dockerSecretRetriever, restartState, existingPodCliqueSet, workerHashSuffix, checkpointInfos,
 	)
 	if err != nil {
 		return nil, err
@@ -117,79 +110,36 @@ func (r *groveWorkloadRenderer) Render(
 		checkpointInfos,
 	)
 
-	// Resolve capacity from the same rendered ordinary workload.
-	gpuShapes, err := dynamo.ResolveGroveGPUShapes(ctx, r.reader, renderDeployment, desired)
+	gpuShapes, err := dynamo.ResolveGroveGPUShapes(ctx, r.reader, req.DGD, req.IsDelegated, desired)
 	if err != nil {
 		return nil, err
 	}
 	return &grovePodCliqueSetRender{
-		existing:         existingPodCliqueSet,
-		desired:          desired,
-		renderDeployment: renderDeployment,
-		gpuShapes:        gpuShapes,
+		existing:  existingPodCliqueSet,
+		desired:   desired,
+		gpuShapes: gpuShapes,
 	}, nil
 }
 
-func groveRenderDeployment(
-	ordinary *nvidiacomv1beta1.DynamoGraphDeployment,
-	pcs *grovev1alpha1.PodCliqueSet,
-	workerHashSuffix bool,
-) (*nvidiacomv1beta1.DynamoGraphDeployment, error) {
-	renderDeployment := ordinary.DeepCopy()
-
-	// Compatibility and worker labels mutate only the independently owned copy.
-	applyGroveCompatibility(renderDeployment, pcs)
-	if !workerHashSuffix {
-		return renderDeployment, nil
-	}
-	if err := applyGroveWorkerHashSuffix(renderDeployment, ordinary); err != nil {
-		return nil, err
-	}
-	return renderDeployment, nil
-}
-
-func applyGroveWorkerHashSuffix(
-	renderDeployment *nvidiacomv1beta1.DynamoGraphDeployment,
-	hashSource *nvidiacomv1beta1.DynamoGraphDeployment,
-) error {
-	workerHash, err := dynamo.ComputeDGDWorkersSpecHash(hashSource)
-	if err != nil {
-		return fmt.Errorf("compute Grove worker hash suffix: %w", err)
-	}
-	for i := range renderDeployment.Spec.Components {
-		component := &renderDeployment.Spec.Components[i]
-		if !dynamo.IsWorkerComponent(string(component.ComponentType)) {
-			continue
-		}
-		if component.PodTemplate == nil {
-			component.PodTemplate = &corev1.PodTemplateSpec{}
-		}
-		if component.PodTemplate.Labels == nil {
-			component.PodTemplate.Labels = make(map[string]string)
-		}
-		component.PodTemplate.Labels[commonconsts.KubeLabelDynamoWorkerHash] = workerHash
-	}
-	return nil
-}
-
 func shouldRenderGroveWorkerHashSuffix(
-	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	req groveReconcileRequest,
 	existing *grovev1alpha1.PodCliqueSet,
 	hashChanged bool,
 ) bool {
-	if !dgdHasWorkerComponents(dgd) {
+	managedComponents := req.ManagedComponents()
+	if !hasWorkerComponents(managedComponents) {
 		return false
 	}
-	if existing == nil || podCliqueSetUsesGroveWorkerHashSuffix(dgd, existing) {
+	if existing == nil || podCliqueSetUsesGroveWorkerHashSuffix(req, existing) {
 		return true
 	}
 
 	return hashChanged
 }
 
-func dgdHasWorkerComponents(dgd *nvidiacomv1beta1.DynamoGraphDeployment) bool {
-	for i := range dgd.Spec.Components {
-		if dynamo.IsWorkerComponent(string(dgd.Spec.Components[i].ComponentType)) {
+func hasWorkerComponents(components []nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec) bool {
+	for i := range components {
+		if dynamo.IsWorkerComponent(string(components[i].ComponentType)) {
 			return true
 		}
 	}
@@ -197,11 +147,12 @@ func dgdHasWorkerComponents(dgd *nvidiacomv1beta1.DynamoGraphDeployment) bool {
 }
 
 func podCliqueSetUsesGroveWorkerHashSuffix(
-	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	req groveReconcileRequest,
 	pcs *grovev1alpha1.PodCliqueSet,
 ) bool {
-	for i := range dgd.Spec.Components {
-		component := &dgd.Spec.Components[i]
+	managedComponents := req.ManagedComponents()
+	for i := range managedComponents {
+		component := &managedComponents[i]
 		if !dynamo.IsWorkerComponent(string(component.ComponentType)) {
 			continue
 		}
@@ -216,21 +167,22 @@ func podCliqueSetUsesGroveWorkerHashSuffix(
 // podCliqueSetObservesWorkerHash reports whether every worker clique in pcs carries the
 // computed DGD worker hash, or, for a pre-existing legacy PCS, that no clique is stamped.
 func podCliqueSetObservesWorkerHash(
-	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	req groveReconcileRequest,
 	pcs *grovev1alpha1.PodCliqueSet,
 	acceptAllUnstamped bool,
 ) (bool, error) {
-	if !dgdHasWorkerComponents(dgd) {
+	managedComponents := req.ManagedComponents()
+	if !hasWorkerComponents(managedComponents) {
 		return true, nil
 	}
-	want, err := dynamo.ComputeDGDWorkersSpecHash(dgd)
+	want, err := dynamo.ComputeDGDWorkersSpecHash(req.DGD)
 	if err != nil {
 		return false, fmt.Errorf("compute desired Grove worker hash: %w", err)
 	}
 	allCanonical := true
 	allUnstamped := acceptAllUnstamped
-	for i := range dgd.Spec.Components {
-		component := &dgd.Spec.Components[i]
+	for i := range managedComponents {
+		component := &managedComponents[i]
 		if !dynamo.IsWorkerComponent(string(component.ComponentType)) {
 			continue
 		}
@@ -258,39 +210,6 @@ func podCliqueSetCliqueForComponent(
 		}
 	}
 	return nil
-}
-
-func applyGroveCompatibility(
-	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
-	pcs *grovev1alpha1.PodCliqueSet,
-) {
-	for i := range dgd.Spec.Components {
-		component := &dgd.Spec.Components[i]
-		componentType := string(component.ComponentType)
-		if !groveComponentTypeCanUseLegacyWorkerSelector(componentType) {
-			continue
-		}
-		if podCliqueSetHasLegacyWorkerSelector(pcs, component.ComponentName, componentType) {
-			applyLegacyGroveWorkerComponentType(component, componentType)
-		}
-	}
-}
-
-func restartAnnotationsFromPodCliqueSet(pcs *grovev1alpha1.PodCliqueSet) map[string]string {
-	restartAnnotations := make(map[string]string)
-	if pcs == nil {
-		return restartAnnotations
-	}
-	for _, clique := range pcs.Spec.Template.Cliques {
-		if clique.Annotations != nil {
-			if timestamp, ok := clique.Annotations[commonconsts.RestartAnnotation]; ok {
-				if componentName, ok := clique.Labels[commonconsts.KubeLabelDynamoComponent]; ok {
-					restartAnnotations[componentName] = timestamp
-				}
-			}
-		}
-	}
-	return restartAnnotations
 }
 
 func preserveGrovePodCliqueSetOrder(
@@ -513,44 +432,4 @@ func podCliqueScalingGroupConfigName(config grovev1alpha1.PodCliqueScalingGroupC
 
 func resourceClaimTemplateConfigName(config grovev1alpha1.ResourceClaimTemplateConfig) string {
 	return config.Name
-}
-
-func groveComponentTypeCanUseLegacyWorkerSelector(componentType string) bool {
-	return componentType == commonconsts.ComponentTypePrefill ||
-		componentType == commonconsts.ComponentTypeDecode
-}
-
-func podCliqueSetHasLegacyWorkerSelector(
-	pcs *grovev1alpha1.PodCliqueSet,
-	componentName string,
-	componentType string,
-) bool {
-	if pcs == nil {
-		return false
-	}
-	for _, clique := range pcs.Spec.Template.Cliques {
-		if clique == nil || clique.Labels[commonconsts.KubeLabelDynamoComponent] != componentName {
-			continue
-		}
-		if hasLegacyWorkerSelector(clique.Labels, componentType) {
-			return true
-		}
-	}
-	return false
-}
-
-func applyLegacyGroveWorkerComponentType(
-	component *nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec,
-	subComponentType string,
-) {
-	component.ComponentType = nvidiacomv1beta1.ComponentTypeWorker
-	if component.PodTemplate == nil {
-		component.PodTemplate = &corev1.PodTemplateSpec{}
-	}
-	if component.PodTemplate.Labels == nil {
-		component.PodTemplate.Labels = map[string]string{}
-	}
-	if _, ok := component.PodTemplate.Labels[commonconsts.KubeLabelDynamoSubComponentType]; !ok {
-		component.PodTemplate.Labels[commonconsts.KubeLabelDynamoSubComponentType] = subComponentType
-	}
 }

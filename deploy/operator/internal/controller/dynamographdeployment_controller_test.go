@@ -504,6 +504,7 @@ func TestDGDScalingAdaptersReconciler_Reconcile(t *testing.T) {
 								Kind:       "DynamoGraphDeployment",
 								Name:       "test-dgd",
 								UID:        "test-uid",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -528,6 +529,7 @@ func TestDGDScalingAdaptersReconciler_Reconcile(t *testing.T) {
 								Kind:       "DynamoGraphDeployment",
 								Name:       "test-dgd",
 								UID:        "test-uid",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -577,6 +579,7 @@ func TestDGDScalingAdaptersReconciler_Reconcile(t *testing.T) {
 								Kind:       "DynamoGraphDeployment",
 								Name:       "test-dgd",
 								UID:        "test-uid",
+								Controller: ptr.To(true),
 							},
 						},
 					},
@@ -712,80 +715,103 @@ func TestGenerateAdapterName(t *testing.T) {
 	})
 }
 
-func TestDGDScalingAdaptersReconciler_EmitsDeleteEventOnlyAfterSuccessfulDelete(t *testing.T) {
-	notFound := apierrors.NewNotFound(
-		schema.GroupResource{
-			Group:    v1alpha1.GroupVersion.Group,
-			Resource: "dynamographdeploymentscalingadapters",
-		},
-		"test-dgd-removed",
-	)
-
+func TestDGDScalingAdaptersReconciler_DeletesOnlyObservedOwnedAdapters(t *testing.T) {
 	tests := []struct {
-		name      string
-		deleteErr error
-		wantEvent bool
+		name        string
+		ownerUID    types.UID
+		deleteErr   error
+		changeOwner bool
+		wantDelete  bool
+		wantEvent   bool
 	}{
+		{name: "owned adapter", ownerUID: "test-uid", wantDelete: true, wantEvent: true},
+		{name: "unowned adapter"},
+		{name: "another graph owns the adapter", ownerUID: "other-uid"},
 		{
-			name:      "successful delete emits event",
-			wantEvent: true,
+			name: "adapter disappeared before delete", ownerUID: "test-uid", wantDelete: true,
+			deleteErr: apierrors.NewNotFound(schema.GroupResource{
+				Group: v1alpha1.GroupVersion.Group, Resource: "dynamographdeploymentscalingadapters",
+			}, "test-dgd-worker"),
 		},
-		{
-			name:      "already absent adapter emits no event",
-			deleteErr: notFound,
-		},
+		{name: "ownership changed before delete", ownerUID: "test-uid", changeOwner: true, wantDelete: true},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dgd := &v1beta1.DynamoGraphDeployment{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-dgd", Namespace: "default"},
-			}
-			adapter := &v1alpha1.DynamoGraphDeploymentScalingAdapter{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-dgd-removed",
-					Namespace: "default",
-					Labels: map[string]string{
-						commonconsts.KubeLabelDynamoGraphDeploymentName: dgd.Name,
+	for _, disabled := range []bool{false, true} {
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("disabled=%t/%s", disabled, tt.name), func(t *testing.T) {
+				t.Log("Store an adapter selected either by component name or by graph label")
+				dgd := &v1beta1.DynamoGraphDeployment{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-dgd", Namespace: "default", UID: "test-uid"},
+				}
+				if disabled {
+					dgd.Spec.Components = []v1beta1.DynamoComponentDeploymentSharedSpec{{ComponentName: "worker"}}
+				}
+				adapter := &v1alpha1.DynamoGraphDeploymentScalingAdapter{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test-dgd-worker", Namespace: dgd.Namespace, UID: "adapter-uid",
+						Labels: map[string]string{commonconsts.KubeLabelDynamoGraphDeploymentName: dgd.Name},
 					},
-				},
-				Spec: v1alpha1.DynamoGraphDeploymentScalingAdapterSpec{
-					DGDRef: v1alpha1.DynamoGraphDeploymentServiceRef{
-						Name:        dgd.Name,
-						ServiceName: "removed",
+					Spec: v1alpha1.DynamoGraphDeploymentScalingAdapterSpec{
+						DGDRef: v1alpha1.DynamoGraphDeploymentServiceRef{Name: dgd.Name, ServiceName: "worker"},
 					},
-				},
-			}
-			kubeClient := fake.NewClientBuilder().
-				WithScheme(newDynamoGraphDeploymentControllerTestScheme(t)).
-				WithObjects(dgd, adapter).
-				WithInterceptorFuncs(interceptor.Funcs{
-					Delete: func(
-						ctx context.Context,
-						writer client.WithWatch,
-						obj client.Object,
-						opts ...client.DeleteOption,
-					) error {
-						if tt.deleteErr != nil {
-							return tt.deleteErr
-						}
-						return writer.Delete(ctx, obj, opts...)
-					},
-				}).
-				Build()
-			recorder := events.NewFakeRecorder(10)
-			reconciler := &DynamoGraphDeploymentReconciler{
-				Client:   kubeClient,
-				Recorder: recorder,
-			}
+				}
+				if tt.ownerUID != "" {
+					adapter.OwnerReferences = []metav1.OwnerReference{{
+						APIVersion: v1beta1.GroupVersion.String(), Kind: "DynamoGraphDeployment",
+						Name: dgd.Name, UID: tt.ownerUID, Controller: ptr.To(true),
+					}}
+				}
 
-			require.NoError(t, newDGDScalingAdaptersReconciler(reconciler.Client, reconciler.Recorder).Reconcile(context.Background(), dgd))
-			if tt.wantEvent {
-				assert.Len(t, recorder.Events, 1)
-				return
-			}
-			assert.Empty(t, recorder.Events)
-		})
+				t.Log("Observe delete preconditions and simulate changes after the ownership read")
+				deleteCalled := false
+				kubeClient := fake.NewClientBuilder().
+					WithScheme(newDynamoGraphDeploymentControllerTestScheme(t)).
+					WithObjects(dgd, adapter).
+					WithInterceptorFuncs(interceptor.Funcs{
+						Delete: func(ctx context.Context, writer client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+							deleteCalled = true
+							options := (&client.DeleteOptions{}).ApplyOptions(opts)
+							require.NotNil(t, options.Preconditions)
+							require.Equal(t, ptr.To(obj.GetUID()), options.Preconditions.UID)
+							require.NotEmpty(t, obj.GetResourceVersion())
+							require.Equal(t, ptr.To(obj.GetResourceVersion()), options.Preconditions.ResourceVersion)
+							if tt.deleteErr != nil {
+								return tt.deleteErr
+							}
+							if tt.changeOwner {
+								replacement := obj.DeepCopyObject().(client.Object)
+								replacement.SetOwnerReferences(nil)
+								require.NoError(t, writer.Update(ctx, replacement))
+							}
+							return writer.Delete(ctx, obj, opts...)
+						},
+					}).Build()
+				recorder := events.NewFakeRecorder(10)
+
+				t.Log("Reconcile and publish an event only for a successful owned deletion")
+				err := newDGDScalingAdaptersReconciler(kubeClient, recorder).Reconcile(t.Context(), dgd)
+				if tt.changeOwner {
+					require.True(t, apierrors.IsConflict(err), "expected conflict, got %v", err)
+				} else {
+					require.NoError(t, err)
+				}
+				require.Equal(t, tt.wantDelete, deleteCalled)
+				if tt.wantEvent {
+					require.Len(t, recorder.Events, 1)
+					require.Contains(t, <-recorder.Events, "AdapterDeleted")
+				} else {
+					require.Empty(t, recorder.Events)
+				}
+
+				t.Log("Preserve unrelated adapters and objects whose ownership changed concurrently")
+				err = kubeClient.Get(t.Context(), client.ObjectKeyFromObject(adapter), adapter)
+				if tt.wantEvent {
+					require.True(t, apierrors.IsNotFound(err), "expected deletion, got %v", err)
+				} else {
+					require.NoError(t, err)
+				}
+			})
+		}
 	}
 }
 
@@ -1203,8 +1229,7 @@ func TestGroveWorkloadsReconciler_Reconcile(t *testing.T) {
 
 			result, err := reconciler.newGroveProgram().workloads.Reconcile(
 				ctx,
-				dgd,
-				projectWithoutExternallyManagedComponents(dgd),
+				groveReconcileRequest{DGD: dgd, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController},
 				nil,
 				nil,
 			)
@@ -1245,8 +1270,7 @@ func TestGroveWorkloadsReconciler_Reconcile(t *testing.T) {
 
 			result, err = reconciler.newGroveProgram().workloads.Reconcile(
 				ctx,
-				dgd,
-				projectWithoutExternallyManagedComponents(dgd),
+				groveReconcileRequest{DGD: dgd, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController},
 				nil,
 				nil,
 			)
@@ -1342,8 +1366,7 @@ func TestGroveWorkloadsReconciler_UsesPreservedAlphaServiceIngress(t *testing.T)
 
 	_, err := reconciler.newGroveProgram().workloads.Reconcile(
 		ctx,
-		dgd,
-		projectWithoutExternallyManagedComponents(dgd),
+		groveReconcileRequest{DGD: dgd, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController},
 		nil,
 		nil,
 	)
@@ -1430,25 +1453,10 @@ func TestGroveWorkloadRendererRenderPreservesLegacyWorkerSelectors(t *testing.T)
 		nil,
 	)
 
-	renderedPCS, err := renderer.Render(ctx, projectWithoutExternallyManagedComponents(dgd), nil, nil, false)
+	renderedPCS, err := renderer.Render(ctx, groveReconcileRequest{DGD: dgd, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil, false)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	generatedPCS := renderedPCS.desired
-	renderDGD := renderedPCS.renderDeployment
 	g.Expect(dgd.GetComponentByName("VllmDecodeWorker").ComponentType).To(gomega.Equal(v1beta1.ComponentTypeDecode))
-
-	prefill := renderDGD.GetComponentByName("VllmPrefillWorker")
-	if prefill == nil {
-		t.Fatal("expected rendered prefill component")
-	}
-	g.Expect(prefill.ComponentType).To(gomega.Equal(v1beta1.ComponentTypeWorker))
-	g.Expect(prefill.PodTemplate.Labels[commonconsts.KubeLabelDynamoSubComponentType]).To(gomega.Equal(commonconsts.ComponentTypePrefill))
-
-	decode := renderDGD.GetComponentByName("VllmDecodeWorker")
-	if decode == nil {
-		t.Fatal("expected rendered decode component")
-	}
-	g.Expect(decode.ComponentType).To(gomega.Equal(v1beta1.ComponentTypeWorker))
-	g.Expect(decode.PodTemplate.Labels[commonconsts.KubeLabelDynamoSubComponentType]).To(gomega.Equal(commonconsts.ComponentTypeDecode))
 
 	g.Expect(generatedPCS.Spec.Template.Cliques[0].Name).To(gomega.Equal("vllmprefillworker"))
 
@@ -1466,16 +1474,23 @@ func TestGroveWorkloadRendererRenderPreservesLegacyWorkerSelectors(t *testing.T)
 	g.Expect(prefillClique.Labels[commonconsts.KubeLabelDynamoSubComponentType]).To(gomega.Equal(commonconsts.ComponentTypePrefill))
 	g.Expect(prefillClique.Annotations[commonconsts.KubeAnnotationDynamoOperatorOriginVersion]).To(gomega.Equal("1.1.0"))
 
-	decodeService, err := dynamo.GenerateComponentService(dynamo.ComponentServiceParams{
-		ServiceName:     dynamo.GetDCDResourceName(renderDGD, "VllmDecodeWorker", ""),
-		Namespace:       renderDGD.Namespace,
-		ComponentType:   string(decode.ComponentType),
-		DynamoNamespace: renderDGD.GetDynamoNamespaceForComponent(decode),
-		ComponentName:   "VllmDecodeWorker",
-		Labels:          dynamo.GetDGDComponentResourceLabels(renderDGD, "VllmDecodeWorker", decode),
-		Annotations:     dynamo.GetDGDComponentResourceAnnotations(renderDGD, "VllmDecodeWorker", decode),
-		IsK8sDiscovery:  true,
-	})
+	decodeClique := podCliqueSetCliqueForComponent(generatedPCS, "VllmDecodeWorker")
+	g.Expect(decodeClique).NotTo(gomega.BeNil())
+	g.Expect(decodeClique.Labels[commonconsts.KubeLabelDynamoComponentType]).To(gomega.Equal(commonconsts.ComponentTypeWorker))
+	g.Expect(decodeClique.Labels[commonconsts.KubeLabelDynamoSubComponentType]).To(gomega.Equal(commonconsts.ComponentTypeDecode))
+
+	stableResources := newGroveStableResourcesReconciler(
+		fakeKubeClient,
+		events.NewFakeRecorder(10),
+		&configv1alpha1.OperatorConfiguration{Discovery: configv1alpha1.DiscoveryConfiguration{Backend: configv1alpha1.DiscoveryBackendKubernetes}},
+	)
+	_, err = stableResources.Reconcile(ctx, groveReconcileRequest{DGD: dgd}, generatedPCS)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	decodeService := &corev1.Service{}
+	err = fakeKubeClient.Get(ctx, types.NamespacedName{
+		Name:      dynamo.GetDCDResourceName(dgd, "VllmDecodeWorker", ""),
+		Namespace: dgd.Namespace,
+	}, decodeService)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(decodeService.Spec.Selector[commonconsts.KubeLabelDynamoComponentType]).To(gomega.Equal(commonconsts.ComponentTypeWorker))
 }
@@ -1728,14 +1743,11 @@ func TestGroveWorkloadRendererRenderKeepsNativeWorkerSelectors(t *testing.T) {
 		&controller_common.RuntimeConfig{},
 		nil,
 	)
-	renderedPCS, err := renderer.Render(ctx, projectWithoutExternallyManagedComponents(dgd), nil, nil, false)
+	renderedPCS, err := renderer.Render(ctx, groveReconcileRequest{DGD: dgd, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil, false)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
-	renderDGD := renderedPCS.renderDeployment
-	prefill := renderDGD.GetComponentByName("prefill")
-	if prefill == nil {
-		t.Fatal("expected rendered prefill component")
-	}
-	g.Expect(prefill.ComponentType).To(gomega.Equal(v1beta1.ComponentTypePrefill))
+	prefill := podCliqueSetCliqueForComponent(renderedPCS.desired, "prefill")
+	g.Expect(prefill).NotTo(gomega.BeNil())
+	g.Expect(prefill.Labels[commonconsts.KubeLabelDynamoComponentType]).To(gomega.Equal(commonconsts.ComponentTypePrefill))
 }
 
 func TestDGDRestartReconciler_ComputeStatus(t *testing.T) {
@@ -2706,7 +2718,10 @@ func TestDGDRestartReconciler_ComputeStatus(t *testing.T) {
 			restartReconciler := newDGDRestartReconciler()
 			var resolveProgress restartProgressResolver = newComponentRestartProgressResolver(reconciler.Client).Resolve
 			if tt.groveEnabled {
-				resolveProgress = newGroveRestartProgressResolver(reconciler.Client).Resolve
+				resolver := newGroveRestartProgressResolver(reconciler.Client)
+				resolveProgress = func(ctx context.Context, dgd *v1beta1.DynamoGraphDeployment, inProgress []string) []string {
+					return resolver.Resolve(ctx, groveReconcileRequest{DGD: dgd, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, inProgress)
+				}
 			}
 			result := restartReconciler.computeRestartStatusWithProgressResolver(ctx, dgd, resolveProgress)
 
@@ -3593,7 +3608,7 @@ func TestDGDGroveTopologyConditionReconciler_Reconcile(t *testing.T) {
 			programResult := newWorkloadProgramResult(tt.dgd)
 			if tt.groveEnabled {
 				newDGDGroveTopologyConditionReconciler(reconciler.Client).
-					Reconcile(ctx, tt.dgd, &programResult)
+					Reconcile(ctx, groveReconcileRequest{DGD: tt.dgd, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, &programResult)
 			}
 			g.Expect(tt.dgd.Status).To(gomega.Equal(originalStatus), "status projection must not mutate request.DGD.Status")
 

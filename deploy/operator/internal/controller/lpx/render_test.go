@@ -101,14 +101,10 @@ func TestGenerateGrovePodCliqueSet_FromDGDYaml(t *testing.T) {
 				require.True(t, component.IsLPX())
 			}
 
-			t.Log("Render conventional components independently from their ordinary-only input")
-			ordinary := dynamoDeployment.DeepCopy()
-			ordinary.Spec.Components = slices.DeleteFunc(ordinary.Spec.Components, func(component v1beta1.DynamoComponentDeploymentSharedSpec) bool {
-				return component.IsLPX()
-			})
+			t.Log("Render ordinary components independently from their explicit selection")
 			normal, err := dynamo.GenerateGrovePodCliqueSet(
-				t.Context(), ordinary, controllerConfig, runtimeConfig,
-				kubeClient, nil, nil, nil, nil,
+				t.Context(), &dynamoDeployment, (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController, controllerConfig, runtimeConfig,
+				kubeClient, nil, nil, nil, false, nil,
 			)
 			require.NoError(t, err)
 			require.NotEqual(t, normal.Name, got.Name)

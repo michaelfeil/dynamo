@@ -43,13 +43,13 @@ type GroveMultinodeDeployer struct {
 	Rank          int32 // explicit node rank (used when IsInterPodGMS is true)
 }
 
-// GroveComponentResourceName returns the Grove child resource name for a DGD
+// GroveComponentResourceName returns the Grove child resource name for a PCS
 // component. Grove currently creates one PodClique or PodCliqueScalingGroup
 // instance per component at PodCliqueSet replica index zero.
-func GroveComponentResourceName(dgd *v1beta1.DynamoGraphDeployment, componentName string) string {
+func GroveComponentResourceName(pcsName, componentName string) string {
 	return fmt.Sprintf(
 		"%s-0-%s",
-		PCSNameForDGD(dgd.Name, dgd.Spec.Components),
+		pcsName,
 		strings.ToLower(componentName),
 	)
 }
@@ -106,16 +106,16 @@ type GroveReadiness struct {
 	ComponentStatuses map[string]v1beta1.ComponentReplicaStatus
 }
 
-// EvaluateGroveReadiness resolves one Grove readiness snapshot from the
-// supplied PCS observation. A nil PCS represents an observed missing PCS.
-// The deployment must contain only components owned by this PCS.
+// EvaluateGroveReadiness observes readiness for the Grove-managed components
+// represented by the supplied PCS. A nil PCS represents an observed missing PCS.
 func EvaluateGroveReadiness(
 	ctx context.Context,
 	reader client.Reader,
 	dgd *v1beta1.DynamoGraphDeployment,
+	isDelegated func(*v1beta1.DynamoComponentDeploymentSharedSpec) bool,
 	pcs *grovev1alpha1.PodCliqueSet,
 ) (GroveReadiness, error) {
-	allReady, classification, message, componentStatuses, err := evaluateGroveComponents(ctx, reader, dgd, pcs)
+	allReady, classification, message, componentStatuses, err := evaluateGroveComponents(ctx, reader, dgd, isDelegated, pcs)
 	if err != nil {
 		return GroveReadiness{}, err
 	}
@@ -151,20 +151,25 @@ func evaluateGroveComponents(
 	ctx context.Context,
 	reader client.Reader,
 	dgd *v1beta1.DynamoGraphDeployment,
+	isDelegated func(*v1beta1.DynamoComponentDeploymentSharedSpec) bool,
 	pcs *grovev1alpha1.PodCliqueSet,
 ) (allReady bool, classificationReason string, message string, componentStatuses map[string]v1beta1.ComponentReplicaStatus, err error) {
 	logger := log.FromContext(ctx)
 	var notReadyComponents []string
 	aggregatedReason := ""
 	componentReadinesses := make(map[string]groveComponentReadiness, len(dgd.Spec.Components))
+	pcsName := PCSNameForDGD(dgd, isDelegated)
 
 	for i := range dgd.Spec.Components {
 		component := &dgd.Spec.Components[i]
+		if isDelegatedComponent(component, isDelegated) {
+			continue
+		}
 		componentName := component.ComponentName
 
 		var componentReadiness groveComponentReadiness
 		var checkErr error
-		resourceName := GroveComponentResourceName(dgd, componentName)
+		resourceName := GroveComponentResourceName(pcsName, componentName)
 		if component.UsesPCSG() {
 			componentReadiness, checkErr = observePCSGReadiness(ctx, reader, resourceName, dgd.Namespace, logger)
 		} else {
@@ -192,14 +197,17 @@ func evaluateGroveComponents(
 		}
 	}
 
-	namespacePlan, err := newGroveRuntimeNamespacePlan(dgd, pcs, componentReadinesses)
+	namespacePlan, err := newGroveRuntimeNamespacePlan(dgd, isDelegated, pcs, componentReadinesses)
 	if err != nil {
 		return false, "", "", nil, err
 	}
 
-	componentStatuses = make(map[string]v1beta1.ComponentReplicaStatus, len(dgd.Spec.Components))
+	componentStatuses = make(map[string]v1beta1.ComponentReplicaStatus, len(componentReadinesses))
 	for i := range dgd.Spec.Components {
 		component := &dgd.Spec.Components[i]
+		if isDelegatedComponent(component, isDelegated) {
+			continue
+		}
 		componentReadiness := componentReadinesses[component.ComponentName]
 		componentStatus := componentReadiness.status
 		componentStatus.RuntimeNamespace = namespacePlan.runtimeNamespace(dgd, component)
@@ -284,11 +292,12 @@ type groveRuntimeNamespacePlan struct {
 
 func newGroveRuntimeNamespacePlan(
 	dgd *v1beta1.DynamoGraphDeployment,
+	isDelegated func(*v1beta1.DynamoComponentDeploymentSharedSpec) bool,
 	pcs *grovev1alpha1.PodCliqueSet,
 	componentReadinesses map[string]groveComponentReadiness,
 ) (groveRuntimeNamespacePlan, error) {
 	acceptedPCSRevisionHash := getAcceptedPCSRevisionHash(pcs)
-	workerHash, workersUseHashSuffix, err := acceptedGroveWorkerHash(dgd, pcs, acceptedPCSRevisionHash)
+	workerHash, workersUseHashSuffix, err := acceptedGroveWorkerHash(dgd, isDelegated, pcs, acceptedPCSRevisionHash)
 	if err != nil {
 		return groveRuntimeNamespacePlan{}, err
 	}
@@ -297,7 +306,7 @@ func newGroveRuntimeNamespacePlan(
 		acceptedPCSRevisionHash: acceptedPCSRevisionHash,
 		workerHash:              workerHash,
 		workersUseHashSuffix:    workersUseHashSuffix,
-		workersCompleted:        groveWorkersCompletedAcceptedPCSRevision(dgd, componentReadinesses, acceptedPCSRevisionHash),
+		workersCompleted:        groveWorkersCompletedAcceptedPCSRevision(dgd, isDelegated, componentReadinesses, acceptedPCSRevisionHash),
 	}, nil
 }
 
@@ -320,16 +329,18 @@ func (p groveRuntimeNamespacePlan) runtimeNamespace(
 	return ComponentRuntimeNamespace(baseNamespace, string(component.ComponentType), p.workerHash)
 }
 
-// groveWorkersCompletedAcceptedPCSRevision reports whether every worker child
-// completed the accepted PCS revision. dgd must contain at least one worker.
 func groveWorkersCompletedAcceptedPCSRevision(
 	dgd *v1beta1.DynamoGraphDeployment,
+	isDelegated func(*v1beta1.DynamoComponentDeploymentSharedSpec) bool,
 	componentReadinesses map[string]groveComponentReadiness,
 	acceptedPCSRevisionHash *string,
 ) bool {
 	workerCount := 0
 	for i := range dgd.Spec.Components {
 		component := &dgd.Spec.Components[i]
+		if isDelegatedComponent(component, isDelegated) {
+			continue
+		}
 		if !IsWorkerComponent(string(component.ComponentType)) {
 			continue
 		}
@@ -345,6 +356,7 @@ func groveWorkersCompletedAcceptedPCSRevision(
 // PCS revision. The second result reports whether that accepted revision is suffixed.
 func acceptedGroveWorkerHash(
 	dgd *v1beta1.DynamoGraphDeployment,
+	isDelegated func(*v1beta1.DynamoComponentDeploymentSharedSpec) bool,
 	pcs *grovev1alpha1.PodCliqueSet,
 	acceptedPCSRevisionHash *string,
 ) (string, bool, error) {
@@ -355,6 +367,9 @@ func acceptedGroveWorkerHash(
 	workerHash := ""
 	for i := range dgd.Spec.Components {
 		component := &dgd.Spec.Components[i]
+		if isDelegatedComponent(component, isDelegated) {
+			continue
+		}
 		if !IsWorkerComponent(string(component.ComponentType)) {
 			continue
 		}
@@ -381,6 +396,9 @@ func acceptedGroveWorkerHash(
 
 	for i := range dgd.Spec.Components {
 		component := &dgd.Spec.Components[i]
+		if isDelegatedComponent(component, isDelegated) {
+			continue
+		}
 		if !IsWorkerComponent(string(component.ComponentType)) {
 			continue
 		}

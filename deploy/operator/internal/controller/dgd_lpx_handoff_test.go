@@ -63,7 +63,7 @@ func newLPXHandoffFixture(t *testing.T, fixture string) (*v1alpha1.LPXGraphDeplo
 	return child, source, kube
 }
 
-func TestProjectWithoutExternallyManagedComponentsDoesNotMutateSource(t *testing.T) {
+func TestGroveComponentSelectionDoesNotMutateDGD(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		longNames bool
@@ -74,7 +74,7 @@ func TestProjectWithoutExternallyManagedComponentsDoesNotMutateSource(t *testing
 		{name: "LPX only", lpxOnly: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			t.Log("Project the exact DGD-owned subset without changing the source")
+			t.Log("Select the exact managed subset without changing the DGD")
 			source := newLPXHandoffSource(t, "node-local-v2-hybrid")
 			lpxComponent := &source.Spec.Components[0]
 			if test.longNames {
@@ -93,15 +93,21 @@ func TestProjectWithoutExternallyManagedComponentsDoesNotMutateSource(t *testing
 				})
 			}
 			before := source.DeepCopy()
-			ordinary := projectWithoutExternallyManagedComponents(source)
-			require.Nil(t, ordinary.GetComponentByName(lpxName))
-			require.Len(t, ordinary.Spec.Components, len(source.Spec.Components)-1)
+			req := groveReconcileRequest{DGD: source, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}
+			managed := req.ManagedComponents()
+			delegated := req.DelegatedComponents()
+			require.Len(t, managed, len(source.Spec.Components)-1)
+			require.Len(t, delegated, 1)
+			require.Equal(t, lpxName, delegated[0].ComponentName)
+			for i := range managed {
+				require.NotEqual(t, lpxName, managed[i].ComponentName)
+			}
 
-			t.Log("Seed the projected PCS only for mixed graphs, including the truncated-name case")
-			pcsName := dynamo.PCSNameForDGD(ordinary.Name, ordinary.Spec.Components)
+			t.Log("Seed the ordinary PCS only for mixed graphs, including the truncated-name case")
+			pcsName := dynamo.PCSNameForDGD(req.DGD, req.IsDelegated)
 			if test.longNames {
 				require.NotEqual(t, source.Name, pcsName)
-				require.NotEqual(t, dynamo.PCSNameForDGD(source.Name, source.Spec.Components), pcsName)
+				require.NotEqual(t, dynamo.PCSNameForDGD(source, nil), pcsName)
 			}
 			pcs := &grovev1alpha1.PodCliqueSet{
 				ObjectMeta: metav1.ObjectMeta{Name: pcsName, Namespace: source.Namespace, Generation: 1},
@@ -111,7 +117,7 @@ func TestProjectWithoutExternallyManagedComponentsDoesNotMutateSource(t *testing
 				}}},
 			}
 			clique := &grovev1alpha1.PodClique{
-				ObjectMeta: metav1.ObjectMeta{Name: dynamo.GroveComponentResourceName(ordinary, "ordinary-frontend"), Namespace: source.Namespace, Generation: 1},
+				ObjectMeta: metav1.ObjectMeta{Name: dynamo.GroveComponentResourceName(pcsName, "ordinary-frontend"), Namespace: source.Namespace, Generation: 1},
 				Spec:       grovev1alpha1.PodCliqueSpec{Replicas: 1},
 				Status:     grovev1alpha1.PodCliqueStatus{ObservedGeneration: ptr.To(int64(1)), Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1},
 			}
@@ -124,19 +130,19 @@ func TestProjectWithoutExternallyManagedComponentsDoesNotMutateSource(t *testing
 			t.Log("Render and observe restarts against that same ordinary PCS")
 			if !test.lpxOnly {
 				renderer := newGroveWorkloadRenderer(kube, &configv1alpha1.OperatorConfiguration{}, &commoncontroller.RuntimeConfig{}, nil)
-				rendered, err := renderer.Render(t.Context(), ordinary, nil, nil, false)
+				rendered, err := renderer.Render(t.Context(), req, nil, nil, false)
 				require.NoError(t, err)
 				require.NotNil(t, rendered.existing)
 				require.Equal(t, pcsName, rendered.existing.Name)
 				require.Equal(t, pcsName, rendered.desired.Name)
 			}
-			remaining := resolveCompositeGroveRestartProgress(t.Context(), source, ordinary,
+			remaining := resolveCompositeGroveRestartProgress(t.Context(), req,
 				[]string{lpxName, "ordinary-frontend"}, newGroveRestartProgressResolver(kube), newLPXRestartProgressResolver(kube))
 			require.Equal(t, []string{lpxName}, remaining)
 
 			t.Log("Observe the graph-level topology through the same ordinary PCS")
 			result := newWorkloadProgramResult(source)
-			newDGDGroveTopologyConditionReconciler(kube).Reconcile(t.Context(), ordinary, &result)
+			newDGDGroveTopologyConditionReconciler(kube).Reconcile(t.Context(), req, &result)
 			condition := meta.FindStatusCondition(result.Status.Conditions, v1beta1.ConditionTypeTopologyLevelsAvailable)
 			if test.lpxOnly {
 				require.Nil(t, condition)
@@ -148,10 +154,10 @@ func TestProjectWithoutExternallyManagedComponentsDoesNotMutateSource(t *testing
 				require.Equal(t, "missing ordinary topology", condition.Message)
 			}
 
-			t.Log("Keep the source unchanged after observations and projected component-slice edits")
+			t.Log("Keep the DGD unchanged after observations and managed component-slice edits")
 			require.Equal(t, before, source)
-			if len(ordinary.Spec.Components) > 0 {
-				ordinary.Spec.Components[0].ComponentName = "ordinary-copy"
+			if len(managed) > 0 {
+				managed[0].ComponentName = "ordinary-copy"
 			}
 			require.Equal(t, before, source)
 		})
@@ -333,10 +339,9 @@ func TestLPXRestartUsesPersistedSelectionAndCurrentChildStatus(t *testing.T) {
 			program := (&DynamoGraphDeploymentReconciler{
 				Client: kube, RuntimeConfig: &commoncontroller.RuntimeConfig{},
 			}).newGroveProgram()
-			ordinaryDGD := projectWithoutExternallyManagedComponents(source)
 			progress := func(ctx context.Context, source *v1beta1.DynamoGraphDeployment, inProgress []string) []string {
 				return resolveCompositeGroveRestartProgress(
-					ctx, source, ordinaryDGD, inProgress, program.restartProgress, program.lpxRestartProgress,
+					ctx, groveReconcileRequest{DGD: source, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, inProgress, program.restartProgress, program.lpxRestartProgress,
 				)
 			}
 			restart := newDGDRestartReconciler().Resolve(t.Context(), source, &source.Status, progress)
@@ -407,16 +412,17 @@ func TestParallelRestartStartsAllLPXAndOrdinaryWorkloadsBeforeReadiness(t *testi
 
 	_, err := program.Reconcile(t.Context(), workloadProgramRequest{DGD: source})
 	require.NoError(t, err)
-	ordinary := projectWithoutExternallyManagedComponents(source)
+	groveReq := groveReconcileRequest{DGD: source, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}
+	pcsName := dynamo.PCSNameForDGD(groveReq.DGD, groveReq.IsDelegated)
 	pcs := &grovev1alpha1.PodCliqueSet{}
 	require.NoError(t, kube.Get(t.Context(), client.ObjectKey{
-		Namespace: source.Namespace, Name: dynamo.PCSNameForDGD(ordinary.Name, ordinary.Spec.Components),
+		Namespace: source.Namespace, Name: pcsName,
 	}, pcs))
 	pcs.Generation = 1
 	pcs.Status.ObservedGeneration = ptr.To(pcs.Generation)
 	require.NoError(t, kube.Update(t.Context(), pcs))
 	frontend := &grovev1alpha1.PodClique{
-		ObjectMeta: metav1.ObjectMeta{Name: dynamo.GroveComponentResourceName(ordinary, "frontend"), Namespace: source.Namespace, Generation: 1},
+		ObjectMeta: metav1.ObjectMeta{Name: dynamo.GroveComponentResourceName(pcsName, "frontend"), Namespace: source.Namespace, Generation: 1},
 		Spec:       grovev1alpha1.PodCliqueSpec{Replicas: 1},
 		Status:     grovev1alpha1.PodCliqueStatus{ObservedGeneration: ptr.To(int64(1)), Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1},
 	}
@@ -591,10 +597,9 @@ func TestSpecDecodeRestartRollsTheSharedChildOnce(t *testing.T) {
 			program := (&DynamoGraphDeploymentReconciler{
 				Client: observed, RuntimeConfig: &commoncontroller.RuntimeConfig{},
 			}).newGroveProgram()
-			ordinaryDGD := projectWithoutExternallyManagedComponents(source)
 			progress := func(ctx context.Context, source *v1beta1.DynamoGraphDeployment, inProgress []string) []string {
 				return resolveCompositeGroveRestartProgress(
-					ctx, source, ordinaryDGD, inProgress, program.restartProgress, program.lpxRestartProgress,
+					ctx, groveReconcileRequest{DGD: source, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, inProgress, program.restartProgress, program.lpxRestartProgress,
 				)
 			}
 			restarter := newDGDRestartReconciler()
@@ -646,7 +651,6 @@ func TestSpecDecodeRestartRollsTheSharedChildOnce(t *testing.T) {
 				v1beta1.DynamoComponentDeploymentSharedSpec{ComponentName: "frontend", ComponentType: v1beta1.ComponentTypeFrontend, Replicas: ptr.To(int32(1))},
 				v1beta1.DynamoComponentDeploymentSharedSpec{ComponentName: "prefill", ComponentType: v1beta1.ComponentTypePrefill, Replicas: ptr.To(int32(1))},
 			)
-			ordinaryDGD = projectWithoutExternallyManagedComponents(source)
 			requested := []string{"draft", "frontend", "lpx", "prefill", "removed"}
 			beforeSource := source.DeepCopy()
 			childReads, pcsReads = 0, 0
@@ -655,8 +659,9 @@ func TestSpecDecodeRestartRollsTheSharedChildOnce(t *testing.T) {
 			require.Equal(t, 1, pcsReads)
 
 			t.Log("An unobserved ordinary PCS cannot hold back either ready LPX member")
+			groveReq := groveReconcileRequest{DGD: source, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}
 			pcs := &grovev1alpha1.PodCliqueSet{
-				ObjectMeta: metav1.ObjectMeta{Name: dynamo.PCSNameForDGD(ordinaryDGD.Name, ordinaryDGD.Spec.Components), Namespace: source.Namespace, Generation: 2},
+				ObjectMeta: metav1.ObjectMeta{Name: dynamo.PCSNameForDGD(groveReq.DGD, groveReq.IsDelegated), Namespace: source.Namespace, Generation: 2},
 				Status:     grovev1alpha1.PodCliqueSetStatus{ObservedGeneration: ptr.To(int64(1))},
 			}
 			require.NoError(t, kube.Create(t.Context(), pcs))
@@ -669,7 +674,7 @@ func TestSpecDecodeRestartRollsTheSharedChildOnce(t *testing.T) {
 			pcs.Status.ObservedGeneration = ptr.To(pcs.Generation)
 			require.NoError(t, kube.Update(t.Context(), pcs))
 			prefill := &grovev1alpha1.PodClique{
-				ObjectMeta: metav1.ObjectMeta{Name: dynamo.GroveComponentResourceName(ordinaryDGD, "prefill"), Namespace: source.Namespace, Generation: 1},
+				ObjectMeta: metav1.ObjectMeta{Name: dynamo.GroveComponentResourceName(dynamo.PCSNameForDGD(groveReq.DGD, groveReq.IsDelegated), "prefill"), Namespace: source.Namespace, Generation: 1},
 				Spec:       grovev1alpha1.PodCliqueSpec{Replicas: 1},
 				Status:     grovev1alpha1.PodCliqueStatus{ObservedGeneration: ptr.To(int64(1)), Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1},
 			}
@@ -797,22 +802,27 @@ func TestLPXPendingDownloadDoesNotBlockOrdinaryWorkloads(t *testing.T) {
 		RuntimeConfig: &commoncontroller.RuntimeConfig{Gate: features.Gates{Grove: true, LPX: true, Checkpoint: true}},
 	}
 	program := parent.newGroveProgram()
-	var adapterDeletes []string
-	program.scalingAdapters.Client = interceptor.NewClient(kube.(client.WithWatch), interceptor.Funcs{
-		Delete: func(ctx context.Context, delegated client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			adapterDeletes = append(adapterDeletes, obj.GetName())
-			return delegated.Delete(ctx, obj, opts...)
+
+	t.Log("Leave a graph-owned adapter behind after ordinary component scaling was disabled")
+	disabledAdapter := &v1alpha1.DynamoGraphDeploymentScalingAdapter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: generateAdapterName(source.Name, "prefill"), Namespace: source.Namespace,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(source, v1beta1.DynamoGraphDeploymentGVK)},
 		},
-	})
+		Spec: v1alpha1.DynamoGraphDeploymentScalingAdapterSpec{
+			DGDRef: v1alpha1.DynamoGraphDeploymentServiceRef{Name: source.Name, ServiceName: "prefill"},
+		},
+	}
+	require.NoError(t, kube.Create(t.Context(), disabledAdapter))
 
 	t.Log("Publish ordinary resources independently of the child's pending download")
 	result, err := program.Reconcile(t.Context(), workloadProgramRequest{DGD: source})
 	require.NoError(t, err)
 	require.Equal(t, v1beta1.DGDStatePending, result.Status.State)
-	require.Equal(t, []string{generateAdapterName(source.Name, "prefill")}, adapterDeletes)
+	require.True(t, apierrors.IsNotFound(kube.Get(t.Context(), client.ObjectKeyFromObject(disabledAdapter), disabledAdapter)))
 	pcs := &grovev1alpha1.PodCliqueSet{}
-	ordinaryDGD := projectWithoutExternallyManagedComponents(source)
-	key := client.ObjectKey{Namespace: source.Namespace, Name: dynamo.PCSNameForDGD(ordinaryDGD.Name, ordinaryDGD.Spec.Components)}
+	groveReq := groveReconcileRequest{DGD: source, IsDelegated: (*v1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}
+	key := client.ObjectKey{Namespace: source.Namespace, Name: dynamo.PCSNameForDGD(groveReq.DGD, groveReq.IsDelegated)}
 	require.NoError(t, kube.Get(t.Context(), key, pcs))
 	require.True(t, metav1.IsControlledBy(pcs, source))
 	require.Len(t, pcs.Spec.Template.Cliques, 1)
@@ -882,4 +892,47 @@ func TestLPXPendingDownloadDoesNotBlockOrdinaryWorkloads(t *testing.T) {
 	require.Equal(t, v1alpha1.LPXReadyReasonFailed, failed.Reason)
 	require.Contains(t, failed.Message, "storage volume mount is missing")
 	require.Equal(t, v1beta1.ComponentCheckpointStatus{CheckpointName: friendlyCheckpointName}, result.Status.Checkpoints["prefill"])
+}
+
+func TestGroveProgramPreservesAnotherGraphsScalingAdapter(t *testing.T) {
+	t.Log("Store two graphs whose component names produce the same adapter name")
+	source := newLPXHandoffSource(t, "node-local-v2-lpu-only")
+	source.Name = "graph"
+	source.Spec.Components[0].ComponentName = "foo-bar"
+	source.Annotations[consts.KubeAnnotationDynamoDiscoveryBackend] = string(configv1alpha1.DiscoveryBackendKubernetes)
+	ordinary := &v1beta1.DynamoGraphDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "graph-foo", Namespace: source.Namespace, UID: "ordinary-uid"},
+		Spec: v1beta1.DynamoGraphDeploymentSpec{Components: []v1beta1.DynamoComponentDeploymentSharedSpec{{
+			ComponentName: "bar", ComponentType: v1beta1.ComponentTypeWorker,
+			Replicas: ptr.To(int32(3)), ScalingAdapter: &v1beta1.ScalingAdapter{},
+		}}},
+	}
+	kube := fake.NewClientBuilder().WithScheme(newDynamoGraphDeploymentControllerTestScheme(t)).
+		WithObjects(source, ordinary).Build()
+	require.NoError(t, rbacv1.AddToScheme(kube.Scheme()))
+
+	t.Log("Create the ordinary graph's adapter through the production reconciler")
+	require.NoError(t, newDGDScalingAdaptersReconciler(kube, nil).Reconcile(t.Context(), ordinary))
+	key := client.ObjectKey{Namespace: source.Namespace, Name: generateAdapterName(ordinary.Name, "bar")}
+	require.Equal(t, key.Name, generateAdapterName(source.Name, source.Spec.Components[0].ComponentName))
+	adapter := &v1alpha1.DynamoGraphDeploymentScalingAdapter{}
+	require.NoError(t, kube.Get(t.Context(), key, adapter))
+	before := adapter.DeepCopy()
+
+	t.Log("Reconcile the complete Grove program with the LPX graph")
+	config := &configv1alpha1.OperatorConfiguration{}
+	config.Namespace.Restricted = source.Namespace
+	program := (&DynamoGraphDeploymentReconciler{
+		Client: kube, Config: config, Recorder: events.NewFakeRecorder(100),
+		RuntimeConfig: &commoncontroller.RuntimeConfig{Gate: features.Gates{Grove: true, LPX: true}},
+	}).newGroveProgram()
+	_, err := program.Reconcile(t.Context(), workloadProgramRequest{DGD: source})
+	require.NoError(t, err)
+	child := &v1alpha1.LPXGraphDeployment{}
+	require.NoError(t, kube.Get(t.Context(), client.ObjectKeyFromObject(source), child))
+	require.True(t, metav1.IsControlledBy(child, source))
+
+	t.Log("Preserve the colliding adapter and its original ownership and replicas")
+	require.NoError(t, kube.Get(t.Context(), key, adapter))
+	require.Equal(t, before, adapter)
 }

@@ -48,6 +48,32 @@ import (
 
 const updatedWorkerVersion = "new"
 
+func TestGroveReconcileRequestUsesDelegationPredicate(t *testing.T) {
+	dgd := newLPXHandoffSource(t, "node-local-v2-hybrid")
+	dgd.Spec.Components = append(dgd.Spec.Components, nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec{
+		ComponentName: "frontend",
+		ComponentType: nvidiacomv1beta1.ComponentTypeFrontend,
+	})
+	req := groveReconcileRequest{
+		DGD: dgd,
+		IsDelegated: func(component *nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec) bool {
+			return component.ComponentName == "lpx"
+		},
+	}
+
+	t.Log("Select exactly the component managed by Grove")
+	components := req.ManagedComponents()
+	require.Len(t, components, 1)
+	require.Equal(t, "frontend", components[0].ComponentName)
+	require.False(t, components[0].IsLPX())
+	require.Equal(t, []nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec{dgd.Spec.Components[0]}, req.DelegatedComponents())
+
+	t.Log("Treat every component as managed when no delegation predicate is supplied")
+	defaultReq := groveReconcileRequest{DGD: dgd}
+	require.Equal(t, dgd.Spec.Components, defaultReq.ManagedComponents())
+	require.Empty(t, defaultReq.DelegatedComponents())
+}
+
 func TestGroveWorkloadsReconciler_EvaluatesReadinessOnce(t *testing.T) {
 	t.Log("Build a ready frontend alongside an independently owned LPX component")
 	dgd := betaDGD(t, &nvidiacomv1alpha1.DynamoGraphDeployment{
@@ -119,8 +145,7 @@ func TestGroveWorkloadsReconciler_EvaluatesReadinessOnce(t *testing.T) {
 	t.Log("Reconcile workloads and reuse the single child observation for readiness")
 	result, err := reconciler.newGroveProgram().workloads.Reconcile(
 		context.Background(),
-		dgd,
-		projectWithoutExternallyManagedComponents(dgd),
+		groveReconcileRequest{DGD: dgd, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController},
 		nil,
 		nil,
 	)
@@ -137,11 +162,10 @@ func TestGroveWorkloadsReconciler_EvaluatesReadinessOnce(t *testing.T) {
 }
 
 func TestGroveWorkloadsReconcilerUsesStableReadinessWithoutOrdinaryPodCliqueSet(t *testing.T) {
-	t.Log("Project an LPX-only graph without an ordinary PodCliqueSet")
+	t.Log("Use an LPX-only graph without an ordinary PodCliqueSet")
 	const dgdName = "graph"
 	source := newLPXHandoffSource(t, "node-local-v2-lpu-only")
 	source.Name, source.Namespace, source.UID = dgdName, corev1.NamespaceDefault, "dgd-uid"
-	ordinary := projectWithoutExternallyManagedComponents(source)
 	pcsReads := 0
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(newDynamoGraphDeploymentControllerTestScheme(t)).
@@ -167,7 +191,7 @@ func TestGroveWorkloadsReconcilerUsesStableReadinessWithoutOrdinaryPodCliqueSet(
 	}
 
 	t.Log("Report stable-resource readiness without looking up an ordinary PodCliqueSet")
-	result, err := reconciler.newGroveProgram().workloads.Reconcile(t.Context(), source, ordinary, nil, nil)
+	result, err := reconciler.newGroveProgram().workloads.Reconcile(t.Context(), groveReconcileRequest{DGD: source, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, nvidiacomv1beta1.DGDStateSuccessful, result.State)
 	require.Zero(t, pcsReads)
@@ -206,7 +230,7 @@ func TestGroveWorkloadsReconciler_DoesNotCommitWorkerHashWhenPodCliqueSetSyncFai
 			if tt.existingPCS {
 				existingPCS = &grovev1alpha1.PodCliqueSet{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      dynamo.PCSNameForDGD(dgd.Name, dgd.Spec.Components),
+						Name:      dynamo.PCSNameForDGD(dgd, nil),
 						Namespace: dgd.Namespace,
 						OwnerReferences: []metav1.OwnerReference{
 							*metav1.NewControllerRef(dgd, nvidiacomv1beta1.GroupVersion.WithKind("DynamoGraphDeployment")),
@@ -277,7 +301,7 @@ func TestGroveWorkloadsReconciler_DoesNotCommitWorkerHashWhenPodCliqueSetSyncFai
 			t.Log("Reconcile the full workload transition")
 			observedDGD := &nvidiacomv1beta1.DynamoGraphDeployment{}
 			require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(dgd), observedDGD))
-			_, err = workloads.Reconcile(context.Background(), observedDGD, projectWithoutExternallyManagedComponents(observedDGD), nil, nil)
+			_, err = workloads.Reconcile(context.Background(), groveReconcileRequest{DGD: observedDGD, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 
 			t.Log("Verify the failed PCS sync leaves the persisted DGD hash unchanged")
 			require.Error(t, err)
@@ -308,7 +332,7 @@ func TestGroveWorkloadsReconciler_RecoversWorkerHashCommitAfterPodCliqueSetSync(
 	require.NoError(t, err)
 	legacyPCS := &grovev1alpha1.PodCliqueSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      dynamo.PCSNameForDGD(dgd.Name, dgd.Spec.Components),
+			Name:      dynamo.PCSNameForDGD(dgd, nil),
 			Namespace: dgd.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(dgd, nvidiacomv1beta1.GroupVersion.WithKind("DynamoGraphDeployment")),
@@ -364,7 +388,7 @@ func TestGroveWorkloadsReconciler_RecoversWorkerHashCommitAfterPodCliqueSetSync(
 	t.Log("Persist the PCS suffix without projecting the DGD hash from the write receipt")
 	observedDGD := &nvidiacomv1beta1.DynamoGraphDeployment{}
 	require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(dgd), observedDGD))
-	_, err = workloads.Reconcile(context.Background(), observedDGD, projectWithoutExternallyManagedComponents(observedDGD), nil, nil)
+	_, err = workloads.Reconcile(context.Background(), groveReconcileRequest{DGD: observedDGD, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 	require.NoError(t, err)
 
 	t.Log("Verify the write receipt leaves the parent hash unchanged")
@@ -383,7 +407,7 @@ func TestGroveWorkloadsReconciler_RecoversWorkerHashCommitAfterPodCliqueSetSync(
 	t.Log("Observe the suffix on a later reconcile, then reject the parent projection")
 	freshDGD := &nvidiacomv1beta1.DynamoGraphDeployment{}
 	require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(dgd), freshDGD))
-	_, err = workloads.Reconcile(context.Background(), freshDGD, projectWithoutExternallyManagedComponents(freshDGD), nil, nil)
+	_, err = workloads.Reconcile(context.Background(), groveReconcileRequest{DGD: freshDGD, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 	require.Error(t, err)
 	assert.Equal(t, 1, pcsUpdateCalls)
 	assert.Equal(t, 1, dgdUpdateCalls)
@@ -392,7 +416,7 @@ func TestGroveWorkloadsReconciler_RecoversWorkerHashCommitAfterPodCliqueSetSync(
 	failDGDUpdate = false
 	freshDGD = &nvidiacomv1beta1.DynamoGraphDeployment{}
 	require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(dgd), freshDGD))
-	_, err = workloads.Reconcile(context.Background(), freshDGD, projectWithoutExternallyManagedComponents(freshDGD), nil, nil)
+	_, err = workloads.Reconcile(context.Background(), groveReconcileRequest{DGD: freshDGD, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 	require.NoError(t, err)
 
 	t.Log("Verify the retry commits the target hash without rewriting the PCS")
@@ -405,7 +429,7 @@ func TestGroveWorkloadsReconciler_RecoversWorkerHashCommitAfterPodCliqueSetSync(
 	t.Log("Verify the completed transition is idempotent")
 	idempotentDGD := &nvidiacomv1beta1.DynamoGraphDeployment{}
 	require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(dgd), idempotentDGD))
-	_, err = workloads.Reconcile(context.Background(), idempotentDGD, projectWithoutExternallyManagedComponents(idempotentDGD), nil, nil)
+	_, err = workloads.Reconcile(context.Background(), groveReconcileRequest{DGD: idempotentDGD, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, pcsUpdateCalls)
 	assert.Equal(t, 2, dgdUpdateCalls)
@@ -625,7 +649,7 @@ func TestPodCliqueSetObservesWorkerHash(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := podCliqueSetObservesWorkerHash(dgd, tt.pcs, tt.acceptAllUnstamped)
+			got, err := podCliqueSetObservesWorkerHash(groveReconcileRequest{DGD: dgd, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, tt.pcs, tt.acceptAllUnstamped)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
@@ -647,7 +671,7 @@ func TestGroveWorkloadsReconciler_SkipsHashObservationWhenHashIsCurrent(t *testi
 	t.Log("Seed a PCS carrying the current hash so the sync is a no-op")
 	existingPCS := &grovev1alpha1.PodCliqueSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      dynamo.PCSNameForDGD(dgd.Name, dgd.Spec.Components),
+			Name:      dynamo.PCSNameForDGD(dgd, nil),
 			Namespace: dgd.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(dgd, nvidiacomv1beta1.GroupVersion.WithKind("DynamoGraphDeployment")),
@@ -689,7 +713,7 @@ func TestGroveWorkloadsReconciler_SkipsHashObservationWhenHashIsCurrent(t *testi
 	t.Log("Reconcile: hash observation block must be skipped entirely when needsCommit is false")
 	observedDGD := &nvidiacomv1beta1.DynamoGraphDeployment{}
 	require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(dgd), observedDGD))
-	_, err = workloads.Reconcile(context.Background(), observedDGD, projectWithoutExternallyManagedComponents(observedDGD), nil, nil)
+	_, err = workloads.Reconcile(context.Background(), groveReconcileRequest{DGD: observedDGD, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 	require.NoError(t, err)
 
 	assert.Zero(t, dgdUpdateCalls, "DGD must not be updated when the hash annotation is already current")
@@ -717,7 +741,7 @@ func TestGroveWorkloadsReconciler_DefersHashCommitUntilPCSWriteObserved(t *testi
 			name: "legacy unsuffixed PCS — bookkeeping write defers commit, second reconcile commits",
 			existingPCS: &grovev1alpha1.PodCliqueSet{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      dynamo.PCSNameForDGD(dgd.Name, dgd.Spec.Components),
+					Name:      dynamo.PCSNameForDGD(dgd, nil),
 					Namespace: dgd.Namespace,
 					OwnerReferences: []metav1.OwnerReference{
 						*metav1.NewControllerRef(dgd, nvidiacomv1beta1.GroupVersion.WithKind("DynamoGraphDeployment")),
@@ -768,14 +792,14 @@ func TestGroveWorkloadsReconciler_DefersHashCommitUntilPCSWriteObserved(t *testi
 			t.Log("First reconcile writes the PCS; commit must be deferred")
 			observedDGD := &nvidiacomv1beta1.DynamoGraphDeployment{}
 			require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(dgd), observedDGD))
-			_, err = workloads.Reconcile(context.Background(), observedDGD, projectWithoutExternallyManagedComponents(observedDGD), nil, nil)
+			_, err = workloads.Reconcile(context.Background(), groveReconcileRequest{DGD: observedDGD, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 			require.NoError(t, err)
 			assert.Zero(t, dgdUpdateCalls, "hash annotation must not be committed on the reconcile that writes the PCS")
 
 			t.Log("Second reconcile is a no-op PCS sync; commit must proceed")
 			freshDGD := &nvidiacomv1beta1.DynamoGraphDeployment{}
 			require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(dgd), freshDGD))
-			_, err = workloads.Reconcile(context.Background(), freshDGD, projectWithoutExternallyManagedComponents(freshDGD), nil, nil)
+			_, err = workloads.Reconcile(context.Background(), groveReconcileRequest{DGD: freshDGD, IsDelegated: (*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec).ManagedByExternalController}, nil, nil)
 			require.NoError(t, err)
 			assert.Equal(t, 1, dgdUpdateCalls, "hash annotation must be committed once the PCS write is observed")
 

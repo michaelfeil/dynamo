@@ -1367,11 +1367,17 @@ func expandMultinodeGMSRoles(componentName string, numberOfNodes int32, totalEng
 // For short DGD names the PCS name equals the DGD name (backwards compatible).
 // For long names, the PCS name is truncated with a deterministic 4-char hash
 // suffix to guarantee uniqueness and reconcile-loop stability.
-// Components must be the exact subset materialized by this PodCliqueSet.
-func PCSNameForDGD(dgdName string, components []v1beta1.DynamoComponentDeploymentSharedSpec) string {
+func PCSNameForDGD(
+	dgd *v1beta1.DynamoGraphDeployment,
+	isDelegated func(*v1beta1.DynamoComponentDeploymentSharedSpec) bool,
+) string {
 	maxComponentBudget := 0
-	for i := range components {
-		budget := ComponentNameBudget(&components[i])
+	for i := range dgd.Spec.Components {
+		component := &dgd.Spec.Components[i]
+		if isDelegatedComponent(component, isDelegated) {
+			continue
+		}
+		budget := ComponentNameBudget(component)
 		if budget > maxComponentBudget {
 			maxComponentBudget = budget
 		}
@@ -1384,15 +1390,22 @@ func PCSNameForDGD(dgdName string, components []v1beta1.DynamoComponentDeploymen
 		pcsBudget = minPCSNameLength
 	}
 
-	if len(dgdName) <= pcsBudget {
-		return dgdName
+	if len(dgd.Name) <= pcsBudget {
+		return dgd.Name
 	}
 
 	// Truncate with a deterministic hash suffix for uniqueness
 	hash := fnv.New32a()
-	hash.Write([]byte(dgdName))
+	hash.Write([]byte(dgd.Name))
 	suffix := fmt.Sprintf("%04x", hash.Sum32()&0xFFFF)
-	return dgdName[:pcsBudget-5] + "-" + suffix
+	return dgd.Name[:pcsBudget-5] + "-" + suffix
+}
+
+func isDelegatedComponent(
+	component *v1beta1.DynamoComponentDeploymentSharedSpec,
+	isDelegated func(*v1beta1.DynamoComponentDeploymentSharedSpec) bool,
+) bool {
+	return isDelegated != nil && isDelegated(component)
 }
 
 // Define BackendFramework enum for sglang, vllm, trtllm
@@ -2556,18 +2569,19 @@ func resolveGroveSchedulerQueue(
 }
 
 // GenerateGrovePodCliqueSet reads the provider inputs needed to construct the
-// desired PodCliqueSet. Resolved domain values stay local and are passed to
-// the leaf rendering helpers that consume them.
-// The deployment must contain only components owned by this PCS.
+// desired PodCliqueSet. The predicate excludes components delegated to another
+// controller while the complete DGD remains available for graph-wide settings.
 func GenerateGrovePodCliqueSet(
 	ctx context.Context,
 	dynamoDeployment *v1beta1.DynamoGraphDeployment,
+	isDelegated func(*v1beta1.DynamoComponentDeploymentSharedSpec) bool,
 	operatorConfig *configv1alpha1.OperatorConfiguration,
 	runtimeConfig *controller_common.RuntimeConfig,
 	reader ctrlclient.Reader,
 	secretsRetriever SecretsRetriever,
 	restartState *RestartState,
-	existingRestartAnnotations map[string]string,
+	existingPodCliqueSet *grovev1alpha1.PodCliqueSet,
+	workerHashSuffix bool,
 	checkpointInfoByComponent map[string]*checkpoint.CheckpointInfo,
 ) (*grovev1alpha1.PodCliqueSet, error) {
 	// Construct the common PCS envelope before rendering ordinary components.
@@ -2575,7 +2589,7 @@ func GenerateGrovePodCliqueSet(
 	if err != nil {
 		return nil, err
 	}
-	gangSet.Name = PCSNameForDGD(dynamoDeployment.Name, dynamoDeployment.Spec.Components)
+	gangSet.Name = PCSNameForDGD(dynamoDeployment, isDelegated)
 
 	validatedQueueName, err := resolveGroveSchedulerQueue(ctx, dynamoDeployment.Annotations, runtimeConfig)
 	if err != nil {
@@ -2599,9 +2613,22 @@ func GenerateGrovePodCliqueSet(
 		scalingGroups          []grovev1alpha1.PodCliqueScalingGroupConfig
 		resourceClaimTemplates []grovev1alpha1.ResourceClaimTemplateConfig
 	)
+	existingRestartAnnotations := groveRestartAnnotations(existingPodCliqueSet)
+	workerHash := ""
+	if workerHashSuffix {
+		workerHash, err = ComputeDGDWorkersSpecHash(dynamoDeployment)
+		if err != nil {
+			return nil, fmt.Errorf("compute Grove worker hash suffix: %w", err)
+		}
+	}
 
 	for i := range dynamoDeployment.Spec.Components {
-		component := dynamoDeployment.Spec.Components[i].DeepCopy()
+		sourceComponent := &dynamoDeployment.Spec.Components[i]
+		if isDelegatedComponent(sourceComponent, isDelegated) {
+			continue
+		}
+		component := sourceComponent.DeepCopy()
+		prepareGroveComponentForRendering(component, existingPodCliqueSet, workerHash)
 		componentName := component.ComponentName
 		dynamoNamespace := GetDynamoNamespace(dynamoDeployment, component)
 		propagateDGDAnnotations(dynamoDeployment.GetAnnotations(), component)
@@ -2688,6 +2715,65 @@ func GenerateGrovePodCliqueSet(
 	gangSet.Spec.Template.PodCliqueScalingGroupConfigs = scalingGroups
 	gangSet.Spec.Template.ResourceClaimTemplates = resourceClaimTemplates
 	return gangSet, nil
+}
+
+func prepareGroveComponentForRendering(
+	component *v1beta1.DynamoComponentDeploymentSharedSpec,
+	existingPodCliqueSet *grovev1alpha1.PodCliqueSet,
+	workerHash string,
+) {
+	componentType := string(component.ComponentType)
+	if grovePodCliqueSetUsesLegacyWorkerSelector(existingPodCliqueSet, component.ComponentName, componentType) {
+		component.ComponentType = v1beta1.ComponentTypeWorker
+		podTemplate := ensurePodTemplate(component)
+		if _, ok := podTemplate.Labels[commonconsts.KubeLabelDynamoSubComponentType]; !ok {
+			podTemplate.Labels[commonconsts.KubeLabelDynamoSubComponentType] = componentType
+		}
+	}
+	if workerHash != "" && IsWorkerComponent(string(component.ComponentType)) {
+		ensurePodTemplate(component).Labels[commonconsts.KubeLabelDynamoWorkerHash] = workerHash
+	}
+}
+
+func grovePodCliqueSetUsesLegacyWorkerSelector(
+	pcs *grovev1alpha1.PodCliqueSet,
+	componentName string,
+	componentType string,
+) bool {
+	if pcs == nil || (componentType != commonconsts.ComponentTypePrefill && componentType != commonconsts.ComponentTypeDecode) {
+		return false
+	}
+	for _, clique := range pcs.Spec.Template.Cliques {
+		if clique == nil || clique.Labels[commonconsts.KubeLabelDynamoComponent] != componentName {
+			continue
+		}
+		if clique.Labels[commonconsts.KubeLabelDynamoComponentType] != commonconsts.ComponentTypeWorker {
+			continue
+		}
+		subComponentType := clique.Labels[commonconsts.KubeLabelDynamoSubComponentType]
+		if subComponentType == "" || subComponentType == componentType {
+			return true
+		}
+	}
+	return false
+}
+
+func groveRestartAnnotations(pcs *grovev1alpha1.PodCliqueSet) map[string]string {
+	restartAnnotations := make(map[string]string)
+	if pcs == nil {
+		return restartAnnotations
+	}
+	for _, clique := range pcs.Spec.Template.Cliques {
+		if clique == nil {
+			continue
+		}
+		timestamp, hasTimestamp := clique.Annotations[commonconsts.RestartAnnotation]
+		componentName, hasComponent := clique.Labels[commonconsts.KubeLabelDynamoComponent]
+		if hasTimestamp && hasComponent {
+			restartAnnotations[componentName] = timestamp
+		}
+	}
+	return restartAnnotations
 }
 
 // newGrovePodCliqueSet constructs the shared Grove envelope. The caller assigns
