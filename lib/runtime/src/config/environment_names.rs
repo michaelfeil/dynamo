@@ -843,6 +843,11 @@ pub mod tcp_response_stream {
     /// If unset or 0, the OS assigns a free ephemeral port.
     pub const DYN_TCP_RESPONSE_STREAM_PORT: &str = "DYN_TCP_RESPONSE_STREAM_PORT";
 
+    /// Listen backlog of the TCP response stream (CallHome) listener. Defaults to
+    /// 4096, capped by the kernel at `net.core.somaxconn`. Unset, zero, negative, or
+    /// unparseable values fall back to the default.
+    pub const DYN_TCP_LISTEN_BACKLOG: &str = "DYN_TCP_LISTEN_BACKLOG";
+
     /// Host or interface for the TCP response stream server and QUIC response listener.
     ///
     /// Accepts IPv4 and IPv6 literals, bracketed IPv6 literals, IPv4 or IPv6
@@ -1186,6 +1191,7 @@ mod tests {
             request_plane::DYN_TCP_RPC_PORT,
             // TCP Response Stream
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT,
+            tcp_response_stream::DYN_TCP_LISTEN_BACKLOG,
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_HOST,
             tcp_response_stream::tls::DYN_TCP_TLS_CERT_PATH,
             tcp_response_stream::tls::DYN_TCP_TLS_KEY_PATH,
