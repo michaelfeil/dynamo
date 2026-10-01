@@ -95,7 +95,39 @@ impl VllmSidecarEngine {
         Self::from_parsed(args).map_err(Into::into)
     }
 
+    /// Parse CLI arguments without connecting; discovery runs after probe startup.
+    pub fn from_cli() -> Result<
+        impl std::future::Future<Output = Result<(Self, WorkerConfig), DynamoError>>,
+        DynamoError,
+    > {
+        let args = <Args as clap::Parser>::parse();
+        let vllm_http_url = Self::validate_args(&args)?;
+        Ok(Self::from_parsed_async(args, vllm_http_url, false))
+    }
+
+    /// Parse embedded launcher arguments now, then discover metadata after the
+    /// shared sidecar runner has started probes and connected the runtime.
+    pub fn try_from_args_async(
+        argv: Vec<String>,
+    ) -> Result<
+        impl std::future::Future<Output = Result<(Self, WorkerConfig), DynamoError>>,
+        SidecarStartupError,
+    > {
+        let args = <Args as clap::Parser>::try_parse_from(argv)?;
+        let vllm_http_url = Self::validate_args(&args)?;
+        Ok(Self::from_parsed_async(args, vllm_http_url, false))
+    }
+
     fn from_parsed(args: Args) -> Result<(Self, WorkerConfig), DynamoError> {
+        let vllm_http_url = Self::validate_args(&args)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| client::engine_shutdown(format!("bootstrap runtime: {error}")))?;
+        runtime.block_on(Self::from_parsed_async(args, vllm_http_url, true))
+    }
+
+    fn validate_args(args: &Args) -> Result<Option<RlAdminBaseUrl>, DynamoError> {
         if args.sidecar.common.dyn_tool_call_parser.is_some()
             || args.sidecar.common.dyn_reasoning_parser.is_some()
         {
@@ -103,12 +135,11 @@ impl VllmSidecarEngine {
                 "vLLM gRPC does not preserve the request options required by Dynamo tool-call and reasoning parsers",
             ));
         }
-
-        let endpoint = args.sidecar.grpc_endpoint;
-        let enable_rl = args.sidecar.common.enable_rl;
-        let vllm_rl_world_size = args.vllm_rl_world_size.map(|world_size| world_size.get());
-        let vllm_http_url = args
-            .vllm_http_endpoint
+        // Reject overflow before runtime connections, but start the actual
+        // engine deadline only when the bootstrap future is polled.
+        client::startup_deadline(args.sidecar.grpc.config().startup_deadline)?;
+        args.vllm_http_endpoint
+            .as_ref()
             .map(|endpoint| {
                 RlAdminBaseUrl::parse(endpoint.as_str()).map_err(|error| {
                     client::invalid_argument(format!(
@@ -116,14 +147,29 @@ impl VllmSidecarEngine {
                     ))
                 })
             })
-            .transpose()?;
+            .transpose()
+    }
+
+    async fn from_parsed_async(
+        args: Args,
+        vllm_http_url: Option<RlAdminBaseUrl>,
+        bootstrap: bool,
+    ) -> Result<(Self, WorkerConfig), DynamoError> {
+        let endpoint = args.sidecar.grpc_endpoint;
+        let enable_rl = args.sidecar.common.enable_rl;
+        let vllm_rl_world_size = args.vllm_rl_world_size.map(|world_size| world_size.get());
         let transport = args.sidecar.grpc.config();
         let bootstrap_deadline = client::startup_deadline(transport.startup_deadline)?;
-        eprintln!(
-            "Discovering vLLM model metadata from {endpoint}; startup deadline: {:?}",
-            transport.startup_deadline
-        );
-        let model = bootstrap_discover(&endpoint, transport, bootstrap_deadline)?;
+        if bootstrap {
+            eprintln!(
+                "Discovering vLLM model metadata from {endpoint}; startup deadline: {:?}",
+                transport.startup_deadline
+            );
+        } else {
+            tracing::info!(%endpoint, startup_deadline = ?transport.startup_deadline,
+                "Discovering vLLM model metadata");
+        }
+        let model = bootstrap_discover(&endpoint, transport, bootstrap_deadline, bootstrap).await?;
         let mode = args.sidecar.common.disaggregation_mode;
         if mode.is_encode() && !model.supports_multimodal {
             return Err(client::invalid_argument(format!(
@@ -1352,32 +1398,27 @@ fn required_object_json(body: &Map<String, Value>, field: &str) -> Result<Vec<u8
         .map_err(|error| client::invalid_argument(format!("invalid `{field}`: {error}")))
 }
 
-fn bootstrap_discover(
+async fn bootstrap_discover(
     endpoint: &GrpcEndpoint,
     transport: GrpcTransportConfig,
     startup_deadline: Instant,
+    bootstrap: bool,
 ) -> Result<DiscoveredModel, DynamoError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| client::engine_shutdown(format!("bootstrap runtime: {error}")))?;
-    runtime.block_on(async {
-        let bootstrap_transport = GrpcTransportConfig {
-            connections: std::num::NonZeroUsize::MIN,
-            ..transport
-        };
-        let client =
-            VllmClient::connect(endpoint, bootstrap_transport, startup_deadline, true).await?;
-        client
-            .wait_for_services(
-                &[CONTROL_SERVICE],
-                startup_deadline,
-                transport.retry_interval,
-            )
-            .await?;
-        let (model, server) = client.discover(startup_deadline).await?;
-        DiscoveredModel::from_proto(model, server)
-    })
+    let bootstrap_transport = GrpcTransportConfig {
+        connections: std::num::NonZeroUsize::MIN,
+        ..transport
+    };
+    let client =
+        VllmClient::connect(endpoint, bootstrap_transport, startup_deadline, bootstrap).await?;
+    client
+        .wait_for_services(
+            &[CONTROL_SERVICE],
+            startup_deadline,
+            transport.retry_interval,
+        )
+        .await?;
+    let (model, server) = client.discover(startup_deadline).await?;
+    DiscoveredModel::from_proto(model, server)
 }
 
 fn is_hot_swap_requested() -> bool {
