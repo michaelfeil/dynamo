@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, TypeAlias
 
+from jinja2.exceptions import TemplateError
 from sglang.srt.entrypoints.openai.protocol import Function as SglangFunction
 from sglang.srt.entrypoints.openai.protocol import Tool as SglangTool
 from sglang.srt.entrypoints.openai.protocol import ToolChoice as SglangToolChoice
@@ -847,9 +848,14 @@ def preprocess_chat_request(
 
         template_messages = _normalize_messages_for_template(messages, tokenizer)
 
-        prompt_token_ids = _normalize_prompt_token_ids(
-            tokenizer.apply_chat_template(template_messages, **template_kwargs)
-        )
+        try:
+            rendered = tokenizer.apply_chat_template(
+                template_messages, **template_kwargs
+            )
+        except (TemplateError, TypeError) as exc:
+            # Jinja filters such as tojson can raise TypeError for invalid inputs.
+            raise PreprocessError(str(exc)) from exc
+        prompt_token_ids = _normalize_prompt_token_ids(rendered)
 
     # Build parsers after rendering, so DeepSeek-V4 can use its custom encoder
     # while still sharing the existing Dynamo parser/guided-decoding behavior.
