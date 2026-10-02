@@ -537,17 +537,17 @@ jobs:
     secrets: inherit
 
   deepseek-v4-pro-agg-perf:
-    name: recipes
+    name: Recipe tests
     needs: [compute-release-mode, resolve-source-sha, vllm-build, vllm-copy-to-acr]
     if: ${{ needs.compute-release-mode.outputs.run_tests == 'true' }}
-    uses: ./.github/workflows/deepseek-v4-pro-nightly.yml
+    uses: ./.github/workflows/deepseek-v4-pro-agg-nightly.yml
     with:
       source_ref: ${{ needs.resolve-source-sha.outputs.source_sha }}
       image_tag: ${{ needs.vllm-copy-to-acr.outputs.image_tag }}
     secrets: inherit
 
   deepseek-v4-pro-disagg-perf:
-    name: recipes
+    name: Recipe tests
     needs: [compute-release-mode, resolve-source-sha, vllm-build, vllm-copy-to-acr]
     if: ${{ needs.compute-release-mode.outputs.run_tests == 'true' }}
     uses: ./.github/workflows/deepseek-v4-pro-disagg-nightly.yml
@@ -611,10 +611,10 @@ jobs:
           model_cache_path: ${{ vars.AZURE_MODEL_CACHE_PATH }}
 
   kimi-k25-agg-perf:
-    name: Kimi K2.5 aggregated functional smoke
+    name: Recipe tests
     needs: [compute-release-mode, resolve-source-sha, trtllm-copy-to-acr]
     if: ${{ needs.compute-release-mode.outputs.run_tests == 'true' }}
-    uses: $/.github/workflows/kimi-k25-nightly.yml
+    uses: $/.github/workflows/kimi-k25-agg-nightly.yml
     with:
       source_ref: ${{ needs.resolve-source-sha.outputs.source_sha }}
       image_tag: ${{ needs.trtllm-copy-to-acr.outputs.image_tag }}
