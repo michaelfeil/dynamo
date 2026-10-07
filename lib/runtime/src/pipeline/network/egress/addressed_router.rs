@@ -695,6 +695,7 @@ impl AddressedPushRouter {
     ///     callback and sends responses over QUIC.
     ///   - `input_stream = None` + `request = Some(_)` → unary, two-part
     ///     `[ctrl, data]` envelope. The payload travels in the data part.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_and_finalize<T, U>(
         &self,
         context: &context::Context<()>,
@@ -1141,14 +1142,14 @@ mod tests {
     use super::{
         AddressedPushRouter, AddressedRequest, CONTROL_MESSAGE_MAX_BYTES, ConnectionInfo,
         FIRST_RESPONSE_GUARD_CONTEXT_KEY, FirstResponseGuard, RequestControlMessage,
-        RequestPlaneClient, RequestPlanePayloadCodec, RequestType, ResponseType, TwoPartCodec,
-        attach_first_response_guard, build_request_envelope, dispatch_with_first_response_guard,
-        payload_codec_for_worker, propagate_first_response_guard, serialize_control_message,
+        RequestPlaneClient, RequestPlanePayloadCodec, RequestType, ResponseType, StreamingDispatch,
+        TwoPartCodec, attach_first_response_guard, build_request_envelope,
+        dispatch_with_first_response_guard, payload_codec_for_worker,
+        propagate_first_response_guard, serialize_control_message,
         try_acquire_retained_dispatch_permit,
     };
     use crate::{
         component::{Instance, TransportType},
-        engine::AsyncEngine,
         error::{ErrorType, match_error_chain},
         pipeline::{
             AsyncEngineContextProvider, Context, ManyOut, ResponseStream,
@@ -1210,7 +1211,7 @@ mod tests {
         use super::{
             AddressedPushRouter, AddressedRequest, RequestPlaneClient, quic_response, tcp,
         };
-        use crate::pipeline::{AsyncEngine, SingleIn};
+        use crate::pipeline::SingleIn;
         use bytes::Bytes;
         use tokio::sync::mpsc;
         use tokio_util::sync::CancellationToken;
@@ -1270,7 +1271,7 @@ mod tests {
                 callbacks,
                 responses,
             );
-            let request = SingleIn::new(AddressedRequest::new(42_u64, "test".to_string()));
+            let request = SingleIn::new(AddressedRequest::new(&42_u64, "test".to_string()));
             let pool = quic_response::QuicResponseClientPool::from_env().unwrap();
             let (response, (mut sender, payload_codec)) =
                 tokio::join!(router.generate(request), async {
@@ -1558,7 +1559,7 @@ mod tests {
                         AddressedPushRouter::new(Arc::new(CapturingClient(connection_tx)), server)
                             .unwrap();
                     let (guard_dropped_tx, mut guard_dropped_rx) = oneshot::channel();
-                    let mut request = Context::new(AddressedRequest::new(1_u64, "worker".into()));
+                    let mut request = Context::new(AddressedRequest::new(&1_u64, "worker".into()));
                     attach_first_response_guard(
                         &mut request,
                         Arc::new(DropSignal(Some(guard_dropped_tx))),
