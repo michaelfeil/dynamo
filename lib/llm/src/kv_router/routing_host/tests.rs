@@ -3606,7 +3606,7 @@ impl StreamingDispatch<PreprocessedRequest, Annotated<LLMEngineOutput>>
 {
     async fn generate(
         &self,
-        request: SingleIn<AddressedRequest<PreprocessedRequest>>,
+        request: SingleIn<AddressedRequest<&PreprocessedRequest>>,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let (addressed, context) = request.transfer(());
         let (_, _, instance) = addressed.into_parts();
