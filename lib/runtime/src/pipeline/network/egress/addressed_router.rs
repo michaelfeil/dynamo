@@ -1076,10 +1076,17 @@ where
         // Retained dispatch can outlive the caller. Only encoded bytes may cross
         // that boundary; the payload itself is borrowed for this call.
         let queue_start = Instant::now();
-        let payload = payload_codec_for_worker(instance_info.as_ref()).encode(request)?;
-        if let Some(guard) = first_response_guard.and_then(|guard| guard.take()) {
+        let retained_dispatch = if let Some(guard) =
+            first_response_guard.and_then(|guard| guard.take())
+        {
             let permit =
                 try_acquire_retained_dispatch_permit(&RETAINED_FIRST_RESPONSE_DISPATCH_PERMITS)?;
+            Some((guard, permit))
+        } else {
+            None
+        };
+        let payload = payload_codec_for_worker(instance_info.as_ref()).encode(request)?;
+        if let Some((guard, permit)) = retained_dispatch {
             let router = self.clone();
             let dispatch = async move {
                 router
@@ -1379,6 +1386,80 @@ mod tests {
                 request
             );
         }
+    }
+
+    #[tokio::test]
+    async fn saturated_retained_dispatch_rejects_before_serialization() {
+        if crate::test_utils::run_isolated(
+            concat!(
+                module_path!(),
+                "::saturated_retained_dispatch_rejects_before_serialization"
+            ),
+            &[],
+        ) {
+            return;
+        }
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingPayload(AtomicUsize);
+
+        impl Serialize for CountingPayload {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                serializer.serialize_u64(123)
+            }
+        }
+
+        struct UnusedClient;
+
+        #[async_trait::async_trait]
+        impl RequestPlaneClient for UnusedClient {
+            async fn send_request(
+                &self,
+                _address: String,
+                _payload: bytes::Bytes,
+                _headers: Headers,
+            ) -> anyhow::Result<bytes::Bytes> {
+                panic!("saturated dispatch must not reach the transport");
+            }
+
+            fn transport_name(&self) -> &'static str {
+                "test"
+            }
+
+            fn is_healthy(&self) -> bool {
+                true
+            }
+        }
+
+        let _held_permits = super::RETAINED_FIRST_RESPONSE_DISPATCH_PERMITS
+            .clone()
+            .try_acquire_many_owned(super::MAX_RETAINED_FIRST_RESPONSE_DISPATCHES as u32)
+            .unwrap();
+        let responses = TcpStreamServer::new(
+            TcpStreamServer::options_builder()
+                .interface(Some("127.0.0.1".into()))
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let router = AddressedPushRouter::new(Arc::new(UnusedClient), responses).unwrap();
+        let payload = CountingPayload(AtomicUsize::new(0));
+        let (guard_dropped_tx, mut guard_dropped_rx) = oneshot::channel();
+        let mut request = Context::new(AddressedRequest::new(&payload, "worker".into()));
+        attach_first_response_guard(&mut request, Arc::new(DropSignal(Some(guard_dropped_tx))));
+
+        let result: anyhow::Result<ManyOut<Annotated<u64>>> = router.generate(request).await;
+        let error = result.unwrap_err();
+        assert!(match_error_chain(
+            error.as_ref(),
+            &[ErrorType::ResourceExhausted],
+            &[],
+        ));
+        assert_eq!(guard_dropped_rx.try_recv(), Ok(()));
+        assert_eq!(payload.0.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
