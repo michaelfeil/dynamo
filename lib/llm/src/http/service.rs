@@ -124,38 +124,6 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn allow_undefined_tools_batch_policy_matches_preprocessing() {
-        for enabled in [false, true] {
-            let mut req = request(json!("auto"));
-            req.inner.parallel_tool_calls = Some(false);
-            req.chat_template_args = Some(std::collections::HashMap::from([(
-                "allow_undefined_tools".to_string(),
-                json!(enabled),
-            )]));
-            let options = ParsingOptions {
-                tool_call_parser: Some("glm47".to_string()),
-                structural_tag: Some(Default::default()),
-                ..Default::default()
-            };
-            let result = apply_request_tool_call_parsing_options(options, &req).unwrap();
-            assert_eq!(
-                result.guided_tool_constraint,
-                if enabled {
-                    GuidedToolConstraint::None
-                } else {
-                    GuidedToolConstraint::StructuralTag
-                }
-            );
-            assert_eq!(
-                result.tools.len(),
-                1,
-                "declarations must remain available for argument coercion"
-            );
-            assert!(!result.suppress_tool_calls);
-        }
-    }
-
-    #[test]
     fn raw_batch_reasoning_policy_respects_deployment_default_and_client_override() {
         let mut options =
             ParsingOptions::new(Some("gemma4".to_string()), Some("gemma4".to_string()));

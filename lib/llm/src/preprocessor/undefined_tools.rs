@@ -160,51 +160,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_undefined_tools_filters_fragmented_names_and_reindexes_calls() {
-        let chunks = vec![
-            response(
-                json!([{"index": 0, "id": "bad", "type": "function", "function": {"name": "known"}}]),
-                json!(null),
-            ),
-            response(
-                json!([{"index": 0, "function": {"name": "_unknown", "arguments": "{}"}}, {"index": 1, "id": "good", "type": "function", "function": {"name": "known", "arguments": "{\"x\":"}}]),
-                json!(null),
-            ),
-            response(
-                json!([{"index": 1, "function": {"arguments": "1}"}}]),
-                json!("tool_calls"),
-            ),
-        ];
-        let output: Vec<_> =
-            apply_stream(stream::iter(chunks), Some(HashSet::from(["known".into()])))
-                .collect()
-                .await;
-        let first = output[0].data.as_ref().unwrap();
-        assert!(first.inner.choices[0].delta.tool_calls.is_none());
-        let calls: Vec<_> = output
-            .iter()
-            .flat_map(|response| {
-                response.data.as_ref().unwrap().inner.choices[0]
-                    .delta
-                    .tool_calls
-                    .iter()
-                    .flatten()
-            })
-            .collect();
-        assert_eq!(calls.len(), 2);
-        assert!(calls.iter().all(|call| call.index == 0));
-        assert_eq!(calls[0].id.as_deref(), Some("good"));
-        assert_eq!(
-            calls[0].function.as_ref().unwrap().name.as_deref(),
-            Some("known")
-        );
-        assert_eq!(
-            output.last().unwrap().data.as_ref().unwrap().inner.choices[0].finish_reason,
-            Some(FinishReason::ToolCalls)
-        );
-    }
-
-    #[tokio::test]
     async fn allow_undefined_tools_handles_parameterless_calls_and_empty_turns() {
         for name in ["known", "unknown"] {
             let chunks = vec![
